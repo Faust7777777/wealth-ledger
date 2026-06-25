@@ -1,38 +1,8 @@
-// Wealth Ledger — app entry.
-// P0: launches the design-token preview (dev) with a dark/light toggle.
-// Real screens (concept: M1 概览) come after P0a OverviewVm wiring (see API_CONTRACT_V1).
+// Wealth Ledger — entry.
+// 默认 real_local 空账本；debug 构建下 --dart-define=DEMO=true 启用隔离 fixture（带 DEMO 角标）。
+// dev token 预览仍可经 /dev/tokens 访问。
 import 'package:flutter/material.dart';
-import 'theme/app_theme.dart';
-import 'dev/tokens_preview.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'app/app.dart';
 
-void main() => runApp(const WealthLedgerApp());
-
-class WealthLedgerApp extends StatefulWidget {
-  const WealthLedgerApp({super.key});
-
-  @override
-  State<WealthLedgerApp> createState() => _WealthLedgerAppState();
-}
-
-class _WealthLedgerAppState extends State<WealthLedgerApp> {
-  ThemeMode _mode = ThemeMode.dark;
-
-  void _toggle() => setState(() {
-        _mode = _mode == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
-      });
-
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Wealth Ledger',
-      debugShowCheckedModeBanner: false,
-      theme: buildLightTheme(),
-      darkTheme: buildDarkTheme(),
-      themeMode: _mode,
-      home: TokensPreview(
-        isDark: _mode == ThemeMode.dark,
-        onToggleTheme: _toggle,
-      ),
-    );
-  }
-}
+void main() => runApp(const ProviderScope(child: WealthLedgerApp()));
