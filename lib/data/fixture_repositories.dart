@@ -300,6 +300,8 @@ class FixtureAiProposalRepository implements AiProposalRepository {
   Future<void> approveAtomicGroup(Id groupId) async {/* DEMO：模拟接受，演示数据不变 */}
   @override
   Future<void> rejectAtomicGroup(Id groupId, {String? reason}) async {/* DEMO：模拟拒绝 */}
+  @override
+  Future<void> createFromText(String text) async {/* DEMO：模拟生成候选（演示数据不变）*/}
 }
 
 class FixtureSnapshotRepository implements SnapshotRepository {

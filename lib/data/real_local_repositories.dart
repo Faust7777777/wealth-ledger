@@ -74,6 +74,9 @@ class RealLocalAiProposalRepository implements AiProposalRepository {
   @override
   Future<void> rejectAtomicGroup(Id groupId, {String? reason}) async =>
       throw UnsupportedError('real_local 暂不支持写入；请用 api_mock 联调');
+  @override
+  Future<void> createFromText(String text) async =>
+      throw UnsupportedError('real_local 暂不支持 AI 导入；请用 api_mock 联调');
 }
 
 class RealLocalSnapshotRepository implements SnapshotRepository {

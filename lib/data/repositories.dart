@@ -40,6 +40,8 @@ abstract interface class AiProposalRepository {
   // 写路径：仅生成/处理 proposal，永不直接写正式账本。
   Future<void> approveAtomicGroup(Id groupId);
   Future<void> rejectAtomicGroup(Id groupId, {String? reason});
+  /// 文本导入：AI 只生成候选 proposal，用户确认后才入账。
+  Future<void> createFromText(String text);
 }
 
 abstract interface class SnapshotRepository {

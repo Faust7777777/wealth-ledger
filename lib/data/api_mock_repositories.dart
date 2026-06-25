@@ -460,6 +460,10 @@ class ApiMockAiProposalRepository implements AiProposalRepository {
     await _c.postData('/v1/ai/atomic-groups/$groupId/reject',
         body: reason == null ? null : {'reason': reason});
   }
+  @override
+  Future<void> createFromText(String text) async {
+    await _c.postData('/v1/ai/proposals/from-text', body: {'text': text});
+  }
 }
 
 class ApiMockSnapshotRepository implements SnapshotRepository {
