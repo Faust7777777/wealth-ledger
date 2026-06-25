@@ -31,6 +31,7 @@ class DevApiClient {
   Object? _handle(http.Response res, String path) {
     if (res.statusCode == 403) throw ApiForbiddenException(path);
     if (res.statusCode >= 400) throw Exception('HTTP ${res.statusCode} · $path');
+    if (res.statusCode == 204 || res.bodyBytes.isEmpty) return null; // 如 AI reject 返回 204
     final body = jsonDecode(utf8.decode(res.bodyBytes));
     if (body is Map<String, dynamic>) {
       if (body['ok'] == false) throw Exception('API error · $path');
