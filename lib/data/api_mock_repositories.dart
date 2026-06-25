@@ -5,6 +5,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import '../core/format.dart';
 import '../core/types.dart';
 import 'repositories.dart';
 import 'view_models.dart';
@@ -353,16 +354,31 @@ PendingSummaryVm _pending(Map<String, dynamic> j) => PendingSummaryVm(
     );
 
 /// 公开以便单测直接喂 examples/*.json（无需起服务）。
-PortfolioOverviewVm parseOverviewData(Map<String, dynamic> j) => PortfolioOverviewVm(
-      latestSnapshot: _snapshotOrNull(j['latestSnapshot']),
-      previousSnapshot: _snapshotOrNull(j['previousSnapshot']),
-      pendingSummary: j['pendingSummary'] is Map ? _pending(_m(j['pendingSummary'])) : const PendingSummaryVm(),
-      quoteStatusSummary:
-          j['quoteStatusSummary'] is Map ? _quoteSummary(_m(j['quoteStatusSummary'])) : const QuoteStatusSummaryVm(),
-      primaryHoldings: [for (final h in _list(j['primaryHoldings'])) _holding(_m(h))],
-      recentMovements: [for (final m in _list(j['recentMovements'])) _movement(_m(m))],
-      changeSinceLastSnapshot: _moneyOrNull(j['changeSinceLastSnapshot']),
+PortfolioOverviewVm parseOverviewData(Map<String, dynamic> j) {
+  final latest = _snapshotOrNull(j['latestSnapshot']);
+  final previous = _snapshotOrNull(j['previousSnapshot']);
+  var change = _moneyOrNull(j['changeSinceLastSnapshot']);
+  // 服务器未给 delta 时，用快照净值精确相减（同币种）。
+  if (change == null &&
+      latest != null &&
+      previous != null &&
+      latest.netWorth.currency == previous.netWorth.currency) {
+    change = Money(
+      amount: subtractDecimal(latest.netWorth.amount, previous.netWorth.amount),
+      currency: latest.netWorth.currency,
     );
+  }
+  return PortfolioOverviewVm(
+    latestSnapshot: latest,
+    previousSnapshot: previous,
+    pendingSummary: j['pendingSummary'] is Map ? _pending(_m(j['pendingSummary'])) : const PendingSummaryVm(),
+    quoteStatusSummary:
+        j['quoteStatusSummary'] is Map ? _quoteSummary(_m(j['quoteStatusSummary'])) : const QuoteStatusSummaryVm(),
+    primaryHoldings: [for (final h in _list(j['primaryHoldings'])) _holding(_m(h))],
+    recentMovements: [for (final m in _list(j['recentMovements'])) _movement(_m(m))],
+    changeSinceLastSnapshot: change,
+  );
+}
 
 // ———— 仓库实现 ————
 class ApiMockAccountRepository implements AccountRepository {

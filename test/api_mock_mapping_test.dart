@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:finwealth/core/format.dart';
 import 'package:finwealth/data/api_mock_repositories.dart';
 
 Map<String, dynamic> _data(String path) {
@@ -22,6 +23,7 @@ void main() {
     expect(vm.primaryHoldings.first.symbol, 'NVDA');
     expect(vm.recentMovements.first.inTransit, isTrue);
     expect(vm.recentMovements.first.displayAmount?.amount, '500.00');
+    expect(vm.changeSinceLastSnapshot?.amount, '1245.67'); // 245678.90 - 244433.23
   });
 
   test('parseOverviewData maps the empty payload to an empty overview', () {
@@ -29,5 +31,12 @@ void main() {
       _data('docs/contracts/examples/portfolio_overview_empty.response.json'),
     );
     expect(vm.isEmpty, isTrue);
+  });
+
+  test('subtractDecimal does exact decimal subtraction (no double)', () {
+    expect(subtractDecimal('245678.90', '244433.23'), '1245.67');
+    expect(subtractDecimal('100', '100.50'), '-0.50');
+    expect(subtractDecimal('5', '3'), '2');
+    expect(subtractDecimal('0.10', '0.30'), '-0.20');
   });
 }
