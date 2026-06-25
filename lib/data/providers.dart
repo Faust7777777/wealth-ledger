@@ -12,9 +12,10 @@ import 'view_models.dart';
 
 DataSourceMode _mode(Ref ref) => ref.watch(appEnvironmentProvider).dataSourceMode;
 
-final devApiClientProvider = Provider<DevApiClient>(
-  (ref) => DevApiClient(ref.watch(appEnvironmentProvider).apiBaseUrl),
-);
+final devApiClientProvider = Provider<DevApiClient>((ref) {
+  final env = ref.watch(appEnvironmentProvider);
+  return DevApiClient(env.apiBaseUrl, scenario: env.apiScenario);
+});
 
 T _pick<T>(
   Ref ref, {

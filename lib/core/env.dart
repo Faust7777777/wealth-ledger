@@ -11,10 +11,12 @@ class AppEnvironment {
   const AppEnvironment({
     required this.dataSourceMode,
     this.apiBaseUrl = 'http://127.0.0.1:8790',
+    this.apiScenario = '',
   });
 
   final DataSourceMode dataSourceMode;
   final String apiBaseUrl;
+  final String apiScenario; // 仅 dev 联调：空=服务器默认(空态)；可设 'degraded'
 
   bool get isDemo => dataSourceMode == DataSourceMode.debugFixture;
   bool get isMock => dataSourceMode == DataSourceMode.apiMock;
@@ -35,6 +37,7 @@ class AppEnvironment {
     const demo = bool.fromEnvironment('DEMO');
     const apiBase =
         String.fromEnvironment('API_BASE', defaultValue: 'http://127.0.0.1:8790');
+    const scenario = String.fromEnvironment('API_SCENARIO');
     final DataSourceMode mode;
     if (ds == 'api_mock') {
       mode = DataSourceMode.apiMock;
@@ -43,7 +46,11 @@ class AppEnvironment {
     } else {
       mode = DataSourceMode.realLocal;
     }
-    return AppEnvironment(dataSourceMode: mode, apiBaseUrl: apiBase);
+    return AppEnvironment(
+      dataSourceMode: mode,
+      apiBaseUrl: apiBase,
+      apiScenario: scenario,
+    );
   }
 }
 

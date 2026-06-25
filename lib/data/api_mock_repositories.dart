@@ -18,12 +18,17 @@ class ApiForbiddenException implements Exception {
 }
 
 class DevApiClient {
-  DevApiClient(this.baseUrl, {http.Client? client}) : _client = client ?? http.Client();
+  DevApiClient(this.baseUrl, {this.scenario = '', http.Client? client})
+      : _client = client ?? http.Client();
   final String baseUrl;
+  final String scenario;
   final http.Client _client;
 
   Future<Object?> getData(String path) async {
-    final res = await _client.get(Uri.parse('$baseUrl$path'));
+    final url = scenario.isEmpty
+        ? '$baseUrl$path'
+        : '$baseUrl$path${path.contains('?') ? '&' : '?'}scenario=$scenario';
+    final res = await _client.get(Uri.parse(url));
     if (res.statusCode == 403) throw ApiForbiddenException(path);
     if (res.statusCode >= 400) throw Exception('HTTP ${res.statusCode} · $path');
     final body = jsonDecode(utf8.decode(res.bodyBytes));
