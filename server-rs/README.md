@@ -44,6 +44,16 @@ cargo run --manifest-path server-rs/Cargo.toml -- --addr 127.0.0.1:8791
 - no AI direct ledger writes
 - no coupon planning
 
+## Internal boundary
+
+Routes now use `AppState { ledger: DevLedgerCore }` as the backend seam.
+`DevLedgerCore` is deterministic and in-memory; it owns the empty/degraded dev
+dataset selection. HTTP handlers should stay thin: parse path/query, call the
+ledger facade, then wrap the result in the shared response envelope.
+
+When real local storage is added, replace the dev core/store behind this facade
+instead of letting route handlers talk directly to SQLite, sync, quotes, or AI.
+
 ## Dev scenarios
 
 Default routes keep the empty-ledger shape. Add `?scenario=degraded` to the

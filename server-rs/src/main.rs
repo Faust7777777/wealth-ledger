@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, Query},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -21,6 +21,192 @@ const DCA_PROPOSAL: &str =
 const QUOTE_STALE: &str =
     include_str!("../../docs/contracts/examples/quote_refresh_stale.response.json");
 
+#[derive(Clone)]
+struct AppState {
+    ledger: DevLedgerCore,
+}
+
+impl AppState {
+    fn dev() -> Self {
+        Self {
+            ledger: DevLedgerCore,
+        }
+    }
+}
+
+/// Dev-only LedgerCore facade.
+///
+/// This is deliberately in-memory and deterministic. It is the seam where the
+/// future encrypted local ledger / SQLite store can replace virtual dev data
+/// without changing HTTP route signatures.
+#[derive(Clone)]
+struct DevLedgerCore;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DevScenario {
+    Empty,
+    Degraded,
+}
+
+impl DevScenario {
+    fn from_query(query: &HashMap<String, String>) -> Self {
+        if query
+            .get("scenario")
+            .is_some_and(|value| value == "degraded")
+        {
+            Self::Degraded
+        } else {
+            Self::Empty
+        }
+    }
+
+    fn is_degraded(self) -> bool {
+        self == Self::Degraded
+    }
+}
+
+impl DevLedgerCore {
+    fn portfolio_overview(&self, scenario: DevScenario) -> Value {
+        match scenario {
+            DevScenario::Empty => example_data(OVERVIEW_EMPTY),
+            DevScenario::Degraded => example_data(OVERVIEW_DEGRADED),
+        }
+    }
+
+    fn accounts(&self, scenario: DevScenario) -> Value {
+        if scenario.is_degraded() {
+            dev_accounts()
+        } else {
+            json!([])
+        }
+    }
+
+    fn account(&self, scenario: DevScenario, account_id: &str) -> Option<Value> {
+        find_by_id(self.accounts(scenario), account_id)
+    }
+
+    fn account_anomalies(&self, scenario: DevScenario) -> Value {
+        if scenario.is_degraded() {
+            dev_account_anomalies()
+        } else {
+            json!([])
+        }
+    }
+
+    fn holdings(&self, scenario: DevScenario) -> Value {
+        if scenario.is_degraded() {
+            dev_holdings()
+        } else {
+            json!([])
+        }
+    }
+
+    fn holdings_by_account(&self, scenario: DevScenario, account_id: &str) -> Value {
+        let items = self
+            .holdings(scenario)
+            .as_array()
+            .expect("dev holdings should be an array")
+            .iter()
+            .filter(|item| item.get("accountId").and_then(Value::as_str) == Some(account_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        json!(items)
+    }
+
+    fn asset_allocation(&self, scenario: DevScenario) -> Value {
+        if scenario.is_degraded() {
+            dev_asset_allocation()
+        } else {
+            json!({
+                "slices": [],
+                "totalAssets": {"amount": "0", "currency": "CNY"},
+                "totalLiabilities": {"amount": "0", "currency": "CNY"},
+                "netWorth": {"amount": "0", "currency": "CNY"}
+            })
+        }
+    }
+
+    fn movements(&self, scenario: DevScenario) -> Value {
+        if scenario.is_degraded() {
+            dev_movements()
+        } else {
+            json!([])
+        }
+    }
+
+    fn movement(&self, scenario: DevScenario, movement_id: &str) -> Option<Value> {
+        find_by_id(self.movements(scenario), movement_id)
+    }
+
+    fn dca_plans(&self, scenario: DevScenario) -> Value {
+        if scenario.is_degraded() {
+            dev_dca_plans()
+        } else {
+            json!([])
+        }
+    }
+
+    fn dca_due_reminders(&self, scenario: DevScenario) -> Value {
+        if scenario.is_degraded() {
+            dev_dca_reminders()
+        } else {
+            json!([])
+        }
+    }
+
+    fn ai_pending(&self, scenario: DevScenario) -> Value {
+        if scenario.is_degraded() {
+            json!([example_data(AI_DIFF)])
+        } else {
+            json!([])
+        }
+    }
+
+    fn ai_proposal(&self, scenario: DevScenario, proposal_id: &str) -> Option<Value> {
+        if !scenario.is_degraded() {
+            return None;
+        }
+        let proposal = example_data(AI_DIFF);
+        (proposal.get("id").and_then(Value::as_str) == Some(proposal_id)).then_some(proposal)
+    }
+
+    fn quote_summary(&self, scenario: DevScenario) -> Value {
+        if scenario.is_degraded() {
+            let overview = self.portfolio_overview(scenario);
+            overview["quoteStatusSummary"].clone()
+        } else {
+            json!({
+                "freshCount": 0,
+                "staleCount": 0,
+                "offlineCachedCount": 0,
+                "unpriceableCount": 0,
+                "errorCount": 0
+            })
+        }
+    }
+
+    fn latest_snapshot(&self, scenario: DevScenario) -> Value {
+        if scenario.is_degraded() {
+            let overview = self.portfolio_overview(scenario);
+            overview["latestSnapshot"].clone()
+        } else {
+            Value::Null
+        }
+    }
+
+    fn snapshots(&self, scenario: DevScenario) -> Value {
+        if scenario.is_degraded() {
+            let overview = self.portfolio_overview(scenario);
+            json!([
+                overview["latestSnapshot"].clone(),
+                overview["previousSnapshot"].clone()
+            ])
+        } else {
+            json!([])
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let addr = read_addr();
@@ -38,6 +224,10 @@ async fn main() {
 }
 
 fn app() -> Router {
+    app_with_state(AppState::dev())
+}
+
+fn app_with_state(state: AppState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/auth/login", post(auth_login))
@@ -135,6 +325,7 @@ fn app() -> Router {
         .route("/v1/ai/auto-approve", any(forbidden))
         .route("/v1/ai/write-ledger-directly", any(forbidden))
         .route("/v1/coupons/plan", any(forbidden))
+        .with_state(state)
 }
 
 fn read_addr() -> SocketAddr {
@@ -200,155 +391,145 @@ async fn auth_refresh() -> Json<Value> {
     auth_login().await
 }
 
-async fn portfolio_overview(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
-    if is_degraded(&query) {
-        example_json(OVERVIEW_DEGRADED)
-    } else {
-        example_json(OVERVIEW_EMPTY)
-    }
+async fn portfolio_overview(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    envelope(
+        state
+            .ledger
+            .portfolio_overview(DevScenario::from_query(&query)),
+    )
 }
 
-async fn accounts(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
-    if is_degraded(&query) {
-        envelope(dev_accounts())
-    } else {
-        envelope(json!([]))
-    }
+async fn accounts(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    envelope(state.ledger.accounts(DevScenario::from_query(&query)))
 }
 
 async fn account_detail(
+    State(state): State<AppState>,
     Path(account_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    if !is_degraded(&query) {
-        return not_found(
-            "account_not_found",
-            "Account not found in empty dev scenario.",
-        );
-    }
-
-    match find_by_id(dev_accounts(), &account_id) {
+    match state
+        .ledger
+        .account(DevScenario::from_query(&query), &account_id)
+    {
         Some(account) => envelope(account).into_response(),
         None => not_found(
             "account_not_found",
-            "Account does not exist in degraded dev scenario.",
+            "Account does not exist in this dev scenario.",
         ),
     }
 }
 
-async fn account_anomalies(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
-    if is_degraded(&query) {
-        envelope(dev_account_anomalies())
-    } else {
-        envelope(json!([]))
-    }
+async fn account_anomalies(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    envelope(
+        state
+            .ledger
+            .account_anomalies(DevScenario::from_query(&query)),
+    )
 }
 
-async fn holdings(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
-    if is_degraded(&query) {
-        envelope(dev_holdings())
-    } else {
-        envelope(json!([]))
-    }
+async fn holdings(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    envelope(state.ledger.holdings(DevScenario::from_query(&query)))
 }
 
 async fn account_holdings(
+    State(state): State<AppState>,
     Path(account_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Json<Value> {
-    if !is_degraded(&query) {
-        return envelope(json!([]));
-    }
-
-    let items = dev_holdings()
-        .as_array()
-        .expect("dev holdings should be an array")
-        .iter()
-        .filter(|item| item.get("accountId").and_then(Value::as_str) == Some(account_id.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    envelope(json!(items))
+    envelope(
+        state
+            .ledger
+            .holdings_by_account(DevScenario::from_query(&query), &account_id),
+    )
 }
 
-async fn asset_allocation(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
-    if is_degraded(&query) {
-        envelope(dev_asset_allocation())
-    } else {
-        envelope(json!({
-            "slices": [],
-            "totalAssets": {"amount": "0", "currency": "CNY"},
-            "totalLiabilities": {"amount": "0", "currency": "CNY"},
-            "netWorth": {"amount": "0", "currency": "CNY"}
-        }))
-    }
+async fn asset_allocation(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    envelope(
+        state
+            .ledger
+            .asset_allocation(DevScenario::from_query(&query)),
+    )
 }
 
-async fn movements(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
-    if is_degraded(&query) {
-        envelope(dev_movements())
-    } else {
-        envelope(json!([]))
-    }
+async fn movements(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    envelope(state.ledger.movements(DevScenario::from_query(&query)))
 }
 
 async fn movement_detail(
+    State(state): State<AppState>,
     Path(movement_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    if !is_degraded(&query) {
-        return not_found(
-            "movement_not_found",
-            "Movement not found in empty dev scenario.",
-        );
-    }
-
-    match find_by_id(dev_movements(), &movement_id) {
+    match state
+        .ledger
+        .movement(DevScenario::from_query(&query), &movement_id)
+    {
         Some(movement) => envelope(movement).into_response(),
         None => not_found(
             "movement_not_found",
-            "Movement does not exist in degraded dev scenario.",
+            "Movement does not exist in this dev scenario.",
         ),
     }
 }
 
-async fn dca_plans(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
-    if is_degraded(&query) {
-        envelope(dev_dca_plans())
-    } else {
-        envelope(json!([]))
-    }
+async fn dca_plans(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    envelope(state.ledger.dca_plans(DevScenario::from_query(&query)))
 }
 
-async fn dca_due_reminders(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
-    if is_degraded(&query) {
-        envelope(dev_dca_reminders())
-    } else {
-        envelope(json!([]))
-    }
+async fn dca_due_reminders(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    envelope(
+        state
+            .ledger
+            .dca_due_reminders(DevScenario::from_query(&query)),
+    )
 }
 
-async fn ai_pending(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
-    if is_degraded(&query) {
-        envelope(json!([example_data(AI_DIFF)]))
-    } else {
-        envelope(json!([]))
-    }
+async fn ai_pending(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    envelope(state.ledger.ai_pending(DevScenario::from_query(&query)))
 }
 
 async fn ai_proposal(
+    State(state): State<AppState>,
     Path(proposal_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    let proposal = example_data(AI_DIFF);
-    if is_degraded(&query)
-        && proposal.get("id").and_then(Value::as_str) == Some(proposal_id.as_str())
+    match state
+        .ledger
+        .ai_proposal(DevScenario::from_query(&query), &proposal_id)
     {
-        envelope(proposal).into_response()
-    } else {
-        not_found(
+        Some(proposal) => envelope(proposal).into_response(),
+        None => not_found(
             "ai_proposal_not_found",
             "AI proposal does not exist in this dev scenario.",
-        )
+        ),
     }
 }
 
@@ -372,40 +553,29 @@ async fn empty_array() -> Json<Value> {
     envelope(json!([]))
 }
 
-async fn quote_summary(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
-    if is_degraded(&query) {
-        let overview = example_data(OVERVIEW_DEGRADED);
-        envelope(overview["quoteStatusSummary"].clone())
-    } else {
-        envelope(json!({
-            "freshCount": 0,
-            "staleCount": 0,
-            "offlineCachedCount": 0,
-            "unpriceableCount": 0,
-            "errorCount": 0
-        }))
-    }
+async fn quote_summary(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    envelope(state.ledger.quote_summary(DevScenario::from_query(&query)))
 }
 
-async fn snapshot_latest(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
-    if is_degraded(&query) {
-        let overview = example_data(OVERVIEW_DEGRADED);
-        envelope(overview["latestSnapshot"].clone())
-    } else {
-        envelope(Value::Null)
-    }
+async fn snapshot_latest(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    envelope(
+        state
+            .ledger
+            .latest_snapshot(DevScenario::from_query(&query)),
+    )
 }
 
-async fn snapshots(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
-    if is_degraded(&query) {
-        let overview = example_data(OVERVIEW_DEGRADED);
-        envelope(json!([
-            overview["latestSnapshot"].clone(),
-            overview["previousSnapshot"].clone()
-        ]))
-    } else {
-        envelope(json!([]))
-    }
+async fn snapshots(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    envelope(state.ledger.snapshots(DevScenario::from_query(&query)))
 }
 
 async fn sync_bootstrap() -> Json<Value> {
@@ -477,12 +647,6 @@ fn example_json(raw: &str) -> Json<Value> {
 fn example_data(raw: &str) -> Value {
     let parsed: Value = serde_json::from_str(raw).expect("contract example JSON must parse");
     parsed["data"].clone()
-}
-
-fn is_degraded(query: &HashMap<String, String>) -> bool {
-    query
-        .get("scenario")
-        .is_some_and(|value| value == "degraded")
 }
 
 fn find_by_id(items: Value, id: &str) -> Option<Value> {
@@ -818,6 +982,32 @@ mod tests {
             let parsed: Value = serde_json::from_str(raw).expect("example should parse");
             assert_eq!(parsed["ok"], true);
         }
+    }
+
+    #[test]
+    fn dev_ledger_core_separates_empty_and_degraded_scenarios() {
+        let core = DevLedgerCore;
+
+        assert_eq!(core.accounts(DevScenario::Empty), json!([]));
+        assert_eq!(core.holdings(DevScenario::Empty), json!([]));
+        assert_eq!(core.movements(DevScenario::Empty), json!([]));
+        assert_eq!(core.ai_pending(DevScenario::Empty), json!([]));
+
+        assert_eq!(
+            core.accounts(DevScenario::Degraded)
+                .as_array()
+                .expect("degraded accounts should be an array")
+                .len(),
+            4
+        );
+        assert_eq!(
+            core.quote_summary(DevScenario::Degraded)["staleCount"],
+            json!(2)
+        );
+        assert!(
+            core.ai_proposal(DevScenario::Degraded, "proposal_ai_001")
+                .is_some()
+        );
     }
 
     async fn request_json(method: Method, uri: &str) -> (StatusCode, Value) {
