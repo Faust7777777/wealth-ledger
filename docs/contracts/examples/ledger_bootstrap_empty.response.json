@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "data": {
+    "ledgerVersion": 1,
+    "syncCursor": "cursor_empty_0001",
+    "baseCurrency": "CNY",
+    "snapshot": null,
+    "accounts": [],
+    "categories": [],
+    "counterparties": []
+  }
+}
+

@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "data": {
+    "latestSnapshot": null,
+    "previousSnapshot": null,
+    "pendingSummary": {
+      "aiPendingCount": 0,
+      "accountAnomalyCount": 0,
+      "dcaDueCount": 0,
+      "inTransitCount": 0,
+      "quoteProblemCount": 0,
+      "syncProblemCount": 0
+    },
+    "quoteStatusSummary": {
+      "freshCount": 0,
+      "staleCount": 0,
+      "offlineCachedCount": 0,
+      "unpriceableCount": 0,
+      "errorCount": 0
+    },
+    "primaryHoldings": [],
+    "recentMovements": []
+  }
+}
+

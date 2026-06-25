@@ -1,0 +1,50 @@
+{
+  "ok": true,
+  "data": {
+    "status": "partial_success",
+    "quotes": [
+      {
+        "id": "quote_btc_20260625",
+        "instrumentId": "inst_btc",
+        "price": "61500.00",
+        "currency": "USD",
+        "asOf": "2026-06-25T09:20:00+08:00",
+        "expiresAt": "2026-06-25T09:25:00+08:00",
+        "source": "cached_provider",
+        "status": "stale"
+      },
+      {
+        "id": "quote_eth_20260625",
+        "instrumentId": "inst_eth",
+        "price": "3400.00",
+        "currency": "USD",
+        "asOf": "2026-06-25T09:29:00+08:00",
+        "expiresAt": "2026-06-25T09:34:00+08:00",
+        "source": "provider",
+        "status": "fresh"
+      }
+    ],
+    "fxRates": [
+      {
+        "id": "fx_usd_cny_20260625",
+        "baseCurrency": "USD",
+        "quoteCurrency": "CNY",
+        "rate": "7.1800",
+        "asOf": "2026-06-25T08:30:00+08:00",
+        "expiresAt": "2026-06-26T08:30:00+08:00",
+        "source": "cached_provider",
+        "status": "offline_cached"
+      }
+    ],
+    "errors": [
+      {
+        "targetType": "instrument",
+        "targetId": "inst_btc",
+        "message": "刷新失败，继续使用缓存报价。",
+        "retryable": true
+      }
+    ],
+    "completedAt": "2026-06-25T09:30:00+08:00"
+  }
+}
+

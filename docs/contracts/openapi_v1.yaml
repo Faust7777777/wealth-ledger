@@ -1,0 +1,2455 @@
+openapi: 3.1.0
+info:
+  title: Finwealth API
+  version: 0.1.0
+  description: >
+    Draft HTTP API for the personal asset / investment / liability control
+    panel. This API never executes transfers, places orders, or lets AI write
+    directly to the confirmed ledger.
+servers:
+  - url: /v1
+security:
+  - bearerAuth: []
+tags:
+  - name: Health
+  - name: Auth
+  - name: Ledger
+  - name: Accounts
+  - name: Portfolio
+  - name: Movements
+  - name: DCA
+  - name: AI Proposals
+  - name: Quotes
+  - name: Snapshots
+  - name: Taxonomy
+  - name: Sync
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      security: []
+      summary: Check service health.
+      responses:
+        "200":
+          description: Service status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Login with username, password, and device name.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Tokens for this device.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthTokenResponse"
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Refresh access token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken:
+                  type: string
+      responses:
+        "200":
+          description: Refreshed tokens.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthTokenResponse"
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke current refresh token.
+      responses:
+        "204":
+          description: Logged out.
+
+  /auth/devices:
+    get:
+      tags: [Auth]
+      summary: List authorized devices.
+      responses:
+        "200":
+          description: Authorized devices.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceListResponse"
+
+  /auth/devices/{deviceId}/revoke:
+    post:
+      tags: [Auth]
+      summary: Revoke a device.
+      parameters:
+        - $ref: "#/components/parameters/deviceId"
+      responses:
+        "204":
+          description: Device revoked.
+
+  /ledger/bootstrap:
+    get:
+      tags: [Ledger]
+      summary: Bootstrap ledger data for a device.
+      responses:
+        "200":
+          description: Bootstrap payload.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LedgerBootstrapResponse"
+
+  /accounts:
+    get:
+      tags: [Accounts]
+      summary: List accounts.
+      responses:
+        "200":
+          description: Accounts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountListResponse"
+    post:
+      tags: [Accounts]
+      summary: Create account.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAccountInput"
+      responses:
+        "200":
+          description: Created account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountResponse"
+
+  /accounts/anomalies:
+    get:
+      tags: [Accounts]
+      summary: List account anomalies.
+      responses:
+        "200":
+          description: Account anomalies.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountAnomalyListResponse"
+
+  /accounts/{accountId}:
+    get:
+      tags: [Accounts]
+      summary: Get account.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+      responses:
+        "200":
+          description: Account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountResponse"
+    patch:
+      tags: [Accounts]
+      summary: Update account.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Updated account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountResponse"
+
+  /accounts/{accountId}/archive:
+    post:
+      tags: [Accounts]
+      summary: Archive account without deleting ledger history.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Archived account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountResponse"
+
+  /accounts/{accountId}/holdings:
+    get:
+      tags: [Portfolio]
+      summary: List holdings by account.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+      responses:
+        "200":
+          description: Holdings in the account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HoldingListResponse"
+
+  /portfolio/overview:
+    get:
+      tags: [Portfolio]
+      summary: Get overview for the first screen.
+      responses:
+        "200":
+          description: Portfolio overview.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PortfolioOverviewResponse"
+
+  /portfolio/holdings:
+    get:
+      tags: [Portfolio]
+      summary: List holdings across accounts.
+      responses:
+        "200":
+          description: Holdings.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HoldingListResponse"
+
+  /portfolio/allocation:
+    get:
+      tags: [Portfolio]
+      summary: Get asset allocation.
+      responses:
+        "200":
+          description: Asset allocation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssetAllocationResponse"
+
+  /movements:
+    get:
+      tags: [Movements]
+      summary: List movements.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/MovementStatus"
+      responses:
+        "200":
+          description: Movements.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MovementListResponse"
+
+  /movements/drafts:
+    post:
+      tags: [Movements]
+      summary: Create a manual draft; does not affect confirmed net worth.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateMovementDraftInput"
+      responses:
+        "200":
+          description: Draft movement.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MovementResponse"
+
+  /movements/{movementId}:
+    get:
+      tags: [Movements]
+      summary: Get movement.
+      parameters:
+        - $ref: "#/components/parameters/movementId"
+      responses:
+        "200":
+          description: Movement.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MovementResponse"
+
+  /movements/{movementId}/submit-review:
+    post:
+      tags: [Movements]
+      summary: Submit a draft movement for review.
+      parameters:
+        - $ref: "#/components/parameters/movementId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Atomic group proposal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
+
+  /movements/corrections:
+    post:
+      tags: [Movements]
+      summary: Create a correction proposal for confirmed ledger data.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCorrectionInput"
+      responses:
+        "200":
+          description: Correction atomic group.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
+
+  /atomic-groups/{atomicGroupId}/confirm:
+    post:
+      tags: [Movements]
+      summary: Confirm an atomic group as one transaction boundary.
+      parameters:
+        - $ref: "#/components/parameters/atomicGroupId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Confirm result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfirmResultResponse"
+
+  /atomic-groups/{atomicGroupId}/reject:
+    post:
+      tags: [Movements]
+      summary: Reject an atomic group.
+      parameters:
+        - $ref: "#/components/parameters/atomicGroupId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejectRequest"
+      responses:
+        "204":
+          description: Rejected.
+
+  /dca/plans:
+    get:
+      tags: [DCA]
+      summary: List DCA plans.
+      responses:
+        "200":
+          description: DCA plans.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DcaPlanListResponse"
+    post:
+      tags: [DCA]
+      summary: Create DCA plan.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDcaPlanInput"
+      responses:
+        "200":
+          description: DCA plan.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DcaPlanResponse"
+
+  /dca/plans/{planId}:
+    patch:
+      tags: [DCA]
+      summary: Update DCA plan.
+      parameters:
+        - $ref: "#/components/parameters/planId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: DCA plan.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DcaPlanResponse"
+
+  /dca/reminders/due:
+    get:
+      tags: [DCA]
+      summary: List due DCA reminders.
+      responses:
+        "200":
+          description: Due reminders.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DcaReminderListResponse"
+
+  /dca/reminders/{reminderId}/mark-executed-as-proposal:
+    post:
+      tags: [DCA]
+      summary: Create a proposal that records the user-executed DCA; never places an order.
+      parameters:
+        - $ref: "#/components/parameters/reminderId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Candidate atomic group.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
+
+  /dca/reminders/{reminderId}/skip:
+    post:
+      tags: [DCA]
+      summary: Skip this DCA reminder.
+      parameters:
+        - $ref: "#/components/parameters/reminderId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Updated reminder.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DcaReminderResponse"
+
+  /dca/reminders/{reminderId}/snooze:
+    post:
+      tags: [DCA]
+      summary: Snooze this DCA reminder.
+      parameters:
+        - $ref: "#/components/parameters/reminderId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [until]
+              properties:
+                until:
+                  $ref: "#/components/schemas/ISODateTime"
+      responses:
+        "200":
+          description: Updated reminder.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DcaReminderResponse"
+
+  /ai/proposals/from-text:
+    post:
+      tags: [AI Proposals]
+      summary: Create AI proposal from text.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AiTextInput"
+      responses:
+        "200":
+          description: AI proposal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiProposalResponse"
+
+  /ai/proposals/from-image:
+    post:
+      tags: [AI Proposals]
+      summary: Create AI proposal from image evidence.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AiImageInput"
+      responses:
+        "200":
+          description: AI proposal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiProposalResponse"
+
+  /ai/proposals/from-csv:
+    post:
+      tags: [AI Proposals]
+      summary: Create AI proposal from CSV import.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AiCsvInput"
+      responses:
+        "200":
+          description: AI proposal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiProposalResponse"
+
+  /ai/proposals/pending:
+    get:
+      tags: [AI Proposals]
+      summary: List pending AI proposals.
+      responses:
+        "200":
+          description: Pending proposals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiProposalListResponse"
+
+  /ai/proposals/{proposalId}:
+    get:
+      tags: [AI Proposals]
+      summary: Get AI proposal.
+      parameters:
+        - $ref: "#/components/parameters/proposalId"
+      responses:
+        "200":
+          description: AI proposal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiProposalResponse"
+
+  /ai/atomic-groups/{atomicGroupId}/approve:
+    post:
+      tags: [AI Proposals]
+      summary: Approve atomic group after validation.
+      parameters:
+        - $ref: "#/components/parameters/atomicGroupId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Confirm result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfirmResultResponse"
+
+  /ai/atomic-groups/{atomicGroupId}/reject:
+    post:
+      tags: [AI Proposals]
+      summary: Reject AI atomic group.
+      parameters:
+        - $ref: "#/components/parameters/atomicGroupId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejectRequest"
+      responses:
+        "204":
+          description: Rejected.
+
+  /ai/atomic-groups/{atomicGroupId}/edit:
+    post:
+      tags: [AI Proposals]
+      summary: Edit atomic group and re-run validation.
+      parameters:
+        - $ref: "#/components/parameters/atomicGroupId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Edited atomic group.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
+
+  /quotes/summary:
+    get:
+      tags: [Quotes]
+      summary: Get quote status summary.
+      responses:
+        "200":
+          description: Quote status summary.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuoteStatusSummaryResponse"
+
+  /quotes:
+    get:
+      tags: [Quotes]
+      summary: List quotes.
+      responses:
+        "200":
+          description: Quotes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuoteListResponse"
+
+  /fx-rates:
+    get:
+      tags: [Quotes]
+      summary: List FX rates.
+      responses:
+        "200":
+          description: FX rates.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FXRateListResponse"
+
+  /quotes/refresh:
+    post:
+      tags: [Quotes]
+      summary: Refresh quotes and FX rates.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QuoteRefreshRequest"
+      responses:
+        "200":
+          description: Refresh result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuoteRefreshResultResponse"
+
+  /instruments/{instrumentId}/historical-prices:
+    get:
+      tags: [Quotes]
+      summary: Get historical prices, capped to one year for MVP.
+      parameters:
+        - $ref: "#/components/parameters/instrumentId"
+        - name: from
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/ISODate"
+        - name: to
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/ISODate"
+      responses:
+        "200":
+          description: Historical prices.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HistoricalPriceListResponse"
+
+  /snapshots/latest:
+    get:
+      tags: [Snapshots]
+      summary: Get latest net worth snapshot.
+      responses:
+        "200":
+          description: Latest snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetWorthSnapshotResponse"
+
+  /snapshots:
+    get:
+      tags: [Snapshots]
+      summary: List snapshots.
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/ISODate"
+        - name: to
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/ISODate"
+      responses:
+        "200":
+          description: Snapshots.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetWorthSnapshotListResponse"
+
+  /snapshots/manual:
+    post:
+      tags: [Snapshots]
+      summary: Create a manual snapshot.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  enum: [baseline, manual_refresh]
+      responses:
+        "200":
+          description: Snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NetWorthSnapshotResponse"
+
+  /snapshots/invalidate:
+    post:
+      tags: [Snapshots]
+      summary: Invalidate snapshots after ledger changes.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+      responses:
+        "204":
+          description: Invalidated.
+
+  /categories:
+    get:
+      tags: [Taxonomy]
+      summary: List categories.
+      responses:
+        "200":
+          description: Categories.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CategoryListResponse"
+    post:
+      tags: [Taxonomy]
+      summary: Create category.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Category"
+      responses:
+        "200":
+          description: Category.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CategoryResponse"
+
+  /categories/{categoryId}:
+    patch:
+      tags: [Taxonomy]
+      summary: Update category.
+      parameters:
+        - $ref: "#/components/parameters/categoryId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Category.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CategoryResponse"
+
+  /counterparties:
+    get:
+      tags: [Taxonomy]
+      summary: List counterparties.
+      responses:
+        "200":
+          description: Counterparties.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CounterpartyListResponse"
+    post:
+      tags: [Taxonomy]
+      summary: Create counterparty.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Counterparty"
+      responses:
+        "200":
+          description: Counterparty.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CounterpartyResponse"
+
+  /counterparties/{counterpartyId}:
+    patch:
+      tags: [Taxonomy]
+      summary: Update counterparty.
+      parameters:
+        - $ref: "#/components/parameters/counterpartyId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Counterparty.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CounterpartyResponse"
+
+  /counterparties/merge-proposal:
+    post:
+      tags: [Taxonomy]
+      summary: Create counterparty merge proposal; never auto-merges.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sourceCounterpartyIds, targetDisplayName]
+              properties:
+                sourceCounterpartyIds:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/ID"
+                targetDisplayName:
+                  type: string
+      responses:
+        "200":
+          description: Merge proposal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
+
+  /sync/bootstrap:
+    get:
+      tags: [Sync]
+      summary: Bootstrap sync cursor and ledger state.
+      responses:
+        "200":
+          description: Sync bootstrap.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncBootstrapResponse"
+
+  /sync/changes:
+    get:
+      tags: [Sync]
+      summary: Pull changes since cursor.
+      parameters:
+        - name: since
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Changes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncPullResponseEnvelope"
+
+  /sync/push:
+    post:
+      tags: [Sync]
+      summary: Push local changes. Debug fixture data must be rejected.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SyncPushRequest"
+      responses:
+        "200":
+          description: Push result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncPushResultResponse"
+
+  /sync/ack:
+    post:
+      tags: [Sync]
+      summary: Acknowledge received sync cursor.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cursor]
+              properties:
+                cursor:
+                  type: string
+      responses:
+        "204":
+          description: Acknowledged.
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    idempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+    accountId:
+      name: accountId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ID"
+    movementId:
+      name: movementId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ID"
+    atomicGroupId:
+      name: atomicGroupId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ID"
+    planId:
+      name: planId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ID"
+    reminderId:
+      name: reminderId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ID"
+    proposalId:
+      name: proposalId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ID"
+    instrumentId:
+      name: instrumentId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ID"
+    categoryId:
+      name: categoryId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ID"
+    counterpartyId:
+      name: counterpartyId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ID"
+    deviceId:
+      name: deviceId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ID"
+
+  schemas:
+    ID:
+      type: string
+    ISODate:
+      type: string
+      format: date
+    ISODateTime:
+      type: string
+      format: date-time
+    DecimalString:
+      type: string
+      pattern: "^-?[0-9]+(\\.[0-9]+)?$"
+    CurrencyCode:
+      type: string
+      minLength: 2
+      maxLength: 12
+
+    AppError:
+      type: object
+      required: [code, message, severity, retryable]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        severity:
+          enum: [info, warning, error, critical]
+        retryable:
+          type: boolean
+        details: {}
+
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount:
+          $ref: "#/components/schemas/DecimalString"
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+
+    ValueQuality:
+      enum: [exact, estimated, incomplete, unpriceable, anomaly]
+    QuoteStatus:
+      enum: [fresh, stale, offline_cached, incomplete, unpriceable, error]
+    MovementStatus:
+      enum: [draft, pending_review, confirmed, in_transit, cancelled, reversed]
+    AccountType:
+      enum:
+        - bank
+        - brokerage
+        - exchange
+        - wallet
+        - platform_wallet
+        - virtual_card
+        - social_security
+        - credit_card
+        - loan
+        - cash
+        - other
+
+    HealthResponse:
+      allOf:
+        - $ref: "#/components/schemas/OkEnvelope"
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [status, serverTime, version]
+              properties:
+                status:
+                  enum: [ok]
+                serverTime:
+                  $ref: "#/components/schemas/ISODateTime"
+                version:
+                  type: string
+
+    OkEnvelope:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data: {}
+    ErrorEnvelope:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          const: false
+        error:
+          $ref: "#/components/schemas/AppError"
+
+    LoginRequest:
+      type: object
+      required: [username, password, deviceName]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          format: password
+        deviceName:
+          type: string
+
+    AuthTokenResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: object
+          required: [accessToken, refreshToken, expiresAt, deviceId]
+          properties:
+            accessToken:
+              type: string
+            refreshToken:
+              type: string
+            expiresAt:
+              $ref: "#/components/schemas/ISODateTime"
+            deviceId:
+              $ref: "#/components/schemas/ID"
+
+    Device:
+      type: object
+      required: [id, name, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        name:
+          type: string
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        lastSeenAt:
+          $ref: "#/components/schemas/ISODateTime"
+    DeviceListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Device"
+
+    AccountCashBalance:
+      type: object
+      required: [currency, amount, asOf, quality]
+      properties:
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+        amount:
+          $ref: "#/components/schemas/DecimalString"
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+        quality:
+          $ref: "#/components/schemas/ValueQuality"
+    Account:
+      type: object
+      required:
+        - id
+        - displayName
+        - accountType
+        - defaultCurrency
+        - supportedCurrencies
+        - includeInNetWorth
+        - visibility
+        - status
+        - balanceMode
+        - cashBalances
+        - tags
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        displayName:
+          type: string
+        institutionName:
+          type: string
+        accountType:
+          $ref: "#/components/schemas/AccountType"
+        defaultCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        supportedCurrencies:
+          type: array
+          items:
+            $ref: "#/components/schemas/CurrencyCode"
+        includeInNetWorth:
+          type: boolean
+        visibility:
+          enum: [normal, hidden_amount, archived]
+        status:
+          enum: [active, inactive, archived]
+        balanceMode:
+          enum: [cash_balance, holdings, liability, mixed]
+        cashBalances:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountCashBalance"
+        tags:
+          type: array
+          items:
+            type: string
+        note:
+          type: string
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        updatedAt:
+          $ref: "#/components/schemas/ISODateTime"
+    CreateAccountInput:
+      type: object
+      required:
+        - displayName
+        - accountType
+        - defaultCurrency
+        - supportedCurrencies
+        - includeInNetWorth
+        - balanceMode
+      properties:
+        displayName:
+          type: string
+        institutionName:
+          type: string
+        accountType:
+          $ref: "#/components/schemas/AccountType"
+        defaultCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        supportedCurrencies:
+          type: array
+          items:
+            $ref: "#/components/schemas/CurrencyCode"
+        includeInNetWorth:
+          type: boolean
+        balanceMode:
+          enum: [cash_balance, holdings, liability, mixed]
+        openingBalances:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountCashBalance"
+    AccountResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/Account"
+    AccountListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Account"
+
+    AccountAnomaly:
+      type: object
+      required: [id, accountId, kind, severity, detail, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        accountId:
+          $ref: "#/components/schemas/ID"
+        kind:
+          enum: [quote_stale, unpriceable, reconcile_needed, negative_balance, data_anomaly]
+        severity:
+          enum: [info, warning, critical]
+        detail:
+          type: string
+        affectedValue:
+          $ref: "#/components/schemas/Money"
+        action:
+          enum: [review, refresh, reconcile, ignore]
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+    AccountAnomalyListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountAnomaly"
+
+    Instrument:
+      type: object
+      required: [id, type, displayName, quoteCurrency]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        type:
+          enum: [cash, equity, fund, crypto, fx_cash, receivable, other]
+        symbol:
+          type: string
+        displayName:
+          type: string
+        quoteCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        market:
+          type: string
+        sourceRef:
+          type: string
+    ValuedMoney:
+      type: object
+      required: [amount, currency, asOf, quality]
+      properties:
+        amount:
+          $ref: "#/components/schemas/DecimalString"
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+        quality:
+          $ref: "#/components/schemas/ValueQuality"
+    Holding:
+      type: object
+      required: [id, accountId, instrumentId, quantity, quoteStatus, asOf]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        accountId:
+          $ref: "#/components/schemas/ID"
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        instrument:
+          $ref: "#/components/schemas/Instrument"
+        quantity:
+          $ref: "#/components/schemas/DecimalString"
+        costBasisTotal:
+          $ref: "#/components/schemas/Money"
+        marketValue:
+          $ref: "#/components/schemas/ValuedMoney"
+        dayChange:
+          $ref: "#/components/schemas/Money"
+        unrealizedPnl:
+          $ref: "#/components/schemas/Money"
+        unrealizedPnlRate:
+          $ref: "#/components/schemas/DecimalString"
+        quoteStatus:
+          $ref: "#/components/schemas/QuoteStatus"
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+        note:
+          type: string
+    HoldingListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Holding"
+
+    MovementEntry:
+      type: object
+      required: [id, accountId, amount, currency, direction, role]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        accountId:
+          $ref: "#/components/schemas/ID"
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        amount:
+          $ref: "#/components/schemas/DecimalString"
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+        direction:
+          enum: [in, out]
+        role:
+          enum: [source, destination, fee, discount, pnl, tax, adjustment]
+    TransactionAmountBreakdown:
+      type: object
+      required: [paidAmount]
+      properties:
+        grossAmount:
+          $ref: "#/components/schemas/Money"
+        savingsAmount:
+          $ref: "#/components/schemas/Money"
+        paidAmount:
+          $ref: "#/components/schemas/Money"
+        benefitSource:
+          enum: [coupon, platform_subsidy, merchant_discount, free_order, other]
+    SettlementInfo:
+      type: object
+      required: [status]
+      properties:
+        status:
+          enum: [settled, in_transit, failed, unknown]
+        expectedSettleAt:
+          $ref: "#/components/schemas/ISODateTime"
+        expectedDelayHours:
+          type: integer
+          minimum: 0
+        settledAt:
+          $ref: "#/components/schemas/ISODateTime"
+    TransferMeta:
+      type: object
+      required: [fromAccountId, toAccountId, fromAmount]
+      properties:
+        fromAccountId:
+          $ref: "#/components/schemas/ID"
+        toAccountId:
+          $ref: "#/components/schemas/ID"
+        fromAmount:
+          $ref: "#/components/schemas/Money"
+        toAmount:
+          $ref: "#/components/schemas/Money"
+        feeAmount:
+          $ref: "#/components/schemas/Money"
+        lossAmount:
+          $ref: "#/components/schemas/Money"
+        fxRate:
+          $ref: "#/components/schemas/DecimalString"
+        note:
+          type: string
+    DataSourceInfo:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          enum: [manual, ai_proposal, csv_import, quote_refresh, sync, system]
+        sourceId:
+          $ref: "#/components/schemas/ID"
+        createdBy:
+          enum: [user, ai, system]
+    Movement:
+      type: object
+      required:
+        - id
+        - atomicGroupId
+        - type
+        - occurredAt
+        - recordedAt
+        - status
+        - title
+        - entries
+        - tags
+        - source
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        atomicGroupId:
+          $ref: "#/components/schemas/ID"
+        type:
+          enum:
+            - income
+            - expense
+            - transfer
+            - buy
+            - sell
+            - dividend
+            - interest
+            - fee
+            - adjustment
+            - loan_disbursement
+            - loan_repayment
+            - correction
+        occurredAt:
+          $ref: "#/components/schemas/ISODateTime"
+        recordedAt:
+          $ref: "#/components/schemas/ISODateTime"
+        status:
+          $ref: "#/components/schemas/MovementStatus"
+        title:
+          type: string
+        description:
+          type: string
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/MovementEntry"
+        categoryId:
+          $ref: "#/components/schemas/ID"
+        counterpartyId:
+          $ref: "#/components/schemas/ID"
+        tags:
+          type: array
+          items:
+            type: string
+        amountBreakdown:
+          $ref: "#/components/schemas/TransactionAmountBreakdown"
+        settlement:
+          $ref: "#/components/schemas/SettlementInfo"
+        transferMeta:
+          $ref: "#/components/schemas/TransferMeta"
+        source:
+          $ref: "#/components/schemas/DataSourceInfo"
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        updatedAt:
+          $ref: "#/components/schemas/ISODateTime"
+    MovementResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/Movement"
+    MovementListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Movement"
+    CreateMovementDraftInput:
+      type: object
+      required: [type, occurredAt, title, entries]
+      properties:
+        type:
+          type: string
+        occurredAt:
+          $ref: "#/components/schemas/ISODateTime"
+        title:
+          type: string
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/MovementEntry"
+        categoryId:
+          $ref: "#/components/schemas/ID"
+        counterpartyId:
+          $ref: "#/components/schemas/ID"
+        amountBreakdown:
+          $ref: "#/components/schemas/TransactionAmountBreakdown"
+        settlement:
+          $ref: "#/components/schemas/SettlementInfo"
+        transferMeta:
+          $ref: "#/components/schemas/TransferMeta"
+    CreateCorrectionInput:
+      type: object
+      required: [targetMovementId, reason]
+      properties:
+        targetMovementId:
+          $ref: "#/components/schemas/ID"
+        reason:
+          type: string
+        proposedDiffs:
+          type: array
+          items:
+            $ref: "#/components/schemas/AiFieldDiff"
+
+    DcaPlan:
+      type: object
+      required:
+        - id
+        - displayName
+        - targetInstrumentId
+        - plannedAmount
+        - frequency
+        - nextDueDate
+        - reminderStatus
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        displayName:
+          type: string
+        targetInstrumentId:
+          $ref: "#/components/schemas/ID"
+        fundingAccountId:
+          $ref: "#/components/schemas/ID"
+        plannedAmount:
+          $ref: "#/components/schemas/Money"
+        frequency:
+          enum: [weekly, monthly, custom]
+        nextDueDate:
+          $ref: "#/components/schemas/ISODate"
+        reminderStatus:
+          enum: [active, snoozed, paused, completed]
+        lastActionAt:
+          $ref: "#/components/schemas/ISODateTime"
+        note:
+          type: string
+    CreateDcaPlanInput:
+      type: object
+      required: [displayName, targetInstrumentId, plannedAmount, frequency, nextDueDate]
+      properties:
+        displayName:
+          type: string
+        targetInstrumentId:
+          $ref: "#/components/schemas/ID"
+        fundingAccountId:
+          $ref: "#/components/schemas/ID"
+        plannedAmount:
+          $ref: "#/components/schemas/Money"
+        frequency:
+          enum: [weekly, monthly, custom]
+        nextDueDate:
+          $ref: "#/components/schemas/ISODate"
+        note:
+          type: string
+    DcaReminder:
+      type: object
+      required: [id, planId, dueDate, status]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        planId:
+          $ref: "#/components/schemas/ID"
+        dueDate:
+          $ref: "#/components/schemas/ISODate"
+        status:
+          enum: [due, overdue, snoozed, recorded, skipped]
+    DcaPlanResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/DcaPlan"
+    DcaPlanListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/DcaPlan"
+    DcaReminderResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/DcaReminder"
+    DcaReminderListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/DcaReminder"
+
+    EvidenceRef:
+      type: object
+      required: [id, type, label]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        type:
+          enum: [text, image, file, url]
+        label:
+          type: string
+        uri:
+          type: string
+        excerpt:
+          type: string
+        capturedAt:
+          $ref: "#/components/schemas/ISODateTime"
+    AiProposalSource:
+      type: object
+      required: [kind, evidenceRefs]
+      properties:
+        kind:
+          enum: [user_text, image, csv, manual_import, web_lookup]
+        evidenceRefs:
+          type: array
+          items:
+            $ref: "#/components/schemas/EvidenceRef"
+        modelName:
+          type: string
+        promptVersion:
+          type: string
+        inputDigest:
+          type: string
+    AiFieldDiff:
+      type: object
+      required: [fieldPath, oldValue, newValue, severity]
+      properties:
+        fieldPath:
+          type: string
+        oldValue: {}
+        newValue: {}
+        severity:
+          enum: [normal, important, danger]
+        reason:
+          type: string
+    AiWarning:
+      type: object
+      required: [code, message, severity]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        severity:
+          enum: [info, warning, critical]
+    AiValidationResult:
+      type: object
+      required: [isValid, errors]
+      properties:
+        isValid:
+          type: boolean
+        errors:
+          type: array
+          items:
+            type: object
+            required: [code, message]
+            properties:
+              fieldPath:
+                type: string
+              code:
+                type: string
+              message:
+                type: string
+    AiAtomicGroup:
+      type: object
+      required: [id, title, operation, targetType, warnings, status, validation]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        title:
+          type: string
+        operation:
+          enum: [create, modify, correction, merge, classify]
+        targetType:
+          enum: [account, holding, movement, dca_plan, category, counterparty]
+        targetId:
+          $ref: "#/components/schemas/ID"
+        proposedMovements:
+          type: array
+          items:
+            $ref: "#/components/schemas/Movement"
+        proposedEntities:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        diffs:
+          type: array
+          items:
+            $ref: "#/components/schemas/AiFieldDiff"
+        warnings:
+          type: array
+          items:
+            $ref: "#/components/schemas/AiWarning"
+        status:
+          enum: [pending, approved, rejected, edited]
+        validation:
+          $ref: "#/components/schemas/AiValidationResult"
+    AiProposal:
+      type: object
+      required: [id, status, source, atomicGroups, warnings, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        status:
+          enum: [pending, partially_reviewed, approved, rejected, edited, expired]
+        source:
+          $ref: "#/components/schemas/AiProposalSource"
+        atomicGroups:
+          type: array
+          items:
+            $ref: "#/components/schemas/AiAtomicGroup"
+        summary:
+          type: string
+        warnings:
+          type: array
+          items:
+            $ref: "#/components/schemas/AiWarning"
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        reviewedAt:
+          $ref: "#/components/schemas/ISODateTime"
+    AiTextInput:
+      type: object
+      required: [text, contextScope]
+      properties:
+        text:
+          type: string
+        contextScope:
+          enum: [selected_accounts, full_ledger]
+        selectedAccountIds:
+          type: array
+          items:
+            $ref: "#/components/schemas/ID"
+    AiImageInput:
+      type: object
+      required: [imageRef, contextScope]
+      properties:
+        imageRef:
+          $ref: "#/components/schemas/EvidenceRef"
+        contextScope:
+          enum: [selected_accounts, full_ledger]
+        selectedAccountIds:
+          type: array
+          items:
+            $ref: "#/components/schemas/ID"
+    AiCsvInput:
+      type: object
+      required: [fileRef]
+      properties:
+        fileRef:
+          $ref: "#/components/schemas/EvidenceRef"
+        importProfile:
+          type: string
+    AiProposalResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AiProposal"
+    AiProposalListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AiProposal"
+    AiAtomicGroupResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AiAtomicGroup"
+
+    ConfirmResult:
+      type: object
+      required: [atomicGroupId, confirmedMovementIds, snapshotInvalidated]
+      properties:
+        atomicGroupId:
+          $ref: "#/components/schemas/ID"
+        confirmedMovementIds:
+          type: array
+          items:
+            $ref: "#/components/schemas/ID"
+        snapshotInvalidated:
+          type: boolean
+    ConfirmResultResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/ConfirmResult"
+    RejectRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+
+    Quote:
+      type: object
+      required: [id, instrumentId, price, currency, asOf, source, status]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        price:
+          $ref: "#/components/schemas/DecimalString"
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+        expiresAt:
+          $ref: "#/components/schemas/ISODateTime"
+        source:
+          type: string
+        sourceUrl:
+          type: string
+        status:
+          $ref: "#/components/schemas/QuoteStatus"
+    FXRate:
+      type: object
+      required: [id, baseCurrency, quoteCurrency, rate, asOf, source, status]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        baseCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        quoteCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        rate:
+          $ref: "#/components/schemas/DecimalString"
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+        expiresAt:
+          $ref: "#/components/schemas/ISODateTime"
+        source:
+          type: string
+        sourceUrl:
+          type: string
+        status:
+          $ref: "#/components/schemas/QuoteStatus"
+    QuoteStatusSummary:
+      type: object
+      required: [freshCount, staleCount, unpriceableCount, errorCount]
+      properties:
+        freshCount:
+          type: integer
+        staleCount:
+          type: integer
+        offlineCachedCount:
+          type: integer
+        unpriceableCount:
+          type: integer
+        errorCount:
+          type: integer
+    QuoteRefreshRequest:
+      type: object
+      required: [mode, requestedAt]
+      properties:
+        mode:
+          enum: [manual, startup, scheduled]
+        requestedAt:
+          $ref: "#/components/schemas/ISODateTime"
+        instruments:
+          type: array
+          items:
+            $ref: "#/components/schemas/ID"
+        currencyPairs:
+          type: array
+          items:
+            type: object
+            required: [baseCurrency, quoteCurrency]
+            properties:
+              baseCurrency:
+                $ref: "#/components/schemas/CurrencyCode"
+              quoteCurrency:
+                $ref: "#/components/schemas/CurrencyCode"
+    QuoteRefreshResult:
+      type: object
+      required: [status, quotes, fxRates, errors, completedAt]
+      properties:
+        status:
+          enum: [success, partial_success, failed, offline]
+        quotes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Quote"
+        fxRates:
+          type: array
+          items:
+            $ref: "#/components/schemas/FXRate"
+        errors:
+          type: array
+          items:
+            type: object
+            required: [targetType, message, retryable]
+            properties:
+              targetType:
+                enum: [instrument, fx_pair]
+              targetId:
+                $ref: "#/components/schemas/ID"
+              message:
+                type: string
+              retryable:
+                type: boolean
+        completedAt:
+          $ref: "#/components/schemas/ISODateTime"
+    HistoricalPricePoint:
+      type: object
+      required: [instrumentId, price, currency, date, source]
+      properties:
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        price:
+          $ref: "#/components/schemas/DecimalString"
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+        date:
+          $ref: "#/components/schemas/ISODate"
+        source:
+          type: string
+        sourceUrl:
+          type: string
+
+    QuoteStatusSummaryResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/QuoteStatusSummary"
+    QuoteListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Quote"
+    FXRateListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/FXRate"
+    QuoteRefreshResultResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/QuoteRefreshResult"
+    HistoricalPriceListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/HistoricalPricePoint"
+
+    NetWorthSnapshot:
+      type: object
+      required:
+        - id
+        - snapshotAt
+        - baseCurrency
+        - grossAssets
+        - totalLiabilities
+        - netWorth
+        - quality
+        - quoteStatusSummary
+        - accountValues
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        snapshotAt:
+          $ref: "#/components/schemas/ISODateTime"
+        baseCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        grossAssets:
+          $ref: "#/components/schemas/Money"
+        totalLiabilities:
+          $ref: "#/components/schemas/Money"
+        netWorth:
+          $ref: "#/components/schemas/Money"
+        quality:
+          $ref: "#/components/schemas/ValueQuality"
+        quoteStatusSummary:
+          $ref: "#/components/schemas/QuoteStatusSummary"
+        accountValues:
+          type: array
+          items:
+            type: object
+            required: [accountId, value]
+            properties:
+              accountId:
+                $ref: "#/components/schemas/ID"
+              value:
+                $ref: "#/components/schemas/ValuedMoney"
+    NetWorthSnapshotResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          oneOf:
+            - $ref: "#/components/schemas/NetWorthSnapshot"
+            - type: "null"
+    NetWorthSnapshotListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/NetWorthSnapshot"
+
+    PendingSummary:
+      type: object
+      required:
+        - aiPendingCount
+        - accountAnomalyCount
+        - dcaDueCount
+        - inTransitCount
+        - quoteProblemCount
+        - syncProblemCount
+      properties:
+        aiPendingCount:
+          type: integer
+        accountAnomalyCount:
+          type: integer
+        dcaDueCount:
+          type: integer
+        inTransitCount:
+          type: integer
+        quoteProblemCount:
+          type: integer
+        syncProblemCount:
+          type: integer
+    PortfolioOverview:
+      type: object
+      required: [pendingSummary, quoteStatusSummary, primaryHoldings, recentMovements]
+      properties:
+        latestSnapshot:
+          $ref: "#/components/schemas/NetWorthSnapshot"
+        previousSnapshot:
+          $ref: "#/components/schemas/NetWorthSnapshot"
+        pendingSummary:
+          $ref: "#/components/schemas/PendingSummary"
+        quoteStatusSummary:
+          $ref: "#/components/schemas/QuoteStatusSummary"
+        primaryHoldings:
+          type: array
+          items:
+            $ref: "#/components/schemas/Holding"
+        recentMovements:
+          type: array
+          items:
+            $ref: "#/components/schemas/Movement"
+    PortfolioOverviewResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/PortfolioOverview"
+    AssetAllocationResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: object
+          additionalProperties: true
+
+    Category:
+      type: object
+      required: [id, displayName, kind, isSystem]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        displayName:
+          type: string
+        parentId:
+          $ref: "#/components/schemas/ID"
+        kind:
+          enum: [income, expense, transfer, investment, liability, system]
+        isSystem:
+          type: boolean
+        aiDescription:
+          type: string
+    Counterparty:
+      type: object
+      required: [id, displayName, aliases, isUserMerged]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        displayName:
+          type: string
+        aliases:
+          type: array
+          items:
+            type: string
+        normalizedName:
+          type: string
+        categoryHintId:
+          $ref: "#/components/schemas/ID"
+        isUserMerged:
+          type: boolean
+    CategoryResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/Category"
+    CategoryListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Category"
+    CounterpartyResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/Counterparty"
+    CounterpartyListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Counterparty"
+
+    LedgerBootstrapResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: object
+          required: [ledgerVersion, syncCursor, baseCurrency, accounts, categories, counterparties]
+          properties:
+            ledgerVersion:
+              type: integer
+            syncCursor:
+              type: string
+            baseCurrency:
+              $ref: "#/components/schemas/CurrencyCode"
+            snapshot:
+              $ref: "#/components/schemas/NetWorthSnapshot"
+            accounts:
+              type: array
+              items:
+                $ref: "#/components/schemas/Account"
+            categories:
+              type: array
+              items:
+                $ref: "#/components/schemas/Category"
+            counterparties:
+              type: array
+              items:
+                $ref: "#/components/schemas/Counterparty"
+
+    SyncStatus:
+      enum: [synced, syncing, offline, degraded, conflict, error]
+    SyncChange:
+      type: object
+      required: [id, deviceId, entityType, entityId, operation, payload, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        deviceId:
+          $ref: "#/components/schemas/ID"
+        entityType:
+          enum:
+            - account
+            - instrument
+            - holding
+            - movement
+            - dca_plan
+            - category
+            - counterparty
+            - quote
+            - fx_rate
+            - snapshot
+            - ai_proposal
+        entityId:
+          $ref: "#/components/schemas/ID"
+        operation:
+          enum: [create, update, delete, correction]
+        payload: {}
+        baseVersion:
+          type: integer
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+    SyncConflict:
+      type: object
+      required: [id, entityType, entityId, localChange, remoteChange, resolution]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        entityType:
+          type: string
+        entityId:
+          $ref: "#/components/schemas/ID"
+        localChange:
+          $ref: "#/components/schemas/SyncChange"
+        remoteChange:
+          $ref: "#/components/schemas/SyncChange"
+        resolution:
+          enum: [pending, local_wins, remote_wins, manual]
+    SyncBootstrapResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: object
+          required: [cursor]
+          properties:
+            cursor:
+              type: string
+    SyncPullResponseEnvelope:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: object
+          required: [cursor, changes, conflicts]
+          properties:
+            cursor:
+              type: string
+            changes:
+              type: array
+              items:
+                $ref: "#/components/schemas/SyncChange"
+            conflicts:
+              type: array
+              items:
+                $ref: "#/components/schemas/SyncConflict"
+    SyncPushRequest:
+      type: object
+      required: [deviceId, changes]
+      properties:
+        deviceId:
+          $ref: "#/components/schemas/ID"
+        lastKnownCursor:
+          type: string
+        changes:
+          type: array
+          items:
+            $ref: "#/components/schemas/SyncChange"
+    SyncPushResultResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: object
+          required: [cursor, conflicts]
+          properties:
+            cursor:
+              type: string
+            conflicts:
+              type: array
+              items:
+                $ref: "#/components/schemas/SyncConflict"

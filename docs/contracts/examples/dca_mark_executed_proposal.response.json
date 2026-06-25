@@ -1,0 +1,64 @@
+{
+  "ok": true,
+  "data": {
+    "id": "ag_dca_recorded_001",
+    "title": "记录已执行的沪深300定投",
+    "operation": "create",
+    "targetType": "movement",
+    "proposedMovements": [
+      {
+        "id": "mov_dca_pending_001",
+        "atomicGroupId": "ag_dca_recorded_001",
+        "type": "buy",
+        "occurredAt": "2026-07-10T09:00:00+08:00",
+        "recordedAt": "2026-07-10T09:05:00+08:00",
+        "status": "pending_review",
+        "title": "记录沪深300定投",
+        "description": "用户点击“记录已执行”后生成的候选记录；不下单、不转账。",
+        "entries": [
+          {
+            "id": "entry_dca_cash_out",
+            "accountId": "acct_cmb_cny",
+            "amount": "1000.00",
+            "currency": "CNY",
+            "direction": "out",
+            "role": "source"
+          },
+          {
+            "id": "entry_dca_fund_in",
+            "accountId": "acct_fund",
+            "instrumentId": "inst_csi300_fund",
+            "amount": "1000.00",
+            "currency": "CNY",
+            "direction": "in",
+            "role": "destination"
+          }
+        ],
+        "categoryId": "cat_investment_dca",
+        "tags": [
+          "dca"
+        ],
+        "source": {
+          "kind": "system",
+          "sourceId": "dca_reminder_001",
+          "createdBy": "system"
+        },
+        "createdAt": "2026-07-10T09:05:00+08:00",
+        "updatedAt": "2026-07-10T09:05:00+08:00"
+      }
+    ],
+    "warnings": [
+      {
+        "code": "record_only_no_order",
+        "message": "该候选只记录用户已执行的定投，不连接券商、不下单、不转账。",
+        "severity": "info"
+      }
+    ],
+    "status": "pending",
+    "validation": {
+      "isValid": true,
+      "errors": []
+    }
+  }
+}
+

@@ -1,0 +1,181 @@
+{
+  "ok": true,
+  "data": {
+    "latestSnapshot": {
+      "id": "snap_20260625_093000",
+      "snapshotAt": "2026-06-25T09:30:00+08:00",
+      "baseCurrency": "CNY",
+      "grossAssets": {
+        "amount": "255298.90",
+        "currency": "CNY"
+      },
+      "totalLiabilities": {
+        "amount": "9620.00",
+        "currency": "CNY"
+      },
+      "netWorth": {
+        "amount": "245678.90",
+        "currency": "CNY"
+      },
+      "quality": "estimated",
+      "quoteStatusSummary": {
+        "freshCount": 8,
+        "staleCount": 2,
+        "offlineCachedCount": 0,
+        "unpriceableCount": 0,
+        "errorCount": 0
+      },
+      "accountValues": [
+        {
+          "accountId": "acct_cmb_cny",
+          "value": {
+            "amount": "38240.00",
+            "currency": "CNY",
+            "asOf": "2026-06-25T09:30:00+08:00",
+            "quality": "exact"
+          }
+        },
+        {
+          "accountId": "acct_us_broker",
+          "value": {
+            "amount": "110320.00",
+            "currency": "CNY",
+            "asOf": "2026-06-25T09:30:00+08:00",
+            "quality": "estimated"
+          }
+        }
+      ]
+    },
+    "previousSnapshot": {
+      "id": "snap_20260624_093000",
+      "snapshotAt": "2026-06-24T09:30:00+08:00",
+      "baseCurrency": "CNY",
+      "grossAssets": {
+        "amount": "253900.00",
+        "currency": "CNY"
+      },
+      "totalLiabilities": {
+        "amount": "9466.77",
+        "currency": "CNY"
+      },
+      "netWorth": {
+        "amount": "244433.23",
+        "currency": "CNY"
+      },
+      "quality": "estimated",
+      "quoteStatusSummary": {
+        "freshCount": 7,
+        "staleCount": 3,
+        "offlineCachedCount": 0,
+        "unpriceableCount": 0,
+        "errorCount": 0
+      },
+      "accountValues": []
+    },
+    "pendingSummary": {
+      "aiPendingCount": 2,
+      "accountAnomalyCount": 1,
+      "dcaDueCount": 1,
+      "inTransitCount": 1,
+      "quoteProblemCount": 2,
+      "syncProblemCount": 0
+    },
+    "quoteStatusSummary": {
+      "freshCount": 8,
+      "staleCount": 2,
+      "offlineCachedCount": 0,
+      "unpriceableCount": 0,
+      "errorCount": 0
+    },
+    "primaryHoldings": [
+      {
+        "id": "holding_nvda_us_broker",
+        "accountId": "acct_us_broker",
+        "instrumentId": "inst_nvda",
+        "instrument": {
+          "id": "inst_nvda",
+          "type": "equity",
+          "symbol": "NVDA",
+          "displayName": "NVIDIA",
+          "quoteCurrency": "USD",
+          "market": "US"
+        },
+        "quantity": "12",
+        "costBasisTotal": {
+          "amount": "61800.00",
+          "currency": "CNY"
+        },
+        "marketValue": {
+          "amount": "65000.00",
+          "currency": "CNY",
+          "asOf": "2026-06-25T09:30:00+08:00",
+          "quality": "estimated"
+        },
+        "dayChange": {
+          "amount": "520.00",
+          "currency": "CNY"
+        },
+        "unrealizedPnl": {
+          "amount": "3200.00",
+          "currency": "CNY"
+        },
+        "unrealizedPnlRate": "0.0518",
+        "quoteStatus": "stale",
+        "asOf": "2026-06-25T09:30:00+08:00"
+      }
+    ],
+    "recentMovements": [
+      {
+        "id": "mov_transfer_pending_001",
+        "atomicGroupId": "ag_transfer_pending_001",
+        "type": "transfer",
+        "occurredAt": "2026-06-25T08:00:00+08:00",
+        "recordedAt": "2026-06-25T08:01:00+08:00",
+        "status": "in_transit",
+        "title": "招行 → 美股券商",
+        "entries": [
+          {
+            "id": "entry_transfer_out",
+            "accountId": "acct_cmb_cny",
+            "amount": "500.00",
+            "currency": "CNY",
+            "direction": "out",
+            "role": "source"
+          },
+          {
+            "id": "entry_transfer_in",
+            "accountId": "acct_us_broker",
+            "amount": "500.00",
+            "currency": "CNY",
+            "direction": "in",
+            "role": "destination"
+          }
+        ],
+        "tags": [],
+        "settlement": {
+          "status": "in_transit",
+          "expectedDelayHours": 6
+        },
+        "transferMeta": {
+          "fromAccountId": "acct_cmb_cny",
+          "toAccountId": "acct_us_broker",
+          "fromAmount": {
+            "amount": "500.00",
+            "currency": "CNY"
+          },
+          "toAmount": {
+            "amount": "500.00",
+            "currency": "CNY"
+          }
+        },
+        "source": {
+          "kind": "manual",
+          "createdBy": "user"
+        },
+        "createdAt": "2026-06-25T08:01:00+08:00",
+        "updatedAt": "2026-06-25T08:01:00+08:00"
+      }
+    ]
+  }
+}
+

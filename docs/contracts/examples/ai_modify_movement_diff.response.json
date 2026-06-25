@@ -1,0 +1,60 @@
+{
+  "ok": true,
+  "data": {
+    "id": "proposal_ai_001",
+    "status": "pending",
+    "source": {
+      "kind": "user_text",
+      "evidenceRefs": [
+        {
+          "id": "evidence_text_001",
+          "type": "text",
+          "label": "用户口述",
+          "excerpt": "把瑞幸那笔 18 改成 21，应该是加了配送费。"
+        }
+      ],
+      "modelName": "example-multimodal-model",
+      "promptVersion": "ai_proposal_schema_v1"
+    },
+    "atomicGroups": [
+      {
+        "id": "ag_ai_modify_001",
+        "title": "修改瑞幸咖啡消费金额",
+        "operation": "modify",
+        "targetType": "movement",
+        "targetId": "mov_luckin_001",
+        "diffs": [
+          {
+            "fieldPath": "amountBreakdown.paidAmount.amount",
+            "oldValue": "18.00",
+            "newValue": "21.00",
+            "severity": "important",
+            "reason": "用户补充配送费。"
+          },
+          {
+            "fieldPath": "title",
+            "oldValue": "瑞幸咖啡",
+            "newValue": "瑞幸咖啡（含配送费）",
+            "severity": "normal"
+          }
+        ],
+        "warnings": [
+          {
+            "code": "confirmed_record_modify_requires_review",
+            "message": "这是已确认记录，确认后建议生成更正事件而不是静默覆盖原记录。",
+            "severity": "warning"
+          }
+        ],
+        "status": "pending",
+        "validation": {
+          "isValid": true,
+          "errors": []
+        }
+      }
+    ],
+    "summary": "AI 建议修改 1 笔已确认消费记录，需用户确认。",
+    "warnings": [],
+    "createdAt": "2026-06-25T10:00:00+08:00"
+  }
+}
+

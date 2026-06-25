@@ -1,17 +1,75 @@
 # finwealth
 
-A new Flutter project.
+Personal asset / investment / liability control panel for Android and Windows.
 
-## Getting Started
+Current development split:
 
-This project is a starting point for a Flutter application.
+- Flutter frontend skeleton: `lib/`
+- Interface and backend contracts: `docs/contracts/`
+- Local read-only mock API: `tools/mock_api_server.py`
+- Local dev server skeleton: `server/dev_server.py`
+- Rust/Axum server skeleton: `server-rs/`
 
-A few resources to get you started if this is your first Flutter project:
+## Contract checks
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+```bash
+python tools/contract_check.py
+```
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+## Local mock API
+
+Returns contract examples only. It is read-only and has no persistence.
+
+```bash
+python tools/mock_api_server.py
+```
+
+Default:
+
+```text
+http://127.0.0.1:8787
+```
+
+## Local dev server skeleton
+
+Dependency-free server skeleton for API shape checks. It does not implement real
+auth, persistence, AI, quotes, or sync.
+
+```bash
+python server/dev_server.py
+```
+
+Default:
+
+```text
+http://127.0.0.1:8788
+```
+
+## Local API smoke checks
+
+Starts the mock API, Python dev server, and Rust server on localhost, verifies
+critical contract responses, then shuts them down:
+
+```bash
+python tools/server_smoke.py
+```
+
+## Rust server skeleton
+
+```bash
+cargo run --manifest-path server-rs/Cargo.toml
+```
+
+Default:
+
+```text
+http://127.0.0.1:8790
+```
+
+## Product boundaries
+
+- No transfer execution.
+- No broker order placement.
+- No AI direct ledger writes.
+- No coupon planning or consumption optimization module.
+- DCA "record executed" creates a proposal only; it never places an order.
