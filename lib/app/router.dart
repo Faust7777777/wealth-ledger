@@ -8,6 +8,7 @@ import '../dev/tokens_preview.dart';
 import '../features/account_detail_page.dart';
 import '../features/accounts_page.dart';
 import '../features/ai_review_page.dart';
+import '../features/anomalies_page.dart';
 import '../features/investment_page.dart';
 import '../features/liabilities_page.dart';
 import '../features/overview_page.dart';
@@ -39,6 +40,7 @@ final appRouter = GoRouter(
       path: '/account/:id',
       builder: (c, s) => AccountDetailPage(accountId: s.pathParameters['id']!),
     ),
+    GoRoute(path: '/anomalies', builder: (c, s) => const AnomaliesPage()),
     GoRoute(path: '/dev/tokens', builder: (c, s) => const _TokensPreviewRoute()),
   ],
 );

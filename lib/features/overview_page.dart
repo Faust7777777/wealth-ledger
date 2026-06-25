@@ -2,6 +2,7 @@
 // 第一阶段：real_local 显空态；debug_fixture 显 DEMO 数据。布局从简，不铺满。
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../core/format.dart';
 import '../core/types.dart';
@@ -108,13 +109,13 @@ class _Pending extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final items = <(String, int)>[
-      ('AI 待确认', s.aiPendingCount),
-      ('账户异常', s.accountAnomalyCount),
-      ('定投到期', s.dcaDueCount),
-      ('在途交易', s.inTransitCount),
-      ('报价问题', s.quoteProblemCount),
-      ('同步降级', s.syncProblemCount),
+    final items = <(String, int, String?)>[
+      ('AI 待确认', s.aiPendingCount, '/ai-review'),
+      ('账户异常', s.accountAnomalyCount, '/anomalies'),
+      ('定投到期', s.dcaDueCount, '/investment'),
+      ('在途交易', s.inTransitCount, null),
+      ('报价问题', s.quoteProblemCount, null),
+      ('同步降级', s.syncProblemCount, null),
     ].where((e) => e.$2 > 0).toList();
 
     return Card(
@@ -127,14 +128,20 @@ class _Pending extends StatelessWidget {
             Text('待处理 (${s.total})', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: AppSpacing.sm),
             for (final e in items)
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: AppSpacing.xxs),
-                child: Row(
-                  children: [
-                    Expanded(child: Text(e.$1, style: AppType.body)),
-                    Text('${e.$2}', style: AppType.bodyStrong),
-                    const Icon(Icons.chevron_right, size: 18),
-                  ],
+              InkWell(
+                onTap: e.$3 == null
+                    ? null
+                    : () => e.$3 == '/investment' ? context.go(e.$3!) : context.push(e.$3!),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
+                  child: Row(
+                    children: [
+                      Expanded(child: Text(e.$1, style: AppType.body)),
+                      Text('${e.$2}', style: AppType.bodyStrong),
+                      Icon(Icons.chevron_right,
+                          size: 18, color: e.$3 == null ? Colors.transparent : null),
+                    ],
+                  ),
                 ),
               ),
           ],

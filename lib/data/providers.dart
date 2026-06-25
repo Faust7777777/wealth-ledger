@@ -42,6 +42,9 @@ final overviewProvider = FutureProvider<PortfolioOverviewVm>(
 final accountsProvider = FutureProvider<List<AccountVm>>(
   (ref) => ref.watch(accountRepositoryProvider).listAccounts(),
 );
+final anomaliesProvider = FutureProvider<List<AccountAnomalyVm>>(
+  (ref) => ref.watch(accountRepositoryProvider).listAnomalies(),
+);
 final liabilitiesProvider = FutureProvider<List<AccountVm>>((ref) async {
   final all = await ref.watch(accountRepositoryProvider).listAccounts();
   return all.where((a) => a.isLiability).toList();
