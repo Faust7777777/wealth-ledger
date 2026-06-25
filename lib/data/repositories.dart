@@ -15,6 +15,7 @@ abstract interface class PortfolioRepository {
   Future<PortfolioOverviewVm> getOverview();
   Future<List<HoldingVm>> listHoldings();
   Future<List<HoldingVm>> listHoldingsByAccount(Id accountId);
+  Future<AssetAllocationVm> getAssetAllocation();
 }
 
 abstract interface class MovementRepository {

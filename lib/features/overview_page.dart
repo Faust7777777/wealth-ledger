@@ -20,6 +20,7 @@ class OverviewPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final async = ref.watch(overviewProvider);
     final accounts = ref.watch(accountsProvider).asData?.value ?? const <AccountVm>[];
+    final allocation = ref.watch(allocationProvider).asData?.value;
     return async.when(
       loading: () => const Center(child: CircularProgressIndicator()),
       error: (e, _) =>
@@ -37,6 +38,7 @@ class OverviewPage extends ConsumerWidget {
           children: [
             _Hero(o: o),
             if (o.pendingSummary.total > 0) _Pending(s: o.pendingSummary),
+            if (allocation != null && !allocation.isEmpty) _AllocationBar(a: allocation),
             if (o.primaryHoldings.isNotEmpty) ...[
               const SectionHeader(title: '主要持仓'),
               for (final h in o.primaryHoldings) _HoldingRow(h: h),
@@ -224,6 +226,80 @@ class _AccountRow extends StatelessWidget {
       title: Text(a.displayName, style: AppType.body),
       trailing: Text(v == null ? '—' : formatValued(v), style: AppType.moneyRow),
       onTap: () => context.push('/account/${a.id}'),
+    );
+  }
+}
+
+class _AllocationBar extends StatelessWidget {
+  const _AllocationBar({required this.a});
+  final AssetAllocationVm a;
+
+  static const List<Color> _palette = [
+    Color(0xFF7FA88B), // sage
+    Color(0xFF6E8DA8), // slate
+    Color(0xFF8E86B3), // iris
+    Color(0xFFCBB079), // champagne
+    Color(0xFFB07BA0), // plum
+    Color(0xFF857D72), // warm gray
+  ];
+
+  int _flex(String pct) {
+    final v = double.tryParse(pct) ?? 0; // 仅用于布局权重，非金额运算
+    final f = (v * 10).round();
+    return f < 1 ? 1 : f;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final slices = a.slices;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SectionHeader(title: '资产构成'),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+          child: SizedBox(
+            height: 12,
+            child: Row(
+              children: [
+                for (var i = 0; i < slices.length; i++)
+                  Expanded(
+                    flex: _flex(slices[i].percent),
+                    child: Container(color: _palette[i % _palette.length]),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: AppSpacing.sm),
+        Wrap(
+          spacing: AppSpacing.base,
+          runSpacing: AppSpacing.xs,
+          children: [
+            for (var i = 0; i < slices.length; i++)
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: _palette[i % _palette.length],
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  const SizedBox(width: AppSpacing.xs),
+                  Text('${slices[i].category} ${slices[i].percent}%', style: AppType.caption),
+                ],
+              ),
+          ],
+        ),
+        const SizedBox(height: AppSpacing.xs),
+        Text(
+          '− 负债 ${formatMoney(a.totalLiabilities)} → 净 ${formatMoney(a.netWorth)}',
+          style: AppType.caption,
+        ),
+      ],
     );
   }
 }

@@ -28,6 +28,13 @@ class RealLocalPortfolioRepository implements PortfolioRepository {
   Future<List<HoldingVm>> listHoldings() async => const [];
   @override
   Future<List<HoldingVm>> listHoldingsByAccount(Id accountId) async => const [];
+  @override
+  Future<AssetAllocationVm> getAssetAllocation() async => const AssetAllocationVm(
+        slices: [],
+        totalAssets: Money(amount: '0', currency: 'CNY'),
+        totalLiabilities: Money(amount: '0', currency: 'CNY'),
+        netWorth: Money(amount: '0', currency: 'CNY'),
+      );
 }
 
 class RealLocalMovementRepository implements MovementRepository {

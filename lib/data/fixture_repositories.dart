@@ -193,6 +193,18 @@ const PortfolioOverviewVm _overview = PortfolioOverviewVm(
   changeSinceLastSnapshot: Money(amount: '1245.67', currency: 'CNY'),
 );
 
+const AssetAllocationVm _allocation = AssetAllocationVm(
+  slices: [
+    AllocationSliceVm(category: '现金与活期', percent: '30.5', value: Money(amount: '77900.45', currency: 'CNY')),
+    AllocationSliceVm(category: '美股', percent: '43.2', value: Money(amount: '110320.00', currency: 'CNY')),
+    AllocationSliceVm(category: '数字资产', percent: '12.5', value: Money(amount: '31870.00', currency: 'CNY')),
+    AllocationSliceVm(category: '其他资产', percent: '13.8', value: Money(amount: '35208.45', currency: 'CNY')),
+  ],
+  totalAssets: Money(amount: '255298.90', currency: 'CNY'),
+  totalLiabilities: Money(amount: '9620.00', currency: 'CNY'),
+  netWorth: Money(amount: '245678.90', currency: 'CNY'),
+);
+
 class FixtureAccountRepository implements AccountRepository {
   const FixtureAccountRepository();
   @override
@@ -213,6 +225,8 @@ class FixturePortfolioRepository implements PortfolioRepository {
   @override
   Future<List<HoldingVm>> listHoldingsByAccount(Id accountId) async =>
       _holdings.where((h) => h.accountId == accountId).toList();
+  @override
+  Future<AssetAllocationVm> getAssetAllocation() async => _allocation;
 }
 
 class FixtureMovementRepository implements MovementRepository {

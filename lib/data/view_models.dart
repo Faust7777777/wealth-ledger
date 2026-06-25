@@ -307,3 +307,29 @@ class PortfolioOverviewVm {
       recentMovements.isEmpty &&
       pendingSummary.total == 0;
 }
+
+class AllocationSliceVm {
+  const AllocationSliceVm({
+    required this.category,
+    required this.percent,
+    required this.value,
+  });
+  final String category;
+  final DecimalString percent; // 占总资产，如 "30.5"
+  final Money value;
+}
+
+/// 资产构成（分母=总资产；负债单列减项）。对齐 APPLICATION_INTERFACES_V1.getAssetAllocation。
+class AssetAllocationVm {
+  const AssetAllocationVm({
+    required this.slices,
+    required this.totalAssets,
+    required this.totalLiabilities,
+    required this.netWorth,
+  });
+  final List<AllocationSliceVm> slices;
+  final Money totalAssets;
+  final Money totalLiabilities;
+  final Money netWorth;
+  bool get isEmpty => slices.isEmpty;
+}

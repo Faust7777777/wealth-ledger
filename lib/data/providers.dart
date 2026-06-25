@@ -52,6 +52,9 @@ final liabilitiesProvider = FutureProvider<List<AccountVm>>((ref) async {
 final holdingsProvider = FutureProvider<List<HoldingVm>>(
   (ref) => ref.watch(portfolioRepositoryProvider).listHoldings(),
 );
+final allocationProvider = FutureProvider<AssetAllocationVm>(
+  (ref) => ref.watch(portfolioRepositoryProvider).getAssetAllocation(),
+);
 final dueRemindersProvider = FutureProvider<List<DcaReminderVm>>(
   (ref) => ref.watch(dcaRepositoryProvider).listDueReminders(),
 );
