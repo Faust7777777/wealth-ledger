@@ -40,6 +40,9 @@
 12. `API_MOCK_STUB_PLAN_V1.md`  
     本地 mock/stub 计划：只读、只返回 examples、不写账、不接真实行情/AI/同步。
 
+13. `FRONTEND_API_INTEGRATION_HANDOFF_V1.md`  
+    给 Flutter 前端线的本地联调交接：数据源模式、可接端点、禁止端点、校验命令。
+
 ## 对 Claude 前端的约束
 
 - 当前 Flutter 前端以 `DATA_SCHEMA_V1.md` 和 `AI_PROPOSAL_SCHEMA_V1.md` 的命名为准。
