@@ -111,6 +111,13 @@ class _Hero extends StatelessWidget {
                   color: dark ? AppColors.warningText : AppColorsLight.warning),
             ),
           ),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton(
+            onPressed: () => context.push('/snapshots'),
+            child: const Text('查看历史'),
+          ),
+        ),
       ],
     );
   }

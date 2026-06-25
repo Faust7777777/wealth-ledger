@@ -12,6 +12,7 @@ import '../features/anomalies_page.dart';
 import '../features/investment_page.dart';
 import '../features/liabilities_page.dart';
 import '../features/overview_page.dart';
+import '../features/snapshots_page.dart';
 import 'home_shell.dart';
 
 final appRouter = GoRouter(
@@ -41,6 +42,7 @@ final appRouter = GoRouter(
       builder: (c, s) => AccountDetailPage(accountId: s.pathParameters['id']!),
     ),
     GoRoute(path: '/anomalies', builder: (c, s) => const AnomaliesPage()),
+    GoRoute(path: '/snapshots', builder: (c, s) => const SnapshotsPage()),
     GoRoute(path: '/dev/tokens', builder: (c, s) => const _TokensPreviewRoute()),
   ],
 );

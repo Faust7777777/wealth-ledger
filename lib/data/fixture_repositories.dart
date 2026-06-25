@@ -265,4 +265,6 @@ class FixtureSnapshotRepository implements SnapshotRepository {
   const FixtureSnapshotRepository();
   @override
   Future<NetWorthSnapshotVm?> getLatest() async => _latest;
+  @override
+  Future<List<NetWorthSnapshotVm>> listSnapshots() async => const [_latest, _previous];
 }

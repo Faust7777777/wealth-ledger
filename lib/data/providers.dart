@@ -64,6 +64,9 @@ final aiPendingProvider = FutureProvider<List<AiProposalVm>>(
 final recentMovementsProvider = FutureProvider<List<MovementVm>>(
   (ref) => ref.watch(movementRepositoryProvider).listRecentMovements(),
 );
+final snapshotsProvider = FutureProvider<List<NetWorthSnapshotVm>>(
+  (ref) => ref.watch(snapshotRepositoryProvider).listSnapshots(),
+);
 
 // —— 账户详情 family ——
 final accountByIdProvider = FutureProvider.family<AccountVm?, String>(

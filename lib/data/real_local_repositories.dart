@@ -69,4 +69,6 @@ class RealLocalSnapshotRepository implements SnapshotRepository {
   const RealLocalSnapshotRepository();
   @override
   Future<NetWorthSnapshotVm?> getLatest() async => null;
+  @override
+  Future<List<NetWorthSnapshotVm>> listSnapshots() async => const [];
 }
