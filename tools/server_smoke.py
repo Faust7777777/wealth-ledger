@@ -216,6 +216,32 @@ def smoke_rust(base: str) -> None:
     ai_pending = request_json(base, "/v1/ai/proposals/pending?scenario=degraded")
     assert ai_pending["data"][0]["id"] == "proposal_ai_001"
 
+    created = request_json(
+        base,
+        "/v1/ai/proposals/from-text",
+        method="POST",
+        body={"text": "server-smoke proposal"},
+    )
+    created_group = created["data"]["atomicGroups"][0]["id"]
+    assert created["data"]["id"].startswith("proposal_ai_dev_")
+    assert created["data"]["status"] == "pending"
+
+    pending_after_create = request_json(base, "/v1/ai/proposals/pending?scenario=degraded")
+    pending_ids = {item["id"] for item in pending_after_create["data"]}
+    assert created["data"]["id"] in pending_ids
+
+    created_approve = request_json(
+        base,
+        f"/v1/ai/atomic-groups/{created_group}/approve",
+        method="POST",
+        body={},
+    )
+    assert created_approve["data"]["ledgerWrite"] is False
+
+    pending_after_created_approve = request_json(base, "/v1/ai/proposals/pending?scenario=degraded")
+    pending_ids = {item["id"] for item in pending_after_created_approve["data"]}
+    assert created["data"]["id"] not in pending_ids
+
     quote_summary = request_json(base, "/v1/quotes/summary?scenario=degraded")
     assert quote_summary["data"]["staleCount"] == 2
 

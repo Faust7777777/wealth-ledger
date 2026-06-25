@@ -6,7 +6,12 @@ use axum::{
     routing::{any, get, post},
 };
 use serde_json::{Value, json};
-use std::{collections::HashMap, env, net::SocketAddr};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 const EMPTY_BOOTSTRAP: &str =
     include_str!("../../docs/contracts/examples/ledger_bootstrap_empty.response.json");
@@ -29,7 +34,7 @@ struct AppState {
 impl AppState {
     fn dev() -> Self {
         Self {
-            ledger: DevLedgerCore,
+            ledger: DevLedgerCore::new(),
         }
     }
 }
@@ -40,7 +45,17 @@ impl AppState {
 /// future encrypted local ledger / SQLite store can replace virtual dev data
 /// without changing HTTP route signatures.
 #[derive(Clone)]
-struct DevLedgerCore;
+struct DevLedgerCore {
+    proposals: Arc<Mutex<DevProposalStore>>,
+}
+
+#[derive(Default)]
+struct DevProposalStore {
+    created_proposals: BTreeMap<String, Value>,
+    edited_groups: BTreeMap<String, Value>,
+    group_statuses: BTreeMap<String, String>,
+    next_proposal_number: u64,
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum DevScenario {
@@ -66,6 +81,23 @@ impl DevScenario {
 }
 
 impl DevLedgerCore {
+    fn new() -> Self {
+        Self {
+            proposals: Arc::new(Mutex::new(DevProposalStore {
+                next_proposal_number: 1,
+                ..DevProposalStore::default()
+            })),
+        }
+    }
+
+    fn with_store<T>(&self, f: impl FnOnce(&mut DevProposalStore) -> T) -> T {
+        let mut store = self
+            .proposals
+            .lock()
+            .expect("dev proposal store mutex should not be poisoned");
+        f(&mut store)
+    }
+
     fn portfolio_overview(&self, scenario: DevScenario) -> Value {
         match scenario {
             DevScenario::Empty => example_data(OVERVIEW_EMPTY),
@@ -155,25 +187,68 @@ impl DevLedgerCore {
     }
 
     fn ai_pending(&self, scenario: DevScenario) -> Value {
-        if scenario.is_degraded() {
-            json!([example_data(AI_DIFF)])
-        } else {
-            json!([])
-        }
+        let mut proposals = Vec::new();
+
+        self.with_store(|store| {
+            if scenario.is_degraded() {
+                let proposal = proposal_with_group_overrides(example_data(AI_DIFF), store);
+                if proposal_has_pending_group(&proposal) {
+                    proposals.push(proposal);
+                }
+            }
+
+            proposals.extend(
+                store
+                    .created_proposals
+                    .values()
+                    .cloned()
+                    .map(|proposal| proposal_with_group_overrides(proposal, store))
+                    .filter(proposal_has_pending_group),
+            );
+        });
+
+        json!(proposals)
     }
 
     fn ai_proposal(&self, scenario: DevScenario, proposal_id: &str) -> Option<Value> {
-        if !scenario.is_degraded() {
-            return None;
-        }
-        let proposal = example_data(AI_DIFF);
-        (proposal.get("id").and_then(Value::as_str) == Some(proposal_id)).then_some(proposal)
+        self.with_store(|store| {
+            if let Some(proposal) = store.created_proposals.get(proposal_id) {
+                return Some(proposal_with_group_overrides(proposal.clone(), store));
+            }
+
+            if !scenario.is_degraded() {
+                return None;
+            }
+
+            let proposal = proposal_with_group_overrides(example_data(AI_DIFF), store);
+            (proposal.get("id").and_then(Value::as_str) == Some(proposal_id)).then_some(proposal)
+        })
     }
 
     fn create_ai_proposal(&self, source_kind: &str) -> Value {
-        let mut proposal = example_data(AI_DIFF);
-        proposal["source"]["kind"] = json!(source_kind);
-        proposal
+        self.with_store(|store| {
+            let n = store.next_proposal_number;
+            store.next_proposal_number += 1;
+
+            let proposal_id = format!("proposal_ai_dev_{n:03}");
+            let group_id = format!("ag_ai_dev_{n:03}");
+            let mut proposal = example_data(AI_DIFF);
+
+            proposal["id"] = json!(proposal_id);
+            proposal["source"]["kind"] = json!(source_kind);
+            proposal["atomicGroups"][0]["id"] = json!(group_id);
+            proposal["atomicGroups"][0]["status"] = json!("pending");
+
+            store.created_proposals.insert(
+                proposal["id"]
+                    .as_str()
+                    .expect("generated proposal id should be string")
+                    .to_string(),
+                proposal.clone(),
+            );
+
+            proposal
+        })
     }
 
     fn mark_dca_executed_as_proposal(&self, reminder_id: &str) -> Option<Value> {
@@ -186,24 +261,59 @@ impl DevLedgerCore {
 
         let mut proposal = example_data(DCA_PROPOSAL);
         proposal["requestedReminderId"] = json!(reminder_id);
+        if let Some(group_id) = proposal.get("id").and_then(Value::as_str) {
+            self.with_store(|store| {
+                store
+                    .group_statuses
+                    .insert(group_id.to_string(), "pending".to_string());
+                store
+                    .edited_groups
+                    .insert(group_id.to_string(), proposal.clone());
+            });
+        }
         Some(proposal)
     }
 
     fn atomic_group(&self, atomic_group_id: &str) -> Option<Value> {
+        if let Some(group) = self.with_store(|store| {
+            if let Some(group) = store.edited_groups.get(atomic_group_id) {
+                return Some(group_with_status_override(group.clone(), store));
+            }
+
+            for proposal in store.created_proposals.values() {
+                if let Some(group) = proposal["atomicGroups"]
+                    .as_array()
+                    .and_then(|groups| find_group(groups, atomic_group_id))
+                {
+                    return Some(group_with_status_override(group, store));
+                }
+            }
+
+            None
+        }) {
+            return Some(group);
+        }
+
         if let Some(group) = example_data(AI_DIFF)["atomicGroups"]
             .as_array()?
             .iter()
             .find(|group| group.get("id").and_then(Value::as_str) == Some(atomic_group_id))
         {
-            return Some(group.clone());
+            return Some(self.with_store(|store| group_with_status_override(group.clone(), store)));
         }
 
         let dca_group = example_data(DCA_PROPOSAL);
-        (dca_group.get("id").and_then(Value::as_str) == Some(atomic_group_id)).then_some(dca_group)
+        (dca_group.get("id").and_then(Value::as_str) == Some(atomic_group_id))
+            .then(|| self.with_store(|store| group_with_status_override(dca_group, store)))
     }
 
     fn approve_atomic_group(&self, atomic_group_id: &str) -> Option<Value> {
         self.atomic_group(atomic_group_id)?;
+        self.with_store(|store| {
+            store
+                .group_statuses
+                .insert(atomic_group_id.to_string(), "approved".to_string());
+        });
         Some(json!({
             "atomicGroupId": atomic_group_id,
             "confirmedMovementIds": [],
@@ -221,7 +331,16 @@ impl DevLedgerCore {
     }
 
     fn reject_atomic_group(&self, atomic_group_id: &str) -> bool {
-        self.atomic_group(atomic_group_id).is_some()
+        if self.atomic_group(atomic_group_id).is_none() {
+            return false;
+        }
+
+        self.with_store(|store| {
+            store
+                .group_statuses
+                .insert(atomic_group_id.to_string(), "rejected".to_string());
+        });
+        true
     }
 
     fn edit_atomic_group(&self, atomic_group_id: &str) -> Option<Value> {
@@ -247,6 +366,15 @@ impl DevLedgerCore {
                 }
             ]);
         }
+
+        self.with_store(|store| {
+            store
+                .group_statuses
+                .insert(atomic_group_id.to_string(), "edited".to_string());
+            store
+                .edited_groups
+                .insert(atomic_group_id.to_string(), group.clone());
+        });
 
         Some(group)
     }
@@ -795,6 +923,52 @@ fn find_by_id(items: Value, id: &str) -> Option<Value> {
         .cloned()
 }
 
+fn find_group(groups: &[Value], atomic_group_id: &str) -> Option<Value> {
+    groups
+        .iter()
+        .find(|group| group.get("id").and_then(Value::as_str) == Some(atomic_group_id))
+        .cloned()
+}
+
+fn group_with_status_override(mut group: Value, store: &DevProposalStore) -> Value {
+    if let Some(group_id) = group.get("id").and_then(Value::as_str)
+        && let Some(status) = store.group_statuses.get(group_id)
+    {
+        group["status"] = json!(status);
+    }
+    group
+}
+
+fn proposal_with_group_overrides(mut proposal: Value, store: &DevProposalStore) -> Value {
+    if let Some(groups) = proposal["atomicGroups"].as_array_mut() {
+        for group in groups {
+            let Some(group_id) = group.get("id").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+
+            if let Some(edited) = store.edited_groups.get(&group_id) {
+                *group = edited.clone();
+            }
+
+            if let Some(status) = store.group_statuses.get(&group_id) {
+                group["status"] = json!(status);
+            }
+        }
+    }
+    proposal
+}
+
+fn proposal_has_pending_group(proposal: &Value) -> bool {
+    proposal["atomicGroups"].as_array().is_some_and(|groups| {
+        groups.iter().any(|group| {
+            matches!(
+                group.get("status").and_then(Value::as_str),
+                Some("pending" | "edited")
+            )
+        })
+    })
+}
+
 fn not_found(code: &str, message: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -1124,7 +1298,7 @@ mod tests {
 
     #[test]
     fn dev_ledger_core_separates_empty_and_degraded_scenarios() {
-        let core = DevLedgerCore;
+        let core = DevLedgerCore::new();
 
         assert_eq!(core.accounts(DevScenario::Empty), json!([]));
         assert_eq!(core.holdings(DevScenario::Empty), json!([]));
@@ -1149,7 +1323,11 @@ mod tests {
     }
 
     async fn request_json(method: Method, uri: &str) -> (StatusCode, Value) {
-        let response = app()
+        request_json_from(app(), method, uri).await
+    }
+
+    async fn request_json_from(router: Router, method: Method, uri: &str) -> (StatusCode, Value) {
+        let response = router
             .oneshot(
                 Request::builder()
                     .method(method)
@@ -1369,6 +1547,111 @@ mod tests {
             request_json(Method::POST, "/v1/ai/atomic-groups/ag_ai_modify_001/reject").await;
         assert_eq!(reject_status, StatusCode::NO_CONTENT);
         assert_eq!(reject_body, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn dev_proposal_store_tracks_review_state_across_requests() {
+        let router = app();
+
+        let (initial_status, initial_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/ai/proposals/pending?scenario=degraded",
+        )
+        .await;
+        assert_eq!(initial_status, StatusCode::OK);
+        assert_eq!(
+            initial_body["data"]
+                .as_array()
+                .expect("pending array")
+                .len(),
+            1
+        );
+
+        let (create_status, create_body) =
+            request_json_from(router.clone(), Method::POST, "/v1/ai/proposals/from-text").await;
+        assert_eq!(create_status, StatusCode::OK);
+        assert_eq!(create_body["data"]["id"], "proposal_ai_dev_001");
+        assert_eq!(
+            create_body["data"]["atomicGroups"][0]["id"],
+            "ag_ai_dev_001"
+        );
+
+        let (after_create_status, after_create_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/ai/proposals/pending?scenario=degraded",
+        )
+        .await;
+        assert_eq!(after_create_status, StatusCode::OK);
+        assert_eq!(
+            after_create_body["data"]
+                .as_array()
+                .expect("pending after create array")
+                .len(),
+            2
+        );
+
+        let (approve_status, approve_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            "/v1/ai/atomic-groups/ag_ai_dev_001/approve",
+        )
+        .await;
+        assert_eq!(approve_status, StatusCode::OK);
+        assert_eq!(approve_body["data"]["ledgerWrite"], false);
+
+        let (after_approve_status, after_approve_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/ai/proposals/pending?scenario=degraded",
+        )
+        .await;
+        assert_eq!(after_approve_status, StatusCode::OK);
+        assert_eq!(
+            after_approve_body["data"]
+                .as_array()
+                .expect("pending after approve array")
+                .len(),
+            1
+        );
+
+        let (edit_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            "/v1/ai/atomic-groups/ag_ai_modify_001/edit",
+        )
+        .await;
+        assert_eq!(edit_status, StatusCode::OK);
+
+        let (after_edit_status, after_edit_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/ai/proposals/pending?scenario=degraded",
+        )
+        .await;
+        assert_eq!(after_edit_status, StatusCode::OK);
+        assert_eq!(
+            after_edit_body["data"][0]["atomicGroups"][0]["status"],
+            "edited"
+        );
+
+        let (reject_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            "/v1/ai/atomic-groups/ag_ai_modify_001/reject",
+        )
+        .await;
+        assert_eq!(reject_status, StatusCode::NO_CONTENT);
+
+        let (after_reject_status, after_reject_body) = request_json_from(
+            router,
+            Method::GET,
+            "/v1/ai/proposals/pending?scenario=degraded",
+        )
+        .await;
+        assert_eq!(after_reject_status, StatusCode::OK);
+        assert_eq!(after_reject_body["data"], json!([]));
     }
 
     #[tokio::test]

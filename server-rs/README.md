@@ -111,6 +111,10 @@ Approve/confirm responses include `ledgerWrite: false` and an empty
 `confirmedMovementIds` list in this dev server. This is intentional until the
 real local ledger store exists.
 
+Within a running dev-server process, proposal create / approve / reject / edit
+state is tracked in memory so the frontend can verify review flows. Restarting
+the server clears this state.
+
 ## Checks
 
 ```bash
