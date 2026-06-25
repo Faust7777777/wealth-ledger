@@ -216,6 +216,7 @@ class _MovementRow extends StatelessWidget {
           ? Text('在途 · 非支出', style: AppType.caption)
           : null,
       trailing: amt == null ? null : Text(formatMoney(amt), style: AppType.moneyRow),
+      onTap: () => context.push('/movement/${m.id}'),
     );
   }
 }

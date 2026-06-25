@@ -117,6 +117,14 @@ class HoldingVm {
   final DecimalString? unrealizedPnlRate;
 }
 
+/// 交易金额拆分（优惠券/免单仅作字段，非功能模块）。paidAmount = gross − savings。
+class TransactionAmountBreakdownVm {
+  const TransactionAmountBreakdownVm({this.gross, this.savings, required this.paid});
+  final Money? gross;
+  final Money? savings;
+  final Money paid;
+}
+
 class MovementVm {
   const MovementVm({
     required this.id,
@@ -127,6 +135,8 @@ class MovementVm {
     required this.occurredAt,
     this.displayAmount,
     this.inTransit = false,
+    this.description,
+    this.amountBreakdown,
   });
   final Id id;
   final Id atomicGroupId;
@@ -136,6 +146,8 @@ class MovementVm {
   final IsoDateTime occurredAt;
   final Money? displayAmount; // 展示主额（由核心/映射层给出）
   final bool inTransit;
+  final String? description;
+  final TransactionAmountBreakdownVm? amountBreakdown;
 }
 
 class DcaReminderVm {

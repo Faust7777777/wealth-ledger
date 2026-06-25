@@ -100,6 +100,20 @@ const List<MovementVm> _movements = [
     occurredAt: _asOf,
     displayAmount: Money(amount: '12000.00', currency: 'CNY'),
   ),
+  MovementVm(
+    id: 'mov_takeout_001',
+    atomicGroupId: 'ag_takeout_001',
+    type: MovementType.expense,
+    status: MovementStatus.confirmed,
+    title: '外卖平台',
+    occurredAt: _asOf,
+    displayAmount: Money(amount: '20.00', currency: 'CNY'),
+    amountBreakdown: TransactionAmountBreakdownVm(
+      gross: Money(amount: '30.00', currency: 'CNY'),
+      savings: Money(amount: '10.00', currency: 'CNY'),
+      paid: Money(amount: '20.00', currency: 'CNY'),
+    ),
+  ),
 ];
 
 const List<DcaReminderVm> _dcaReminders = [
