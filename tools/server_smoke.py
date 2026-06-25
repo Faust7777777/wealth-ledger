@@ -227,6 +227,34 @@ def smoke_rust(base: str) -> None:
     )
     assert dca["data"]["proposedMovements"][0]["status"] == "pending_review"
 
+    approve = request_json(
+        base,
+        "/v1/ai/atomic-groups/ag_ai_modify_001/approve",
+        method="POST",
+        body={},
+    )
+    assert approve["data"]["atomicGroupId"] == "ag_ai_modify_001"
+    assert approve["data"]["ledgerWrite"] is False
+    assert approve["data"]["confirmedMovementIds"] == []
+
+    edit = request_json(
+        base,
+        "/v1/ai/atomic-groups/ag_ai_modify_001/edit",
+        method="POST",
+        body={"patch": {"title": "dev smoke edit"}},
+    )
+    assert edit["data"]["id"] == "ag_ai_modify_001"
+    assert edit["data"]["status"] == "edited"
+
+    reject = request_json(
+        base,
+        "/v1/ai/atomic-groups/ag_ai_modify_001/reject",
+        method="POST",
+        body={"reason": "server-smoke"},
+        expected_status=204,
+    )
+    assert reject == {}
+
     login = request_json(
         base,
         "/v1/auth/login",

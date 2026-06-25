@@ -90,6 +90,27 @@ GET /v1/holdings?scenario=degraded          # canonical: /v1/portfolio/holdings
 GET /v1/movements/recent?scenario=degraded  # canonical: /v1/movements
 ```
 
+## Dev proposal write paths
+
+The following POST routes validate frontend flow shape but do not persist state
+and do not write the confirmed ledger:
+
+```text
+POST /v1/dca/reminders/{reminder_id}/mark-executed-as-proposal
+POST /v1/ai/proposals/from-text
+POST /v1/ai/proposals/from-image
+POST /v1/ai/proposals/from-csv
+POST /v1/ai/atomic-groups/{atomic_group_id}/approve
+POST /v1/ai/atomic-groups/{atomic_group_id}/reject
+POST /v1/ai/atomic-groups/{atomic_group_id}/edit
+POST /v1/atomic-groups/{atomic_group_id}/confirm
+POST /v1/atomic-groups/{atomic_group_id}/reject
+```
+
+Approve/confirm responses include `ledgerWrite: false` and an empty
+`confirmedMovementIds` list in this dev server. This is intentional until the
+real local ledger store exists.
+
 ## Checks
 
 ```bash
@@ -108,5 +129,6 @@ Current route regression tests cover:
 - empty-list defaults for first-batch read routes
 - degraded account / holding / movement / DCA / AI / snapshot / quote routes
 - DCA mark-executed returns `pending_review` proposal and states no order/no transfer
+- dev-only AI/DCA proposal write paths do not write confirmed ledger
 - forbidden product-boundary endpoints return 403
 - AI proposal contains old → new diff

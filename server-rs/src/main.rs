@@ -170,6 +170,87 @@ impl DevLedgerCore {
         (proposal.get("id").and_then(Value::as_str) == Some(proposal_id)).then_some(proposal)
     }
 
+    fn create_ai_proposal(&self, source_kind: &str) -> Value {
+        let mut proposal = example_data(AI_DIFF);
+        proposal["source"]["kind"] = json!(source_kind);
+        proposal
+    }
+
+    fn mark_dca_executed_as_proposal(&self, reminder_id: &str) -> Option<Value> {
+        if !matches!(
+            reminder_id,
+            "reminder_001" | "dca_reminder_001" | "rem_csi300_20260710"
+        ) {
+            return None;
+        }
+
+        let mut proposal = example_data(DCA_PROPOSAL);
+        proposal["requestedReminderId"] = json!(reminder_id);
+        Some(proposal)
+    }
+
+    fn atomic_group(&self, atomic_group_id: &str) -> Option<Value> {
+        if let Some(group) = example_data(AI_DIFF)["atomicGroups"]
+            .as_array()?
+            .iter()
+            .find(|group| group.get("id").and_then(Value::as_str) == Some(atomic_group_id))
+        {
+            return Some(group.clone());
+        }
+
+        let dca_group = example_data(DCA_PROPOSAL);
+        (dca_group.get("id").and_then(Value::as_str) == Some(atomic_group_id)).then_some(dca_group)
+    }
+
+    fn approve_atomic_group(&self, atomic_group_id: &str) -> Option<Value> {
+        self.atomic_group(atomic_group_id)?;
+        Some(json!({
+            "atomicGroupId": atomic_group_id,
+            "confirmedMovementIds": [],
+            "snapshotInvalidated": false,
+            "ledgerWrite": false,
+            "devOnly": true,
+            "warnings": [
+                {
+                    "code": "dev_no_persistence",
+                    "message": "Dev server approval validates the flow but does not write the confirmed ledger.",
+                    "severity": "info"
+                }
+            ]
+        }))
+    }
+
+    fn reject_atomic_group(&self, atomic_group_id: &str) -> bool {
+        self.atomic_group(atomic_group_id).is_some()
+    }
+
+    fn edit_atomic_group(&self, atomic_group_id: &str) -> Option<Value> {
+        let mut group = self.atomic_group(atomic_group_id)?;
+        group["status"] = json!("edited");
+        group["validation"] = json!({
+            "isValid": true,
+            "errors": []
+        });
+
+        if let Some(warnings) = group.get_mut("warnings").and_then(Value::as_array_mut) {
+            warnings.push(json!({
+                "code": "dev_edit_not_persisted",
+                "message": "Dev server edit returns an edited atomic group but does not persist proposal state.",
+                "severity": "info"
+            }));
+        } else {
+            group["warnings"] = json!([
+                {
+                    "code": "dev_edit_not_persisted",
+                    "message": "Dev server edit returns an edited atomic group but does not persist proposal state.",
+                    "severity": "info"
+                }
+            ]);
+        }
+
+        Some(group)
+    }
+
     fn quote_summary(&self, scenario: DevScenario) -> Value {
         if scenario.is_degraded() {
             let overview = self.portfolio_overview(scenario);
@@ -259,18 +340,18 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/movements/corrections", post(not_implemented))
         .route(
             "/v1/atomic-groups/{atomic_group_id}/confirm",
-            post(not_implemented),
+            post(confirm_atomic_group),
         )
         .route(
             "/v1/atomic-groups/{atomic_group_id}/reject",
-            post(not_implemented),
+            post(reject_atomic_group),
         )
         .route("/v1/dca/plans", get(dca_plans).post(not_implemented))
         .route("/v1/dca/plans/{plan_id}", any(not_implemented))
         .route("/v1/dca/reminders/due", get(dca_due_reminders))
         .route(
             "/v1/dca/reminders/{reminder_id}/mark-executed-as-proposal",
-            post(example_dca_proposal),
+            post(mark_dca_executed_as_proposal),
         )
         .route(
             "/v1/dca/reminders/{reminder_id}/skip",
@@ -280,22 +361,22 @@ fn app_with_state(state: AppState) -> Router {
             "/v1/dca/reminders/{reminder_id}/snooze",
             post(not_implemented),
         )
-        .route("/v1/ai/proposals/from-text", post(example_ai_diff))
-        .route("/v1/ai/proposals/from-image", post(example_ai_diff))
-        .route("/v1/ai/proposals/from-csv", post(example_ai_diff))
+        .route("/v1/ai/proposals/from-text", post(ai_proposal_from_text))
+        .route("/v1/ai/proposals/from-image", post(ai_proposal_from_image))
+        .route("/v1/ai/proposals/from-csv", post(ai_proposal_from_csv))
         .route("/v1/ai/proposals/pending", get(ai_pending))
         .route("/v1/ai/proposals/{proposal_id}", get(ai_proposal))
         .route(
             "/v1/ai/atomic-groups/{atomic_group_id}/approve",
-            post(not_implemented),
+            post(confirm_atomic_group),
         )
         .route(
             "/v1/ai/atomic-groups/{atomic_group_id}/reject",
-            post(not_implemented),
+            post(reject_atomic_group),
         )
         .route(
             "/v1/ai/atomic-groups/{atomic_group_id}/edit",
-            post(not_implemented),
+            post(edit_atomic_group),
         )
         .route("/v1/quotes/summary", get(quote_summary))
         .route("/v1/quotes", get(empty_array))
@@ -533,16 +614,73 @@ async fn ai_proposal(
     }
 }
 
+async fn ai_proposal_from_text(State(state): State<AppState>) -> Json<Value> {
+    envelope(state.ledger.create_ai_proposal("user_text"))
+}
+
+async fn ai_proposal_from_image(State(state): State<AppState>) -> Json<Value> {
+    envelope(state.ledger.create_ai_proposal("user_image"))
+}
+
+async fn ai_proposal_from_csv(State(state): State<AppState>) -> Json<Value> {
+    envelope(state.ledger.create_ai_proposal("csv_import"))
+}
+
+async fn mark_dca_executed_as_proposal(
+    State(state): State<AppState>,
+    Path(reminder_id): Path<String>,
+) -> Response {
+    match state.ledger.mark_dca_executed_as_proposal(&reminder_id) {
+        Some(proposal) => envelope(proposal).into_response(),
+        None => not_found(
+            "dca_reminder_not_found",
+            "DCA reminder does not exist in this dev scenario.",
+        ),
+    }
+}
+
+async fn confirm_atomic_group(
+    State(state): State<AppState>,
+    Path(atomic_group_id): Path<String>,
+) -> Response {
+    match state.ledger.approve_atomic_group(&atomic_group_id) {
+        Some(result) => envelope(result).into_response(),
+        None => not_found(
+            "atomic_group_not_found",
+            "Atomic group does not exist in this dev scenario.",
+        ),
+    }
+}
+
+async fn reject_atomic_group(
+    State(state): State<AppState>,
+    Path(atomic_group_id): Path<String>,
+) -> Response {
+    if state.ledger.reject_atomic_group(&atomic_group_id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        not_found(
+            "atomic_group_not_found",
+            "Atomic group does not exist in this dev scenario.",
+        )
+    }
+}
+
+async fn edit_atomic_group(
+    State(state): State<AppState>,
+    Path(atomic_group_id): Path<String>,
+) -> Response {
+    match state.ledger.edit_atomic_group(&atomic_group_id) {
+        Some(group) => envelope(group).into_response(),
+        None => not_found(
+            "atomic_group_not_found",
+            "Atomic group does not exist in this dev scenario.",
+        ),
+    }
+}
+
 async fn example_empty_bootstrap() -> Json<Value> {
     example_json(EMPTY_BOOTSTRAP)
-}
-
-async fn example_ai_diff() -> Json<Value> {
-    example_json(AI_DIFF)
-}
-
-async fn example_dca_proposal() -> Json<Value> {
-    example_json(DCA_PROPOSAL)
 }
 
 async fn example_quote_stale() -> Json<Value> {
@@ -1171,6 +1309,83 @@ mod tests {
         let warning_text = serde_json::to_string(warnings).expect("warnings should stringify");
         assert!(warning_text.contains("不下单"));
         assert!(warning_text.contains("不转账"));
+    }
+
+    #[tokio::test]
+    async fn dca_mark_executed_rejects_unknown_reminder() {
+        let (status, body) = request_json(
+            Method::POST,
+            "/v1/dca/reminders/missing_reminder/mark-executed-as-proposal",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "dca_reminder_not_found");
+    }
+
+    #[tokio::test]
+    async fn ai_proposal_sources_keep_diff_and_do_not_write_ledger() {
+        for (uri, source_kind) in [
+            ("/v1/ai/proposals/from-text", "user_text"),
+            ("/v1/ai/proposals/from-image", "user_image"),
+            ("/v1/ai/proposals/from-csv", "csv_import"),
+        ] {
+            let (status, body) = request_json(Method::POST, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(body["data"]["source"]["kind"], source_kind, "{uri}");
+            assert_eq!(body["data"]["status"], "pending", "{uri}");
+            assert!(
+                body["data"]["atomicGroups"][0]["diffs"]
+                    .as_array()
+                    .expect("diffs should be an array")
+                    .len()
+                    >= 2,
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ai_atomic_group_approve_reject_edit_are_dev_only() {
+        let (approve_status, approve_body) = request_json(
+            Method::POST,
+            "/v1/ai/atomic-groups/ag_ai_modify_001/approve",
+        )
+        .await;
+        assert_eq!(approve_status, StatusCode::OK);
+        assert_eq!(approve_body["data"]["atomicGroupId"], "ag_ai_modify_001");
+        assert_eq!(approve_body["data"]["confirmedMovementIds"], json!([]));
+        assert_eq!(approve_body["data"]["snapshotInvalidated"], false);
+        assert_eq!(approve_body["data"]["ledgerWrite"], false);
+
+        let (edit_status, edit_body) =
+            request_json(Method::POST, "/v1/ai/atomic-groups/ag_ai_modify_001/edit").await;
+        assert_eq!(edit_status, StatusCode::OK);
+        assert_eq!(edit_body["data"]["id"], "ag_ai_modify_001");
+        assert_eq!(edit_body["data"]["status"], "edited");
+        assert_eq!(edit_body["data"]["validation"]["isValid"], true);
+
+        let (reject_status, reject_body) =
+            request_json(Method::POST, "/v1/ai/atomic-groups/ag_ai_modify_001/reject").await;
+        assert_eq!(reject_status, StatusCode::NO_CONTENT);
+        assert_eq!(reject_body, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn atomic_group_alias_confirm_reject_use_same_guardrails() {
+        let (confirm_status, confirm_body) = request_json(
+            Method::POST,
+            "/v1/atomic-groups/ag_dca_recorded_001/confirm",
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK);
+        assert_eq!(confirm_body["data"]["atomicGroupId"], "ag_dca_recorded_001");
+        assert_eq!(confirm_body["data"]["ledgerWrite"], false);
+
+        let (reject_status, reject_body) =
+            request_json(Method::POST, "/v1/atomic-groups/missing_group/reject").await;
+        assert_eq!(reject_status, StatusCode::NOT_FOUND);
+        assert_eq!(reject_body["error"]["code"], "atomic_group_not_found");
     }
 
     #[tokio::test]
