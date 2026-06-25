@@ -80,13 +80,15 @@ GET  /v1/accounts
 GET  /v1/accounts/{accountId}
 GET  /v1/accounts/{accountId}/holdings
 GET  /v1/accounts/anomalies
-GET  /v1/holdings
-GET  /v1/movements/recent
+GET  /v1/portfolio/holdings
+GET  /v1/portfolio/allocation
+GET  /v1/movements
 GET  /v1/movements/{movementId}
 GET  /v1/dca/plans
 GET  /v1/dca/reminders/due
 GET  /v1/ai/proposals/pending
 GET  /v1/ai/proposals/{proposalId}
+GET  /v1/snapshots/latest
 GET  /v1/snapshots
 GET  /v1/quotes/summary
 ```
@@ -115,10 +117,31 @@ GET /v1/portfolio/overview?scenario=empty
 GET /v1/portfolio/overview?scenario=degraded
 ```
 
+Rust dev server 还支持把 `?scenario=degraded` 加到第一批只读端点上，用同一组虚构数据驱动账户、持仓、流水、DCA、AI pending、快照、报价摘要页面：
+
+```text
+GET /v1/accounts?scenario=degraded
+GET /v1/accounts/acct_us_broker?scenario=degraded
+GET /v1/accounts/acct_us_broker/holdings?scenario=degraded
+GET /v1/accounts/anomalies?scenario=degraded
+GET /v1/portfolio/holdings?scenario=degraded
+GET /v1/portfolio/allocation?scenario=degraded
+GET /v1/movements?scenario=degraded
+GET /v1/movements/mov_luckin_001?scenario=degraded
+GET /v1/dca/plans?scenario=degraded
+GET /v1/dca/reminders/due?scenario=degraded
+GET /v1/ai/proposals/pending?scenario=degraded
+GET /v1/ai/proposals/proposal_ai_001?scenario=degraded
+GET /v1/snapshots/latest?scenario=degraded
+GET /v1/snapshots?scenario=degraded
+GET /v1/quotes/summary?scenario=degraded
+```
+
 规则：
 
 - `empty` 用于真实空账本首屏。
 - `degraded` 用于报价过期、AI 待确认、定投到期、账户异常、在途交易并发态。
+- 不带 `scenario=degraded` 时，Rust dev server 的第一批列表端点仍返回空态。
 - `degraded` 不是用户真实数据，也不是 debug fixture 种子。
 
 ## 6. 必须保持的 UI 语义

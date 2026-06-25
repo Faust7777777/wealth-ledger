@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::Query,
+    extract::{Path, Query},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -46,20 +46,22 @@ fn app() -> Router {
         .route("/v1/auth/devices", get(empty_array))
         .route("/v1/auth/devices/{device_id}/revoke", post(no_content))
         .route("/v1/ledger/bootstrap", get(example_empty_bootstrap))
-        .route("/v1/accounts", get(empty_array).post(not_implemented))
-        .route("/v1/accounts/anomalies", get(empty_array))
+        .route("/v1/accounts", get(accounts).post(not_implemented))
+        .route("/v1/accounts/anomalies", get(account_anomalies))
         .route(
             "/v1/accounts/{account_id}",
-            get(not_implemented).patch(not_implemented),
+            get(account_detail).patch(not_implemented),
         )
         .route("/v1/accounts/{account_id}/archive", post(not_implemented))
-        .route("/v1/accounts/{account_id}/holdings", get(empty_array))
+        .route("/v1/accounts/{account_id}/holdings", get(account_holdings))
         .route("/v1/portfolio/overview", get(portfolio_overview))
-        .route("/v1/portfolio/holdings", get(empty_array))
-        .route("/v1/portfolio/allocation", get(empty_object))
-        .route("/v1/movements", get(empty_array))
+        .route("/v1/portfolio/holdings", get(holdings))
+        .route("/v1/holdings", get(holdings))
+        .route("/v1/portfolio/allocation", get(asset_allocation))
+        .route("/v1/movements", get(movements))
+        .route("/v1/movements/recent", get(movements))
         .route("/v1/movements/drafts", post(not_implemented))
-        .route("/v1/movements/{movement_id}", get(not_implemented))
+        .route("/v1/movements/{movement_id}", get(movement_detail))
         .route(
             "/v1/movements/{movement_id}/submit-review",
             post(not_implemented),
@@ -73,9 +75,9 @@ fn app() -> Router {
             "/v1/atomic-groups/{atomic_group_id}/reject",
             post(not_implemented),
         )
-        .route("/v1/dca/plans", get(empty_array).post(not_implemented))
+        .route("/v1/dca/plans", get(dca_plans).post(not_implemented))
         .route("/v1/dca/plans/{plan_id}", any(not_implemented))
-        .route("/v1/dca/reminders/due", get(empty_array))
+        .route("/v1/dca/reminders/due", get(dca_due_reminders))
         .route(
             "/v1/dca/reminders/{reminder_id}/mark-executed-as-proposal",
             post(example_dca_proposal),
@@ -91,8 +93,8 @@ fn app() -> Router {
         .route("/v1/ai/proposals/from-text", post(example_ai_diff))
         .route("/v1/ai/proposals/from-image", post(example_ai_diff))
         .route("/v1/ai/proposals/from-csv", post(example_ai_diff))
-        .route("/v1/ai/proposals/pending", get(empty_array))
-        .route("/v1/ai/proposals/{proposal_id}", get(not_implemented))
+        .route("/v1/ai/proposals/pending", get(ai_pending))
+        .route("/v1/ai/proposals/{proposal_id}", get(ai_proposal))
         .route(
             "/v1/ai/atomic-groups/{atomic_group_id}/approve",
             post(not_implemented),
@@ -113,8 +115,8 @@ fn app() -> Router {
             "/v1/instruments/{instrument_id}/historical-prices",
             get(empty_array),
         )
-        .route("/v1/snapshots/latest", get(null_data))
-        .route("/v1/snapshots", get(empty_array))
+        .route("/v1/snapshots/latest", get(snapshot_latest))
+        .route("/v1/snapshots", get(snapshots))
         .route("/v1/snapshots/manual", post(not_implemented))
         .route("/v1/snapshots/invalidate", post(no_content))
         .route("/v1/categories", get(empty_array).post(not_implemented))
@@ -136,10 +138,39 @@ fn app() -> Router {
 }
 
 fn read_addr() -> SocketAddr {
-    env::var("FINWEALTH_RS_ADDR")
-        .unwrap_or_else(|_| "127.0.0.1:8790".to_string())
+    read_addr_from(env::args())
+}
+
+fn read_addr_from<I, S>(args: I) -> SocketAddr
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into).skip(1);
+    let mut cli_addr: Option<String> = None;
+    let mut cli_port: Option<String> = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--addr" => {
+                cli_addr = Some(
+                    args.next()
+                        .expect("--addr requires a socket address, e.g. 127.0.0.1:8791"),
+                );
+            }
+            "--port" => {
+                cli_port = Some(args.next().expect("--port requires a port, e.g. 8791"));
+            }
+            _ => {}
+        }
+    }
+
+    cli_addr
+        .or_else(|| cli_port.map(|port| format!("127.0.0.1:{port}")))
+        .or_else(|| env::var("FINWEALTH_RS_ADDR").ok())
+        .unwrap_or_else(|| "127.0.0.1:8790".to_string())
         .parse()
-        .expect("FINWEALTH_RS_ADDR must be a socket address")
+        .expect("server address must be a socket address")
 }
 
 fn assert_loopback(addr: SocketAddr) {
@@ -170,13 +201,154 @@ async fn auth_refresh() -> Json<Value> {
 }
 
 async fn portfolio_overview(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
-    if query
-        .get("scenario")
-        .is_some_and(|value| value == "degraded")
-    {
+    if is_degraded(&query) {
         example_json(OVERVIEW_DEGRADED)
     } else {
         example_json(OVERVIEW_EMPTY)
+    }
+}
+
+async fn accounts(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+    if is_degraded(&query) {
+        envelope(dev_accounts())
+    } else {
+        envelope(json!([]))
+    }
+}
+
+async fn account_detail(
+    Path(account_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if !is_degraded(&query) {
+        return not_found(
+            "account_not_found",
+            "Account not found in empty dev scenario.",
+        );
+    }
+
+    match find_by_id(dev_accounts(), &account_id) {
+        Some(account) => envelope(account).into_response(),
+        None => not_found(
+            "account_not_found",
+            "Account does not exist in degraded dev scenario.",
+        ),
+    }
+}
+
+async fn account_anomalies(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+    if is_degraded(&query) {
+        envelope(dev_account_anomalies())
+    } else {
+        envelope(json!([]))
+    }
+}
+
+async fn holdings(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+    if is_degraded(&query) {
+        envelope(dev_holdings())
+    } else {
+        envelope(json!([]))
+    }
+}
+
+async fn account_holdings(
+    Path(account_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    if !is_degraded(&query) {
+        return envelope(json!([]));
+    }
+
+    let items = dev_holdings()
+        .as_array()
+        .expect("dev holdings should be an array")
+        .iter()
+        .filter(|item| item.get("accountId").and_then(Value::as_str) == Some(account_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    envelope(json!(items))
+}
+
+async fn asset_allocation(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+    if is_degraded(&query) {
+        envelope(dev_asset_allocation())
+    } else {
+        envelope(json!({
+            "slices": [],
+            "totalAssets": {"amount": "0", "currency": "CNY"},
+            "totalLiabilities": {"amount": "0", "currency": "CNY"},
+            "netWorth": {"amount": "0", "currency": "CNY"}
+        }))
+    }
+}
+
+async fn movements(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+    if is_degraded(&query) {
+        envelope(dev_movements())
+    } else {
+        envelope(json!([]))
+    }
+}
+
+async fn movement_detail(
+    Path(movement_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if !is_degraded(&query) {
+        return not_found(
+            "movement_not_found",
+            "Movement not found in empty dev scenario.",
+        );
+    }
+
+    match find_by_id(dev_movements(), &movement_id) {
+        Some(movement) => envelope(movement).into_response(),
+        None => not_found(
+            "movement_not_found",
+            "Movement does not exist in degraded dev scenario.",
+        ),
+    }
+}
+
+async fn dca_plans(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+    if is_degraded(&query) {
+        envelope(dev_dca_plans())
+    } else {
+        envelope(json!([]))
+    }
+}
+
+async fn dca_due_reminders(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+    if is_degraded(&query) {
+        envelope(dev_dca_reminders())
+    } else {
+        envelope(json!([]))
+    }
+}
+
+async fn ai_pending(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+    if is_degraded(&query) {
+        envelope(json!([example_data(AI_DIFF)]))
+    } else {
+        envelope(json!([]))
+    }
+}
+
+async fn ai_proposal(
+    Path(proposal_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let proposal = example_data(AI_DIFF);
+    if is_degraded(&query)
+        && proposal.get("id").and_then(Value::as_str) == Some(proposal_id.as_str())
+    {
+        envelope(proposal).into_response()
+    } else {
+        not_found(
+            "ai_proposal_not_found",
+            "AI proposal does not exist in this dev scenario.",
+        )
     }
 }
 
@@ -200,22 +372,40 @@ async fn empty_array() -> Json<Value> {
     envelope(json!([]))
 }
 
-async fn empty_object() -> Json<Value> {
-    envelope(json!({}))
+async fn quote_summary(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+    if is_degraded(&query) {
+        let overview = example_data(OVERVIEW_DEGRADED);
+        envelope(overview["quoteStatusSummary"].clone())
+    } else {
+        envelope(json!({
+            "freshCount": 0,
+            "staleCount": 0,
+            "offlineCachedCount": 0,
+            "unpriceableCount": 0,
+            "errorCount": 0
+        }))
+    }
 }
 
-async fn null_data() -> Json<Value> {
-    envelope(Value::Null)
+async fn snapshot_latest(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+    if is_degraded(&query) {
+        let overview = example_data(OVERVIEW_DEGRADED);
+        envelope(overview["latestSnapshot"].clone())
+    } else {
+        envelope(Value::Null)
+    }
 }
 
-async fn quote_summary() -> Json<Value> {
-    envelope(json!({
-        "freshCount": 0,
-        "staleCount": 0,
-        "offlineCachedCount": 0,
-        "unpriceableCount": 0,
-        "errorCount": 0
-    }))
+async fn snapshots(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+    if is_degraded(&query) {
+        let overview = example_data(OVERVIEW_DEGRADED);
+        envelope(json!([
+            overview["latestSnapshot"].clone(),
+            overview["previousSnapshot"].clone()
+        ]))
+    } else {
+        envelope(json!([]))
+    }
 }
 
 async fn sync_bootstrap() -> Json<Value> {
@@ -284,6 +474,308 @@ fn example_json(raw: &str) -> Json<Value> {
     Json(serde_json::from_str(raw).expect("contract example JSON must parse"))
 }
 
+fn example_data(raw: &str) -> Value {
+    let parsed: Value = serde_json::from_str(raw).expect("contract example JSON must parse");
+    parsed["data"].clone()
+}
+
+fn is_degraded(query: &HashMap<String, String>) -> bool {
+    query
+        .get("scenario")
+        .is_some_and(|value| value == "degraded")
+}
+
+fn find_by_id(items: Value, id: &str) -> Option<Value> {
+    items
+        .as_array()?
+        .iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+        .cloned()
+}
+
+fn not_found(code: &str, message: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "ok": false,
+            "error": {
+                "code": code,
+                "message": message,
+                "severity": "warning",
+                "retryable": false
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn dev_accounts() -> Value {
+    json!([
+        {
+            "id": "acct_cmb_cny",
+            "displayName": "招行储蓄卡",
+            "institutionName": "招商银行",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "visibility": "normal",
+            "status": "active",
+            "balanceMode": "cash_balance",
+            "cashBalances": [
+                {
+                    "currency": "CNY",
+                    "amount": "38240.00",
+                    "asOf": "2026-06-25T09:30:00+08:00",
+                    "quality": "exact"
+                }
+            ],
+            "value": {
+                "amount": "38240.00",
+                "currency": "CNY",
+                "asOf": "2026-06-25T09:30:00+08:00",
+                "quality": "exact"
+            },
+            "tags": [],
+            "createdAt": "2026-06-25T08:00:00+08:00",
+            "updatedAt": "2026-06-25T09:30:00+08:00"
+        },
+        {
+            "id": "acct_us_broker",
+            "displayName": "美股券商",
+            "institutionName": "US Broker",
+            "accountType": "brokerage",
+            "defaultCurrency": "USD",
+            "supportedCurrencies": ["USD", "CNY"],
+            "includeInNetWorth": true,
+            "visibility": "normal",
+            "status": "active",
+            "balanceMode": "holdings",
+            "cashBalances": [],
+            "value": {
+                "amount": "110320.00",
+                "currency": "CNY",
+                "asOf": "2026-06-25T09:30:00+08:00",
+                "quality": "estimated"
+            },
+            "tags": [],
+            "createdAt": "2026-06-25T08:00:00+08:00",
+            "updatedAt": "2026-06-25T09:30:00+08:00"
+        },
+        {
+            "id": "acct_crypto",
+            "displayName": "数字资产",
+            "institutionName": "Crypto Exchange",
+            "accountType": "exchange",
+            "defaultCurrency": "USDT",
+            "supportedCurrencies": ["USDT", "BTC", "ETH"],
+            "includeInNetWorth": true,
+            "visibility": "normal",
+            "status": "active",
+            "balanceMode": "holdings",
+            "cashBalances": [],
+            "value": {
+                "amount": "31870.00",
+                "currency": "CNY",
+                "asOf": "2026-06-25T09:30:00+08:00",
+                "quality": "estimated"
+            },
+            "tags": [],
+            "createdAt": "2026-06-25T08:00:00+08:00",
+            "updatedAt": "2026-06-25T09:30:00+08:00"
+        },
+        {
+            "id": "acct_psbc_student_loan",
+            "displayName": "邮储助学贷款",
+            "institutionName": "中国邮政储蓄银行",
+            "accountType": "loan",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "visibility": "normal",
+            "status": "active",
+            "balanceMode": "liability",
+            "cashBalances": [
+                {
+                    "currency": "CNY",
+                    "amount": "-9620.00",
+                    "asOf": "2026-06-25T09:30:00+08:00",
+                    "quality": "exact"
+                }
+            ],
+            "value": {
+                "amount": "-9620.00",
+                "currency": "CNY",
+                "asOf": "2026-06-25T09:30:00+08:00",
+                "quality": "exact"
+            },
+            "tags": ["student_loan"],
+            "note": "在校贴息；负数是正常负债，不触发 negative_balance。",
+            "createdAt": "2026-06-25T08:00:00+08:00",
+            "updatedAt": "2026-06-25T09:30:00+08:00"
+        }
+    ])
+}
+
+fn dev_holdings() -> Value {
+    let overview = example_data(OVERVIEW_DEGRADED);
+    let mut holdings = overview["primaryHoldings"]
+        .as_array()
+        .expect("primaryHoldings should be an array")
+        .clone();
+    holdings.push(json!({
+        "id": "holding_btc_crypto",
+        "accountId": "acct_crypto",
+        "instrumentId": "inst_btc",
+        "instrument": {
+            "id": "inst_btc",
+            "type": "crypto",
+            "symbol": "BTC",
+            "displayName": "Bitcoin",
+            "quoteCurrency": "USDT",
+            "market": "CRYPTO"
+        },
+        "quantity": "0.0300",
+        "costBasisTotal": {"amount": "17770.00", "currency": "CNY"},
+        "marketValue": {
+            "amount": "18870.00",
+            "currency": "CNY",
+            "asOf": "2026-06-25T09:30:00+08:00",
+            "quality": "estimated"
+        },
+        "unrealizedPnl": {"amount": "1100.00", "currency": "CNY"},
+        "unrealizedPnlRate": "0.0619",
+        "quoteStatus": "fresh",
+        "asOf": "2026-06-25T09:30:00+08:00"
+    }));
+    json!(holdings)
+}
+
+fn dev_movements() -> Value {
+    let overview = example_data(OVERVIEW_DEGRADED);
+    let mut movements = overview["recentMovements"]
+        .as_array()
+        .expect("recentMovements should be an array")
+        .clone();
+    movements.push(json!({
+        "id": "mov_luckin_001",
+        "atomicGroupId": "ag_luckin_001",
+        "type": "expense",
+        "occurredAt": "2026-06-24T18:40:00+08:00",
+        "recordedAt": "2026-06-24T18:41:00+08:00",
+        "status": "confirmed",
+        "title": "瑞幸咖啡",
+        "entries": [
+            {
+                "id": "entry_luckin_paid",
+                "accountId": "acct_cmb_cny",
+                "amount": "18.00",
+                "currency": "CNY",
+                "direction": "out",
+                "role": "source"
+            }
+        ],
+        "amountBreakdown": {
+            "grossAmount": {"amount": "28.00", "currency": "CNY"},
+            "savingsAmount": {"amount": "10.00", "currency": "CNY"},
+            "paidAmount": {"amount": "18.00", "currency": "CNY"},
+            "savingsKind": "merchant_discount"
+        },
+        "tags": ["coffee"],
+        "source": {"kind": "manual", "createdBy": "user"},
+        "createdAt": "2026-06-24T18:41:00+08:00",
+        "updatedAt": "2026-06-24T18:41:00+08:00"
+    }));
+    json!(movements)
+}
+
+fn dev_account_anomalies() -> Value {
+    json!([
+        {
+            "id": "anom_broker_quote_stale",
+            "accountId": "acct_us_broker",
+            "accountName": "美股券商",
+            "kind": "quote_stale",
+            "severity": "warning",
+            "detail": "NVDA 报价已过期，当前使用本地缓存估值。",
+            "action": "refresh",
+            "createdAt": "2026-06-25T09:30:00+08:00"
+        }
+    ])
+}
+
+fn dev_asset_allocation() -> Value {
+    json!({
+        "slices": [
+            {
+                "category": "现金与活期",
+                "percent": "30.5",
+                "value": {"amount": "77900.45", "currency": "CNY"}
+            },
+            {
+                "category": "美股",
+                "percent": "43.2",
+                "value": {"amount": "110320.00", "currency": "CNY"}
+            },
+            {
+                "category": "数字资产",
+                "percent": "12.5",
+                "value": {"amount": "31870.00", "currency": "CNY"}
+            },
+            {
+                "category": "其他资产",
+                "percent": "13.8",
+                "value": {"amount": "35208.45", "currency": "CNY"}
+            }
+        ],
+        "totalAssets": {"amount": "255298.90", "currency": "CNY"},
+        "totalLiabilities": {"amount": "9620.00", "currency": "CNY"},
+        "netWorth": {"amount": "245678.90", "currency": "CNY"}
+    })
+}
+
+fn dev_dca_plans() -> Value {
+    json!([
+        {
+            "id": "plan_csi300",
+            "displayName": "沪深300ETF",
+            "targetInstrumentId": "inst_csi300_fund",
+            "fundingAccountId": "acct_cmb_cny",
+            "plannedAmount": {"amount": "1000.00", "currency": "CNY"},
+            "frequency": "monthly",
+            "nextDueDate": "2026-07-10",
+            "reminderStatus": "active",
+            "note": "只提醒与记录，不下单。",
+            "lastActionAt": null
+        },
+        {
+            "id": "plan_nasdaq",
+            "displayName": "纳指ETF",
+            "targetInstrumentId": "inst_nasdaq_fund",
+            "fundingAccountId": "acct_cmb_cny",
+            "plannedAmount": {"amount": "800.00", "currency": "CNY"},
+            "frequency": "monthly",
+            "nextDueDate": "2026-07-25",
+            "reminderStatus": "active",
+            "note": "只提醒与记录，不下单。",
+            "lastActionAt": null
+        }
+    ])
+}
+
+fn dev_dca_reminders() -> Value {
+    json!([
+        {
+            "id": "rem_csi300_20260710",
+            "planId": "plan_csi300",
+            "displayName": "沪深300ETF",
+            "plannedAmount": {"amount": "1000.00", "currency": "CNY"},
+            "dueDate": "2026-07-10",
+            "status": "due"
+        }
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +791,18 @@ mod tests {
             assert_loopback("0.0.0.0:8790".parse().expect("valid socket addr"));
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn reads_cli_port_and_addr() {
+        assert_eq!(
+            read_addr_from(["finwealth-server", "--port", "8791"]),
+            "127.0.0.1:8791".parse().expect("valid socket addr")
+        );
+        assert_eq!(
+            read_addr_from(["finwealth-server", "--addr", "127.0.0.1:8792"]),
+            "127.0.0.1:8792".parse().expect("valid socket addr")
+        );
     }
 
     #[test]
@@ -355,6 +859,108 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["data"]["pendingSummary"]["aiPendingCount"], 2);
         assert_eq!(body["data"]["pendingSummary"]["dcaDueCount"], 1);
+    }
+
+    #[tokio::test]
+    async fn default_list_routes_stay_empty() {
+        for uri in [
+            "/v1/accounts",
+            "/v1/portfolio/holdings",
+            "/v1/movements",
+            "/v1/dca/plans",
+            "/v1/dca/reminders/due",
+            "/v1/ai/proposals/pending",
+            "/v1/snapshots",
+        ] {
+            let (status, body) = request_json(Method::GET, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(body["data"], json!([]), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_routes_expose_consistent_frontend_dataset() {
+        let (status, accounts) = request_json(Method::GET, "/v1/accounts?scenario=degraded").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            accounts["data"].as_array().expect("accounts array").len(),
+            4
+        );
+        assert_eq!(accounts["data"][3]["accountType"], "loan");
+        assert_eq!(
+            accounts["data"][3]["note"],
+            "在校贴息；负数是正常负债，不触发 negative_balance。"
+        );
+
+        let (status, account) =
+            request_json(Method::GET, "/v1/accounts/acct_us_broker?scenario=degraded").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(account["data"]["displayName"], "美股券商");
+
+        let (status, account_holdings) = request_json(
+            Method::GET,
+            "/v1/accounts/acct_us_broker/holdings?scenario=degraded",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(account_holdings["data"][0]["accountId"], "acct_us_broker");
+
+        let (status, movements) =
+            request_json(Method::GET, "/v1/movements?scenario=degraded").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(movements["data"].as_array().expect("movements array").len() >= 2);
+
+        let (status, holdings_alias) =
+            request_json(Method::GET, "/v1/holdings?scenario=degraded").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(holdings_alias["data"][0]["id"], "holding_nvda_us_broker");
+
+        let (status, movements_alias) =
+            request_json(Method::GET, "/v1/movements/recent?scenario=degraded").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            movements_alias["data"]
+                .as_array()
+                .expect("movements alias array")
+                .len()
+                >= 2
+        );
+
+        let (status, movement) = request_json(
+            Method::GET,
+            "/v1/movements/mov_luckin_001?scenario=degraded",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            movement["data"]["amountBreakdown"]["paidAmount"]["amount"],
+            "18.00"
+        );
+
+        let (status, dca_plans) =
+            request_json(Method::GET, "/v1/dca/plans?scenario=degraded").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(dca_plans["data"][0]["note"], "只提醒与记录，不下单。");
+
+        let (status, dca_due) =
+            request_json(Method::GET, "/v1/dca/reminders/due?scenario=degraded").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(dca_due["data"][0]["status"], "due");
+
+        let (status, ai_pending) =
+            request_json(Method::GET, "/v1/ai/proposals/pending?scenario=degraded").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ai_pending["data"][0]["id"], "proposal_ai_001");
+
+        let (status, latest_snapshot) =
+            request_json(Method::GET, "/v1/snapshots/latest?scenario=degraded").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(latest_snapshot["data"]["quality"], "estimated");
+
+        let (status, quote_summary) =
+            request_json(Method::GET, "/v1/quotes/summary?scenario=degraded").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(quote_summary["data"]["staleCount"], 2);
     }
 
     #[tokio::test]

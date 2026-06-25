@@ -191,6 +191,34 @@ def smoke_rust(base: str) -> None:
     degraded = request_json(base, "/v1/portfolio/overview?scenario=degraded")
     assert degraded["data"]["pendingSummary"]["aiPendingCount"] == 2
 
+    default_accounts = request_json(base, "/v1/accounts")
+    assert default_accounts["data"] == []
+
+    accounts = request_json(base, "/v1/accounts?scenario=degraded")
+    assert len(accounts["data"]) == 4
+    assert accounts["data"][3]["accountType"] == "loan"
+
+    broker = request_json(base, "/v1/accounts/acct_us_broker?scenario=degraded")
+    assert broker["data"]["displayName"] == "美股券商"
+
+    holdings = request_json(base, "/v1/accounts/acct_us_broker/holdings?scenario=degraded")
+    assert holdings["data"][0]["accountId"] == "acct_us_broker"
+
+    holdings_alias = request_json(base, "/v1/holdings?scenario=degraded")
+    assert holdings_alias["data"][0]["id"] == "holding_nvda_us_broker"
+
+    movements_alias = request_json(base, "/v1/movements/recent?scenario=degraded")
+    assert len(movements_alias["data"]) >= 2
+
+    movement = request_json(base, "/v1/movements/mov_luckin_001?scenario=degraded")
+    assert movement["data"]["amountBreakdown"]["paidAmount"]["amount"] == "18.00"
+
+    ai_pending = request_json(base, "/v1/ai/proposals/pending?scenario=degraded")
+    assert ai_pending["data"][0]["id"] == "proposal_ai_001"
+
+    quote_summary = request_json(base, "/v1/quotes/summary?scenario=degraded")
+    assert quote_summary["data"]["staleCount"] == 2
+
     dca = request_json(
         base,
         "/v1/dca/reminders/reminder_001/mark-executed-as-proposal",
