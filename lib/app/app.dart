@@ -14,7 +14,7 @@ class WealthLedgerApp extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final mode = ref.watch(themeModeProvider);
-    final isDemo = ref.watch(appEnvironmentProvider).isDemo;
+    final banner = ref.watch(appEnvironmentProvider).devBannerLabel;
 
     return MaterialApp.router(
       title: 'Wealth Ledger',
@@ -25,10 +25,10 @@ class WealthLedgerApp extends ConsumerWidget {
       routerConfig: appRouter,
       builder: (context, child) {
         final app = child ?? const SizedBox.shrink();
-        // debug_fixture 模式全局 DEMO 角标：演示数据，不写入真实账本。
-        if (!isDemo) return app;
+        // 非生产数据来源（DEMO/MOCK）全局角标：不写入真实账本。
+        if (banner == null) return app;
         return Banner(
-          message: 'DEMO',
+          message: banner,
           location: BannerLocation.topEnd,
           color: AppColors.brand,
           child: app,

@@ -9,6 +9,7 @@ import '../theme/app_dimens.dart';
 String _modeLabel(DataSourceMode m) => switch (m) {
       DataSourceMode.realLocal => '真实本地账本（默认；当前为空账本）',
       DataSourceMode.debugFixture => 'DEMO 演示数据（隔离；不写真实账本、不同步）',
+      DataSourceMode.apiMock => '本地 dev/mock server（联调；MOCK 非真实数据）',
       DataSourceMode.apiRemote => '远端 API（未接入）',
     };
 

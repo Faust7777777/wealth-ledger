@@ -4,36 +4,73 @@ import 'package:flutter/material.dart' show ThemeMode;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/env.dart';
+import 'api_mock_repositories.dart';
 import 'fixture_repositories.dart';
 import 'real_local_repositories.dart';
 import 'repositories.dart';
 import 'view_models.dart';
 
-bool _useFixture(Ref ref) =>
-    ref.watch(appEnvironmentProvider).dataSourceMode == DataSourceMode.debugFixture;
+DataSourceMode _mode(Ref ref) => ref.watch(appEnvironmentProvider).dataSourceMode;
 
-// —— 仓库 provider（按 mode 选实现）——
-final accountRepositoryProvider = Provider<AccountRepository>(
-  (ref) => _useFixture(ref) ? const FixtureAccountRepository() : const RealLocalAccountRepository(),
+final devApiClientProvider = Provider<DevApiClient>(
+  (ref) => DevApiClient(ref.watch(appEnvironmentProvider).apiBaseUrl),
 );
-final portfolioRepositoryProvider = Provider<PortfolioRepository>(
-  (ref) => _useFixture(ref) ? const FixturePortfolioRepository() : const RealLocalPortfolioRepository(),
-);
-final movementRepositoryProvider = Provider<MovementRepository>(
-  (ref) => _useFixture(ref) ? const FixtureMovementRepository() : const RealLocalMovementRepository(),
-);
-final dcaRepositoryProvider = Provider<DcaRepository>(
-  (ref) => _useFixture(ref) ? const FixtureDcaRepository() : const RealLocalDcaRepository(),
-);
-final quoteRepositoryProvider = Provider<QuoteRepository>(
-  (ref) => _useFixture(ref) ? const FixtureQuoteRepository() : const RealLocalQuoteRepository(),
-);
-final aiProposalRepositoryProvider = Provider<AiProposalRepository>(
-  (ref) => _useFixture(ref) ? const FixtureAiProposalRepository() : const RealLocalAiProposalRepository(),
-);
-final snapshotRepositoryProvider = Provider<SnapshotRepository>(
-  (ref) => _useFixture(ref) ? const FixtureSnapshotRepository() : const RealLocalSnapshotRepository(),
-);
+
+T _pick<T>(
+  Ref ref, {
+  required T Function() real,
+  required T Function() fixture,
+  required T Function() api,
+}) =>
+    switch (_mode(ref)) {
+      DataSourceMode.debugFixture => fixture(),
+      DataSourceMode.apiMock => api(),
+      _ => real(),
+    };
+
+// —— 仓库 provider（按 mode 选实现：real_local / debug_fixture / api_mock）——
+final accountRepositoryProvider = Provider<AccountRepository>((ref) => _pick(
+      ref,
+      real: () => const RealLocalAccountRepository(),
+      fixture: () => const FixtureAccountRepository(),
+      api: () => ApiMockAccountRepository(ref.watch(devApiClientProvider)),
+    ));
+final portfolioRepositoryProvider = Provider<PortfolioRepository>((ref) => _pick(
+      ref,
+      real: () => const RealLocalPortfolioRepository(),
+      fixture: () => const FixturePortfolioRepository(),
+      api: () => ApiMockPortfolioRepository(ref.watch(devApiClientProvider)),
+    ));
+final movementRepositoryProvider = Provider<MovementRepository>((ref) => _pick(
+      ref,
+      real: () => const RealLocalMovementRepository(),
+      fixture: () => const FixtureMovementRepository(),
+      api: () => ApiMockMovementRepository(ref.watch(devApiClientProvider)),
+    ));
+final dcaRepositoryProvider = Provider<DcaRepository>((ref) => _pick(
+      ref,
+      real: () => const RealLocalDcaRepository(),
+      fixture: () => const FixtureDcaRepository(),
+      api: () => ApiMockDcaRepository(ref.watch(devApiClientProvider)),
+    ));
+final quoteRepositoryProvider = Provider<QuoteRepository>((ref) => _pick(
+      ref,
+      real: () => const RealLocalQuoteRepository(),
+      fixture: () => const FixtureQuoteRepository(),
+      api: () => ApiMockQuoteRepository(ref.watch(devApiClientProvider)),
+    ));
+final aiProposalRepositoryProvider = Provider<AiProposalRepository>((ref) => _pick(
+      ref,
+      real: () => const RealLocalAiProposalRepository(),
+      fixture: () => const FixtureAiProposalRepository(),
+      api: () => ApiMockAiProposalRepository(ref.watch(devApiClientProvider)),
+    ));
+final snapshotRepositoryProvider = Provider<SnapshotRepository>((ref) => _pick(
+      ref,
+      real: () => const RealLocalSnapshotRepository(),
+      fixture: () => const FixtureSnapshotRepository(),
+      api: () => ApiMockSnapshotRepository(ref.watch(devApiClientProvider)),
+    ));
 
 // —— 功能数据 provider ——
 final overviewProvider = FutureProvider<PortfolioOverviewVm>(
