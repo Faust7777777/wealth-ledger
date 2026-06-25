@@ -69,6 +69,70 @@ pub fn write_document(path: &Path, document: &Value) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+pub enum LedgerError {
+    InvalidInput(Vec<String>),
+    Conflict(String),
+    Io(io::Error),
+}
+
+impl From<io::Error> for LedgerError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+pub fn list_accounts(path: &Path) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    let accounts = document["accounts"]
+        .as_array()
+        .expect("validated local ledger accounts should be an array")
+        .iter()
+        .map(project_account_for_api)
+        .collect::<Vec<_>>();
+    Ok(json!(accounts))
+}
+
+pub fn get_account(path: &Path, account_id: &str) -> io::Result<Option<Value>> {
+    let accounts = list_accounts(path)?;
+    Ok(accounts
+        .as_array()
+        .expect("projected accounts should be an array")
+        .iter()
+        .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+        .cloned())
+}
+
+pub fn create_account(
+    path: &Path,
+    input: Value,
+    account_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let account = account_from_create_input(&input, account_id, now)?;
+
+    {
+        let accounts = document["accounts"]
+            .as_array_mut()
+            .expect("validated local ledger accounts should be an array");
+
+        if accounts
+            .iter()
+            .any(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+        {
+            return Err(LedgerError::Conflict(format!(
+                "account id already exists: {account_id}"
+            )));
+        }
+
+        accounts.push(account.clone());
+    }
+
+    write_document(path, &document)?;
+    Ok(project_account_for_api(&account))
+}
+
 pub fn ensure_real_and_fixture_paths_separate(
     real_path: &Path,
     fixture_path: &Path,
@@ -164,6 +228,44 @@ fn validate_accounts(accounts: Option<&Value>, errors: &mut Vec<String>) {
             }
         }
 
+        for key in [
+            "visibility",
+            "status",
+            "balanceMode",
+            "createdAt",
+            "updatedAt",
+        ] {
+            if account
+                .get(key)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                errors.push(format!(
+                    "accounts[{index}].{key} must be a non-empty string"
+                ));
+            }
+        }
+
+        if !account
+            .get("includeInNetWorth")
+            .is_some_and(Value::is_boolean)
+        {
+            errors.push(format!(
+                "accounts[{index}].includeInNetWorth must be a boolean"
+            ));
+        }
+
+        validate_string_array(
+            account.get("supportedCurrencies"),
+            &format!("accounts[{index}].supportedCurrencies"),
+            errors,
+        );
+        validate_string_array(
+            account.get("tags"),
+            &format!("accounts[{index}].tags"),
+            errors,
+        );
+
         let Some(cash_balances) = account.get("cashBalances").and_then(Value::as_array) else {
             errors.push(format!("accounts[{index}].cashBalances must be an array"));
             continue;
@@ -193,8 +295,297 @@ fn validate_accounts(accounts: Option<&Value>, errors: &mut Vec<String>) {
                     "accounts[{index}].cashBalances[{balance_index}].currency must be non-empty"
                 ));
             }
+
+            if balance
+                .get("asOf")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                errors.push(format!(
+                    "accounts[{index}].cashBalances[{balance_index}].asOf must be non-empty"
+                ));
+            }
+
+            if !matches!(
+                balance.get("quality").and_then(Value::as_str),
+                Some("exact" | "estimated" | "incomplete" | "unpriceable" | "anomaly")
+            ) {
+                errors.push(format!(
+                    "accounts[{index}].cashBalances[{balance_index}].quality must be a valid ValueQuality"
+                ));
+            }
         }
     }
+}
+
+fn account_from_create_input(
+    input: &Value,
+    account_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "create account input must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut errors = Vec::new();
+    let display_name = required_string(object, "displayName", &mut errors);
+    let institution_name = optional_string(object, "institutionName", &mut errors);
+    let account_type = required_enum(
+        object,
+        "accountType",
+        &[
+            "bank",
+            "brokerage",
+            "exchange",
+            "wallet",
+            "platform_wallet",
+            "virtual_card",
+            "social_security",
+            "credit_card",
+            "loan",
+            "cash",
+            "other",
+        ],
+        &mut errors,
+    );
+    let default_currency = required_string(object, "defaultCurrency", &mut errors);
+    let supported_currencies = required_string_array(object, "supportedCurrencies", &mut errors);
+    let include_in_net_worth = required_bool(object, "includeInNetWorth", &mut errors);
+    let balance_mode = required_enum(
+        object,
+        "balanceMode",
+        &["cash_balance", "holdings", "liability", "mixed"],
+        &mut errors,
+    );
+    let opening_balances =
+        normalized_opening_balances(object.get("openingBalances"), now, &mut errors);
+
+    if let (Some(default_currency), Some(supported_currencies)) =
+        (default_currency.as_deref(), supported_currencies.as_ref())
+        && !supported_currencies
+            .iter()
+            .any(|currency| currency == default_currency)
+    {
+        errors.push("supportedCurrencies must include defaultCurrency".to_string());
+    }
+
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    let mut account = json!({
+        "id": account_id,
+        "displayName": display_name.expect("validated displayName"),
+        "accountType": account_type.expect("validated accountType"),
+        "defaultCurrency": default_currency.expect("validated defaultCurrency"),
+        "supportedCurrencies": supported_currencies.expect("validated supportedCurrencies"),
+        "includeInNetWorth": include_in_net_worth.expect("validated includeInNetWorth"),
+        "visibility": "normal",
+        "status": "active",
+        "balanceMode": balance_mode.expect("validated balanceMode"),
+        "cashBalances": opening_balances.expect("validated openingBalances"),
+        "tags": [],
+        "createdAt": now,
+        "updatedAt": now
+    });
+
+    if let Some(institution_name) = institution_name {
+        account["institutionName"] = json!(institution_name);
+    }
+
+    Ok(account)
+}
+
+fn project_account_for_api(account: &Value) -> Value {
+    let mut projected = account.clone();
+
+    if projected.get("value").is_none()
+        && let Some(value) = projected_account_value(account)
+    {
+        projected["value"] = value;
+    }
+
+    projected
+}
+
+fn projected_account_value(account: &Value) -> Option<Value> {
+    let default_currency = account.get("defaultCurrency").and_then(Value::as_str);
+    let balances = account.get("cashBalances")?.as_array()?;
+
+    let balance = balances
+        .iter()
+        .find(|balance| balance.get("currency").and_then(Value::as_str) == default_currency)
+        .or_else(|| balances.first())?;
+
+    Some(json!({
+        "amount": balance.get("amount")?.clone(),
+        "currency": balance.get("currency")?.clone(),
+        "asOf": balance.get("asOf")?.clone(),
+        "quality": balance.get("quality")?.clone()
+    }))
+}
+
+fn required_string(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    errors: &mut Vec<String>,
+) -> Option<String> {
+    match object.get(key).and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => Some(value.to_string()),
+        _ => {
+            errors.push(format!("{key} must be a non-empty string"));
+            None
+        }
+    }
+}
+
+fn optional_string(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    errors: &mut Vec<String>,
+) -> Option<String> {
+    match object.get(key) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.to_string()),
+        _ => {
+            errors.push(format!("{key} must be a non-empty string when present"));
+            None
+        }
+    }
+}
+
+fn required_bool(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    errors: &mut Vec<String>,
+) -> Option<bool> {
+    match object.get(key).and_then(Value::as_bool) {
+        Some(value) => Some(value),
+        None => {
+            errors.push(format!("{key} must be a boolean"));
+            None
+        }
+    }
+}
+
+fn required_enum(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    allowed: &[&str],
+    errors: &mut Vec<String>,
+) -> Option<String> {
+    match object.get(key).and_then(Value::as_str) {
+        Some(value) if allowed.contains(&value) => Some(value.to_string()),
+        _ => {
+            errors.push(format!("{key} must be one of {}", allowed.join(", ")));
+            None
+        }
+    }
+}
+
+fn required_string_array(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    errors: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    let Some(value) = object.get(key) else {
+        errors.push(format!("{key} must be a non-empty string array"));
+        return None;
+    };
+
+    match string_array(value) {
+        Some(items) if !items.is_empty() => Some(items),
+        _ => {
+            errors.push(format!("{key} must be a non-empty string array"));
+            None
+        }
+    }
+}
+
+fn normalized_opening_balances(
+    value: Option<&Value>,
+    now: &str,
+    errors: &mut Vec<String>,
+) -> Option<Vec<Value>> {
+    let Some(value) = value else {
+        return Some(Vec::new());
+    };
+
+    let Some(items) = value.as_array() else {
+        errors.push("openingBalances must be an array when present".to_string());
+        return None;
+    };
+
+    let mut balances = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(item) = item.as_object() else {
+            errors.push(format!("openingBalances[{index}] must be an object"));
+            continue;
+        };
+
+        let currency = required_string(item, "currency", errors);
+        let amount = match item.get("amount").and_then(Value::as_str) {
+            Some(amount) if is_decimal_string(amount) => Some(amount.to_string()),
+            _ => {
+                errors.push(format!(
+                    "openingBalances[{index}].amount must be a decimal string"
+                ));
+                None
+            }
+        };
+
+        let as_of = item
+            .get("asOf")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(now);
+
+        let quality = item
+            .get("quality")
+            .and_then(Value::as_str)
+            .unwrap_or("exact");
+
+        if !matches!(
+            quality,
+            "exact" | "estimated" | "incomplete" | "unpriceable" | "anomaly"
+        ) {
+            errors.push(format!(
+                "openingBalances[{index}].quality must be a valid ValueQuality"
+            ));
+        }
+
+        if let (Some(currency), Some(amount)) = (currency, amount) {
+            balances.push(json!({
+                "currency": currency,
+                "amount": amount,
+                "asOf": as_of,
+                "quality": quality
+            }));
+        }
+    }
+
+    Some(balances)
+}
+
+fn validate_string_array(value: Option<&Value>, label: &str, errors: &mut Vec<String>) {
+    match value.and_then(string_array) {
+        Some(_) => {}
+        None => errors.push(format!("{label} must be a string array")),
+    }
+}
+
+fn string_array(value: &Value) -> Option<Vec<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .collect::<Option<Vec<_>>>()
 }
 
 fn require_array(object: &serde_json::Map<String, Value>, key: &str, errors: &mut Vec<String>) {

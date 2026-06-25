@@ -14,7 +14,9 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const EMPTY_BOOTSTRAP: &str =
     include_str!("../../docs/contracts/examples/ledger_bootstrap_empty.response.json");
@@ -32,13 +34,26 @@ const QUOTE_STALE: &str =
 #[derive(Clone)]
 struct AppState {
     ledger: DevLedgerCore,
+    local_ledger_path: Option<PathBuf>,
 }
 
 impl AppState {
     fn dev() -> Self {
         Self {
             ledger: DevLedgerCore::new(),
+            local_ledger_path: None,
         }
+    }
+
+    fn local(path: PathBuf) -> Self {
+        Self {
+            ledger: DevLedgerCore::new(),
+            local_ledger_path: Some(path),
+        }
+    }
+
+    fn should_use_local_ledger(&self, query: &HashMap<String, String>) -> bool {
+        self.local_ledger_path.is_some() && !query.contains_key("scenario")
     }
 }
 
@@ -428,14 +443,30 @@ async fn main() {
 
     let addr = read_addr();
     assert_loopback(addr);
+    let state = read_ledger_path(env::args())
+        .map(|path| {
+            local_ledger::load_or_initialize(&path).expect("real_local ledger should initialize");
+            println!("real_local ledger enabled at {}", path.display());
+            AppState::local(path)
+        })
+        .unwrap_or_else(AppState::dev);
+    let local_ledger_enabled = state.local_ledger_path.is_some();
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("bind finwealth rust server");
     println!("finwealth rust server listening on http://{addr}");
-    println!("dev skeleton only: no persistence, real auth, real AI, real quotes, or sync effects");
+    if local_ledger_enabled {
+        println!(
+            "dev skeleton only: real_local JSON persistence for accounts; no real auth, real AI, real quotes, or sync effects"
+        );
+    } else {
+        println!(
+            "dev skeleton only: no persistence, real auth, real AI, real quotes, or sync effects"
+        );
+    }
 
-    axum::serve(listener, app())
+    axum::serve(listener, app_with_state(state))
         .await
         .expect("serve finwealth rust server");
 }
@@ -528,6 +559,27 @@ fn run_ledger_command(command: LedgerCommand) -> std::io::Result<()> {
     }
 }
 
+fn read_ledger_path<I, S>(args: I) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into).skip(1);
+    let mut cli_path: Option<PathBuf> = None;
+
+    while let Some(arg) = args.next() {
+        if arg == "--ledger-path" {
+            cli_path = Some(PathBuf::from(
+                args.next()
+                    .expect("--ledger-path requires a local ledger file path"),
+            ));
+        }
+    }
+
+    cli_path.or_else(|| env::var("FINWEALTH_LEDGER_PATH").ok().map(PathBuf::from))
+}
+
+#[cfg(test)]
 fn app() -> Router {
     app_with_state(AppState::dev())
 }
@@ -541,7 +593,7 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/auth/devices", get(empty_array))
         .route("/v1/auth/devices/{device_id}/revoke", post(no_content))
         .route("/v1/ledger/bootstrap", get(example_empty_bootstrap))
-        .route("/v1/accounts", get(accounts).post(not_implemented))
+        .route("/v1/accounts", get(accounts).post(create_account))
         .route("/v1/accounts/anomalies", get(account_anomalies))
         .route(
             "/v1/accounts/{account_id}",
@@ -710,8 +762,41 @@ async fn portfolio_overview(
 async fn accounts(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
-    envelope(state.ledger.accounts(DevScenario::from_query(&query)))
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_accounts(path) {
+            Ok(accounts) => envelope(accounts).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(state.ledger.accounts(DevScenario::from_query(&query))).into_response()
+}
+
+async fn create_account(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    let now = current_timestamp();
+    let account_id = next_local_account_id();
+
+    match local_ledger::create_account(path, input, &account_id, &now) {
+        Ok(account) => (StatusCode::CREATED, envelope(account)).into_response(),
+        Err(local_ledger::LedgerError::InvalidInput(errors)) => bad_request(
+            "invalid_account_input",
+            "Create account input is invalid.",
+            json!({ "errors": errors }),
+        ),
+        Err(local_ledger::LedgerError::Conflict(message)) => {
+            bad_request("account_conflict", &message, json!({}))
+        }
+        Err(local_ledger::LedgerError::Io(error)) => ledger_io_error(error),
+    }
 }
 
 async fn account_detail(
@@ -719,6 +804,21 @@ async fn account_detail(
     Path(account_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::get_account(path, &account_id) {
+            Ok(Some(account)) => envelope(account).into_response(),
+            Ok(None) => not_found(
+                "account_not_found",
+                "Account does not exist in local ledger.",
+            ),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
     match state
         .ledger
         .account(DevScenario::from_query(&query), &account_id)
@@ -1002,6 +1102,20 @@ fn envelope(data: Value) -> Json<Value> {
     }))
 }
 
+fn current_timestamp() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed")
+}
+
+fn next_local_account_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_nanos();
+    format!("acct_local_{nanos}")
+}
+
 fn example_json(raw: &str) -> Json<Value> {
     Json(serde_json::from_str(raw).expect("contract example JSON must parse"))
 }
@@ -1074,6 +1188,39 @@ fn not_found(code: &str, message: &str) -> Response {
                 "code": code,
                 "message": message,
                 "severity": "warning",
+                "retryable": false
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn bad_request(code: &str, message: &str, details: Value) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "ok": false,
+            "error": {
+                "code": code,
+                "message": message,
+                "severity": "warning",
+                "retryable": false,
+                "details": details
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn ledger_io_error(error: std::io::Error) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "ok": false,
+            "error": {
+                "code": "local_ledger_io_error",
+                "message": error.to_string(),
+                "severity": "error",
                 "retryable": false
             }
         })),
@@ -1406,6 +1553,24 @@ mod tests {
     }
 
     #[test]
+    fn reads_local_ledger_server_path() {
+        assert_eq!(
+            read_ledger_path(["finwealth-server", "--ledger-path", "ledger.json"]),
+            Some(PathBuf::from("ledger.json"))
+        );
+        assert_eq!(
+            read_ledger_path([
+                "finwealth-server",
+                "--port",
+                "8791",
+                "--ledger-path",
+                "ledger.json"
+            ]),
+            Some(PathBuf::from("ledger.json"))
+        );
+    }
+
+    #[test]
     fn examples_parse() {
         for raw in [
             EMPTY_BOOTSTRAP,
@@ -1451,13 +1616,24 @@ mod tests {
     }
 
     async fn request_json_from(router: Router, method: Method, uri: &str) -> (StatusCode, Value) {
+        request_json_body_from(router, method, uri, json!({})).await
+    }
+
+    async fn request_json_body_from(
+        router: Router,
+        method: Method,
+        uri: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
         let response = router
             .oneshot(
                 Request::builder()
                     .method(method)
                     .uri(uri)
                     .header("content-type", "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(
+                        serde_json::to_vec(&body).expect("request body should serialize"),
+                    ))
                     .expect("request should build"),
             )
             .await
@@ -1472,6 +1648,95 @@ mod tests {
             serde_json::from_slice(&bytes).expect("response body should be JSON")
         };
         (status, body)
+    }
+
+    #[tokio::test]
+    async fn local_ledger_accounts_route_reads_creates_and_persists_accounts() {
+        let path = unique_test_ledger_path("route_accounts");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (empty_status, empty_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/accounts").await;
+        assert_eq!(empty_status, StatusCode::OK);
+        assert_eq!(empty_body["data"], json!([]));
+
+        let create_input = json!({
+            "displayName": "建行卡",
+            "institutionName": "中国建设银行",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {
+                    "currency": "CNY",
+                    "amount": "123.45"
+                }
+            ]
+        });
+        let (create_status, create_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", create_input)
+                .await;
+        assert_eq!(create_status, StatusCode::CREATED);
+        assert_eq!(create_body["data"]["displayName"], "建行卡");
+        assert_eq!(create_body["data"]["value"]["amount"], "123.45");
+        assert_eq!(create_body["data"]["value"]["currency"], "CNY");
+        let account_id = create_body["data"]["id"]
+            .as_str()
+            .expect("created account id should be string")
+            .to_string();
+
+        let (list_status, list_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/accounts").await;
+        assert_eq!(list_status, StatusCode::OK);
+        assert_eq!(
+            list_body["data"]
+                .as_array()
+                .expect("accounts should be an array")
+                .len(),
+            1
+        );
+        assert_eq!(list_body["data"][0]["id"], account_id);
+        assert_eq!(list_body["data"][0]["value"]["amount"], "123.45");
+
+        let (detail_status, detail_body) =
+            request_json_from(router, Method::GET, &format!("/v1/accounts/{account_id}")).await;
+        assert_eq!(detail_status, StatusCode::OK);
+        assert_eq!(detail_body["data"]["id"], account_id);
+
+        let persisted = local_ledger::read_document(&path).expect("ledger should persist account");
+        assert_eq!(persisted["accounts"][0]["displayName"], "建行卡");
+        assert!(
+            persisted["accounts"][0].get("value").is_none(),
+            "derived account value must not be persisted into the ledger file"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_create_account_rejects_invalid_input() {
+        let path = unique_test_ledger_path("invalid_account");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (status, body) =
+            request_json_body_from(router, Method::POST, "/v1/accounts", json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_account_input");
+        assert!(
+            body["error"]["details"]["errors"]
+                .as_array()
+                .expect("validation errors should be an array")
+                .iter()
+                .any(|error| error
+                    .as_str()
+                    .is_some_and(|text| text.contains("displayName")))
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -1823,5 +2088,15 @@ mod tests {
         assert!(!diffs.is_empty());
         assert!(diffs[0].get("oldValue").is_some());
         assert!(diffs[0].get("newValue").is_some());
+    }
+
+    fn unique_test_ledger_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("finwealth_server_{label}_{nanos}"))
+            .join("ledger.json")
     }
 }

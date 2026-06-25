@@ -31,10 +31,17 @@ cargo run --manifest-path server-rs/Cargo.toml -- --port 8791
 cargo run --manifest-path server-rs/Cargo.toml -- --addr 127.0.0.1:8791
 ```
 
+Enable the real-local JSON ledger seam:
+
+```powershell
+cargo run --manifest-path server-rs/Cargo.toml -- --port 8791 --ledger-path .\tmp\ledger.json
+```
+
 ## Boundaries
 
 - localhost only
-- no persistence
+- no persistence by default
+- `--ledger-path` enables real-local JSON persistence for accounts only
 - no real auth
 - no real AI
 - no real quotes
@@ -94,6 +101,11 @@ cargo run --manifest-path server-rs/Cargo.toml -- --init-ledger .\tmp\ledger.jso
 cargo run --manifest-path server-rs/Cargo.toml -- --validate-ledger .\tmp\ledger.json
 cargo run --manifest-path server-rs/Cargo.toml -- --check-ledger-paths .\tmp\ledger.json .\tmp\ledger.fixture.json
 ```
+
+Running the server with `--ledger-path` makes `GET /v1/accounts`,
+`POST /v1/accounts`, and `GET /v1/accounts/{account_id}` use the JSON ledger
+when no `?scenario=` query is present. Passing `?scenario=degraded` still uses
+the virtual dev dataset for frontend demo integration.
 
 The validator rejects debug fixture markers and basic invalid money shapes so a
 real-local file cannot silently become demo data.
