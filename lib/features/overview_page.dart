@@ -19,6 +19,7 @@ class OverviewPage extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final async = ref.watch(overviewProvider);
+    final accounts = ref.watch(accountsProvider).asData?.value ?? const <AccountVm>[];
     return async.when(
       loading: () => const Center(child: CircularProgressIndicator()),
       error: (e, _) =>
@@ -39,6 +40,16 @@ class OverviewPage extends ConsumerWidget {
             if (o.primaryHoldings.isNotEmpty) ...[
               const SectionHeader(title: '主要持仓'),
               for (final h in o.primaryHoldings) _HoldingRow(h: h),
+            ],
+            if (accounts.isNotEmpty) ...[
+              SectionHeader(
+                title: '账户',
+                trailing: TextButton(
+                  onPressed: () => context.go('/accounts'),
+                  child: const Text('全部'),
+                ),
+              ),
+              for (final a in accounts.take(5)) _AccountRow(a: a),
             ],
             if (o.recentMovements.isNotEmpty) ...[
               const SectionHeader(title: '近期变动'),
@@ -196,6 +207,23 @@ class _MovementRow extends StatelessWidget {
           ? Text('在途 · 非支出', style: AppType.caption)
           : null,
       trailing: amt == null ? null : Text(formatMoney(amt), style: AppType.moneyRow),
+    );
+  }
+}
+
+class _AccountRow extends StatelessWidget {
+  const _AccountRow({required this.a});
+  final AccountVm a;
+
+  @override
+  Widget build(BuildContext context) {
+    final v = a.value;
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      dense: true,
+      title: Text(a.displayName, style: AppType.body),
+      trailing: Text(v == null ? '—' : formatValued(v), style: AppType.moneyRow),
+      onTap: () => context.push('/account/${a.id}'),
     );
   }
 }
