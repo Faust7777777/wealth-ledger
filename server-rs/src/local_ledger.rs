@@ -1,6 +1,8 @@
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs, io,
+    ops::{Add, AddAssign, Neg, Sub},
     path::{Path, PathBuf},
 };
 
@@ -131,6 +133,49 @@ pub fn create_account(
 
     write_document(path, &document)?;
     Ok(project_account_for_api(&account))
+}
+
+pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    let summary = summarize_accounts(&document, now)?;
+
+    Ok(json!({
+        "latestSnapshot": summary.latest_snapshot,
+        "previousSnapshot": Value::Null,
+        "pendingSummary": {
+            "aiPendingCount": 0,
+            "accountAnomalyCount": summary.account_anomaly_count,
+            "dcaDueCount": 0,
+            "inTransitCount": 0,
+            "quoteProblemCount": summary.unpriceable_count,
+            "syncProblemCount": 0
+        },
+        "quoteStatusSummary": {
+            "freshCount": 0,
+            "staleCount": 0,
+            "offlineCachedCount": 0,
+            "unpriceableCount": summary.unpriceable_count,
+            "errorCount": 0
+        },
+        "primaryHoldings": [],
+        "recentMovements": []
+    }))
+}
+
+pub fn asset_allocation(path: &Path, now: &str) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    let summary = summarize_accounts(&document, now)?;
+    Ok(json!({
+        "slices": summary.allocation_slices,
+        "totalAssets": money(summary.gross_assets, &summary.base_currency),
+        "totalLiabilities": money(summary.total_liabilities, &summary.base_currency),
+        "netWorth": money(summary.net_worth(), &summary.base_currency)
+    }))
+}
+
+pub fn latest_snapshot(path: &Path, now: &str) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    Ok(summarize_accounts(&document, now)?.latest_snapshot)
 }
 
 pub fn ensure_real_and_fixture_paths_separate(
@@ -318,6 +363,173 @@ fn validate_accounts(accounts: Option<&Value>, errors: &mut Vec<String>) {
     }
 }
 
+struct AccountSummary {
+    base_currency: String,
+    gross_assets: DecimalAmount,
+    total_liabilities: DecimalAmount,
+    unpriceable_count: u64,
+    account_anomaly_count: u64,
+    latest_snapshot: Value,
+    allocation_slices: Vec<Value>,
+}
+
+impl AccountSummary {
+    fn net_worth(&self) -> DecimalAmount {
+        self.gross_assets - self.total_liabilities
+    }
+}
+
+fn summarize_accounts(document: &Value, now: &str) -> io::Result<AccountSummary> {
+    let base_currency = document
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_BASE_CURRENCY)
+        .to_string();
+    let accounts = document["accounts"]
+        .as_array()
+        .expect("validated local ledger accounts should be an array");
+
+    let mut gross_assets = DecimalAmount::ZERO;
+    let mut total_liabilities = DecimalAmount::ZERO;
+    let mut unpriceable_count = 0_u64;
+    let mut account_anomaly_count = 0_u64;
+    let mut included_account_count = 0_u64;
+    let mut account_values = Vec::new();
+    let mut allocation_by_category: BTreeMap<String, DecimalAmount> = BTreeMap::new();
+    let mut quality = "exact";
+
+    for account in accounts {
+        if !account
+            .get("includeInNetWorth")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+            || account.get("status").and_then(Value::as_str) == Some("archived")
+        {
+            continue;
+        }
+
+        included_account_count += 1;
+        let is_liability = is_liability_account(account);
+        let mut account_total = DecimalAmount::ZERO;
+        let mut has_base_value = false;
+
+        for balance in account
+            .get("cashBalances")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if balance.get("currency").and_then(Value::as_str) != Some(base_currency.as_str()) {
+                unpriceable_count += 1;
+                quality = combine_quality(quality, "incomplete");
+                continue;
+            }
+
+            let amount = parse_decimal(
+                balance
+                    .get("amount")
+                    .and_then(Value::as_str)
+                    .expect("validated cash balance amount should be a string"),
+            )?;
+            has_base_value = true;
+            account_total += amount;
+            quality = combine_quality(
+                quality,
+                balance
+                    .get("quality")
+                    .and_then(Value::as_str)
+                    .unwrap_or("exact"),
+            );
+        }
+
+        if !has_base_value {
+            continue;
+        }
+
+        let account_id = account
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("validated account id should be a string");
+        account_values.push(json!({
+            "accountId": account_id,
+            "value": {
+                "amount": money_amount(account_total),
+                "currency": base_currency,
+                "asOf": now,
+                "quality": quality
+            }
+        }));
+
+        if is_liability {
+            total_liabilities += absolute_decimal(account_total);
+        } else if account_total.is_negative() {
+            account_anomaly_count += 1;
+            total_liabilities += absolute_decimal(account_total);
+            quality = combine_quality(quality, "anomaly");
+        } else {
+            gross_assets += account_total;
+            let category = allocation_category(account).to_string();
+            *allocation_by_category
+                .entry(category)
+                .or_insert(DecimalAmount::ZERO) += account_total;
+        }
+    }
+
+    if account_anomaly_count > 0 {
+        quality = combine_quality(quality, "anomaly");
+    }
+
+    let net_worth = gross_assets - total_liabilities;
+    let latest_snapshot = if included_account_count == 0 {
+        Value::Null
+    } else {
+        json!({
+            "id": format!("snap_local_{}", now.replace([':', '-', '.'], "")),
+            "snapshotAt": now,
+            "baseCurrency": base_currency,
+            "grossAssets": money(gross_assets, &base_currency),
+            "totalLiabilities": money(total_liabilities, &base_currency),
+            "netWorth": money(net_worth, &base_currency),
+            "quality": quality,
+            "quoteStatusSummary": {
+                "freshCount": 0,
+                "staleCount": 0,
+                "offlineCachedCount": 0,
+                "unpriceableCount": unpriceable_count,
+                "errorCount": 0
+            },
+            "accountValues": account_values
+        })
+    };
+
+    let allocation_slices = allocation_by_category
+        .into_iter()
+        .filter(|(_, amount)| *amount > DecimalAmount::ZERO)
+        .map(|(category, amount)| {
+            let percent = if gross_assets > DecimalAmount::ZERO {
+                percent_tenths(amount, gross_assets)
+            } else {
+                0
+            };
+            json!({
+                "category": category,
+                "percent": percent_amount(percent),
+                "value": money(amount, &base_currency)
+            })
+        })
+        .collect();
+
+    Ok(AccountSummary {
+        base_currency,
+        gross_assets,
+        total_liabilities,
+        unpriceable_count,
+        account_anomaly_count,
+        latest_snapshot,
+        allocation_slices,
+    })
+}
+
 fn account_from_create_input(
     input: &Value,
     account_id: &str,
@@ -425,6 +637,188 @@ fn projected_account_value(account: &Value) -> Option<Value> {
         "asOf": balance.get("asOf")?.clone(),
         "quality": balance.get("quality")?.clone()
     }))
+}
+
+fn is_liability_account(account: &Value) -> bool {
+    matches!(
+        account.get("balanceMode").and_then(Value::as_str),
+        Some("liability")
+    ) || matches!(
+        account.get("accountType").and_then(Value::as_str),
+        Some("loan" | "credit_card")
+    )
+}
+
+fn allocation_category(account: &Value) -> &'static str {
+    match account.get("accountType").and_then(Value::as_str) {
+        Some("brokerage") => "投资",
+        Some("exchange") => "数字资产",
+        Some(
+            "bank" | "wallet" | "platform_wallet" | "virtual_card" | "social_security" | "cash",
+        ) => "现金",
+        _ => "其他",
+    }
+}
+
+fn combine_quality(current: &str, next: &str) -> &'static str {
+    let rank = |quality: &str| match quality {
+        "exact" => 0,
+        "estimated" => 1,
+        "incomplete" | "unpriceable" => 2,
+        "anomaly" => 3,
+        _ => 2,
+    };
+
+    let quality = if rank(next) > rank(current) {
+        next
+    } else {
+        current
+    };
+
+    match quality {
+        "exact" => "exact",
+        "estimated" => "estimated",
+        "anomaly" => "anomaly",
+        _ => "incomplete",
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DecimalAmount(i128);
+
+impl DecimalAmount {
+    const SCALE: i128 = 100_000_000;
+    const ZERO: Self = Self(0);
+
+    fn parse(value: &str) -> io::Result<Self> {
+        let (negative, value) = match value.strip_prefix('-') {
+            Some(value) => (true, value),
+            None => (false, value.strip_prefix('+').unwrap_or(value)),
+        };
+        let mut parts = value.split('.');
+        let integer = parts.next().unwrap_or_default();
+        let fraction = parts.next().unwrap_or_default();
+
+        if parts.next().is_some()
+            || integer.is_empty()
+            || !integer.chars().all(|c| c.is_ascii_digit())
+            || !fraction.chars().all(|c| c.is_ascii_digit())
+            || fraction.len() > 8
+        {
+            return Err(invalid_decimal(value));
+        }
+
+        let integer_units = integer.parse::<i128>().map_err(invalid_data)? * Self::SCALE;
+        let fraction_units = if fraction.is_empty() {
+            0
+        } else {
+            let padded = format!("{fraction:0<8}");
+            padded.parse::<i128>().map_err(invalid_data)?
+        };
+        let units = integer_units + fraction_units;
+        Ok(if negative { Self(-units) } else { Self(units) })
+    }
+
+    fn is_negative(self) -> bool {
+        self.0 < 0
+    }
+
+    fn abs(self) -> Self {
+        if self.is_negative() { -self } else { self }
+    }
+
+    fn money_string(self) -> String {
+        let cents = round_div(self.0, Self::SCALE / 100);
+        signed_fixed_string(cents, 2)
+    }
+}
+
+impl Add for DecimalAmount {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self(self.0 + rhs.0)
+    }
+}
+
+impl AddAssign for DecimalAmount {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+impl Sub for DecimalAmount {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self(self.0 - rhs.0)
+    }
+}
+
+impl Neg for DecimalAmount {
+    type Output = Self;
+
+    fn neg(self) -> Self::Output {
+        Self(-self.0)
+    }
+}
+
+fn parse_decimal(value: &str) -> io::Result<DecimalAmount> {
+    DecimalAmount::parse(value)
+}
+
+fn absolute_decimal(value: DecimalAmount) -> DecimalAmount {
+    value.abs()
+}
+
+fn money(value: DecimalAmount, currency: &str) -> Value {
+    json!({
+        "amount": money_amount(value),
+        "currency": currency
+    })
+}
+
+fn money_amount(value: DecimalAmount) -> String {
+    value.money_string()
+}
+
+fn percent_tenths(amount: DecimalAmount, total: DecimalAmount) -> i128 {
+    round_div(amount.0 * 1000, total.0)
+}
+
+fn percent_amount(tenths: i128) -> String {
+    signed_fixed_string(tenths, 1)
+}
+
+fn round_div(numerator: i128, denominator: i128) -> i128 {
+    if denominator == 0 {
+        return 0;
+    }
+
+    if numerator >= 0 {
+        (numerator + denominator.abs() / 2) / denominator
+    } else {
+        (numerator - denominator.abs() / 2) / denominator
+    }
+}
+
+fn signed_fixed_string(units: i128, scale_digits: u32) -> String {
+    let scale = 10_i128.pow(scale_digits);
+    let sign = if units < 0 { "-" } else { "" };
+    let absolute = units.abs();
+    let integer = absolute / scale;
+    let fraction = absolute % scale;
+    format!(
+        "{sign}{integer}.{fraction:0width$}",
+        width = scale_digits as usize
+    )
+}
+
+fn invalid_decimal(value: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("decimal value is unsupported for local summary: {value}"),
+    )
 }
 
 fn required_string(

@@ -751,12 +751,24 @@ async fn auth_refresh() -> Json<Value> {
 async fn portfolio_overview(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::portfolio_overview(path, &current_timestamp()) {
+            Ok(overview) => envelope(overview).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
     envelope(
         state
             .ledger
             .portfolio_overview(DevScenario::from_query(&query)),
     )
+    .into_response()
 }
 
 async fn accounts(
@@ -864,12 +876,24 @@ async fn account_holdings(
 async fn asset_allocation(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::asset_allocation(path, &current_timestamp()) {
+            Ok(allocation) => envelope(allocation).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
     envelope(
         state
             .ledger
             .asset_allocation(DevScenario::from_query(&query)),
     )
+    .into_response()
 }
 
 async fn movements(
@@ -1018,26 +1042,61 @@ async fn empty_array() -> Json<Value> {
 async fn quote_summary(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
-    envelope(state.ledger.quote_summary(DevScenario::from_query(&query)))
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::portfolio_overview(path, &current_timestamp()) {
+            Ok(overview) => envelope(overview["quoteStatusSummary"].clone()).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(state.ledger.quote_summary(DevScenario::from_query(&query))).into_response()
 }
 
 async fn snapshot_latest(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::latest_snapshot(path, &current_timestamp()) {
+            Ok(snapshot) => envelope(snapshot).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
     envelope(
         state
             .ledger
             .latest_snapshot(DevScenario::from_query(&query)),
     )
+    .into_response()
 }
 
 async fn snapshots(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
-    envelope(state.ledger.snapshots(DevScenario::from_query(&query)))
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::latest_snapshot(path, &current_timestamp()) {
+            Ok(Value::Null) => envelope(json!([])).into_response(),
+            Ok(snapshot) => envelope(json!([snapshot])).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(state.ledger.snapshots(DevScenario::from_query(&query))).into_response()
 }
 
 async fn sync_bootstrap() -> Json<Value> {
@@ -1712,6 +1771,93 @@ mod tests {
             persisted["accounts"][0].get("value").is_none(),
             "derived account value must not be persisted into the ledger file"
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_overview_and_allocation_are_computed_from_accounts() {
+        let path = unique_test_ledger_path("route_overview");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let asset_input = json!({
+            "displayName": "建行卡",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "123.45"}
+            ]
+        });
+        let liability_input = json!({
+            "displayName": "助学贷款",
+            "accountType": "loan",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "liability",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "-20.00"}
+            ]
+        });
+
+        let (asset_status, _) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", asset_input).await;
+        assert_eq!(asset_status, StatusCode::CREATED);
+        let (liability_status, _) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            liability_input,
+        )
+        .await;
+        assert_eq!(liability_status, StatusCode::CREATED);
+
+        let (overview_status, overview_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_status, StatusCode::OK);
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["grossAssets"]["amount"],
+            "123.45"
+        );
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["totalLiabilities"]["amount"],
+            "20.00"
+        );
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "103.45"
+        );
+        assert_eq!(overview_body["data"]["latestSnapshot"]["quality"], "exact");
+        assert_eq!(
+            overview_body["data"]["pendingSummary"]["quoteProblemCount"],
+            0
+        );
+
+        let (allocation_status, allocation_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/allocation").await;
+        assert_eq!(allocation_status, StatusCode::OK);
+        assert_eq!(allocation_body["data"]["totalAssets"]["amount"], "123.45");
+        assert_eq!(
+            allocation_body["data"]["totalLiabilities"]["amount"],
+            "20.00"
+        );
+        assert_eq!(allocation_body["data"]["netWorth"]["amount"], "103.45");
+        assert_eq!(allocation_body["data"]["slices"][0]["category"], "现金");
+        assert_eq!(allocation_body["data"]["slices"][0]["percent"], "100.0");
+
+        let (snapshot_status, snapshot_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/snapshots/latest").await;
+        assert_eq!(snapshot_status, StatusCode::OK);
+        assert_eq!(snapshot_body["data"]["netWorth"]["amount"], "103.45");
+
+        let (quote_status, quote_body) =
+            request_json_from(router, Method::GET, "/v1/quotes/summary").await;
+        assert_eq!(quote_status, StatusCode::OK);
+        assert_eq!(quote_body["data"]["unpriceableCount"], 0);
 
         let _ = std::fs::remove_file(path);
     }
