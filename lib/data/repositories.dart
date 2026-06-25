@@ -26,6 +26,8 @@ abstract interface class MovementRepository {
 abstract interface class DcaRepository {
   Future<List<DcaReminderVm>> listDueReminders();
   Future<List<DcaPlanVm>> listPlans();
+  /// 「记录已执行」：只生成待确认候选记录；不下单、不转账、不连券商。
+  Future<void> markExecutedAsProposal(Id reminderId);
 }
 
 abstract interface class QuoteRepository {
@@ -35,6 +37,9 @@ abstract interface class QuoteRepository {
 abstract interface class AiProposalRepository {
   Future<List<AiProposalVm>> listPending();
   Future<AiProposalVm?> getProposal(Id id);
+  // 写路径：仅生成/处理 proposal，永不直接写正式账本。
+  Future<void> approveAtomicGroup(Id groupId);
+  Future<void> rejectAtomicGroup(Id groupId, {String? reason});
 }
 
 abstract interface class SnapshotRepository {

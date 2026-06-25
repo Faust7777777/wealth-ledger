@@ -24,11 +24,11 @@ class DevApiClient {
   final String scenario;
   final http.Client _client;
 
-  Future<Object?> getData(String path) async {
-    final url = scenario.isEmpty
-        ? '$baseUrl$path'
-        : '$baseUrl$path${path.contains('?') ? '&' : '?'}scenario=$scenario';
-    final res = await _client.get(Uri.parse(url));
+  String _url(String path) => scenario.isEmpty
+      ? '$baseUrl$path'
+      : '$baseUrl$path${path.contains('?') ? '&' : '?'}scenario=$scenario';
+
+  Object? _handle(http.Response res, String path) {
     if (res.statusCode == 403) throw ApiForbiddenException(path);
     if (res.statusCode >= 400) throw Exception('HTTP ${res.statusCode} · $path');
     final body = jsonDecode(utf8.decode(res.bodyBytes));
@@ -38,6 +38,27 @@ class DevApiClient {
     }
     return body;
   }
+
+  Future<Object?> getData(String path) async =>
+      _handle(await _client.get(Uri.parse(_url(path))), path);
+
+  Future<Object?> postData(String path, {Object? body}) async => _handle(
+        await _client.post(
+          Uri.parse(_url(path)),
+          headers: const {'content-type': 'application/json'},
+          body: body == null ? null : jsonEncode(body),
+        ),
+        path,
+      );
+
+  Future<Object?> patchData(String path, {Object? body}) async => _handle(
+        await _client.patch(
+          Uri.parse(_url(path)),
+          headers: const {'content-type': 'application/json'},
+          body: body == null ? null : jsonEncode(body),
+        ),
+        path,
+      );
 }
 
 // ———— 小工具 ————
@@ -404,6 +425,10 @@ class ApiMockDcaRepository implements DcaRepository {
   @override
   Future<List<DcaPlanVm>> listPlans() async =>
       [for (final p in _list(await _c.getData('/v1/dca/plans'))) _plan(_m(p))];
+  @override
+  Future<void> markExecutedAsProposal(Id reminderId) async {
+    await _c.postData('/v1/dca/reminders/$reminderId/mark-executed-as-proposal');
+  }
 }
 
 class ApiMockQuoteRepository implements QuoteRepository {
@@ -424,6 +449,15 @@ class ApiMockAiProposalRepository implements AiProposalRepository {
   Future<AiProposalVm?> getProposal(Id id) async {
     final d = await _c.getData('/v1/ai/proposals/$id');
     return d == null ? null : _proposal(_m(d));
+  }
+  @override
+  Future<void> approveAtomicGroup(Id groupId) async {
+    await _c.postData('/v1/ai/atomic-groups/$groupId/approve');
+  }
+  @override
+  Future<void> rejectAtomicGroup(Id groupId, {String? reason}) async {
+    await _c.postData('/v1/ai/atomic-groups/$groupId/reject',
+        body: reason == null ? null : {'reason': reason});
   }
 }
 

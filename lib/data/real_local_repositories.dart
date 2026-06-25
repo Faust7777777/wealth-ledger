@@ -51,6 +51,9 @@ class RealLocalDcaRepository implements DcaRepository {
   Future<List<DcaReminderVm>> listDueReminders() async => const [];
   @override
   Future<List<DcaPlanVm>> listPlans() async => const [];
+  @override
+  Future<void> markExecutedAsProposal(Id reminderId) async =>
+      throw UnsupportedError('real_local 暂不支持写入；请用 api_mock 联调');
 }
 
 class RealLocalQuoteRepository implements QuoteRepository {
@@ -65,6 +68,12 @@ class RealLocalAiProposalRepository implements AiProposalRepository {
   Future<List<AiProposalVm>> listPending() async => const [];
   @override
   Future<AiProposalVm?> getProposal(Id id) async => null;
+  @override
+  Future<void> approveAtomicGroup(Id groupId) async =>
+      throw UnsupportedError('real_local 暂不支持写入；请用 api_mock 联调');
+  @override
+  Future<void> rejectAtomicGroup(Id groupId, {String? reason}) async =>
+      throw UnsupportedError('real_local 暂不支持写入；请用 api_mock 联调');
 }
 
 class RealLocalSnapshotRepository implements SnapshotRepository {

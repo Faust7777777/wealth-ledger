@@ -278,6 +278,8 @@ class FixtureDcaRepository implements DcaRepository {
   Future<List<DcaReminderVm>> listDueReminders() async => _dcaReminders;
   @override
   Future<List<DcaPlanVm>> listPlans() async => _dcaPlans;
+  @override
+  Future<void> markExecutedAsProposal(Id reminderId) async {/* DEMO：模拟生成候选 */}
 }
 
 class FixtureQuoteRepository implements QuoteRepository {
@@ -294,6 +296,10 @@ class FixtureAiProposalRepository implements AiProposalRepository {
   @override
   Future<AiProposalVm?> getProposal(Id id) async =>
       _proposals.where((p) => p.id == id).cast<AiProposalVm?>().firstWhere((p) => true, orElse: () => null);
+  @override
+  Future<void> approveAtomicGroup(Id groupId) async {/* DEMO：模拟接受，演示数据不变 */}
+  @override
+  Future<void> rejectAtomicGroup(Id groupId, {String? reason}) async {/* DEMO：模拟拒绝 */}
 }
 
 class FixtureSnapshotRepository implements SnapshotRepository {

@@ -65,7 +65,7 @@ class _ProposalCard extends StatelessWidget {
   }
 }
 
-class _GroupBlock extends StatelessWidget {
+class _GroupBlock extends ConsumerWidget {
   const _GroupBlock({required this.g});
   final AiAtomicGroupVm g;
 
@@ -78,7 +78,7 @@ class _GroupBlock extends StatelessWidget {
       };
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return Padding(
       padding: const EdgeInsets.only(bottom: AppSpacing.sm),
       child: Column(
@@ -103,17 +103,29 @@ class _GroupBlock extends StatelessWidget {
           Row(
             children: [
               TextButton(
-                onPressed: () => _stub(context, '拒绝整组'),
+                onPressed: () => _run(
+                  context,
+                  ref,
+                  () => ref.read(aiProposalRepositoryProvider).rejectAtomicGroup(g.id),
+                  '已拒绝该组',
+                ),
                 child: const Text('拒绝整组'),
               ),
               const Spacer(),
               TextButton(
-                onPressed: () => _stub(context, '编辑'),
+                onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('编辑表单：后续批次（编辑后重新校验再提交）')),
+                ),
                 child: const Text('编辑'),
               ),
               const SizedBox(width: AppSpacing.sm),
               FilledButton(
-                onPressed: () => _stub(context, '接受整组'),
+                onPressed: () => _run(
+                  context,
+                  ref,
+                  () => ref.read(aiProposalRepositoryProvider).approveAtomicGroup(g.id),
+                  '已接受该组',
+                ),
                 child: const Text('接受整组'),
               ),
             ],
@@ -123,10 +135,20 @@ class _GroupBlock extends StatelessWidget {
     );
   }
 
-  void _stub(BuildContext context, String action) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('$action：后续批次经校验后处理（可追溯 proposal；确认前不入账）')),
-    );
+  Future<void> _run(
+    BuildContext context,
+    WidgetRef ref,
+    Future<void> Function() op,
+    String okMsg,
+  ) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await op();
+      ref.invalidate(aiPendingProvider);
+      messenger.showSnackBar(SnackBar(content: Text('$okMsg（候选，未写正式账本）')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
   }
 }
 

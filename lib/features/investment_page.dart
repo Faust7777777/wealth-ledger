@@ -100,24 +100,36 @@ class _HoldingTile extends StatelessWidget {
   }
 }
 
-class _ReminderTile extends StatelessWidget {
+class _ReminderTile extends ConsumerWidget {
   const _ReminderTile({required this.r});
   final DcaReminderVm r;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return ListTile(
       contentPadding: EdgeInsets.zero,
       leading: const Icon(Icons.event_repeat_outlined),
       title: Text(r.displayName),
       subtitle: Text('每期 ${formatMoney(r.plannedAmount)} · 下次 ${r.dueDate}'),
       trailing: OutlinedButton(
-        onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('记录已执行：生成候选记录（不下单 / 不转账），确认后入账')),
-        ),
+        onPressed: () => _record(context, ref),
         child: const Text('记录已执行'),
       ),
     );
+  }
+
+  Future<void> _record(BuildContext context, WidgetRef ref) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await ref.read(dcaRepositoryProvider).markExecutedAsProposal(r.id);
+      ref.invalidate(dueRemindersProvider);
+      ref.invalidate(aiPendingProvider);
+      messenger.showSnackBar(
+        const SnackBar(content: Text('已生成待确认记录（不下单 / 不转账）；见 AI 待确认')),
+      );
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
   }
 }
 
