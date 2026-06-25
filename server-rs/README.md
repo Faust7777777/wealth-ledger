@@ -82,6 +82,22 @@ GET /v1/quotes/summary?scenario=degraded
 This data is virtual dev data only. It is not a fixture seed and must not be
 synced or persisted.
 
+## Real-local ledger bootstrap
+
+The first real-local storage seam is a validated JSON ledger file. This is a
+bootstrap format for local self-use development: it is not the debug fixture,
+not synced, and not encrypted yet. Future SQLite/encryption work should sit
+behind the same ledger boundary instead of changing route handlers.
+
+```powershell
+cargo run --manifest-path server-rs/Cargo.toml -- --init-ledger .\tmp\ledger.json
+cargo run --manifest-path server-rs/Cargo.toml -- --validate-ledger .\tmp\ledger.json
+cargo run --manifest-path server-rs/Cargo.toml -- --check-ledger-paths .\tmp\ledger.json .\tmp\ledger.fixture.json
+```
+
+The validator rejects debug fixture markers and basic invalid money shapes so a
+real-local file cannot silently become demo data.
+
 The Rust dev server also accepts two temporary compatibility aliases for early
 frontend integration:
 

@@ -5,11 +5,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get, post},
 };
+mod local_ledger;
+
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
     env,
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -418,6 +421,11 @@ impl DevLedgerCore {
 
 #[tokio::main]
 async fn main() {
+    if let Some(command) = read_ledger_command_from(env::args()) {
+        run_ledger_command(command).expect("ledger command failed");
+        return;
+    }
+
     let addr = read_addr();
     assert_loopback(addr);
 
@@ -430,6 +438,94 @@ async fn main() {
     axum::serve(listener, app())
         .await
         .expect("serve finwealth rust server");
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LedgerCommand {
+    Init(PathBuf),
+    Validate(PathBuf),
+    CheckPaths {
+        real_path: PathBuf,
+        fixture_path: PathBuf,
+    },
+}
+
+fn read_ledger_command_from<I, S>(args: I) -> Option<LedgerCommand>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = args.into_iter().map(Into::into).skip(1);
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--init-ledger" => {
+                return Some(LedgerCommand::Init(PathBuf::from(
+                    args.next().expect("--init-ledger requires a file path"),
+                )));
+            }
+            "--validate-ledger" => {
+                return Some(LedgerCommand::Validate(PathBuf::from(
+                    args.next().expect("--validate-ledger requires a file path"),
+                )));
+            }
+            "--check-ledger-paths" => {
+                let real_path = PathBuf::from(
+                    args.next()
+                        .expect("--check-ledger-paths requires a real ledger path"),
+                );
+                let fixture_path = PathBuf::from(
+                    args.next()
+                        .expect("--check-ledger-paths requires a fixture ledger path"),
+                );
+                return Some(LedgerCommand::CheckPaths {
+                    real_path,
+                    fixture_path,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn run_ledger_command(command: LedgerCommand) -> std::io::Result<()> {
+    match command {
+        LedgerCommand::Init(path) => {
+            let document = local_ledger::load_or_initialize(&path)?;
+            println!(
+                "initialized real_local ledger at {} (version {}, base {})",
+                path.display(),
+                document["ledgerVersion"],
+                document["baseCurrency"]
+            );
+            Ok(())
+        }
+        LedgerCommand::Validate(path) => {
+            let document = local_ledger::read_document(&path)?;
+            println!(
+                "validated real_local ledger at {} (version {}, base {})",
+                path.display(),
+                document["ledgerVersion"],
+                document["baseCurrency"]
+            );
+            Ok(())
+        }
+        LedgerCommand::CheckPaths {
+            real_path,
+            fixture_path,
+        } => {
+            local_ledger::ensure_real_and_fixture_paths_separate(&real_path, &fixture_path)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            println!(
+                "ledger paths are separate: real={} fixture={}",
+                real_path.display(),
+                fixture_path.display()
+            );
+            Ok(())
+        }
+    }
 }
 
 fn app() -> Router {
@@ -1278,6 +1374,34 @@ mod tests {
         assert_eq!(
             read_addr_from(["finwealth-server", "--addr", "127.0.0.1:8792"]),
             "127.0.0.1:8792".parse().expect("valid socket addr")
+        );
+    }
+
+    #[test]
+    fn reads_local_ledger_cli_commands() {
+        assert_eq!(
+            read_ledger_command_from(["finwealth-server", "--init-ledger", "ledger.json"]),
+            Some(LedgerCommand::Init(PathBuf::from("ledger.json")))
+        );
+        assert_eq!(
+            read_ledger_command_from(["finwealth-server", "--validate-ledger", "ledger.json"]),
+            Some(LedgerCommand::Validate(PathBuf::from("ledger.json")))
+        );
+        assert_eq!(
+            read_ledger_command_from([
+                "finwealth-server",
+                "--check-ledger-paths",
+                "ledger.json",
+                "ledger.fixture.json"
+            ]),
+            Some(LedgerCommand::CheckPaths {
+                real_path: PathBuf::from("ledger.json"),
+                fixture_path: PathBuf::from("ledger.fixture.json")
+            })
+        );
+        assert_eq!(
+            read_ledger_command_from(["finwealth-server", "--port", "8791"]),
+            None
         );
     }
 
