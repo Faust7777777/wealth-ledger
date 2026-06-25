@@ -13,6 +13,7 @@ import '../features/investment_page.dart';
 import '../features/liabilities_page.dart';
 import '../features/movement_detail_page.dart';
 import '../features/overview_page.dart';
+import '../features/settings_page.dart';
 import '../features/snapshots_page.dart';
 import 'home_shell.dart';
 
@@ -44,6 +45,7 @@ final appRouter = GoRouter(
     ),
     GoRoute(path: '/anomalies', builder: (c, s) => const AnomaliesPage()),
     GoRoute(path: '/snapshots', builder: (c, s) => const SnapshotsPage()),
+    GoRoute(path: '/settings', builder: (c, s) => const SettingsPage()),
     GoRoute(
       path: '/movement/:id',
       builder: (c, s) => MovementDetailPage(movementId: s.pathParameters['id']!),

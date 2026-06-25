@@ -53,6 +53,11 @@ class HomeShell extends ConsumerWidget {
           icon: const Icon(Icons.brightness_6_outlined),
           tooltip: '深 / 浅色',
         ),
+        IconButton(
+          onPressed: () => context.push('/settings'),
+          icon: const Icon(Icons.settings_outlined),
+          tooltip: '设置',
+        ),
       ],
     );
 
