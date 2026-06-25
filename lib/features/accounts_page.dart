@@ -1,6 +1,7 @@
 // Wealth Ledger — 账户页（多币种容器；空态 / DEMO）。
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../core/format.dart';
 import '../data/providers.dart';
@@ -46,6 +47,7 @@ class AccountsPage extends ConsumerWidget {
                 v == null ? '—' : formatValued(v),
                 style: AppType.moneyRow,
               ),
+              onTap: () => context.push('/account/${a.id}'),
             );
           },
         );

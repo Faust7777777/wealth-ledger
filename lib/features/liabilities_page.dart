@@ -1,6 +1,7 @@
 // Wealth Ledger — 负债页（负债账户；为负=正常负债，不算异常）。
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../core/format.dart';
 import '../data/providers.dart';
@@ -46,6 +47,7 @@ class LiabilitiesPage extends ConsumerWidget {
                 v == null ? '—' : formatValued(v),
                 style: AppType.moneyRow,
               ),
+              onTap: () => context.push('/account/${a.id}'),
             );
           },
         );

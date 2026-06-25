@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 
 import '../data/providers.dart';
 import '../dev/tokens_preview.dart';
+import '../features/account_detail_page.dart';
 import '../features/accounts_page.dart';
 import '../features/ai_review_page.dart';
 import '../features/investment_page.dart';
@@ -34,6 +35,10 @@ final appRouter = GoRouter(
       ],
     ),
     GoRoute(path: '/ai-review', builder: (c, s) => const AiReviewPage()),
+    GoRoute(
+      path: '/account/:id',
+      builder: (c, s) => AccountDetailPage(accountId: s.pathParameters['id']!),
+    ),
     GoRoute(path: '/dev/tokens', builder: (c, s) => const _TokensPreviewRoute()),
   ],
 );

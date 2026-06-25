@@ -59,6 +59,14 @@ final recentMovementsProvider = FutureProvider<List<MovementVm>>(
   (ref) => ref.watch(movementRepositoryProvider).listRecentMovements(),
 );
 
+// —— 账户详情 family ——
+final accountByIdProvider = FutureProvider.family<AccountVm?, String>(
+  (ref, id) => ref.watch(accountRepositoryProvider).getAccount(id),
+);
+final holdingsByAccountProvider = FutureProvider.family<List<HoldingVm>, String>(
+  (ref, id) => ref.watch(portfolioRepositoryProvider).listHoldingsByAccount(id),
+);
+
 // —— 主题（深色默认）——
 class ThemeModeNotifier extends Notifier<ThemeMode> {
   @override
