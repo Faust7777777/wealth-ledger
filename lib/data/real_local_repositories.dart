@@ -49,6 +49,8 @@ class RealLocalDcaRepository implements DcaRepository {
   const RealLocalDcaRepository();
   @override
   Future<List<DcaReminderVm>> listDueReminders() async => const [];
+  @override
+  Future<List<DcaPlanVm>> listPlans() async => const [];
 }
 
 class RealLocalQuoteRepository implements QuoteRepository {

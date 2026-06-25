@@ -167,6 +167,27 @@ class DcaReminderVm {
   final DcaReminderStatus status;
 }
 
+enum DcaFrequency { weekly, monthly, custom }
+
+enum DcaPlanStatus { active, snoozed, paused, completed }
+
+class DcaPlanVm {
+  const DcaPlanVm({
+    required this.id,
+    required this.displayName,
+    required this.plannedAmount,
+    required this.frequency,
+    required this.nextDueDate,
+    required this.status,
+  });
+  final Id id;
+  final String displayName;
+  final Money plannedAmount;
+  final DcaFrequency frequency;
+  final IsoDate nextDueDate;
+  final DcaPlanStatus status;
+}
+
 class AiFieldDiffVm {
   const AiFieldDiffVm({
     required this.fieldPath,

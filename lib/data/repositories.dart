@@ -25,6 +25,7 @@ abstract interface class MovementRepository {
 
 abstract interface class DcaRepository {
   Future<List<DcaReminderVm>> listDueReminders();
+  Future<List<DcaPlanVm>> listPlans();
 }
 
 abstract interface class QuoteRepository {

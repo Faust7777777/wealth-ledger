@@ -18,6 +18,7 @@ class InvestmentPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final holdings = ref.watch(holdingsProvider);
     final reminders = ref.watch(dueRemindersProvider);
+    final plans = ref.watch(dcaPlansProvider).asData?.value ?? const <DcaPlanVm>[];
 
     return holdings.when(
       loading: () => const Center(child: CircularProgressIndicator()),
@@ -25,7 +26,7 @@ class InvestmentPage extends ConsumerWidget {
           ErrorStateView(message: '$e', onRetry: () => ref.invalidate(holdingsProvider)),
       data: (hs) {
         final rs = reminders.asData?.value ?? const <DcaReminderVm>[];
-        if (hs.isEmpty && rs.isEmpty) {
+        if (hs.isEmpty && rs.isEmpty && plans.isEmpty) {
           return const EmptyState(
             icon: Icons.trending_up_outlined,
             title: '还没有投资持仓',
@@ -47,6 +48,10 @@ class InvestmentPage extends ConsumerWidget {
               )
             else
               for (final r in rs) _ReminderTile(r: r),
+            if (plans.isNotEmpty) ...[
+              const SectionHeader(title: '定投计划'),
+              for (final p in plans) _PlanTile(p: p),
+            ],
           ],
         );
       },
@@ -112,6 +117,34 @@ class _ReminderTile extends StatelessWidget {
         ),
         child: const Text('记录已执行'),
       ),
+    );
+  }
+}
+
+class _PlanTile extends StatelessWidget {
+  const _PlanTile({required this.p});
+  final DcaPlanVm p;
+
+  String get _freq => switch (p.frequency) {
+        DcaFrequency.weekly => '每周',
+        DcaFrequency.monthly => '每月',
+        DcaFrequency.custom => '自定义',
+      };
+
+  String get _status => switch (p.status) {
+        DcaPlanStatus.active => '进行中',
+        DcaPlanStatus.snoozed => '已暂缓',
+        DcaPlanStatus.paused => '已暂停',
+        DcaPlanStatus.completed => '已完成',
+      };
+
+  @override
+  Widget build(BuildContext context) {
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: const Icon(Icons.repeat),
+      title: Text(p.displayName),
+      subtitle: Text('$_freq ${formatMoney(p.plannedAmount)} · 下次 ${p.nextDueDate} · $_status'),
     );
   }
 }

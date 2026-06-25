@@ -127,6 +127,25 @@ const List<DcaReminderVm> _dcaReminders = [
   ),
 ];
 
+const List<DcaPlanVm> _dcaPlans = [
+  DcaPlanVm(
+    id: 'plan_csi300',
+    displayName: '沪深300ETF',
+    plannedAmount: Money(amount: '1000.00', currency: 'CNY'),
+    frequency: DcaFrequency.monthly,
+    nextDueDate: '2026-07-10',
+    status: DcaPlanStatus.active,
+  ),
+  DcaPlanVm(
+    id: 'plan_nasdaq',
+    displayName: '纳指ETF',
+    plannedAmount: Money(amount: '800.00', currency: 'CNY'),
+    frequency: DcaFrequency.monthly,
+    nextDueDate: '2026-07-25',
+    status: DcaPlanStatus.active,
+  ),
+];
+
 const List<AiProposalVm> _proposals = [
   AiProposalVm(
     id: 'prop_modify_001',
@@ -257,6 +276,8 @@ class FixtureDcaRepository implements DcaRepository {
   const FixtureDcaRepository();
   @override
   Future<List<DcaReminderVm>> listDueReminders() async => _dcaReminders;
+  @override
+  Future<List<DcaPlanVm>> listPlans() async => _dcaPlans;
 }
 
 class FixtureQuoteRepository implements QuoteRepository {

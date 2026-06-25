@@ -58,6 +58,9 @@ final allocationProvider = FutureProvider<AssetAllocationVm>(
 final dueRemindersProvider = FutureProvider<List<DcaReminderVm>>(
   (ref) => ref.watch(dcaRepositoryProvider).listDueReminders(),
 );
+final dcaPlansProvider = FutureProvider<List<DcaPlanVm>>(
+  (ref) => ref.watch(dcaRepositoryProvider).listPlans(),
+);
 final aiPendingProvider = FutureProvider<List<AiProposalVm>>(
   (ref) => ref.watch(aiProposalRepositoryProvider).listPending(),
 );
