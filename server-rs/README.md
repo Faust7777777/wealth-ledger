@@ -103,9 +103,11 @@ cargo run --manifest-path server-rs/Cargo.toml -- --check-ledger-paths .\tmp\led
 ```
 
 Running the server with `--ledger-path` makes `GET /v1/accounts`,
-`POST /v1/accounts`, and `GET /v1/accounts/{account_id}` use the JSON ledger
-when no `?scenario=` query is present. Passing `?scenario=degraded` still uses
-the virtual dev dataset for frontend demo integration.
+`POST /v1/accounts`, `GET /v1/accounts/{account_id}`,
+`PATCH /v1/accounts/{account_id}`, and
+`POST /v1/accounts/{account_id}/archive` use the JSON ledger when no
+`?scenario=` query is present. Passing `?scenario=degraded` still uses the
+virtual dev dataset for frontend demo integration.
 
 The validator rejects debug fixture markers and basic invalid money shapes so a
 real-local file cannot silently become demo data.

@@ -75,6 +75,7 @@ pub fn write_document(path: &Path, document: &Value) -> io::Result<()> {
 pub enum LedgerError {
     InvalidInput(Vec<String>),
     Conflict(String),
+    NotFound(String),
     Io(io::Error),
 }
 
@@ -133,6 +134,33 @@ pub fn create_account(
 
     write_document(path, &document)?;
     Ok(project_account_for_api(&account))
+}
+
+pub fn update_account(
+    path: &Path,
+    account_id: &str,
+    patch: Value,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let account = find_account_mut(&mut document, account_id)
+        .ok_or_else(|| LedgerError::NotFound(format!("account does not exist: {account_id}")))?;
+    apply_account_patch(account, &patch, now)?;
+    let projected = project_account_for_api(account);
+    write_document(path, &document)?;
+    Ok(projected)
+}
+
+pub fn archive_account(path: &Path, account_id: &str, now: &str) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let account = find_account_mut(&mut document, account_id)
+        .ok_or_else(|| LedgerError::NotFound(format!("account does not exist: {account_id}")))?;
+    account["status"] = json!("archived");
+    account["visibility"] = json!("archived");
+    account["updatedAt"] = json!(now);
+    let projected = project_account_for_api(account);
+    write_document(path, &document)?;
+    Ok(projected)
 }
 
 pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
@@ -311,6 +339,18 @@ fn validate_accounts(accounts: Option<&Value>, errors: &mut Vec<String>) {
             errors,
         );
 
+        if let (Some(default_currency), Some(supported_currencies)) = (
+            account.get("defaultCurrency").and_then(Value::as_str),
+            account.get("supportedCurrencies").and_then(string_array),
+        ) && !supported_currencies
+            .iter()
+            .any(|currency| currency == default_currency)
+        {
+            errors.push(format!(
+                "accounts[{index}].supportedCurrencies must include defaultCurrency"
+            ));
+        }
+
         let Some(cash_balances) = account.get("cashBalances").and_then(Value::as_array) else {
             errors.push(format!("accounts[{index}].cashBalances must be an array"));
             continue;
@@ -360,6 +400,164 @@ fn validate_accounts(accounts: Option<&Value>, errors: &mut Vec<String>) {
                 ));
             }
         }
+    }
+}
+
+fn find_account_mut<'a>(document: &'a mut Value, account_id: &str) -> Option<&'a mut Value> {
+    document["accounts"]
+        .as_array_mut()
+        .expect("validated local ledger accounts should be an array")
+        .iter_mut()
+        .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+}
+
+fn apply_account_patch(account: &mut Value, patch: &Value, now: &str) -> Result<(), LedgerError> {
+    let Some(object) = patch.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "account patch must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut errors = Vec::new();
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "displayName"
+                | "institutionName"
+                | "accountType"
+                | "defaultCurrency"
+                | "supportedCurrencies"
+                | "includeInNetWorth"
+                | "visibility"
+                | "status"
+                | "balanceMode"
+                | "cashBalances"
+                | "tags"
+                | "note"
+        ) {
+            errors.push(format!("{key} is not an updatable account field"));
+        }
+    }
+
+    if let Some(value) = object.get("displayName") {
+        match value.as_str().filter(|value| !value.trim().is_empty()) {
+            Some(value) => account["displayName"] = json!(value),
+            None => errors.push("displayName must be a non-empty string".to_string()),
+        }
+    }
+
+    if object.contains_key("institutionName") {
+        patch_optional_string(account, object, "institutionName", &mut errors);
+    }
+
+    if let Some(value) = object.get("accountType") {
+        match value.as_str() {
+            Some(
+                value @ ("bank" | "brokerage" | "exchange" | "wallet" | "platform_wallet"
+                | "virtual_card" | "social_security" | "credit_card" | "loan" | "cash"
+                | "other"),
+            ) => account["accountType"] = json!(value),
+            _ => errors.push("accountType must be a valid AccountType".to_string()),
+        }
+    }
+
+    if let Some(value) = object.get("defaultCurrency") {
+        match value.as_str().filter(|value| !value.trim().is_empty()) {
+            Some(value) => account["defaultCurrency"] = json!(value),
+            None => errors.push("defaultCurrency must be a non-empty string".to_string()),
+        }
+    }
+
+    if let Some(value) = object.get("supportedCurrencies") {
+        match string_array(value) {
+            Some(items) if !items.is_empty() => account["supportedCurrencies"] = json!(items),
+            _ => errors.push("supportedCurrencies must be a non-empty string array".to_string()),
+        }
+    }
+
+    if let Some(value) = object.get("includeInNetWorth") {
+        match value.as_bool() {
+            Some(value) => account["includeInNetWorth"] = json!(value),
+            None => errors.push("includeInNetWorth must be a boolean".to_string()),
+        }
+    }
+
+    if let Some(value) = object.get("visibility") {
+        match value.as_str() {
+            Some(value @ ("normal" | "hidden_amount" | "archived")) => {
+                account["visibility"] = json!(value)
+            }
+            _ => errors.push("visibility must be normal, hidden_amount, or archived".to_string()),
+        }
+    }
+
+    if let Some(value) = object.get("status") {
+        match value.as_str() {
+            Some(value @ ("active" | "inactive" | "archived")) => account["status"] = json!(value),
+            _ => errors.push("status must be active, inactive, or archived".to_string()),
+        }
+    }
+
+    if let Some(value) = object.get("balanceMode") {
+        match value.as_str() {
+            Some(value @ ("cash_balance" | "holdings" | "liability" | "mixed")) => {
+                account["balanceMode"] = json!(value)
+            }
+            _ => errors.push(
+                "balanceMode must be cash_balance, holdings, liability, or mixed".to_string(),
+            ),
+        }
+    }
+
+    if let Some(value) = object.get("cashBalances")
+        && let Some(balances) = normalized_opening_balances(Some(value), now, &mut errors)
+    {
+        account["cashBalances"] = json!(balances);
+    }
+
+    if let Some(value) = object.get("tags") {
+        match string_array(value) {
+            Some(items) => account["tags"] = json!(items),
+            None => errors.push("tags must be a string array".to_string()),
+        }
+    }
+
+    if object.contains_key("note") {
+        patch_optional_string(account, object, "note", &mut errors);
+    }
+
+    if let (Some(default_currency), Some(supported_currencies)) = (
+        account.get("defaultCurrency").and_then(Value::as_str),
+        account.get("supportedCurrencies").and_then(string_array),
+    ) && !supported_currencies
+        .iter()
+        .any(|currency| currency == default_currency)
+    {
+        errors.push("supportedCurrencies must include defaultCurrency".to_string());
+    }
+
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    account["updatedAt"] = json!(now);
+    Ok(())
+}
+
+fn patch_optional_string(
+    target: &mut Value,
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    errors: &mut Vec<String>,
+) {
+    match object.get(key) {
+        Some(Value::Null) => {
+            if let Some(target) = target.as_object_mut() {
+                target.remove(key);
+            }
+        }
+        Some(Value::String(value)) if !value.trim().is_empty() => target[key] = json!(value),
+        _ => errors.push(format!("{key} must be a non-empty string or null")),
     }
 }
 

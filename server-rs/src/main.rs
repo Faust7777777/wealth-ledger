@@ -597,9 +597,9 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/accounts/anomalies", get(account_anomalies))
         .route(
             "/v1/accounts/{account_id}",
-            get(account_detail).patch(not_implemented),
+            get(account_detail).patch(update_account),
         )
-        .route("/v1/accounts/{account_id}/archive", post(not_implemented))
+        .route("/v1/accounts/{account_id}/archive", post(archive_account))
         .route("/v1/accounts/{account_id}/holdings", get(account_holdings))
         .route("/v1/portfolio/overview", get(portfolio_overview))
         .route("/v1/portfolio/holdings", get(holdings))
@@ -799,15 +799,36 @@ async fn create_account(State(state): State<AppState>, Json(input): Json<Value>)
 
     match local_ledger::create_account(path, input, &account_id, &now) {
         Ok(account) => (StatusCode::CREATED, envelope(account)).into_response(),
-        Err(local_ledger::LedgerError::InvalidInput(errors)) => bad_request(
-            "invalid_account_input",
-            "Create account input is invalid.",
-            json!({ "errors": errors }),
-        ),
-        Err(local_ledger::LedgerError::Conflict(message)) => {
-            bad_request("account_conflict", &message, json!({}))
-        }
-        Err(local_ledger::LedgerError::Io(error)) => ledger_io_error(error),
+        Err(error) => local_ledger_error(error, "invalid_account_input"),
+    }
+}
+
+async fn update_account(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Json(patch): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::update_account(path, &account_id, patch, &current_timestamp()) {
+        Ok(account) => envelope(account).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_account_patch"),
+    }
+}
+
+async fn archive_account(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::archive_account(path, &account_id, &current_timestamp()) {
+        Ok(account) => envelope(account).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_account_archive"),
     }
 }
 
@@ -1285,6 +1306,23 @@ fn ledger_io_error(error: std::io::Error) -> Response {
         })),
     )
         .into_response()
+}
+
+fn local_ledger_error(error: local_ledger::LedgerError, invalid_code: &str) -> Response {
+    match error {
+        local_ledger::LedgerError::InvalidInput(errors) => bad_request(
+            invalid_code,
+            "Local ledger request is invalid.",
+            json!({ "errors": errors }),
+        ),
+        local_ledger::LedgerError::Conflict(message) => {
+            bad_request("local_ledger_conflict", &message, json!({}))
+        }
+        local_ledger::LedgerError::NotFound(message) => {
+            not_found("local_ledger_not_found", &message)
+        }
+        local_ledger::LedgerError::Io(error) => ledger_io_error(error),
+    }
 }
 
 fn dev_accounts() -> Value {
@@ -1771,6 +1809,97 @@ mod tests {
             persisted["accounts"][0].get("value").is_none(),
             "derived account value must not be persisted into the ledger file"
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_account_patch_and_archive_update_persisted_summary() {
+        let path = unique_test_ledger_path("patch_archive_account");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let create_input = json!({
+            "displayName": "建行卡",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "100.00"}
+            ]
+        });
+        let (create_status, create_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", create_input)
+                .await;
+        assert_eq!(create_status, StatusCode::CREATED);
+        let account_id = create_body["data"]["id"]
+            .as_str()
+            .expect("account id should be string")
+            .to_string();
+
+        let patch = json!({
+            "displayName": "建行工资卡",
+            "cashBalances": [
+                {"currency": "CNY", "amount": "200.50"}
+            ],
+            "tags": ["工资卡"],
+            "note": "手动校准余额"
+        });
+        let (patch_status, patch_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/accounts/{account_id}"),
+            patch,
+        )
+        .await;
+        assert_eq!(patch_status, StatusCode::OK);
+        assert_eq!(patch_body["data"]["displayName"], "建行工资卡");
+        assert_eq!(patch_body["data"]["value"]["amount"], "200.50");
+        assert_eq!(patch_body["data"]["tags"][0], "工资卡");
+
+        let (overview_status, overview_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_status, StatusCode::OK);
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "200.50"
+        );
+
+        let invalid_patch = json!({"id": "acct_should_not_change"});
+        let (invalid_status, invalid_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/accounts/{account_id}"),
+            invalid_patch,
+        )
+        .await;
+        assert_eq!(invalid_status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid_body["error"]["code"], "invalid_account_patch");
+
+        let (archive_status, archive_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/accounts/{account_id}/archive"),
+        )
+        .await;
+        assert_eq!(archive_status, StatusCode::OK);
+        assert_eq!(archive_body["data"]["status"], "archived");
+        assert_eq!(archive_body["data"]["visibility"], "archived");
+
+        let (after_archive_status, after_archive_body) =
+            request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(after_archive_status, StatusCode::OK);
+        assert_eq!(after_archive_body["data"]["latestSnapshot"], Value::Null);
+
+        let persisted = local_ledger::read_document(&path).expect("ledger should persist patch");
+        assert_eq!(persisted["accounts"][0]["displayName"], "建行工资卡");
+        assert_eq!(
+            persisted["accounts"][0]["cashBalances"][0]["amount"],
+            "200.50"
+        );
+        assert_eq!(persisted["accounts"][0]["status"], "archived");
 
         let _ = std::fs::remove_file(path);
     }
