@@ -77,9 +77,10 @@ final snapshotRepositoryProvider = Provider<SnapshotRepository>((ref) => _pick(
 final overviewProvider = FutureProvider<PortfolioOverviewVm>(
   (ref) => ref.watch(portfolioRepositoryProvider).getOverview(),
 );
-final accountsProvider = FutureProvider<List<AccountVm>>(
-  (ref) => ref.watch(accountRepositoryProvider).listAccounts(),
-);
+final accountsProvider = FutureProvider<List<AccountVm>>((ref) async {
+  final all = await ref.watch(accountRepositoryProvider).listAccounts();
+  return all.where((a) => !a.isArchived).toList(); // 归档账户不进默认列表
+});
 final anomaliesProvider = FutureProvider<List<AccountAnomalyVm>>(
   (ref) => ref.watch(accountRepositoryProvider).listAnomalies(),
 );

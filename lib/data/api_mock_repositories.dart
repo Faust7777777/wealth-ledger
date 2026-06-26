@@ -226,6 +226,7 @@ AccountVm _account(Map<String, dynamic> j) {
     isLiability: isLiab,
     value: _valuedOrNull(j['value']),
     note: j['note'] as String?,
+    isArchived: j['status'] == 'archived' || j['visibility'] == 'archived',
   );
 }
 

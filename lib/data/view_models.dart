@@ -81,6 +81,7 @@ class AccountVm {
     required this.isLiability,
     this.value,
     this.note,
+    this.isArchived = false,
   });
   final Id id;
   final String displayName;
@@ -88,6 +89,7 @@ class AccountVm {
   final bool isLiability;
   final ValuedMoney? value; // CNY 估值；unpriceable → quality 标记
   final String? note;
+  final bool isArchived;
 }
 
 /// 创建账户输入（对齐 APPLICATION_INTERFACES_V1.CreateAccountInput）。
