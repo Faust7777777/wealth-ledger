@@ -507,7 +507,7 @@ class LocalServerMovementRepository implements MovementRepository {
   @override
   Future<MovementVm> createManualRecord(ManualRecordInput input) async {
     final isIncome = input.type == MovementType.income;
-    final draft = _m(await _c.postData('/v1/movements/drafts', body: {
+    return _recordViaPipeline({
       'type': _movementTypeWire(input.type),
       'occurredAt':
           input.occurredAt ?? DateTime.now().toUtc().toIso8601String(),
@@ -523,10 +523,46 @@ class LocalServerMovementRepository implements MovementRepository {
           'role': 'source',
         },
       ],
-    }));
+    });
+  }
+
+  @override
+  Future<MovementVm> createTransfer(TransferInput input) async {
+    return _recordViaPipeline({
+      'type': 'transfer',
+      'occurredAt':
+          input.occurredAt ?? DateTime.now().toUtc().toIso8601String(),
+      'title': input.title,
+      if (input.note != null && input.note!.isNotEmpty) 'description': input.note,
+      'entries': [
+        {
+          'accountId': input.fromAccountId,
+          'amount': input.amount,
+          'currency': input.currency,
+          'direction': 'out',
+          'role': 'source',
+        },
+        {
+          'accountId': input.toAccountId,
+          'amount': input.amount,
+          'currency': input.currency,
+          'direction': 'in',
+          'role': 'destination',
+        },
+      ],
+      'transferMeta': {
+        'fromAccountId': input.fromAccountId,
+        'toAccountId': input.toAccountId,
+        if (input.note != null && input.note!.isNotEmpty) 'note': input.note,
+      },
+    });
+  }
+
+  // 候选 → 确认：草稿 → 提交复核 → 确认入账（均为用户主动发起的合法写路径）。
+  Future<MovementVm> _recordViaPipeline(Map<String, Object?> body) async {
+    final draft = _m(await _c.postData('/v1/movements/drafts', body: body));
     final movementId = '${draft['id']}';
     final groupId = '${draft['atomicGroupId']}';
-    // 候选 → 确认：提交复核后确认入账（均为用户主动发起的合法写路径）。
     await _c.postData('/v1/movements/$movementId/submit-review');
     await _c.postData('/v1/atomic-groups/$groupId/confirm');
     final confirmed = await _c.getData('/v1/movements/$movementId');

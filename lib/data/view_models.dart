@@ -138,6 +138,26 @@ class ManualRecordInput {
   final IsoDateTime? occurredAt; // null → 仓库用当前时间
 }
 
+/// 转账输入（同币种、同额双分录 MVP；暂不做跨币种折算）。
+class TransferInput {
+  const TransferInput({
+    required this.fromAccountId,
+    required this.toAccountId,
+    required this.amount,
+    required this.currency,
+    required this.title,
+    this.note,
+    this.occurredAt,
+  });
+  final Id fromAccountId;
+  final Id toAccountId;
+  final DecimalString amount; // 正数 decimal 字符串
+  final CurrencyCode currency;
+  final String title;
+  final String? note;
+  final IsoDateTime? occurredAt;
+}
+
 class HoldingVm {
   const HoldingVm({
     required this.id,

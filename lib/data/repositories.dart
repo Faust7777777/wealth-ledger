@@ -28,6 +28,8 @@ abstract interface class MovementRepository {
   /// 手动记账：草稿 → 提交复核 → 确认入账（候选→确认，全程用户主动发起）。
   /// 仅 local_server 真实账本；real_local / DEMO 不支持。
   Future<MovementVm> createManualRecord(ManualRecordInput input);
+  /// 转账：账户间转移（双分录草稿 → 复核 → 确认）。仅 local_server。
+  Future<MovementVm> createTransfer(TransferInput input);
 }
 
 abstract interface class DcaRepository {

@@ -282,6 +282,9 @@ class FixtureMovementRepository implements MovementRepository {
   @override
   Future<MovementVm> createManualRecord(ManualRecordInput input) async =>
       throw UnsupportedError('DEMO 演示只读，不支持手动记账；请用 local_server');
+  @override
+  Future<MovementVm> createTransfer(TransferInput input) async =>
+      throw UnsupportedError('DEMO 演示只读，不支持转账；请用 local_server');
 }
 
 class FixtureDcaRepository implements DcaRepository {

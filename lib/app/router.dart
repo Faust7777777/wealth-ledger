@@ -19,6 +19,7 @@ import '../features/movement_detail_page.dart';
 import '../features/overview_page.dart';
 import '../features/settings_page.dart';
 import '../features/snapshots_page.dart';
+import '../features/transfer_page.dart';
 import 'home_shell.dart';
 
 final appRouter = GoRouter(
@@ -54,6 +55,7 @@ final appRouter = GoRouter(
       builder: (c, s) => AccountFormPage(existing: s.extra as AccountVm?),
     ),
     GoRoute(path: '/record/manual', builder: (c, s) => const ManualRecordPage()),
+    GoRoute(path: '/record/transfer', builder: (c, s) => const TransferPage()),
     GoRoute(path: '/anomalies', builder: (c, s) => const AnomaliesPage()),
     GoRoute(path: '/snapshots', builder: (c, s) => const SnapshotsPage()),
     GoRoute(path: '/settings', builder: (c, s) => const SettingsPage()),
