@@ -515,7 +515,55 @@ pub fn asset_allocation(path: &Path, now: &str) -> io::Result<Value> {
 
 pub fn latest_snapshot(path: &Path, now: &str) -> io::Result<Value> {
     let document = load_or_initialize(path)?;
+    if let Some(snapshot) = latest_persisted_snapshot(&document) {
+        return Ok(snapshot);
+    }
     Ok(summarize_accounts(&document, now)?.latest_snapshot)
+}
+
+pub fn list_snapshots(path: &Path) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    Ok(json!(
+        document["snapshots"]
+            .as_array()
+            .expect("validated local ledger snapshots should be an array")
+            .clone()
+    ))
+}
+
+pub fn create_manual_snapshot(path: &Path, input: Value, now: &str) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "manual snapshot input must be a JSON object".to_string(),
+        ]));
+    };
+    let mut errors = Vec::new();
+    let reason = required_enum(
+        object,
+        "reason",
+        &["baseline", "manual_refresh"],
+        &mut errors,
+    );
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    let mut snapshot = summarize_accounts(&document, now)?.latest_snapshot;
+    if snapshot.is_null() {
+        return Err(LedgerError::Conflict(
+            "cannot create a manual snapshot before any included account exists".to_string(),
+        ));
+    }
+    snapshot["reason"] = json!(reason.expect("validated snapshot reason"));
+    snapshot["createdAt"] = json!(now);
+
+    document["snapshots"]
+        .as_array_mut()
+        .expect("validated local ledger snapshots should be an array")
+        .push(snapshot.clone());
+    write_document(path, &document)?;
+    Ok(snapshot)
 }
 
 pub fn ensure_real_and_fixture_paths_separate(
@@ -1340,6 +1388,14 @@ fn recent_movements_from_document(document: &Value) -> Vec<Value> {
         .take(20)
         .map(project_movement_for_api)
         .collect()
+}
+
+fn latest_persisted_snapshot(document: &Value) -> Option<Value> {
+    document["snapshots"]
+        .as_array()
+        .expect("validated local ledger snapshots should be an array")
+        .last()
+        .cloned()
 }
 
 fn projected_account_value(account: &Value) -> Option<Value> {

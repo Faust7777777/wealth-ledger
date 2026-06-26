@@ -664,7 +664,7 @@ fn app_with_state(state: AppState) -> Router {
         )
         .route("/v1/snapshots/latest", get(snapshot_latest))
         .route("/v1/snapshots", get(snapshots))
-        .route("/v1/snapshots/manual", post(not_implemented))
+        .route("/v1/snapshots/manual", post(create_manual_snapshot))
         .route("/v1/snapshots/invalidate", post(no_content))
         .route("/v1/categories", get(empty_array).post(not_implemented))
         .route("/v1/categories/{category_id}", any(not_implemented))
@@ -1254,14 +1254,27 @@ async fn snapshots(
             .local_ledger_path
             .as_ref()
             .expect("local ledger path should exist when local ledger is selected");
-        return match local_ledger::latest_snapshot(path, &current_timestamp()) {
-            Ok(Value::Null) => envelope(json!([])).into_response(),
-            Ok(snapshot) => envelope(json!([snapshot])).into_response(),
+        return match local_ledger::list_snapshots(path) {
+            Ok(snapshots) => envelope(snapshots).into_response(),
             Err(error) => ledger_io_error(error),
         };
     }
 
     envelope(state.ledger.snapshots(DevScenario::from_query(&query))).into_response()
+}
+
+async fn create_manual_snapshot(
+    State(state): State<AppState>,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::create_manual_snapshot(path, input, &current_timestamp()) {
+        Ok(snapshot) => envelope(snapshot).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_manual_snapshot"),
+    }
 }
 
 async fn sync_bootstrap() -> Json<Value> {
@@ -2436,6 +2449,86 @@ mod tests {
         assert_eq!(persisted["dcaPlans"].as_array().expect("plans").len(), 2);
         assert_eq!(persisted["dcaReminders"][0]["status"], "skipped");
         assert_eq!(persisted["dcaReminders"][1]["status"], "snoozed");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_manual_snapshot_persists_current_net_worth() {
+        let path = unique_test_ledger_path("manual_snapshot");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let account_input = json!({
+            "displayName": "快照账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "100.00"}
+            ]
+        });
+        let (account_status, account_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", account_input)
+                .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id should be string")
+            .to_string();
+
+        let (empty_status, empty_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/snapshots").await;
+        assert_eq!(empty_status, StatusCode::OK);
+        assert_eq!(empty_body["data"], json!([]));
+
+        let (create_status, create_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/snapshots/manual",
+            json!({"reason": "baseline"}),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::OK);
+        assert_eq!(create_body["data"]["reason"], "baseline");
+        assert_eq!(create_body["data"]["netWorth"]["amount"], "100.00");
+
+        let (list_status, list_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/snapshots").await;
+        assert_eq!(list_status, StatusCode::OK);
+        assert_eq!(list_body["data"][0]["netWorth"]["amount"], "100.00");
+
+        let patch = json!({
+            "cashBalances": [
+                {"currency": "CNY", "amount": "120.00"}
+            ]
+        });
+        let (patch_status, _) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/accounts/{account_id}"),
+            patch,
+        )
+        .await;
+        assert_eq!(patch_status, StatusCode::OK);
+
+        let (overview_status, overview_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_status, StatusCode::OK);
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "120.00"
+        );
+
+        let (latest_status, latest_body) =
+            request_json_from(router, Method::GET, "/v1/snapshots/latest").await;
+        assert_eq!(latest_status, StatusCode::OK);
+        assert_eq!(latest_body["data"]["netWorth"]["amount"], "100.00");
+
+        let persisted = local_ledger::read_document(&path).expect("ledger should persist snapshot");
+        assert_eq!(persisted["snapshots"][0]["netWorth"]["amount"], "100.00");
 
         let _ = std::fs::remove_file(path);
     }
