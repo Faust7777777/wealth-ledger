@@ -163,9 +163,235 @@ pub fn archive_account(path: &Path, account_id: &str, now: &str) -> Result<Value
     Ok(projected)
 }
 
+pub fn list_movements(path: &Path) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    let movements = document["movements"]
+        .as_array()
+        .expect("validated local ledger movements should be an array")
+        .iter()
+        .map(project_movement_for_api)
+        .collect::<Vec<_>>();
+    Ok(json!(movements))
+}
+
+pub fn get_movement(path: &Path, movement_id: &str) -> io::Result<Option<Value>> {
+    let movements = list_movements(path)?;
+    Ok(movements
+        .as_array()
+        .expect("projected movements should be an array")
+        .iter()
+        .find(|movement| movement.get("id").and_then(Value::as_str) == Some(movement_id))
+        .cloned())
+}
+
+pub fn create_movement_draft(
+    path: &Path,
+    input: Value,
+    movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let movement =
+        movement_from_create_input(&document, &input, movement_id, atomic_group_id, now)?;
+
+    {
+        let movements = document["movements"]
+            .as_array_mut()
+            .expect("validated local ledger movements should be an array");
+        movements.push(movement.clone());
+    }
+
+    if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
+        let movement_entries = document["movementEntries"]
+            .as_array_mut()
+            .expect("validated local ledger movementEntries should be an array");
+        for entry in entries {
+            let mut indexed_entry = entry.clone();
+            indexed_entry["movementId"] = json!(movement_id);
+            indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+            movement_entries.push(indexed_entry);
+        }
+    }
+
+    write_document(path, &document)?;
+    Ok(project_movement_for_api(&movement))
+}
+
+pub fn submit_movement_review(
+    path: &Path,
+    movement_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let movement = find_movement_mut(&mut document, movement_id)
+        .ok_or_else(|| LedgerError::NotFound(format!("movement does not exist: {movement_id}")))?;
+
+    match movement.get("status").and_then(Value::as_str) {
+        Some("draft") => {
+            movement["status"] = json!("pending_review");
+            movement["updatedAt"] = json!(now);
+        }
+        Some("pending_review") => {}
+        Some(status) => {
+            return Err(LedgerError::Conflict(format!(
+                "movement cannot be submitted for review from status: {status}"
+            )));
+        }
+        None => {
+            return Err(LedgerError::InvalidInput(vec![
+                "movement.status must be present".to_string(),
+            ]));
+        }
+    }
+
+    let group = atomic_group_from_movement(movement, "pending");
+    write_document(path, &document)?;
+    Ok(group)
+}
+
+pub fn confirm_atomic_group(
+    path: &Path,
+    atomic_group_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let candidate_movements = document["movements"]
+        .as_array()
+        .expect("validated local ledger movements should be an array")
+        .iter()
+        .filter(|movement| {
+            movement.get("atomicGroupId").and_then(Value::as_str) == Some(atomic_group_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if candidate_movements.is_empty() {
+        return Err(LedgerError::NotFound(format!(
+            "atomic group does not exist: {atomic_group_id}"
+        )));
+    }
+
+    let mut confirmed_movement_ids = Vec::new();
+    for movement in &candidate_movements {
+        match movement.get("status").and_then(Value::as_str) {
+            Some("draft" | "pending_review") => {
+                let entries = movement
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                apply_movement_entries(&mut document, &entries, now)?;
+                confirmed_movement_ids.push(
+                    movement
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .expect("validated movement id should be a string")
+                        .to_string(),
+                );
+            }
+            Some("confirmed" | "in_transit") => {}
+            Some("cancelled" | "reversed") => {
+                return Err(LedgerError::Conflict(format!(
+                    "atomic group cannot be confirmed from movement status: {}",
+                    movement
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .expect("status should exist")
+                )));
+            }
+            Some(status) => {
+                return Err(LedgerError::Conflict(format!(
+                    "atomic group cannot be confirmed from movement status: {status}"
+                )));
+            }
+            None => {
+                return Err(LedgerError::InvalidInput(vec![
+                    "movement.status must be present".to_string(),
+                ]));
+            }
+        }
+    }
+
+    if !confirmed_movement_ids.is_empty() {
+        let movements = document["movements"]
+            .as_array_mut()
+            .expect("validated local ledger movements should be an array");
+        for movement in movements.iter_mut().filter(|movement| {
+            movement.get("atomicGroupId").and_then(Value::as_str) == Some(atomic_group_id)
+        }) {
+            if matches!(
+                movement.get("status").and_then(Value::as_str),
+                Some("draft" | "pending_review")
+            ) {
+                movement["status"] = json!(confirmed_status_for_movement(movement));
+                movement["updatedAt"] = json!(now);
+            }
+        }
+    }
+
+    write_document(path, &document)?;
+    Ok(json!({
+        "atomicGroupId": atomic_group_id,
+        "confirmedMovementIds": confirmed_movement_ids,
+        "snapshotInvalidated": !confirmed_movement_ids.is_empty(),
+        "ledgerWrite": !confirmed_movement_ids.is_empty(),
+        "devOnly": false
+    }))
+}
+
+pub fn reject_atomic_group(
+    path: &Path,
+    atomic_group_id: &str,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let mut found = false;
+    let movements = document["movements"]
+        .as_array_mut()
+        .expect("validated local ledger movements should be an array");
+
+    for movement in movements.iter_mut().filter(|movement| {
+        movement.get("atomicGroupId").and_then(Value::as_str) == Some(atomic_group_id)
+    }) {
+        found = true;
+        match movement.get("status").and_then(Value::as_str) {
+            Some("draft" | "pending_review") => {
+                movement["status"] = json!("cancelled");
+                movement["updatedAt"] = json!(now);
+            }
+            Some("cancelled") => {}
+            Some(status) => {
+                return Err(LedgerError::Conflict(format!(
+                    "atomic group cannot be rejected from movement status: {status}"
+                )));
+            }
+            None => {
+                return Err(LedgerError::InvalidInput(vec![
+                    "movement.status must be present".to_string(),
+                ]));
+            }
+        }
+    }
+
+    if !found {
+        return Err(LedgerError::NotFound(format!(
+            "atomic group does not exist: {atomic_group_id}"
+        )));
+    }
+
+    write_document(path, &document)?;
+    Ok(())
+}
+
 pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
     let document = load_or_initialize(path)?;
     let summary = summarize_accounts(&document, now)?;
+    let recent_movements = recent_movements_from_document(&document);
+    let in_transit_count = recent_movements
+        .iter()
+        .filter(|movement| movement.get("status").and_then(Value::as_str) == Some("in_transit"))
+        .count();
 
     Ok(json!({
         "latestSnapshot": summary.latest_snapshot,
@@ -174,7 +400,7 @@ pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
             "aiPendingCount": 0,
             "accountAnomalyCount": summary.account_anomaly_count,
             "dcaDueCount": 0,
-            "inTransitCount": 0,
+            "inTransitCount": in_transit_count,
             "quoteProblemCount": summary.unpriceable_count,
             "syncProblemCount": 0
         },
@@ -186,7 +412,7 @@ pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
             "errorCount": 0
         },
         "primaryHoldings": [],
-        "recentMovements": []
+        "recentMovements": recent_movements
     }))
 }
 
@@ -409,6 +635,14 @@ fn find_account_mut<'a>(document: &'a mut Value, account_id: &str) -> Option<&'a
         .expect("validated local ledger accounts should be an array")
         .iter_mut()
         .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+}
+
+fn find_movement_mut<'a>(document: &'a mut Value, movement_id: &str) -> Option<&'a mut Value> {
+    document["movements"]
+        .as_array_mut()
+        .expect("validated local ledger movements should be an array")
+        .iter_mut()
+        .find(|movement| movement.get("id").and_then(Value::as_str) == Some(movement_id))
 }
 
 fn apply_account_patch(account: &mut Value, patch: &Value, now: &str) -> Result<(), LedgerError> {
@@ -808,6 +1042,102 @@ fn account_from_create_input(
     Ok(account)
 }
 
+fn movement_from_create_input(
+    document: &Value,
+    input: &Value,
+    movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "create movement draft input must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut errors = Vec::new();
+    let movement_type = required_enum(
+        object,
+        "type",
+        &[
+            "income",
+            "expense",
+            "transfer",
+            "buy",
+            "sell",
+            "dividend",
+            "interest",
+            "fee",
+            "adjustment",
+            "loan_disbursement",
+            "loan_repayment",
+            "correction",
+        ],
+        &mut errors,
+    );
+    let occurred_at = required_string(object, "occurredAt", &mut errors);
+    let title = required_string(object, "title", &mut errors);
+    let description = optional_string(object, "description", &mut errors);
+    let entries =
+        normalized_movement_entries(document, object.get("entries"), movement_id, &mut errors);
+    let tags = match object.get("tags") {
+        Some(value) => match string_array(value) {
+            Some(items) => items,
+            None => {
+                errors.push("tags must be a string array".to_string());
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    let category_id = optional_string(object, "categoryId", &mut errors);
+    let counterparty_id = optional_string(object, "counterpartyId", &mut errors);
+    let amount_breakdown = normalized_amount_breakdown(object.get("amountBreakdown"), &mut errors);
+    let settlement = normalized_settlement(object.get("settlement"), &mut errors);
+    let transfer_meta = normalized_transfer_meta(object.get("transferMeta"), &mut errors);
+
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    let mut movement = json!({
+        "id": movement_id,
+        "atomicGroupId": atomic_group_id,
+        "type": movement_type.expect("validated movement type"),
+        "occurredAt": occurred_at.expect("validated occurredAt"),
+        "recordedAt": now,
+        "status": "draft",
+        "title": title.expect("validated title"),
+        "entries": entries.expect("validated entries"),
+        "tags": tags,
+        "settlement": settlement.expect("validated settlement"),
+        "source": {
+            "kind": "manual",
+            "createdBy": "user"
+        },
+        "createdAt": now,
+        "updatedAt": now
+    });
+
+    if let Some(description) = description {
+        movement["description"] = json!(description);
+    }
+    if let Some(category_id) = category_id {
+        movement["categoryId"] = json!(category_id);
+    }
+    if let Some(counterparty_id) = counterparty_id {
+        movement["counterpartyId"] = json!(counterparty_id);
+    }
+    if let Some(amount_breakdown) = amount_breakdown {
+        movement["amountBreakdown"] = amount_breakdown;
+    }
+    if let Some(transfer_meta) = transfer_meta {
+        movement["transferMeta"] = transfer_meta;
+    }
+
+    Ok(movement)
+}
+
 fn project_account_for_api(account: &Value) -> Value {
     let mut projected = account.clone();
 
@@ -818,6 +1148,30 @@ fn project_account_for_api(account: &Value) -> Value {
     }
 
     projected
+}
+
+fn project_movement_for_api(movement: &Value) -> Value {
+    let mut projected = movement.clone();
+
+    if projected.get("displayAmount").is_none()
+        && let Some(display_amount) = projected_movement_amount(movement)
+    {
+        projected["displayAmount"] = display_amount;
+    }
+
+    projected
+}
+
+fn recent_movements_from_document(document: &Value) -> Vec<Value> {
+    document["movements"]
+        .as_array()
+        .expect("validated local ledger movements should be an array")
+        .iter()
+        .filter(|movement| movement.get("status").and_then(Value::as_str) != Some("cancelled"))
+        .rev()
+        .take(20)
+        .map(project_movement_for_api)
+        .collect()
 }
 
 fn projected_account_value(account: &Value) -> Option<Value> {
@@ -835,6 +1189,60 @@ fn projected_account_value(account: &Value) -> Option<Value> {
         "asOf": balance.get("asOf")?.clone(),
         "quality": balance.get("quality")?.clone()
     }))
+}
+
+fn projected_movement_amount(movement: &Value) -> Option<Value> {
+    if let Some(paid_amount) = movement
+        .get("amountBreakdown")
+        .and_then(|breakdown| breakdown.get("paidAmount"))
+    {
+        return Some(paid_amount.clone());
+    }
+
+    let entry = movement.get("entries")?.as_array()?.first()?;
+    Some(json!({
+        "amount": entry.get("amount")?.clone(),
+        "currency": entry.get("currency")?.clone()
+    }))
+}
+
+fn atomic_group_from_movement(movement: &Value, status: &str) -> Value {
+    json!({
+        "id": movement
+            .get("atomicGroupId")
+            .and_then(Value::as_str)
+            .expect("validated atomicGroupId should be a string"),
+        "title": movement
+            .get("title")
+            .and_then(Value::as_str)
+            .expect("validated movement title should be a string"),
+        "operation": "create",
+        "targetType": "movement",
+        "targetId": movement
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("validated movement id should be a string"),
+        "proposedMovements": [project_movement_for_api(movement)],
+        "warnings": [],
+        "status": status,
+        "validation": {
+            "isValid": true,
+            "errors": []
+        }
+    })
+}
+
+fn confirmed_status_for_movement(movement: &Value) -> &'static str {
+    if movement
+        .get("settlement")
+        .and_then(|settlement| settlement.get("status"))
+        .and_then(Value::as_str)
+        == Some("in_transit")
+    {
+        "in_transit"
+    } else {
+        "confirmed"
+    }
 }
 
 fn is_liability_account(account: &Value) -> bool {
@@ -1161,6 +1569,341 @@ fn normalized_opening_balances(
     Some(balances)
 }
 
+fn normalized_movement_entries(
+    document: &Value,
+    value: Option<&Value>,
+    movement_id: &str,
+    errors: &mut Vec<String>,
+) -> Option<Vec<Value>> {
+    let Some(value) = value else {
+        errors.push("entries must be a non-empty array".to_string());
+        return None;
+    };
+
+    let Some(items) = value.as_array() else {
+        errors.push("entries must be a non-empty array".to_string());
+        return None;
+    };
+
+    if items.is_empty() {
+        errors.push("entries must be a non-empty array".to_string());
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(item) = item.as_object() else {
+            errors.push(format!("entries[{index}] must be an object"));
+            continue;
+        };
+
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("entry_{movement_id}_{index}"));
+        let account_id = required_string(item, "accountId", errors);
+        if let Some(account_id) = account_id.as_deref()
+            && !active_account_exists(document, account_id)
+        {
+            errors.push(format!(
+                "entries[{index}].accountId does not exist or is archived"
+            ));
+        }
+
+        let amount = match item.get("amount").and_then(Value::as_str) {
+            Some(amount) if is_positive_decimal_string(amount) => Some(amount.to_string()),
+            _ => {
+                errors.push(format!(
+                    "entries[{index}].amount must be a positive decimal string"
+                ));
+                None
+            }
+        };
+        let currency = required_string(item, "currency", errors);
+        let direction = match item.get("direction").and_then(Value::as_str) {
+            Some(value @ ("in" | "out")) => Some(value.to_string()),
+            _ => {
+                errors.push(format!("entries[{index}].direction must be in or out"));
+                None
+            }
+        };
+        let role = match item.get("role").and_then(Value::as_str) {
+            Some(
+                value @ ("source" | "destination" | "fee" | "discount" | "pnl" | "tax"
+                | "adjustment"),
+            ) => Some(value.to_string()),
+            _ => {
+                errors.push(format!(
+                    "entries[{index}].role must be a valid MovementEntryRole"
+                ));
+                None
+            }
+        };
+
+        if let (Some(account_id), Some(amount), Some(currency), Some(direction), Some(role)) =
+            (account_id, amount, currency, direction, role)
+        {
+            let mut entry = json!({
+                "id": id,
+                "accountId": account_id,
+                "amount": amount,
+                "currency": currency,
+                "direction": direction,
+                "role": role
+            });
+
+            if let Some(instrument_id) = optional_string(item, "instrumentId", errors) {
+                entry["instrumentId"] = json!(instrument_id);
+            }
+
+            entries.push(entry);
+        }
+    }
+
+    Some(entries)
+}
+
+fn normalized_settlement(value: Option<&Value>, errors: &mut Vec<String>) -> Option<Value> {
+    let Some(value) = value else {
+        return Some(json!({ "status": "settled" }));
+    };
+
+    let Some(object) = value.as_object() else {
+        errors.push("settlement must be an object when present".to_string());
+        return None;
+    };
+
+    let status = match object.get("status").and_then(Value::as_str) {
+        Some(value @ ("settled" | "in_transit" | "failed" | "unknown")) => value,
+        _ => {
+            errors.push(
+                "settlement.status must be settled, in_transit, failed, or unknown".to_string(),
+            );
+            "unknown"
+        }
+    };
+
+    let mut settlement = json!({ "status": status });
+    if let Some(expected_settle_at) = optional_string(object, "expectedSettleAt", errors) {
+        settlement["expectedSettleAt"] = json!(expected_settle_at);
+    }
+    if let Some(settled_at) = optional_string(object, "settledAt", errors) {
+        settlement["settledAt"] = json!(settled_at);
+    }
+    if let Some(delay) = object.get("expectedDelayHours") {
+        match delay.as_u64() {
+            Some(delay) => settlement["expectedDelayHours"] = json!(delay),
+            None => errors
+                .push("settlement.expectedDelayHours must be a non-negative integer".to_string()),
+        }
+    }
+
+    Some(settlement)
+}
+
+fn normalized_amount_breakdown(value: Option<&Value>, errors: &mut Vec<String>) -> Option<Value> {
+    let value = value?;
+
+    let Some(object) = value.as_object() else {
+        errors.push("amountBreakdown must be an object when present".to_string());
+        return None;
+    };
+
+    if !object.contains_key("paidAmount") {
+        errors.push("amountBreakdown.paidAmount is required".to_string());
+    }
+    let paid_amount = normalized_money(
+        object.get("paidAmount"),
+        "amountBreakdown.paidAmount",
+        errors,
+    );
+    let mut breakdown = json!({});
+    if let Some(gross_amount) = normalized_money(
+        object.get("grossAmount"),
+        "amountBreakdown.grossAmount",
+        errors,
+    ) {
+        breakdown["grossAmount"] = gross_amount;
+    }
+    if let Some(savings_amount) = normalized_money(
+        object.get("savingsAmount"),
+        "amountBreakdown.savingsAmount",
+        errors,
+    ) {
+        breakdown["savingsAmount"] = savings_amount;
+    }
+    if let Some(paid_amount) = paid_amount {
+        breakdown["paidAmount"] = paid_amount;
+    }
+    if let Some(value) = object.get("benefitSource") {
+        match value.as_str() {
+            Some(
+                value @ ("coupon" | "platform_subsidy" | "merchant_discount" | "free_order"
+                | "other"),
+            ) => {
+                breakdown["benefitSource"] = json!(value);
+            }
+            _ => errors
+                .push("amountBreakdown.benefitSource must be a valid benefit source".to_string()),
+        }
+    }
+
+    Some(breakdown)
+}
+
+fn normalized_transfer_meta(value: Option<&Value>, errors: &mut Vec<String>) -> Option<Value> {
+    let value = value?;
+
+    let Some(object) = value.as_object() else {
+        errors.push("transferMeta must be an object when present".to_string());
+        return None;
+    };
+
+    let mut meta = json!({});
+    for key in ["fromAccountId", "toAccountId", "note"] {
+        if let Some(value) = optional_string(object, key, errors) {
+            meta[key] = json!(value);
+        }
+    }
+    for key in ["fromAmount", "toAmount", "feeAmount", "lossAmount"] {
+        if let Some(value) =
+            normalized_money(object.get(key), &format!("transferMeta.{key}"), errors)
+        {
+            meta[key] = value;
+        }
+    }
+    if let Some(value) = object.get("fxRate") {
+        match value.as_str() {
+            Some(value) if is_positive_decimal_string(value) => meta["fxRate"] = json!(value),
+            _ => errors.push("transferMeta.fxRate must be a positive decimal string".to_string()),
+        }
+    }
+
+    Some(meta)
+}
+
+fn normalized_money(value: Option<&Value>, label: &str, errors: &mut Vec<String>) -> Option<Value> {
+    let value = value?;
+
+    let Some(object) = value.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return None;
+    };
+
+    let amount = match object.get("amount").and_then(Value::as_str) {
+        Some(amount) if is_decimal_string(amount) => Some(amount.to_string()),
+        _ => {
+            errors.push(format!("{label}.amount must be a decimal string"));
+            None
+        }
+    };
+    let currency = required_string(object, "currency", errors);
+
+    match (amount, currency) {
+        (Some(amount), Some(currency)) => Some(json!({
+            "amount": amount,
+            "currency": currency
+        })),
+        _ => None,
+    }
+}
+
+fn active_account_exists(document: &Value, account_id: &str) -> bool {
+    document["accounts"]
+        .as_array()
+        .expect("validated local ledger accounts should be an array")
+        .iter()
+        .any(|account| {
+            account.get("id").and_then(Value::as_str) == Some(account_id)
+                && account.get("status").and_then(Value::as_str) != Some("archived")
+        })
+}
+
+fn apply_movement_entries(
+    document: &mut Value,
+    entries: &[Value],
+    now: &str,
+) -> Result<(), LedgerError> {
+    for entry in entries {
+        let account_id = entry
+            .get("accountId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["entry.accountId is missing".to_string()])
+            })?;
+        let currency = entry
+            .get("currency")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["entry.currency is missing".to_string()])
+            })?;
+        let amount =
+            parse_decimal(entry.get("amount").and_then(Value::as_str).ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["entry.amount is missing".to_string()])
+            })?)
+            .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+        let delta = match entry.get("direction").and_then(Value::as_str) {
+            Some("in") => amount,
+            Some("out") => -amount,
+            _ => {
+                return Err(LedgerError::InvalidInput(vec![
+                    "entry.direction must be in or out".to_string(),
+                ]));
+            }
+        };
+
+        apply_account_cash_delta(document, account_id, currency, delta, now)?;
+    }
+
+    Ok(())
+}
+
+fn apply_account_cash_delta(
+    document: &mut Value,
+    account_id: &str,
+    currency: &str,
+    delta: DecimalAmount,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let account = find_account_mut(document, account_id)
+        .ok_or_else(|| LedgerError::NotFound(format!("account does not exist: {account_id}")))?;
+    if account.get("status").and_then(Value::as_str) == Some("archived") {
+        return Err(LedgerError::Conflict(format!(
+            "account is archived: {account_id}"
+        )));
+    }
+
+    let balances = account["cashBalances"]
+        .as_array_mut()
+        .expect("validated account cashBalances should be an array");
+    if let Some(balance) = balances
+        .iter_mut()
+        .find(|balance| balance.get("currency").and_then(Value::as_str) == Some(currency))
+    {
+        let current = parse_decimal(
+            balance
+                .get("amount")
+                .and_then(Value::as_str)
+                .expect("validated balance amount should be a string"),
+        )
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+        balance["amount"] = json!(money_amount(current + delta));
+        balance["asOf"] = json!(now);
+        balance["quality"] = json!("exact");
+    } else {
+        balances.push(json!({
+            "currency": currency,
+            "amount": money_amount(delta),
+            "asOf": now,
+            "quality": "exact"
+        }));
+    }
+    account["updatedAt"] = json!(now);
+    Ok(())
+}
+
 fn validate_string_array(value: Option<&Value>, label: &str, errors: &mut Vec<String>) {
     match value.and_then(string_array) {
         Some(_) => {}
@@ -1205,6 +1948,11 @@ fn is_decimal_string(value: &str) -> bool {
         Some(value) => !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()),
         None => true,
     }
+}
+
+fn is_positive_decimal_string(value: &str) -> bool {
+    is_decimal_string(value)
+        && DecimalAmount::parse(value).is_ok_and(|amount| amount > DecimalAmount::ZERO)
 }
 
 fn contains_fixture_marker(value: &Value) -> bool {

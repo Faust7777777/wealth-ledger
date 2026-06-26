@@ -607,11 +607,11 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/portfolio/allocation", get(asset_allocation))
         .route("/v1/movements", get(movements))
         .route("/v1/movements/recent", get(movements))
-        .route("/v1/movements/drafts", post(not_implemented))
+        .route("/v1/movements/drafts", post(create_movement_draft))
         .route("/v1/movements/{movement_id}", get(movement_detail))
         .route(
             "/v1/movements/{movement_id}/submit-review",
-            post(not_implemented),
+            post(submit_movement_review),
         )
         .route("/v1/movements/corrections", post(not_implemented))
         .route(
@@ -920,8 +920,19 @@ async fn asset_allocation(
 async fn movements(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
-    envelope(state.ledger.movements(DevScenario::from_query(&query)))
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_movements(path) {
+            Ok(movements) => envelope(movements).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(state.ledger.movements(DevScenario::from_query(&query))).into_response()
 }
 
 async fn movement_detail(
@@ -929,6 +940,21 @@ async fn movement_detail(
     Path(movement_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::get_movement(path, &movement_id) {
+            Ok(Some(movement)) => envelope(movement).into_response(),
+            Ok(None) => not_found(
+                "movement_not_found",
+                "Movement does not exist in local ledger.",
+            ),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
     match state
         .ledger
         .movement(DevScenario::from_query(&query), &movement_id)
@@ -938,6 +964,38 @@ async fn movement_detail(
             "movement_not_found",
             "Movement does not exist in this dev scenario.",
         ),
+    }
+}
+
+async fn create_movement_draft(
+    State(state): State<AppState>,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    let now = current_timestamp();
+    let movement_id = next_local_movement_id();
+    let atomic_group_id = next_local_atomic_group_id();
+
+    match local_ledger::create_movement_draft(path, input, &movement_id, &atomic_group_id, &now) {
+        Ok(movement) => (StatusCode::CREATED, envelope(movement)).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_movement_draft_input"),
+    }
+}
+
+async fn submit_movement_review(
+    State(state): State<AppState>,
+    Path(movement_id): Path<String>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::submit_movement_review(path, &movement_id, &current_timestamp()) {
+        Ok(group) => envelope(group).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_movement_review_submit"),
     }
 }
 
@@ -1012,6 +1070,17 @@ async fn confirm_atomic_group(
     State(state): State<AppState>,
     Path(atomic_group_id): Path<String>,
 ) -> Response {
+    if let Some(path) = state.local_ledger_path.as_ref() {
+        return match local_ledger::confirm_atomic_group(
+            path,
+            &atomic_group_id,
+            &current_timestamp(),
+        ) {
+            Ok(result) => envelope(result).into_response(),
+            Err(error) => local_ledger_error(error, "invalid_atomic_group_confirm"),
+        };
+    }
+
     match state.ledger.approve_atomic_group(&atomic_group_id) {
         Some(result) => envelope(result).into_response(),
         None => not_found(
@@ -1025,6 +1094,14 @@ async fn reject_atomic_group(
     State(state): State<AppState>,
     Path(atomic_group_id): Path<String>,
 ) -> Response {
+    if let Some(path) = state.local_ledger_path.as_ref() {
+        return match local_ledger::reject_atomic_group(path, &atomic_group_id, &current_timestamp())
+        {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => local_ledger_error(error, "invalid_atomic_group_reject"),
+        };
+    }
+
     if state.ledger.reject_atomic_group(&atomic_group_id) {
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -1189,11 +1266,23 @@ fn current_timestamp() -> String {
 }
 
 fn next_local_account_id() -> String {
+    next_local_id("acct_local")
+}
+
+fn next_local_movement_id() -> String {
+    next_local_id("mov_local")
+}
+
+fn next_local_atomic_group_id() -> String {
+    next_local_id("ag_local")
+}
+
+fn next_local_id(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
-    format!("acct_local_{nanos}")
+    format!("{prefix}_{nanos}")
 }
 
 fn example_json(raw: &str) -> Json<Value> {
@@ -1987,6 +2076,167 @@ mod tests {
             request_json_from(router, Method::GET, "/v1/quotes/summary").await;
         assert_eq!(quote_status, StatusCode::OK);
         assert_eq!(quote_body["data"]["unpriceableCount"], 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_movement_draft_review_and_confirm_updates_balances() {
+        let path = unique_test_ledger_path("movement_confirm");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let create_account_input = json!({
+            "displayName": "招行卡",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "100.00"}
+            ]
+        });
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            create_account_input,
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id should be a string")
+            .to_string();
+
+        let draft_input = json!({
+            "type": "expense",
+            "occurredAt": "2026-06-26T10:00:00+08:00",
+            "title": "瑞幸咖啡",
+            "entries": [
+                {
+                    "accountId": account_id,
+                    "amount": "18.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }
+            ],
+            "amountBreakdown": {
+                "grossAmount": {"amount": "28.00", "currency": "CNY"},
+                "savingsAmount": {"amount": "10.00", "currency": "CNY"},
+                "paidAmount": {"amount": "18.00", "currency": "CNY"},
+                "benefitSource": "merchant_discount"
+            },
+            "tags": ["coffee"]
+        });
+        let (draft_status, draft_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            draft_input,
+        )
+        .await;
+        assert_eq!(draft_status, StatusCode::CREATED);
+        assert_eq!(draft_body["data"]["status"], "draft");
+        assert_eq!(draft_body["data"]["displayAmount"]["amount"], "18.00");
+        let movement_id = draft_body["data"]["id"]
+            .as_str()
+            .expect("movement id should be a string")
+            .to_string();
+        let atomic_group_id = draft_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("atomic group id should be a string")
+            .to_string();
+
+        let (overview_before_status, overview_before_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_before_status, StatusCode::OK);
+        assert_eq!(
+            overview_before_body["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "100.00"
+        );
+
+        let (submit_status, submit_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/movements/{movement_id}/submit-review"),
+        )
+        .await;
+        assert_eq!(submit_status, StatusCode::OK);
+        assert_eq!(submit_body["data"]["id"], atomic_group_id);
+        assert_eq!(submit_body["data"]["status"], "pending");
+        assert_eq!(
+            submit_body["data"]["proposedMovements"][0]["status"],
+            "pending_review"
+        );
+
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{atomic_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK);
+        assert_eq!(confirm_body["data"]["ledgerWrite"], true);
+        assert_eq!(confirm_body["data"]["confirmedMovementIds"][0], movement_id);
+
+        let (account_after_status, account_after_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(account_after_status, StatusCode::OK);
+        assert_eq!(account_after_body["data"]["value"]["amount"], "82.00");
+
+        let (movement_after_status, movement_after_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/movements/{movement_id}"),
+        )
+        .await;
+        assert_eq!(movement_after_status, StatusCode::OK);
+        assert_eq!(movement_after_body["data"]["status"], "confirmed");
+
+        let persisted = local_ledger::read_document(&path).expect("ledger should persist movement");
+        assert_eq!(
+            persisted["movementEntries"][0]["movementId"],
+            movement_after_body["data"]["id"]
+        );
+        assert_eq!(
+            persisted["accounts"][0]["cashBalances"][0]["amount"],
+            "82.00"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_movement_draft_rejects_unknown_account() {
+        let path = unique_test_ledger_path("movement_invalid_account");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let draft_input = json!({
+            "type": "expense",
+            "occurredAt": "2026-06-26T10:00:00+08:00",
+            "title": "不存在账户消费",
+            "entries": [
+                {
+                    "accountId": "acct_missing",
+                    "amount": "18.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }
+            ]
+        });
+        let (status, body) =
+            request_json_body_from(router, Method::POST, "/v1/movements/drafts", draft_input).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_movement_draft_input");
 
         let _ = std::fs::remove_file(path);
     }
