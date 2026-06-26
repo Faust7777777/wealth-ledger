@@ -25,6 +25,9 @@ abstract interface class PortfolioRepository {
 abstract interface class MovementRepository {
   Future<List<MovementVm>> listRecentMovements({int limit = 20});
   Future<MovementVm?> getMovement(Id id);
+  /// 手动记账：草稿 → 提交复核 → 确认入账（候选→确认，全程用户主动发起）。
+  /// 仅 local_server 真实账本；real_local / DEMO 不支持。
+  Future<MovementVm> createManualRecord(ManualRecordInput input);
 }
 
 abstract interface class DcaRepository {

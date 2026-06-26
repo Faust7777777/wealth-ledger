@@ -113,6 +113,20 @@ String _acctTypeWire(AccountType t) => switch (t) {
       AccountType.cash => 'cash',
       AccountType.other => 'other',
     };
+String _movementTypeWire(MovementType t) => switch (t) {
+      MovementType.income => 'income',
+      MovementType.expense => 'expense',
+      MovementType.transfer => 'transfer',
+      MovementType.buy => 'buy',
+      MovementType.sell => 'sell',
+      MovementType.dividend => 'dividend',
+      MovementType.interest => 'interest',
+      MovementType.fee => 'fee',
+      MovementType.adjustment => 'adjustment',
+      MovementType.loanDisbursement => 'loan_disbursement',
+      MovementType.loanRepayment => 'loan_repayment',
+      MovementType.correction => 'correction',
+    };
 MovementType _movType(Object? s) => switch (s) {
       'income' => MovementType.income,
       'expense' => MovementType.expense,
@@ -488,6 +502,35 @@ class LocalServerMovementRepository implements MovementRepository {
   Future<MovementVm?> getMovement(Id id) async {
     final d = await _c.getData('/v1/movements/$id');
     return d == null ? null : _movement(_m(d));
+  }
+
+  @override
+  Future<MovementVm> createManualRecord(ManualRecordInput input) async {
+    final isIncome = input.type == MovementType.income;
+    final draft = _m(await _c.postData('/v1/movements/drafts', body: {
+      'type': _movementTypeWire(input.type),
+      'occurredAt':
+          input.occurredAt ?? DateTime.now().toUtc().toIso8601String(),
+      'title': input.title,
+      if (input.description != null && input.description!.isNotEmpty)
+        'description': input.description,
+      'entries': [
+        {
+          'accountId': input.accountId,
+          'amount': input.amount,
+          'currency': input.currency,
+          'direction': isIncome ? 'in' : 'out',
+          'role': 'source',
+        },
+      ],
+    }));
+    final movementId = '${draft['id']}';
+    final groupId = '${draft['atomicGroupId']}';
+    // 候选 → 确认：提交复核后确认入账（均为用户主动发起的合法写路径）。
+    await _c.postData('/v1/movements/$movementId/submit-review');
+    await _c.postData('/v1/atomic-groups/$groupId/confirm');
+    final confirmed = await _c.getData('/v1/movements/$movementId');
+    return _movement(confirmed == null ? draft : _m(confirmed));
   }
 }
 

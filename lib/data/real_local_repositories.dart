@@ -52,6 +52,9 @@ class RealLocalMovementRepository implements MovementRepository {
   Future<List<MovementVm>> listRecentMovements({int limit = 20}) async => const [];
   @override
   Future<MovementVm?> getMovement(Id id) async => null;
+  @override
+  Future<MovementVm> createManualRecord(ManualRecordInput input) async =>
+      throw UnsupportedError('real_local 暂不支持手动记账；请用 local_server');
 }
 
 class RealLocalDcaRepository implements DcaRepository {

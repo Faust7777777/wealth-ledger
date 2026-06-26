@@ -118,6 +118,26 @@ class CreateAccountInput {
   final String? institutionName;
 }
 
+/// 手动记账输入（income/expense 单分录 MVP）。direction/role 由仓库按 type 推导。
+class ManualRecordInput {
+  const ManualRecordInput({
+    required this.type,
+    required this.accountId,
+    required this.amount,
+    required this.currency,
+    required this.title,
+    this.description,
+    this.occurredAt,
+  });
+  final MovementType type; // income | expense（单分录）
+  final Id accountId;
+  final DecimalString amount; // 正数 decimal 字符串
+  final CurrencyCode currency;
+  final String title;
+  final String? description;
+  final IsoDateTime? occurredAt; // null → 仓库用当前时间
+}
+
 class HoldingVm {
   const HoldingVm({
     required this.id,

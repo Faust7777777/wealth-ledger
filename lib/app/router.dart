@@ -14,6 +14,7 @@ import '../features/ai_review_page.dart';
 import '../features/anomalies_page.dart';
 import '../features/investment_page.dart';
 import '../features/liabilities_page.dart';
+import '../features/manual_record_page.dart';
 import '../features/movement_detail_page.dart';
 import '../features/overview_page.dart';
 import '../features/settings_page.dart';
@@ -52,6 +53,7 @@ final appRouter = GoRouter(
       path: '/account/:id/edit',
       builder: (c, s) => AccountFormPage(existing: s.extra as AccountVm?),
     ),
+    GoRoute(path: '/record/manual', builder: (c, s) => const ManualRecordPage()),
     GoRoute(path: '/anomalies', builder: (c, s) => const AnomaliesPage()),
     GoRoute(path: '/snapshots', builder: (c, s) => const SnapshotsPage()),
     GoRoute(path: '/settings', builder: (c, s) => const SettingsPage()),

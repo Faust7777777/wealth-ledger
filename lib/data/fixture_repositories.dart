@@ -279,6 +279,9 @@ class FixtureMovementRepository implements MovementRepository {
   @override
   Future<MovementVm?> getMovement(Id id) async =>
       _movements.where((m) => m.id == id).cast<MovementVm?>().firstWhere((m) => true, orElse: () => null);
+  @override
+  Future<MovementVm> createManualRecord(ManualRecordInput input) async =>
+      throw UnsupportedError('DEMO 演示只读，不支持手动记账；请用 local_server');
 }
 
 class FixtureDcaRepository implements DcaRepository {
