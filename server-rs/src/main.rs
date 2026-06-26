@@ -613,7 +613,7 @@ fn app_with_state(state: AppState) -> Router {
             "/v1/movements/{movement_id}/submit-review",
             post(submit_movement_review),
         )
-        .route("/v1/movements/corrections", post(not_implemented))
+        .route("/v1/movements/corrections", post(create_correction))
         .route(
             "/v1/atomic-groups/{atomic_group_id}/confirm",
             post(confirm_atomic_group),
@@ -1028,6 +1028,27 @@ async fn submit_movement_review(
     match local_ledger::submit_movement_review(path, &movement_id, &current_timestamp()) {
         Ok(group) => envelope(group).into_response(),
         Err(error) => local_ledger_error(error, "invalid_movement_review_submit"),
+    }
+}
+
+async fn create_correction(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    let now = current_timestamp();
+    let movement_id = next_local_movement_id();
+    let atomic_group_id = next_local_atomic_group_id();
+
+    match local_ledger::create_correction_proposal(
+        path,
+        input,
+        &movement_id,
+        &atomic_group_id,
+        &now,
+    ) {
+        Ok(group) => envelope(group).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_correction_input"),
     }
 }
 
@@ -3011,6 +3032,148 @@ mod tests {
         let persisted = local_ledger::read_document(&path).expect("ledger should persist taxonomy");
         assert_eq!(persisted["categories"][0]["displayName"], "咖啡饮品");
         assert_eq!(persisted["counterparties"][0]["isUserMerged"], true);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_correction_proposal_adds_adjustment_without_rewriting_original() {
+        let path = unique_test_ledger_path("correction");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let account_input = json!({
+            "displayName": "消费账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "100.00"}
+            ]
+        });
+        let (account_status, account_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", account_input)
+                .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id should be string")
+            .to_string();
+
+        let draft_input = json!({
+            "type": "expense",
+            "occurredAt": "2026-06-26T12:00:00+08:00",
+            "title": "午餐",
+            "entries": [
+                {
+                    "accountId": account_id,
+                    "amount": "20.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }
+            ],
+            "amountBreakdown": {
+                "paidAmount": {"amount": "20.00", "currency": "CNY"}
+            }
+        });
+        let (draft_status, draft_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            draft_input,
+        )
+        .await;
+        assert_eq!(draft_status, StatusCode::CREATED);
+        let original_movement_id = draft_body["data"]["id"]
+            .as_str()
+            .expect("movement id should be string")
+            .to_string();
+        let original_group_id = draft_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("atomic group id should be string")
+            .to_string();
+        let (confirm_original_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{original_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_original_status, StatusCode::OK);
+
+        let correction_input = json!({
+            "targetMovementId": original_movement_id,
+            "reason": "实际支付是 18 元",
+            "proposedDiffs": [
+                {
+                    "fieldPath": "amountBreakdown.paidAmount.amount",
+                    "oldValue": "20.00",
+                    "newValue": "18.00",
+                    "severity": "danger",
+                    "reason": "用户复核账单"
+                }
+            ]
+        });
+        let (correction_status, correction_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            correction_input,
+        )
+        .await;
+        assert_eq!(correction_status, StatusCode::OK);
+        assert_eq!(correction_body["data"]["operation"], "correction");
+        assert_eq!(
+            correction_body["data"]["proposedMovements"][0]["entries"][0]["direction"],
+            "in"
+        );
+        assert_eq!(
+            correction_body["data"]["proposedMovements"][0]["entries"][0]["amount"],
+            "2.00"
+        );
+        let correction_group_id = correction_body["data"]["id"]
+            .as_str()
+            .expect("correction group id should be string")
+            .to_string();
+
+        let (confirm_correction_status, confirm_correction_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{correction_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_correction_status, StatusCode::OK);
+        assert_eq!(confirm_correction_body["data"]["ledgerWrite"], true);
+
+        let (account_after_status, account_after_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(account_after_status, StatusCode::OK);
+        assert_eq!(account_after_body["data"]["value"]["amount"], "82.00");
+
+        let (original_status, original_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/movements/{original_movement_id}"),
+        )
+        .await;
+        assert_eq!(original_status, StatusCode::OK);
+        assert_eq!(original_body["data"]["status"], "confirmed");
+        assert_eq!(original_body["data"]["entries"][0]["amount"], "20.00");
+
+        let persisted =
+            local_ledger::read_document(&path).expect("ledger should persist correction");
+        assert_eq!(
+            persisted["movements"].as_array().expect("movements").len(),
+            2
+        );
+        assert_eq!(persisted["movements"][1]["type"], "correction");
+        assert_eq!(persisted["movements"][1]["status"], "confirmed");
 
         let _ = std::fs::remove_file(path);
     }

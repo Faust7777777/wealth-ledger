@@ -234,6 +234,114 @@ pub fn create_movement_draft(
     Ok(project_movement_for_api(&movement))
 }
 
+pub fn create_correction_proposal(
+    path: &Path,
+    input: Value,
+    movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "correction input must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut errors = Vec::new();
+    let target_movement_id = required_string(object, "targetMovementId", &mut errors);
+    let reason = required_string(object, "reason", &mut errors);
+    let proposed_diffs = object
+        .get("proposedDiffs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    let target_movement_id = target_movement_id.expect("validated correction targetMovementId");
+    let reason = reason.expect("validated correction reason");
+    let target = document["movements"]
+        .as_array()
+        .expect("validated local ledger movements should be an array")
+        .iter()
+        .find(|movement| {
+            movement.get("id").and_then(Value::as_str) == Some(target_movement_id.as_str())
+        })
+        .cloned()
+        .ok_or_else(|| {
+            LedgerError::NotFound(format!(
+                "target movement does not exist: {target_movement_id}"
+            ))
+        })?;
+
+    if target.get("status").and_then(Value::as_str) != Some("confirmed")
+        && target.get("status").and_then(Value::as_str) != Some("in_transit")
+    {
+        return Err(LedgerError::Conflict(format!(
+            "target movement must be confirmed before correction: {target_movement_id}"
+        )));
+    }
+
+    let correction_entry = correction_entry_from_diffs(&target, &proposed_diffs, movement_id)?;
+    let target_title = target
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or(target_movement_id.as_str());
+    let movement = json!({
+        "id": movement_id,
+        "atomicGroupId": atomic_group_id,
+        "type": "correction",
+        "occurredAt": now,
+        "recordedAt": now,
+        "status": "pending_review",
+        "title": format!("更正：{target_title}"),
+        "description": reason,
+        "entries": [correction_entry],
+        "tags": ["correction"],
+        "source": {
+            "kind": "manual",
+            "sourceId": target_movement_id,
+            "createdBy": "user"
+        },
+        "createdAt": now,
+        "updatedAt": now
+    });
+
+    document["movements"]
+        .as_array_mut()
+        .expect("validated local ledger movements should be an array")
+        .push(movement.clone());
+    if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
+        let movement_entries = document["movementEntries"]
+            .as_array_mut()
+            .expect("validated local ledger movementEntries should be an array");
+        for entry in entries {
+            let mut indexed_entry = entry.clone();
+            indexed_entry["movementId"] = json!(movement_id);
+            indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+            movement_entries.push(indexed_entry);
+        }
+    }
+
+    let mut group = atomic_group_from_movement(&movement, "pending");
+    group["operation"] = json!("correction");
+    group["targetId"] = json!(target_movement_id);
+    group["diffs"] = json!(proposed_diffs);
+    group["warnings"] = json!([
+        {
+            "code": "confirmed_movement_not_modified",
+            "message": "该更正不会改写原 confirmed 记录，只会在确认后新增 correction movement。",
+            "severity": "info"
+        }
+    ]);
+
+    write_document(path, &document)?;
+    Ok(group)
+}
+
 pub fn submit_movement_review(
     path: &Path,
     movement_id: &str,
@@ -1586,6 +1694,114 @@ fn movement_from_create_input(
     }
 
     Ok(movement)
+}
+
+fn correction_entry_from_diffs(
+    target: &Value,
+    diffs: &[Value],
+    movement_id: &str,
+) -> Result<Value, LedgerError> {
+    if diffs.is_empty() {
+        return Err(LedgerError::InvalidInput(vec![
+            "proposedDiffs must contain one amount diff for correction MVP".to_string(),
+        ]));
+    }
+
+    let mut amount_delta: Option<DecimalAmount> = None;
+    for diff in diffs {
+        let field_path = diff.get("fieldPath").and_then(Value::as_str).unwrap_or("");
+        if !field_path.to_ascii_lowercase().contains("amount") {
+            return Err(LedgerError::InvalidInput(vec![format!(
+                "unsupported correction diff fieldPath: {field_path}"
+            )]));
+        }
+        let old_value = diff_value_as_decimal(diff.get("oldValue")).ok_or_else(|| {
+            LedgerError::InvalidInput(vec![format!(
+                "unsupported correction oldValue for fieldPath: {field_path}"
+            )])
+        })?;
+        let new_value = diff_value_as_decimal(diff.get("newValue")).ok_or_else(|| {
+            LedgerError::InvalidInput(vec![format!(
+                "unsupported correction newValue for fieldPath: {field_path}"
+            )])
+        })?;
+        amount_delta = Some(amount_delta.unwrap_or(DecimalAmount::ZERO) + (new_value - old_value));
+    }
+
+    let delta = amount_delta.unwrap_or(DecimalAmount::ZERO);
+    if delta == DecimalAmount::ZERO {
+        return Err(LedgerError::InvalidInput(vec![
+            "correction amount delta must not be zero".to_string(),
+        ]));
+    }
+
+    let base_entry = target
+        .get("entries")
+        .and_then(Value::as_array)
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.get("role").and_then(Value::as_str) == Some("source"))
+                .or_else(|| entries.first())
+        })
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "target movement must have at least one entry for correction".to_string(),
+            ])
+        })?;
+    let account_id = base_entry
+        .get("accountId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "target movement entry.accountId is required".to_string(),
+            ])
+        })?;
+    let currency = base_entry
+        .get("currency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "target movement entry.currency is required".to_string(),
+            ])
+        })?;
+    let direction = match (
+        base_entry.get("direction").and_then(Value::as_str),
+        delta > DecimalAmount::ZERO,
+    ) {
+        (Some("out"), true) | (Some("in"), false) => "out",
+        (Some("out"), false) | (Some("in"), true) => "in",
+        _ => {
+            return Err(LedgerError::InvalidInput(vec![
+                "target movement entry.direction must be in or out".to_string(),
+            ]));
+        }
+    };
+
+    let mut entry = json!({
+        "id": format!("entry_{movement_id}_correction"),
+        "accountId": account_id,
+        "amount": money_amount(delta.abs()),
+        "currency": currency,
+        "direction": direction,
+        "role": "adjustment"
+    });
+    if let Some(instrument_id) = base_entry.get("instrumentId").and_then(Value::as_str) {
+        entry["instrumentId"] = json!(instrument_id);
+    }
+    Ok(entry)
+}
+
+fn diff_value_as_decimal(value: Option<&Value>) -> Option<DecimalAmount> {
+    match value? {
+        Value::String(value) => parse_decimal(value).ok(),
+        Value::Number(value) => parse_decimal(&value.to_string()).ok(),
+        Value::Object(object) => object
+            .get("amount")
+            .and_then(Value::as_str)
+            .and_then(|amount| parse_decimal(amount).ok()),
+        _ => None,
+    }
 }
 
 fn dca_plan_from_create_input(
