@@ -9,7 +9,7 @@ import '../theme/app_dimens.dart';
 String _modeLabel(DataSourceMode m) => switch (m) {
       DataSourceMode.realLocal => '真实本地账本（默认；当前为空账本）',
       DataSourceMode.debugFixture => 'DEMO 演示数据（隔离；不写真实账本、不同步）',
-      DataSourceMode.apiMock => '本地 dev/mock server（联调；MOCK 非真实数据）',
+      DataSourceMode.localServer => '本地 Rust 服务（dev/local server；可连 --ledger-path 真实账本）',
       DataSourceMode.apiRemote => '远端 API（未接入）',
     };
 
@@ -44,7 +44,7 @@ class SettingsPage extends ConsumerWidget {
             contentPadding: EdgeInsets.zero,
             title: const Text('数据源'),
             subtitle: Text(_modeLabel(env.dataSourceMode)),
-            trailing: env.isDemo ? const Chip(label: Text('DEMO')) : null,
+            trailing: env.devBannerLabel == null ? null : Chip(label: Text(env.devBannerLabel!)),
           ),
           const Divider(),
           const ListTile(

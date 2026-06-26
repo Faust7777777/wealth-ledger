@@ -1,5 +1,6 @@
-// Wealth Ledger — api_mock 仓库：读取本地 dev / mock server 的 /v1 接口（仅本地联调）。
-// 仅在 DATA_SOURCE=api_mock 时启用，绝非默认；写路径只生成 proposal；禁用端点以 403 呈现。
+// Wealth Ledger — local_server 仓库（LocalServer*）：读取本地 Rust dev/local server 的 /v1 接口。
+// 仅在 DATA_SOURCE=local_server（别名 dev_server / api_mock）时启用，绝非默认；可连 --ledger-path 真实账本；
+// 写路径只生成 proposal；禁用端点以 403 呈现。（文件名暂留 api_mock_repositories.dart 以免动测试导入。）
 // 形状对齐 docs/contracts（DATA_SCHEMA_V1 / examples / FRONTEND_API_INTEGRATION_HANDOFF_V1）。
 import 'dart:convert';
 
@@ -395,8 +396,8 @@ AssetAllocationVm parseAssetAllocationData(Map<String, dynamic> j) => AssetAlloc
     );
 
 // ———— 仓库实现 ————
-class ApiMockAccountRepository implements AccountRepository {
-  ApiMockAccountRepository(this._c);
+class LocalServerAccountRepository implements AccountRepository {
+  LocalServerAccountRepository(this._c);
   final DevApiClient _c;
   @override
   Future<List<AccountVm>> listAccounts() async =>
@@ -411,8 +412,8 @@ class ApiMockAccountRepository implements AccountRepository {
       [for (final a in _list(await _c.getData('/v1/accounts/anomalies'))) _anomaly(_m(a))];
 }
 
-class ApiMockPortfolioRepository implements PortfolioRepository {
-  ApiMockPortfolioRepository(this._c);
+class LocalServerPortfolioRepository implements PortfolioRepository {
+  LocalServerPortfolioRepository(this._c);
   final DevApiClient _c;
   @override
   Future<PortfolioOverviewVm> getOverview() async =>
@@ -428,8 +429,8 @@ class ApiMockPortfolioRepository implements PortfolioRepository {
       parseAssetAllocationData(_m(await _c.getData('/v1/portfolio/allocation')));
 }
 
-class ApiMockMovementRepository implements MovementRepository {
-  ApiMockMovementRepository(this._c);
+class LocalServerMovementRepository implements MovementRepository {
+  LocalServerMovementRepository(this._c);
   final DevApiClient _c;
   @override
   Future<List<MovementVm>> listRecentMovements({int limit = 20}) async =>
@@ -441,8 +442,8 @@ class ApiMockMovementRepository implements MovementRepository {
   }
 }
 
-class ApiMockDcaRepository implements DcaRepository {
-  ApiMockDcaRepository(this._c);
+class LocalServerDcaRepository implements DcaRepository {
+  LocalServerDcaRepository(this._c);
   final DevApiClient _c;
   @override
   Future<List<DcaReminderVm>> listDueReminders() async =>
@@ -456,16 +457,16 @@ class ApiMockDcaRepository implements DcaRepository {
   }
 }
 
-class ApiMockQuoteRepository implements QuoteRepository {
-  ApiMockQuoteRepository(this._c);
+class LocalServerQuoteRepository implements QuoteRepository {
+  LocalServerQuoteRepository(this._c);
   final DevApiClient _c;
   @override
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       _quoteSummary(_m(await _c.getData('/v1/quotes/summary')));
 }
 
-class ApiMockAiProposalRepository implements AiProposalRepository {
-  ApiMockAiProposalRepository(this._c);
+class LocalServerAiProposalRepository implements AiProposalRepository {
+  LocalServerAiProposalRepository(this._c);
   final DevApiClient _c;
   @override
   Future<List<AiProposalVm>> listPending() async =>
@@ -490,8 +491,8 @@ class ApiMockAiProposalRepository implements AiProposalRepository {
   }
 }
 
-class ApiMockSnapshotRepository implements SnapshotRepository {
-  ApiMockSnapshotRepository(this._c);
+class LocalServerSnapshotRepository implements SnapshotRepository {
+  LocalServerSnapshotRepository(this._c);
   final DevApiClient _c;
   @override
   Future<List<NetWorthSnapshotVm>> listSnapshots() async =>

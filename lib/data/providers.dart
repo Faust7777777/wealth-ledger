@@ -25,52 +25,52 @@ T _pick<T>(
 }) =>
     switch (_mode(ref)) {
       DataSourceMode.debugFixture => fixture(),
-      DataSourceMode.apiMock => api(),
+      DataSourceMode.localServer => api(),
       _ => real(),
     };
 
-// —— 仓库 provider（按 mode 选实现：real_local / debug_fixture / api_mock）——
+// —— 仓库 provider（按 mode 选实现：real_local / debug_fixture / local_server）——
 final accountRepositoryProvider = Provider<AccountRepository>((ref) => _pick(
       ref,
       real: () => const RealLocalAccountRepository(),
       fixture: () => const FixtureAccountRepository(),
-      api: () => ApiMockAccountRepository(ref.watch(devApiClientProvider)),
+      api: () => LocalServerAccountRepository(ref.watch(devApiClientProvider)),
     ));
 final portfolioRepositoryProvider = Provider<PortfolioRepository>((ref) => _pick(
       ref,
       real: () => const RealLocalPortfolioRepository(),
       fixture: () => const FixturePortfolioRepository(),
-      api: () => ApiMockPortfolioRepository(ref.watch(devApiClientProvider)),
+      api: () => LocalServerPortfolioRepository(ref.watch(devApiClientProvider)),
     ));
 final movementRepositoryProvider = Provider<MovementRepository>((ref) => _pick(
       ref,
       real: () => const RealLocalMovementRepository(),
       fixture: () => const FixtureMovementRepository(),
-      api: () => ApiMockMovementRepository(ref.watch(devApiClientProvider)),
+      api: () => LocalServerMovementRepository(ref.watch(devApiClientProvider)),
     ));
 final dcaRepositoryProvider = Provider<DcaRepository>((ref) => _pick(
       ref,
       real: () => const RealLocalDcaRepository(),
       fixture: () => const FixtureDcaRepository(),
-      api: () => ApiMockDcaRepository(ref.watch(devApiClientProvider)),
+      api: () => LocalServerDcaRepository(ref.watch(devApiClientProvider)),
     ));
 final quoteRepositoryProvider = Provider<QuoteRepository>((ref) => _pick(
       ref,
       real: () => const RealLocalQuoteRepository(),
       fixture: () => const FixtureQuoteRepository(),
-      api: () => ApiMockQuoteRepository(ref.watch(devApiClientProvider)),
+      api: () => LocalServerQuoteRepository(ref.watch(devApiClientProvider)),
     ));
 final aiProposalRepositoryProvider = Provider<AiProposalRepository>((ref) => _pick(
       ref,
       real: () => const RealLocalAiProposalRepository(),
       fixture: () => const FixtureAiProposalRepository(),
-      api: () => ApiMockAiProposalRepository(ref.watch(devApiClientProvider)),
+      api: () => LocalServerAiProposalRepository(ref.watch(devApiClientProvider)),
     ));
 final snapshotRepositoryProvider = Provider<SnapshotRepository>((ref) => _pick(
       ref,
       real: () => const RealLocalSnapshotRepository(),
       fixture: () => const FixtureSnapshotRepository(),
-      api: () => ApiMockSnapshotRepository(ref.watch(devApiClientProvider)),
+      api: () => LocalServerSnapshotRepository(ref.watch(devApiClientProvider)),
     ));
 
 // —— 功能数据 provider ——
