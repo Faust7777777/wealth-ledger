@@ -108,6 +108,7 @@ class _GroupBlock extends ConsumerWidget {
                   ref,
                   () => ref.read(aiProposalRepositoryProvider).rejectAtomicGroup(g.id),
                   '已拒绝该组',
+                  writesLedger: false,
                 ),
                 child: const Text('拒绝整组'),
               ),
@@ -125,6 +126,7 @@ class _GroupBlock extends ConsumerWidget {
                   ref,
                   () => ref.read(aiProposalRepositoryProvider).approveAtomicGroup(g.id),
                   '已接受该组',
+                  writesLedger: true,
                 ),
                 child: const Text('接受整组'),
               ),
@@ -139,13 +141,24 @@ class _GroupBlock extends ConsumerWidget {
     BuildContext context,
     WidgetRef ref,
     Future<void> Function() op,
-    String okMsg,
-  ) async {
+    String okMsg, {
+    required bool writesLedger,
+  }) async {
     final messenger = ScaffoldMessenger.of(context);
     try {
       await op();
       ref.invalidate(aiPendingProvider);
-      messenger.showSnackBar(SnackBar(content: Text('$okMsg（候选，未写正式账本）')));
+      if (writesLedger) {
+        // 接受 = confirm：已写入正式账本，刷新所有账本派生视图。
+        ref.invalidate(overviewProvider);
+        ref.invalidate(accountsProvider);
+        ref.invalidate(recentMovementsProvider);
+        ref.invalidate(allocationProvider);
+        ref.invalidate(snapshotsProvider);
+      }
+      messenger.showSnackBar(
+        SnackBar(content: Text(writesLedger ? '$okMsg · 已入账' : '$okMsg（未写账本）')),
+      );
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
     }
