@@ -2,6 +2,7 @@
 // 只读、fixture 驱动；与投资页（资产视角）是同一份 holding 数据的两种投影。
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../core/format.dart';
 import '../data/providers.dart';
@@ -20,11 +21,18 @@ class AccountDetailPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final accountAsync = ref.watch(accountByIdProvider(accountId));
     final holdingsAsync = ref.watch(holdingsByAccountProvider(accountId));
+    final acct = accountAsync.asData?.value;
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(accountAsync.asData?.value?.displayName ?? '账户详情'),
+        title: Text(acct?.displayName ?? '账户详情'),
         actions: [
+          if (acct != null)
+            IconButton(
+              tooltip: '编辑',
+              icon: const Icon(Icons.edit_outlined),
+              onPressed: () => context.push('/account/${acct.id}/edit', extra: acct),
+            ),
           IconButton(
             tooltip: '归档',
             icon: const Icon(Icons.archive_outlined),

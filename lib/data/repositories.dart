@@ -11,6 +11,7 @@ abstract interface class AccountRepository {
   Future<List<AccountAnomalyVm>> listAnomalies();
   // 写路径（仅 local_server 真实账本；real_local / DEMO 不支持）。
   Future<AccountVm> createAccount(CreateAccountInput input);
+  Future<AccountVm> updateAccount(Id id, CreateAccountInput input);
   Future<void> archiveAccount(Id id);
 }
 

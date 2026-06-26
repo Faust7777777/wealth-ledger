@@ -1,4 +1,4 @@
-// Wealth Ledger — 新建账户表单（写真实账本，仅 local_server）。
+// Wealth Ledger — 账户表单（新建 / 编辑；写真实账本，仅 local_server）。
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -17,7 +17,11 @@ const Map<String, String> _balanceModes = {
 };
 
 class AccountFormPage extends ConsumerStatefulWidget {
-  const AccountFormPage({super.key});
+  const AccountFormPage({super.key, this.existing});
+
+  /// 非 null → 编辑模式（PATCH）；null → 新建模式（POST）。
+  final AccountVm? existing;
+
   @override
   ConsumerState<AccountFormPage> createState() => _AccountFormPageState();
 }
@@ -30,6 +34,22 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
   String _balanceMode = 'cash_balance';
   bool _includeInNetWorth = true;
   bool _busy = false;
+
+  bool get _isEdit => widget.existing != null;
+
+  @override
+  void initState() {
+    super.initState();
+    final e = widget.existing;
+    if (e != null) {
+      _name.text = e.displayName;
+      _institution.text = e.institutionName ?? '';
+      _type = e.accountType;
+      _currency = e.defaultCurrency;
+      _balanceMode = e.balanceMode;
+      _includeInNetWorth = e.includeInNetWorth;
+    }
+  }
 
   @override
   void dispose() {
@@ -44,21 +64,29 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
     setState(() => _busy = true);
     final messenger = ScaffoldMessenger.of(context);
     final router = GoRouter.of(context);
+    final repo = ref.read(accountRepositoryProvider);
+    final input = CreateAccountInput(
+      displayName: name,
+      accountType: _type,
+      defaultCurrency: _currency,
+      balanceMode: _balanceMode,
+      includeInNetWorth: _includeInNetWorth,
+      institutionName:
+          _institution.text.trim().isEmpty ? null : _institution.text.trim(),
+    );
     try {
-      await ref.read(accountRepositoryProvider).createAccount(
-            CreateAccountInput(
-              displayName: name,
-              accountType: _type,
-              defaultCurrency: _currency,
-              balanceMode: _balanceMode,
-              includeInNetWorth: _includeInNetWorth,
-              institutionName:
-                  _institution.text.trim().isEmpty ? null : _institution.text.trim(),
-            ),
-          );
+      if (_isEdit) {
+        await repo.updateAccount(widget.existing!.id, input);
+        ref.invalidate(accountByIdProvider(widget.existing!.id));
+      } else {
+        await repo.createAccount(input);
+      }
       ref.invalidate(accountsProvider);
       ref.invalidate(overviewProvider);
-      messenger.showSnackBar(const SnackBar(content: Text('账户已创建')));
+      ref.invalidate(liabilitiesProvider);
+      messenger.showSnackBar(
+        SnackBar(content: Text(_isEdit ? '账户已更新' : '账户已创建')),
+      );
       if (mounted) router.pop();
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
@@ -69,8 +97,13 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
 
   @override
   Widget build(BuildContext context) {
+    // 若账户现有币种不在预设列表（历史数据），补进去避免 Dropdown 断言。
+    final currencyItems = [
+      ..._currencies,
+      if (!_currencies.contains(_currency)) _currency,
+    ];
     return Scaffold(
-      appBar: AppBar(title: const Text('新建账户')),
+      appBar: AppBar(title: Text(_isEdit ? '编辑账户' : '新建账户')),
       body: ListView(
         padding: const EdgeInsets.all(AppSpacing.base),
         children: [
@@ -102,7 +135,8 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
               border: OutlineInputBorder(),
             ),
             items: [
-              for (final c in _currencies) DropdownMenuItem(value: c, child: Text(c)),
+              for (final c in currencyItems)
+                DropdownMenuItem(value: c, child: Text(c)),
             ],
             onChanged: (v) => setState(() => _currency = v ?? _currency),
           ),
@@ -137,7 +171,11 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
           const SizedBox(height: AppSpacing.base),
           FilledButton(
             onPressed: _busy ? null : _save,
-            child: Text(_busy ? '创建中…' : '创建账户'),
+            child: Text(
+              _busy
+                  ? (_isEdit ? '保存中…' : '创建中…')
+                  : (_isEdit ? '保存修改' : '创建账户'),
+            ),
           ),
         ],
       ),

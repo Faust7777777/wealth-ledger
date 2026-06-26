@@ -226,6 +226,10 @@ AccountVm _account(Map<String, dynamic> j) {
     isLiability: isLiab,
     value: _valuedOrNull(j['value']),
     note: j['note'] as String?,
+    defaultCurrency: (j['defaultCurrency'] as String?) ?? 'CNY',
+    balanceMode: (j['balanceMode'] as String?) ?? 'cash_balance',
+    includeInNetWorth: j['includeInNetWorth'] as bool? ?? true,
+    institutionName: j['institutionName'] as String?,
     isArchived: j['status'] == 'archived' || j['visibility'] == 'archived',
   );
 }
@@ -437,6 +441,20 @@ class LocalServerAccountRepository implements AccountRepository {
     });
     return _account(_m(d));
   }
+  @override
+  Future<AccountVm> updateAccount(Id id, CreateAccountInput input) async {
+    final d = await _c.patchData('/v1/accounts/$id', body: {
+      'displayName': input.displayName,
+      'accountType': _acctTypeWire(input.accountType),
+      'defaultCurrency': input.defaultCurrency,
+      'supportedCurrencies': [input.defaultCurrency],
+      'includeInNetWorth': input.includeInNetWorth,
+      'balanceMode': input.balanceMode,
+      if (input.institutionName != null) 'institutionName': input.institutionName,
+    });
+    return _account(_m(d));
+  }
+
   @override
   Future<void> archiveAccount(Id id) async {
     await _c.postData('/v1/accounts/$id/archive');

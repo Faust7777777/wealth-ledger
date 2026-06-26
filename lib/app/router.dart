@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../data/providers.dart';
+import '../data/view_models.dart';
 import '../dev/tokens_preview.dart';
 import '../features/account_detail_page.dart';
 import '../features/account_form_page.dart';
@@ -46,6 +47,10 @@ final appRouter = GoRouter(
     GoRoute(
       path: '/account/:id',
       builder: (c, s) => AccountDetailPage(accountId: s.pathParameters['id']!),
+    ),
+    GoRoute(
+      path: '/account/:id/edit',
+      builder: (c, s) => AccountFormPage(existing: s.extra as AccountVm?),
     ),
     GoRoute(path: '/anomalies', builder: (c, s) => const AnomaliesPage()),
     GoRoute(path: '/snapshots', builder: (c, s) => const SnapshotsPage()),

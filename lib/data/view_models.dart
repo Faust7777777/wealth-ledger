@@ -82,6 +82,10 @@ class AccountVm {
     this.value,
     this.note,
     this.isArchived = false,
+    this.defaultCurrency = 'CNY',
+    this.balanceMode = 'cash_balance',
+    this.includeInNetWorth = true,
+    this.institutionName,
   });
   final Id id;
   final String displayName;
@@ -90,6 +94,10 @@ class AccountVm {
   final ValuedMoney? value; // CNY 估值；unpriceable → quality 标记
   final String? note;
   final bool isArchived;
+  final CurrencyCode defaultCurrency;
+  final String balanceMode; // cash_balance | holdings | liability | mixed
+  final bool includeInNetWorth;
+  final String? institutionName;
 }
 
 /// 创建账户输入（对齐 APPLICATION_INTERFACES_V1.CreateAccountInput）。

@@ -17,6 +17,9 @@ class RealLocalAccountRepository implements AccountRepository {
   Future<AccountVm> createAccount(CreateAccountInput input) async =>
       throw UnsupportedError('real_local 暂不支持建账户；请用 local_server');
   @override
+  Future<AccountVm> updateAccount(Id id, CreateAccountInput input) async =>
+      throw UnsupportedError('real_local 暂不支持改账户；请用 local_server');
+  @override
   Future<void> archiveAccount(Id id) async =>
       throw UnsupportedError('real_local 暂不支持归档；请用 local_server');
 }

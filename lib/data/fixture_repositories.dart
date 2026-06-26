@@ -251,6 +251,9 @@ class FixtureAccountRepository implements AccountRepository {
   Future<AccountVm> createAccount(CreateAccountInput input) async =>
       throw UnsupportedError('DEMO 演示只读，不支持账户写入；请用 local_server');
   @override
+  Future<AccountVm> updateAccount(Id id, CreateAccountInput input) async =>
+      throw UnsupportedError('DEMO 演示只读，不支持账户写入；请用 local_server');
+  @override
   Future<void> archiveAccount(Id id) async =>
       throw UnsupportedError('DEMO 演示只读，不支持账户写入；请用 local_server');
 }
