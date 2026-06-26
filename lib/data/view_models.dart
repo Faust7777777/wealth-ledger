@@ -223,6 +223,7 @@ class MovementVm {
     this.inTransit = false,
     this.description,
     this.amountBreakdown,
+    this.entries = const [],
   });
   final Id id;
   final Id atomicGroupId;
@@ -234,6 +235,25 @@ class MovementVm {
   final bool inTransit;
   final String? description;
   final TransactionAmountBreakdownVm? amountBreakdown;
+  final List<MovementEntryVm> entries;
+}
+
+/// 分录（双分录账本的一条腿）：方向 in/out、角色、所属账户。
+class MovementEntryVm {
+  const MovementEntryVm({
+    required this.accountId,
+    required this.amount,
+    required this.currency,
+    required this.direction,
+    required this.role,
+    this.instrumentId,
+  });
+  final Id accountId;
+  final DecimalString amount;
+  final CurrencyCode currency;
+  final String direction; // in | out
+  final String role; // source | destination | fee | discount | pnl | tax | adjustment
+  final String? instrumentId;
 }
 
 class DcaReminderVm {

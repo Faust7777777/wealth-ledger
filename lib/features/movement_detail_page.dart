@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/format.dart';
+import '../core/types.dart';
 import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../shared/widgets.dart';
@@ -25,6 +26,30 @@ String _typeLabel(MovementType t) => switch (t) {
       MovementType.correction => '更正',
     };
 
+Widget _entryRow(
+  BuildContext context,
+  MovementEntryVm e,
+  Map<String, String> nameById,
+) {
+  final isIn = e.direction == 'in';
+  return Padding(
+    padding: const EdgeInsets.symmetric(vertical: AppSpacing.xxs),
+    child: Row(
+      children: [
+        Icon(isIn ? Icons.arrow_downward : Icons.arrow_upward, size: 16),
+        const SizedBox(width: AppSpacing.xs),
+        Expanded(
+          child: Text(nameById[e.accountId] ?? e.accountId, style: AppType.body),
+        ),
+        Text(
+          '${isIn ? '+' : '−'}${formatMoney(Money(amount: e.amount, currency: e.currency))}',
+          style: AppType.moneyRow,
+        ),
+      ],
+    ),
+  );
+}
+
 class MovementDetailPage extends ConsumerWidget {
   const MovementDetailPage({super.key, required this.movementId});
   final String movementId;
@@ -32,6 +57,9 @@ class MovementDetailPage extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final async = ref.watch(movementByIdProvider(movementId));
+    final accounts =
+        ref.watch(accountsProvider).asData?.value ?? const <AccountVm>[];
+    final nameById = {for (final a in accounts) a.id: a.displayName};
     return Scaffold(
       appBar: AppBar(title: const Text('交易详情')),
       body: async.when(
@@ -69,6 +97,11 @@ class MovementDetailPage extends ConsumerWidget {
                   padding: const EdgeInsets.only(top: AppSpacing.xs),
                   child: Text('优惠仅作交易字段；节省不计为收入。', style: AppType.caption),
                 ),
+              ],
+              if (m.entries.isNotEmpty) ...[
+                const Divider(),
+                const SectionHeader(title: '分录'),
+                for (final e in m.entries) _entryRow(context, e, nameById),
               ],
               const SizedBox(height: AppSpacing.lg),
               OutlinedButton(

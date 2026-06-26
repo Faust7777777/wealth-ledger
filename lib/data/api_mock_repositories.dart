@@ -287,6 +287,22 @@ TransactionAmountBreakdownVm? _breakdown(Object? o) {
   );
 }
 
+List<MovementEntryVm> _entries(Object? v) {
+  if (v is! List) return const [];
+  return [
+    for (final e in v)
+      if (e is Map)
+        MovementEntryVm(
+          accountId: '${e['accountId']}',
+          amount: '${e['amount']}',
+          currency: '${e['currency']}',
+          direction: '${e['direction']}',
+          role: '${e['role']}',
+          instrumentId: e['instrumentId'] as String?,
+        ),
+  ];
+}
+
 MovementVm _movement(Map<String, dynamic> j) {
   final settlement = j['settlement'] is Map ? _m(j['settlement']) : const <String, dynamic>{};
   final status = _movStatus(j['status']);
@@ -307,6 +323,7 @@ MovementVm _movement(Map<String, dynamic> j) {
     inTransit: inTransit,
     description: j['description'] as String?,
     amountBreakdown: _breakdown(j['amountBreakdown']),
+    entries: _entries(j['entries']),
   );
 }
 
