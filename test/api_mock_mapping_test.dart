@@ -33,6 +33,28 @@ void main() {
     expect(vm.isEmpty, isTrue);
   });
 
+  test('parseAssetAllocationData maps server allocation payload', () {
+    final vm = parseAssetAllocationData({
+      'slices': [
+        {
+          'category': '现金',
+          'percent': '100.0',
+          'value': {'amount': '123.45', 'currency': 'CNY'},
+        }
+      ],
+      'totalAssets': {'amount': '123.45', 'currency': 'CNY'},
+      'totalLiabilities': {'amount': '20.00', 'currency': 'CNY'},
+      'netWorth': {'amount': '103.45', 'currency': 'CNY'},
+    });
+
+    expect(vm.slices.length, 1);
+    expect(vm.slices.first.category, '现金');
+    expect(vm.slices.first.percent, '100.0');
+    expect(vm.totalAssets.amount, '123.45');
+    expect(vm.totalLiabilities.amount, '20.00');
+    expect(vm.netWorth.amount, '103.45');
+  });
+
   test('subtractDecimal does exact decimal subtraction (no double)', () {
     expect(subtractDecimal('245678.90', '244433.23'), '1245.67');
     expect(subtractDecimal('100', '100.50'), '-0.50');

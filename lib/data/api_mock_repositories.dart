@@ -353,6 +353,12 @@ PendingSummaryVm _pending(Map<String, dynamic> j) => PendingSummaryVm(
       syncProblemCount: _int(j['syncProblemCount']),
     );
 
+AllocationSliceVm _allocationSlice(Map<String, dynamic> j) => AllocationSliceVm(
+      category: '${j['category']}',
+      percent: '${j['percent']}',
+      value: _money(j['value']),
+    );
+
 /// 公开以便单测直接喂 examples/*.json（无需起服务）。
 PortfolioOverviewVm parseOverviewData(Map<String, dynamic> j) {
   final latest = _snapshotOrNull(j['latestSnapshot']);
@@ -379,6 +385,14 @@ PortfolioOverviewVm parseOverviewData(Map<String, dynamic> j) {
     changeSinceLastSnapshot: change,
   );
 }
+
+/// 公开以便单测直接喂 /v1/portfolio/allocation 的 data。
+AssetAllocationVm parseAssetAllocationData(Map<String, dynamic> j) => AssetAllocationVm(
+      slices: [for (final s in _list(j['slices'])) _allocationSlice(_m(s))],
+      totalAssets: _money(j['totalAssets']),
+      totalLiabilities: _money(j['totalLiabilities']),
+      netWorth: _money(j['netWorth']),
+    );
 
 // ———— 仓库实现 ————
 class ApiMockAccountRepository implements AccountRepository {
@@ -411,13 +425,7 @@ class ApiMockPortfolioRepository implements PortfolioRepository {
       [for (final h in _list(await _c.getData('/v1/accounts/$accountId/holdings'))) _holding(_m(h))];
   @override
   Future<AssetAllocationVm> getAssetAllocation() async =>
-      // dev server 暂无 allocation 端点；返回空配置（UI 隐藏分段条）。
-      const AssetAllocationVm(
-        slices: [],
-        totalAssets: Money(amount: '0', currency: 'CNY'),
-        totalLiabilities: Money(amount: '0', currency: 'CNY'),
-        netWorth: Money(amount: '0', currency: 'CNY'),
-      );
+      parseAssetAllocationData(_m(await _c.getData('/v1/portfolio/allocation')));
 }
 
 class ApiMockMovementRepository implements MovementRepository {
