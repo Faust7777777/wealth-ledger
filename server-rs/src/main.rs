@@ -666,10 +666,19 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/snapshots", get(snapshots))
         .route("/v1/snapshots/manual", post(create_manual_snapshot))
         .route("/v1/snapshots/invalidate", post(no_content))
-        .route("/v1/categories", get(empty_array).post(not_implemented))
-        .route("/v1/categories/{category_id}", any(not_implemented))
-        .route("/v1/counterparties", get(empty_array).post(not_implemented))
-        .route("/v1/counterparties/{counterparty_id}", any(not_implemented))
+        .route("/v1/categories", get(categories).post(create_category))
+        .route(
+            "/v1/categories/{category_id}",
+            get(category_detail).patch(update_category),
+        )
+        .route(
+            "/v1/counterparties",
+            get(counterparties).post(create_counterparty),
+        )
+        .route(
+            "/v1/counterparties/{counterparty_id}",
+            get(counterparty_detail).patch(update_counterparty),
+        )
         .route("/v1/counterparties/merge-proposal", post(not_implemented))
         .route("/v1/sync/bootstrap", get(sync_bootstrap))
         .route("/v1/sync/changes", get(sync_changes))
@@ -1316,6 +1325,144 @@ async fn create_manual_snapshot(
     }
 }
 
+async fn categories(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_categories(path) {
+            Ok(categories) => envelope(categories).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(json!([])).into_response()
+}
+
+async fn create_category(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::create_category(path, input, &next_local_category_id()) {
+        Ok(category) => (StatusCode::CREATED, envelope(category)).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_category_input"),
+    }
+}
+
+async fn category_detail(
+    State(state): State<AppState>,
+    Path(category_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_categories(path) {
+            Ok(categories) => match find_by_id(categories, &category_id) {
+                Some(category) => envelope(category).into_response(),
+                None => not_found("category_not_found", "Category does not exist."),
+            },
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    not_found(
+        "category_not_found",
+        "Category does not exist in this dev scenario.",
+    )
+}
+
+async fn update_category(
+    State(state): State<AppState>,
+    Path(category_id): Path<String>,
+    Json(patch): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::update_category(path, &category_id, patch) {
+        Ok(category) => envelope(category).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_category_patch"),
+    }
+}
+
+async fn counterparties(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_counterparties(path) {
+            Ok(counterparties) => envelope(counterparties).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(json!([])).into_response()
+}
+
+async fn create_counterparty(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::create_counterparty(path, input, &next_local_counterparty_id()) {
+        Ok(counterparty) => (StatusCode::CREATED, envelope(counterparty)).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_counterparty_input"),
+    }
+}
+
+async fn counterparty_detail(
+    State(state): State<AppState>,
+    Path(counterparty_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_counterparties(path) {
+            Ok(counterparties) => match find_by_id(counterparties, &counterparty_id) {
+                Some(counterparty) => envelope(counterparty).into_response(),
+                None => not_found("counterparty_not_found", "Counterparty does not exist."),
+            },
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    not_found(
+        "counterparty_not_found",
+        "Counterparty does not exist in this dev scenario.",
+    )
+}
+
+async fn update_counterparty(
+    State(state): State<AppState>,
+    Path(counterparty_id): Path<String>,
+    Json(patch): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::update_counterparty(path, &counterparty_id, patch) {
+        Ok(counterparty) => envelope(counterparty).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_counterparty_patch"),
+    }
+}
+
 async fn sync_bootstrap() -> Json<Value> {
     envelope(json!({"cursor": "rust_dev_cursor_0001"}))
 }
@@ -1402,6 +1549,14 @@ fn next_local_dca_plan_id() -> String {
 
 fn next_local_dca_reminder_id() -> String {
     next_local_id("rem_local")
+}
+
+fn next_local_category_id() -> String {
+    next_local_id("cat_local")
+}
+
+fn next_local_counterparty_id() -> String {
+    next_local_id("cp_local")
 }
 
 fn next_local_id(prefix: &str) -> String {
@@ -2761,6 +2916,101 @@ mod tests {
             local_ledger::read_document(&path).expect("ledger should persist DCA execution");
         assert_eq!(persisted["dcaReminders"][0]["status"], "recorded");
         assert_eq!(persisted["holdings"][0]["quantity"], "200");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_taxonomy_routes_create_update_and_persist() {
+        let path = unique_test_ledger_path("taxonomy");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let category_input = json!({
+            "displayName": "咖啡",
+            "kind": "expense",
+            "aiDescription": "咖啡、饮品类消费"
+        });
+        let (category_status, category_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/categories",
+            category_input,
+        )
+        .await;
+        assert_eq!(category_status, StatusCode::CREATED);
+        assert_eq!(category_body["data"]["displayName"], "咖啡");
+        assert_eq!(category_body["data"]["isSystem"], false);
+        let category_id = category_body["data"]["id"]
+            .as_str()
+            .expect("category id should be string")
+            .to_string();
+
+        let (category_patch_status, category_patch_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/categories/{category_id}"),
+            json!({"displayName": "咖啡饮品", "kind": "expense"}),
+        )
+        .await;
+        assert_eq!(category_patch_status, StatusCode::OK);
+        assert_eq!(category_patch_body["data"]["displayName"], "咖啡饮品");
+
+        let counterparty_input = json!({
+            "displayName": "瑞幸咖啡",
+            "aliases": ["瑞幸", "luckin"],
+            "categoryHintId": category_id
+        });
+        let (counterparty_status, counterparty_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/counterparties",
+            counterparty_input,
+        )
+        .await;
+        assert_eq!(counterparty_status, StatusCode::CREATED);
+        assert_eq!(counterparty_body["data"]["normalizedName"], "瑞幸咖啡");
+        let counterparty_id = counterparty_body["data"]["id"]
+            .as_str()
+            .expect("counterparty id should be string")
+            .to_string();
+
+        let (counterparty_patch_status, counterparty_patch_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/counterparties/{counterparty_id}"),
+            json!({"aliases": ["瑞幸", "Luckin Coffee"], "isUserMerged": true}),
+        )
+        .await;
+        assert_eq!(counterparty_patch_status, StatusCode::OK);
+        assert_eq!(counterparty_patch_body["data"]["isUserMerged"], true);
+
+        let (categories_status, categories_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/categories").await;
+        assert_eq!(categories_status, StatusCode::OK);
+        assert_eq!(
+            categories_body["data"]
+                .as_array()
+                .expect("categories")
+                .len(),
+            1
+        );
+
+        let (counterparty_detail_status, counterparty_detail_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/counterparties/{counterparty_id}"),
+        )
+        .await;
+        assert_eq!(counterparty_detail_status, StatusCode::OK);
+        assert_eq!(
+            counterparty_detail_body["data"]["aliases"][1],
+            "Luckin Coffee"
+        );
+
+        let persisted = local_ledger::read_document(&path).expect("ledger should persist taxonomy");
+        assert_eq!(persisted["categories"][0]["displayName"], "咖啡饮品");
+        assert_eq!(persisted["counterparties"][0]["isUserMerged"], true);
 
         let _ = std::fs::remove_file(path);
     }

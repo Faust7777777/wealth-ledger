@@ -743,6 +743,88 @@ pub fn create_manual_snapshot(path: &Path, input: Value, now: &str) -> Result<Va
     Ok(snapshot)
 }
 
+pub fn list_categories(path: &Path) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    Ok(json!(
+        document["categories"]
+            .as_array()
+            .expect("validated local ledger categories should be an array")
+            .clone()
+    ))
+}
+
+pub fn create_category(path: &Path, input: Value, category_id: &str) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let category = category_from_input(&input, category_id)?;
+    document["categories"]
+        .as_array_mut()
+        .expect("validated local ledger categories should be an array")
+        .push(category.clone());
+    write_document(path, &document)?;
+    Ok(category)
+}
+
+pub fn update_category(path: &Path, category_id: &str, patch: Value) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let category = document["categories"]
+        .as_array_mut()
+        .expect("validated local ledger categories should be an array")
+        .iter_mut()
+        .find(|category| category.get("id").and_then(Value::as_str) == Some(category_id))
+        .ok_or_else(|| LedgerError::NotFound(format!("category does not exist: {category_id}")))?;
+    apply_category_patch(category, &patch)?;
+    let projected = category.clone();
+    write_document(path, &document)?;
+    Ok(projected)
+}
+
+pub fn list_counterparties(path: &Path) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    Ok(json!(
+        document["counterparties"]
+            .as_array()
+            .expect("validated local ledger counterparties should be an array")
+            .clone()
+    ))
+}
+
+pub fn create_counterparty(
+    path: &Path,
+    input: Value,
+    counterparty_id: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let counterparty = counterparty_from_input(&input, counterparty_id)?;
+    document["counterparties"]
+        .as_array_mut()
+        .expect("validated local ledger counterparties should be an array")
+        .push(counterparty.clone());
+    write_document(path, &document)?;
+    Ok(counterparty)
+}
+
+pub fn update_counterparty(
+    path: &Path,
+    counterparty_id: &str,
+    patch: Value,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let counterparty = document["counterparties"]
+        .as_array_mut()
+        .expect("validated local ledger counterparties should be an array")
+        .iter_mut()
+        .find(|counterparty| {
+            counterparty.get("id").and_then(Value::as_str) == Some(counterparty_id)
+        })
+        .ok_or_else(|| {
+            LedgerError::NotFound(format!("counterparty does not exist: {counterparty_id}"))
+        })?;
+    apply_counterparty_patch(counterparty, &patch)?;
+    let projected = counterparty.clone();
+    write_document(path, &document)?;
+    Ok(projected)
+}
+
 pub fn ensure_real_and_fixture_paths_separate(
     real_path: &Path,
     fixture_path: &Path,
@@ -1586,6 +1668,218 @@ fn dca_reminder_from_plan(plan: &Value, reminder_id: &str) -> Value {
             .expect("validated DCA nextDueDate should be string"),
         "status": "due"
     })
+}
+
+fn category_from_input(input: &Value, category_id: &str) -> Result<Value, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "category input must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut errors = Vec::new();
+    let display_name = required_string(object, "displayName", &mut errors);
+    let kind = required_enum(
+        object,
+        "kind",
+        &[
+            "income",
+            "expense",
+            "transfer",
+            "investment",
+            "liability",
+            "system",
+        ],
+        &mut errors,
+    );
+    let parent_id = optional_string(object, "parentId", &mut errors);
+    let is_system = object
+        .get("isSystem")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ai_description = optional_string(object, "aiDescription", &mut errors);
+
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    let mut category = json!({
+        "id": category_id,
+        "displayName": display_name.expect("validated category displayName"),
+        "kind": kind.expect("validated category kind"),
+        "isSystem": is_system
+    });
+    if let Some(parent_id) = parent_id {
+        category["parentId"] = json!(parent_id);
+    }
+    if let Some(ai_description) = ai_description {
+        category["aiDescription"] = json!(ai_description);
+    }
+    Ok(category)
+}
+
+fn apply_category_patch(category: &mut Value, patch: &Value) -> Result<(), LedgerError> {
+    let Some(object) = patch.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "category patch must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut errors = Vec::new();
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "displayName" | "parentId" | "kind" | "isSystem" | "aiDescription"
+        ) {
+            errors.push(format!("{key} is not an updatable category field"));
+        }
+    }
+    if let Some(display_name) = object.get("displayName") {
+        match display_name
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(value) => category["displayName"] = json!(value),
+            None => errors.push("displayName must be a non-empty string".to_string()),
+        }
+    }
+    if object.contains_key("parentId") {
+        patch_optional_string(category, object, "parentId", &mut errors);
+    }
+    if let Some(kind) = object.get("kind") {
+        match kind.as_str() {
+            Some(
+                value @ ("income" | "expense" | "transfer" | "investment" | "liability" | "system"),
+            ) => category["kind"] = json!(value),
+            _ => errors.push("kind must be a valid CategoryKind".to_string()),
+        }
+    }
+    if let Some(is_system) = object.get("isSystem") {
+        match is_system.as_bool() {
+            Some(value) => category["isSystem"] = json!(value),
+            None => errors.push("isSystem must be a boolean".to_string()),
+        }
+    }
+    if object.contains_key("aiDescription") {
+        patch_optional_string(category, object, "aiDescription", &mut errors);
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(LedgerError::InvalidInput(errors))
+    }
+}
+
+fn counterparty_from_input(input: &Value, counterparty_id: &str) -> Result<Value, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "counterparty input must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut errors = Vec::new();
+    let display_name = required_string(object, "displayName", &mut errors);
+    let aliases = match object.get("aliases") {
+        Some(value) => match string_array(value) {
+            Some(items) => items,
+            None => {
+                errors.push("aliases must be a string array".to_string());
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    let normalized_name = optional_string(object, "normalizedName", &mut errors);
+    let category_hint_id = optional_string(object, "categoryHintId", &mut errors);
+    let is_user_merged = object
+        .get("isUserMerged")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    let display_name = display_name.expect("validated counterparty displayName");
+    let normalized_name =
+        normalized_name.unwrap_or_else(|| normalize_name(&display_name, counterparty_id));
+    let mut counterparty = json!({
+        "id": counterparty_id,
+        "displayName": display_name,
+        "aliases": aliases,
+        "normalizedName": normalized_name,
+        "isUserMerged": is_user_merged
+    });
+    if let Some(category_hint_id) = category_hint_id {
+        counterparty["categoryHintId"] = json!(category_hint_id);
+    }
+    Ok(counterparty)
+}
+
+fn apply_counterparty_patch(counterparty: &mut Value, patch: &Value) -> Result<(), LedgerError> {
+    let Some(object) = patch.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "counterparty patch must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut errors = Vec::new();
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "displayName" | "aliases" | "normalizedName" | "categoryHintId" | "isUserMerged"
+        ) {
+            errors.push(format!("{key} is not an updatable counterparty field"));
+        }
+    }
+    if let Some(display_name) = object.get("displayName") {
+        match display_name
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(value) => counterparty["displayName"] = json!(value),
+            None => errors.push("displayName must be a non-empty string".to_string()),
+        }
+    }
+    if let Some(aliases) = object.get("aliases") {
+        match string_array(aliases) {
+            Some(items) => counterparty["aliases"] = json!(items),
+            None => errors.push("aliases must be a string array".to_string()),
+        }
+    }
+    if object.contains_key("normalizedName") {
+        patch_optional_string(counterparty, object, "normalizedName", &mut errors);
+    }
+    if object.contains_key("categoryHintId") {
+        patch_optional_string(counterparty, object, "categoryHintId", &mut errors);
+    }
+    if let Some(is_user_merged) = object.get("isUserMerged") {
+        match is_user_merged.as_bool() {
+            Some(value) => counterparty["isUserMerged"] = json!(value),
+            None => errors.push("isUserMerged must be a boolean".to_string()),
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(LedgerError::InvalidInput(errors))
+    }
+}
+
+fn normalize_name(display_name: &str, fallback: &str) -> String {
+    let normalized = display_name
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    if normalized.is_empty() {
+        fallback.to_string()
+    } else {
+        normalized
+    }
 }
 
 fn project_account_for_api(account: &Value) -> Value {
