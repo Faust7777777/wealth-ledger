@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../core/format.dart';
+import '../core/types.dart';
 import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../shared/widgets.dart';
@@ -55,6 +56,18 @@ class AccountDetailPage extends ConsumerWidget {
             padding: const EdgeInsets.all(AppSpacing.base),
             children: [
               _Header(a: a),
+              if (a.cashBalances.isNotEmpty) ...[
+                const SectionHeader(title: '现金余额'),
+                for (final e in a.cashBalances.entries)
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(e.key),
+                    trailing: Text(
+                      formatMoney(Money(amount: e.value, currency: e.key)),
+                      style: AppType.moneyRow,
+                    ),
+                  ),
+              ],
               if (holdings.isNotEmpty) ...[
                 const SectionHeader(title: '持仓'),
                 for (final h in holdings) _HoldingTile(h: h),
