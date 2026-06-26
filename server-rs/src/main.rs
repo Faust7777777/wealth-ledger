@@ -878,20 +878,43 @@ async fn account_anomalies(
 async fn holdings(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
-    envelope(state.ledger.holdings(DevScenario::from_query(&query)))
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_holdings(path) {
+            Ok(holdings) => envelope(holdings).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(state.ledger.holdings(DevScenario::from_query(&query))).into_response()
 }
 
 async fn account_holdings(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_holdings_by_account(path, &account_id) {
+            Ok(holdings) => envelope(holdings).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
     envelope(
         state
             .ledger
             .holdings_by_account(DevScenario::from_query(&query), &account_id),
     )
+    .into_response()
 }
 
 async fn asset_allocation(
@@ -2297,6 +2320,170 @@ mod tests {
             persisted["accounts"][0]["cashBalances"][0]["amount"],
             "82.00"
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_confirmed_buy_updates_holdings_without_distorting_net_worth() {
+        let path = unique_test_ledger_path("buy_holding");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let cash_input = json!({
+            "displayName": "现金账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "1000.00"}
+            ]
+        });
+        let (cash_status, cash_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", cash_input).await;
+        assert_eq!(cash_status, StatusCode::CREATED);
+        let cash_account_id = cash_body["data"]["id"]
+            .as_str()
+            .expect("cash account id should be string")
+            .to_string();
+
+        let brokerage_input = json!({
+            "displayName": "基金账户",
+            "accountType": "brokerage",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "holdings",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "0.00"}
+            ]
+        });
+        let (brokerage_status, brokerage_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            brokerage_input,
+        )
+        .await;
+        assert_eq!(brokerage_status, StatusCode::CREATED);
+        let brokerage_account_id = brokerage_body["data"]["id"]
+            .as_str()
+            .expect("brokerage account id should be string")
+            .to_string();
+
+        let draft_input = json!({
+            "type": "buy",
+            "occurredAt": "2026-06-26T11:00:00+08:00",
+            "title": "记录沪深300定投",
+            "entries": [
+                {
+                    "accountId": cash_account_id,
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": brokerage_account_id,
+                    "instrumentId": "inst_csi300_fund",
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ],
+            "tags": ["dca"]
+        });
+        let (draft_status, draft_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            draft_input,
+        )
+        .await;
+        assert_eq!(draft_status, StatusCode::CREATED);
+        let atomic_group_id = draft_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("atomic group id should be string")
+            .to_string();
+
+        let (before_status, before_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(before_status, StatusCode::OK);
+        assert_eq!(
+            before_body["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "1000.00"
+        );
+        assert_eq!(before_body["data"]["primaryHoldings"], json!([]));
+
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{atomic_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK);
+        assert_eq!(confirm_body["data"]["ledgerWrite"], true);
+
+        let (cash_after_status, cash_after_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{cash_account_id}"),
+        )
+        .await;
+        assert_eq!(cash_after_status, StatusCode::OK);
+        assert_eq!(cash_after_body["data"]["value"]["amount"], "900.00");
+
+        let (all_holdings_status, all_holdings_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(all_holdings_status, StatusCode::OK);
+        assert_eq!(
+            all_holdings_body["data"][0]["instrumentId"],
+            "inst_csi300_fund"
+        );
+        assert_eq!(all_holdings_body["data"][0]["quantity"], "100");
+        assert_eq!(
+            all_holdings_body["data"][0]["marketValue"]["amount"],
+            "100.00"
+        );
+        assert_eq!(all_holdings_body["data"][0]["quoteStatus"], "stale");
+
+        let (brokerage_holdings_status, brokerage_holdings_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{brokerage_account_id}/holdings"),
+        )
+        .await;
+        assert_eq!(brokerage_holdings_status, StatusCode::OK);
+        assert_eq!(
+            brokerage_holdings_body["data"]
+                .as_array()
+                .expect("holdings")
+                .len(),
+            1
+        );
+
+        let (after_status, after_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(after_status, StatusCode::OK);
+        assert_eq!(
+            after_body["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "1000.00"
+        );
+        assert_eq!(
+            after_body["data"]["latestSnapshot"]["quoteStatusSummary"]["staleCount"],
+            1
+        );
+        assert_eq!(
+            after_body["data"]["primaryHoldings"][0]["quoteStatus"],
+            "stale"
+        );
+
+        let persisted = local_ledger::read_document(&path).expect("ledger should persist holding");
+        assert_eq!(persisted["instruments"][0]["id"], "inst_csi300_fund");
+        assert_eq!(persisted["holdings"][0]["quantity"], "100");
 
         let _ = std::fs::remove_file(path);
     }

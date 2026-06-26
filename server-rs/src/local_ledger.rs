@@ -163,6 +163,21 @@ pub fn archive_account(path: &Path, account_id: &str, now: &str) -> Result<Value
     Ok(projected)
 }
 
+pub fn list_holdings(path: &Path) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    Ok(json!(project_holdings_for_api(&document)))
+}
+
+pub fn list_holdings_by_account(path: &Path, account_id: &str) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    Ok(json!(
+        project_holdings_for_api(&document)
+            .into_iter()
+            .filter(|holding| holding.get("accountId").and_then(Value::as_str) == Some(account_id))
+            .collect::<Vec<_>>()
+    ))
+}
+
 pub fn list_movements(path: &Path) -> io::Result<Value> {
     let document = load_or_initialize(path)?;
     let movements = document["movements"]
@@ -491,13 +506,13 @@ pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
             "syncProblemCount": 0
         },
         "quoteStatusSummary": {
-            "freshCount": 0,
-            "staleCount": 0,
-            "offlineCachedCount": 0,
+            "freshCount": summary.fresh_count,
+            "staleCount": summary.stale_count,
+            "offlineCachedCount": summary.offline_cached_count,
             "unpriceableCount": summary.unpriceable_count,
-            "errorCount": 0
+            "errorCount": summary.error_count
         },
-        "primaryHoldings": [],
+        "primaryHoldings": summary.primary_holdings,
         "recentMovements": recent_movements
     }))
 }
@@ -933,10 +948,15 @@ struct AccountSummary {
     base_currency: String,
     gross_assets: DecimalAmount,
     total_liabilities: DecimalAmount,
+    fresh_count: u64,
+    stale_count: u64,
+    offline_cached_count: u64,
     unpriceable_count: u64,
+    error_count: u64,
     account_anomaly_count: u64,
     latest_snapshot: Value,
     allocation_slices: Vec<Value>,
+    primary_holdings: Vec<Value>,
 }
 
 impl AccountSummary {
@@ -957,12 +977,17 @@ fn summarize_accounts(document: &Value, now: &str) -> io::Result<AccountSummary>
 
     let mut gross_assets = DecimalAmount::ZERO;
     let mut total_liabilities = DecimalAmount::ZERO;
+    let mut fresh_count = 0_u64;
+    let mut stale_count = 0_u64;
+    let mut offline_cached_count = 0_u64;
     let mut unpriceable_count = 0_u64;
+    let mut error_count = 0_u64;
     let mut account_anomaly_count = 0_u64;
     let mut included_account_count = 0_u64;
     let mut account_values = Vec::new();
     let mut allocation_by_category: BTreeMap<String, DecimalAmount> = BTreeMap::new();
     let mut quality = "exact";
+    let projected_holdings = project_holdings_for_api(document);
 
     for account in accounts {
         if !account
@@ -978,6 +1003,11 @@ fn summarize_accounts(document: &Value, now: &str) -> io::Result<AccountSummary>
         let is_liability = is_liability_account(account);
         let mut account_total = DecimalAmount::ZERO;
         let mut has_base_value = false;
+        let mut account_quality = "exact";
+        let account_id = account
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("validated account id should be a string");
 
         for balance in account
             .get("cashBalances")
@@ -999,30 +1029,67 @@ fn summarize_accounts(document: &Value, now: &str) -> io::Result<AccountSummary>
             )?;
             has_base_value = true;
             account_total += amount;
-            quality = combine_quality(
-                quality,
-                balance
-                    .get("quality")
+            let balance_quality = balance
+                .get("quality")
+                .and_then(Value::as_str)
+                .unwrap_or("exact");
+            account_quality = combine_quality(account_quality, balance_quality);
+            quality = combine_quality(quality, balance_quality);
+        }
+
+        for holding in projected_holdings
+            .iter()
+            .filter(|holding| holding.get("accountId").and_then(Value::as_str) == Some(account_id))
+        {
+            match holding.get("quoteStatus").and_then(Value::as_str) {
+                Some("fresh") => fresh_count += 1,
+                Some("stale") => stale_count += 1,
+                Some("offline_cached") => offline_cached_count += 1,
+                Some("error") => error_count += 1,
+                Some("unpriceable" | "incomplete") | None => unpriceable_count += 1,
+                Some(_) => unpriceable_count += 1,
+            }
+
+            let Some(market_value) = holding.get("marketValue") else {
+                quality = combine_quality(quality, "incomplete");
+                account_quality = combine_quality(account_quality, "incomplete");
+                continue;
+            };
+            if market_value.get("currency").and_then(Value::as_str) != Some(base_currency.as_str())
+            {
+                unpriceable_count += 1;
+                quality = combine_quality(quality, "incomplete");
+                account_quality = combine_quality(account_quality, "incomplete");
+                continue;
+            }
+
+            let amount = parse_decimal(
+                market_value
+                    .get("amount")
                     .and_then(Value::as_str)
-                    .unwrap_or("exact"),
-            );
+                    .expect("validated market value amount should be a string"),
+            )?;
+            has_base_value = true;
+            account_total += amount;
+            let holding_quality = market_value
+                .get("quality")
+                .and_then(Value::as_str)
+                .unwrap_or("estimated");
+            account_quality = combine_quality(account_quality, holding_quality);
+            quality = combine_quality(quality, holding_quality);
         }
 
         if !has_base_value {
             continue;
         }
 
-        let account_id = account
-            .get("id")
-            .and_then(Value::as_str)
-            .expect("validated account id should be a string");
         account_values.push(json!({
             "accountId": account_id,
             "value": {
                 "amount": money_amount(account_total),
                 "currency": base_currency,
                 "asOf": now,
-                "quality": quality
+                "quality": account_quality
             }
         }));
 
@@ -1058,11 +1125,11 @@ fn summarize_accounts(document: &Value, now: &str) -> io::Result<AccountSummary>
             "netWorth": money(net_worth, &base_currency),
             "quality": quality,
             "quoteStatusSummary": {
-                "freshCount": 0,
-                "staleCount": 0,
-                "offlineCachedCount": 0,
+                "freshCount": fresh_count,
+                "staleCount": stale_count,
+                "offlineCachedCount": offline_cached_count,
                 "unpriceableCount": unpriceable_count,
-                "errorCount": 0
+                "errorCount": error_count
             },
             "accountValues": account_values
         })
@@ -1089,10 +1156,15 @@ fn summarize_accounts(document: &Value, now: &str) -> io::Result<AccountSummary>
         base_currency,
         gross_assets,
         total_liabilities,
+        fresh_count,
+        stale_count,
+        offline_cached_count,
         unpriceable_count,
+        error_count,
         account_anomaly_count,
         latest_snapshot,
         allocation_slices,
+        primary_holdings: projected_holdings.into_iter().take(5).collect(),
     })
 }
 
@@ -1378,6 +1450,83 @@ fn project_movement_for_api(movement: &Value) -> Value {
     projected
 }
 
+fn project_holdings_for_api(document: &Value) -> Vec<Value> {
+    let mut holdings = document["holdings"]
+        .as_array()
+        .expect("validated local ledger holdings should be an array")
+        .iter()
+        .filter(|holding| {
+            parse_decimal(
+                holding
+                    .get("quantity")
+                    .and_then(Value::as_str)
+                    .unwrap_or("0"),
+            )
+            .is_ok_and(|quantity| quantity > DecimalAmount::ZERO)
+        })
+        .map(|holding| project_holding_for_api(document, holding))
+        .collect::<Vec<_>>();
+
+    holdings.sort_by(|left, right| {
+        let left_value = holding_market_value_amount(left).unwrap_or(DecimalAmount::ZERO);
+        let right_value = holding_market_value_amount(right).unwrap_or(DecimalAmount::ZERO);
+        right_value.cmp(&left_value)
+    });
+    holdings
+}
+
+fn project_holding_for_api(document: &Value, holding: &Value) -> Value {
+    let mut projected = holding.clone();
+    if projected.get("instrument").is_none()
+        && let Some(instrument_id) = holding.get("instrumentId").and_then(Value::as_str)
+    {
+        projected["instrument"] = instrument_for_api(document, instrument_id);
+    }
+    if projected.get("unrealizedPnl").is_none()
+        && let (Some(market_value), Some(cost_basis)) = (
+            projected
+                .get("marketValue")
+                .and_then(|value| value.get("amount"))
+                .and_then(Value::as_str),
+            projected
+                .get("costBasisTotal")
+                .and_then(|value| value.get("amount"))
+                .and_then(Value::as_str),
+        )
+        && let (Ok(market_value), Ok(cost_basis)) =
+            (parse_decimal(market_value), parse_decimal(cost_basis))
+    {
+        let currency = projected
+            .get("costBasisTotal")
+            .and_then(|value| value.get("currency"))
+            .and_then(Value::as_str)
+            .unwrap_or(DEFAULT_BASE_CURRENCY);
+        projected["unrealizedPnl"] = money(market_value - cost_basis, currency);
+    }
+    projected
+}
+
+fn instrument_for_api(document: &Value, instrument_id: &str) -> Value {
+    document["instruments"]
+        .as_array()
+        .expect("validated local ledger instruments should be an array")
+        .iter()
+        .find(|instrument| instrument.get("id").and_then(Value::as_str) == Some(instrument_id))
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "id": instrument_id,
+                "type": "other",
+                "displayName": instrument_id,
+                "quoteCurrency": DEFAULT_BASE_CURRENCY
+            })
+        })
+}
+
+fn holding_market_value_amount(holding: &Value) -> Option<DecimalAmount> {
+    parse_decimal(holding.get("marketValue")?.get("amount")?.as_str()?).ok()
+}
+
 fn recent_movements_from_document(document: &Value) -> Vec<Value> {
     document["movements"]
         .as_array()
@@ -1560,6 +1709,15 @@ impl DecimalAmount {
     fn money_string(self) -> String {
         let cents = round_div(self.0, Self::SCALE / 100);
         signed_fixed_string(cents, 2)
+    }
+
+    fn decimal_string(self) -> String {
+        let raw = signed_fixed_string(self.0, 8);
+        if raw.contains('.') {
+            raw.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            raw
+        }
     }
 }
 
@@ -2089,7 +2247,11 @@ fn apply_movement_entries(
             }
         };
 
-        apply_account_cash_delta(document, account_id, currency, delta, now)?;
+        if let Some(instrument_id) = entry.get("instrumentId").and_then(Value::as_str) {
+            apply_holding_delta(document, account_id, instrument_id, currency, delta, now)?;
+        } else {
+            apply_account_cash_delta(document, account_id, currency, delta, now)?;
+        }
     }
 
     Ok(())
@@ -2137,6 +2299,167 @@ fn apply_account_cash_delta(
     }
     account["updatedAt"] = json!(now);
     Ok(())
+}
+
+fn apply_holding_delta(
+    document: &mut Value,
+    account_id: &str,
+    instrument_id: &str,
+    currency: &str,
+    delta: DecimalAmount,
+    now: &str,
+) -> Result<(), LedgerError> {
+    if !active_account_exists(document, account_id) {
+        return Err(LedgerError::NotFound(format!(
+            "account does not exist or is archived: {account_id}"
+        )));
+    }
+    ensure_instrument(document, instrument_id, currency);
+
+    let holdings = document["holdings"]
+        .as_array_mut()
+        .expect("validated local ledger holdings should be an array");
+    if let Some(holding) = holdings.iter_mut().find(|holding| {
+        holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+            && holding.get("instrumentId").and_then(Value::as_str) == Some(instrument_id)
+    }) {
+        let current_quantity = parse_decimal(
+            holding
+                .get("quantity")
+                .and_then(Value::as_str)
+                .expect("holding quantity should be a string"),
+        )
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+        let next_quantity = current_quantity + delta;
+        if next_quantity < DecimalAmount::ZERO {
+            return Err(LedgerError::Conflict(format!(
+                "holding quantity cannot become negative: {instrument_id}"
+            )));
+        }
+        holding["quantity"] = json!(next_quantity.decimal_string());
+        apply_holding_money_delta(holding, "costBasisTotal", currency, delta)?;
+        apply_holding_valued_money_delta(holding, "marketValue", currency, delta, now)?;
+        holding["quoteStatus"] = json!("stale");
+        holding["asOf"] = json!(now);
+        if let Some(pnl) = holding.as_object_mut() {
+            pnl.remove("unrealizedPnl");
+            pnl.remove("unrealizedPnlRate");
+        }
+    } else {
+        if delta < DecimalAmount::ZERO {
+            return Err(LedgerError::Conflict(format!(
+                "holding does not exist for sell/out entry: {instrument_id}"
+            )));
+        }
+        holdings.push(json!({
+            "id": stable_holding_id(account_id, instrument_id),
+            "accountId": account_id,
+            "instrumentId": instrument_id,
+            "quantity": delta.decimal_string(),
+            "costBasisTotal": money(delta, currency),
+            "marketValue": {
+                "amount": money_amount(delta),
+                "currency": currency,
+                "asOf": now,
+                "quality": "estimated"
+            },
+            "quoteStatus": "stale",
+            "asOf": now,
+            "note": "MVP cost-based valuation until quote refresh"
+        }));
+    }
+
+    Ok(())
+}
+
+fn apply_holding_money_delta(
+    holding: &mut Value,
+    field: &str,
+    currency: &str,
+    delta: DecimalAmount,
+) -> Result<(), LedgerError> {
+    let current = holding
+        .get(field)
+        .and_then(|value| value.get("amount"))
+        .and_then(Value::as_str)
+        .map(parse_decimal)
+        .transpose()
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?
+        .unwrap_or(DecimalAmount::ZERO);
+    let next = current + delta;
+    if next < DecimalAmount::ZERO {
+        return Err(LedgerError::Conflict(format!(
+            "{field} cannot become negative"
+        )));
+    }
+    holding[field] = money(next, currency);
+    Ok(())
+}
+
+fn apply_holding_valued_money_delta(
+    holding: &mut Value,
+    field: &str,
+    currency: &str,
+    delta: DecimalAmount,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let current = holding
+        .get(field)
+        .and_then(|value| value.get("amount"))
+        .and_then(Value::as_str)
+        .map(parse_decimal)
+        .transpose()
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?
+        .unwrap_or(DecimalAmount::ZERO);
+    let next = current + delta;
+    if next < DecimalAmount::ZERO {
+        return Err(LedgerError::Conflict(format!(
+            "{field} cannot become negative"
+        )));
+    }
+    holding[field] = json!({
+        "amount": money_amount(next),
+        "currency": currency,
+        "asOf": now,
+        "quality": "estimated"
+    });
+    Ok(())
+}
+
+fn ensure_instrument(document: &mut Value, instrument_id: &str, currency: &str) {
+    let instruments = document["instruments"]
+        .as_array_mut()
+        .expect("validated local ledger instruments should be an array");
+    if instruments
+        .iter()
+        .any(|instrument| instrument.get("id").and_then(Value::as_str) == Some(instrument_id))
+    {
+        return;
+    }
+
+    instruments.push(json!({
+        "id": instrument_id,
+        "type": "other",
+        "displayName": instrument_id,
+        "quoteCurrency": currency
+    }));
+}
+
+fn stable_holding_id(account_id: &str, instrument_id: &str) -> String {
+    fn clean(value: &str) -> String {
+        value
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+
+    format!("holding_{}_{}", clean(account_id), clean(instrument_id))
 }
 
 fn update_dca_reminder_status(
