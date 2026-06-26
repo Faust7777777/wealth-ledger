@@ -384,6 +384,81 @@ pub fn reject_atomic_group(
     Ok(())
 }
 
+pub fn list_dca_plans(path: &Path) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    Ok(json!(
+        document["dcaPlans"]
+            .as_array()
+            .expect("validated local ledger dcaPlans should be an array")
+            .clone()
+    ))
+}
+
+pub fn create_dca_plan(
+    path: &Path,
+    input: Value,
+    plan_id: &str,
+    reminder_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let plan = dca_plan_from_create_input(&document, &input, plan_id, now)?;
+    let reminder = dca_reminder_from_plan(&plan, reminder_id);
+
+    document["dcaPlans"]
+        .as_array_mut()
+        .expect("validated local ledger dcaPlans should be an array")
+        .push(plan.clone());
+    document["dcaReminders"]
+        .as_array_mut()
+        .expect("validated local ledger dcaReminders should be an array")
+        .push(reminder);
+
+    write_document(path, &document)?;
+    Ok(plan)
+}
+
+pub fn list_due_dca_reminders(path: &Path) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    let reminders = document["dcaReminders"]
+        .as_array()
+        .expect("validated local ledger dcaReminders should be an array")
+        .iter()
+        .filter(|reminder| {
+            matches!(
+                reminder.get("status").and_then(Value::as_str),
+                Some("due" | "overdue")
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(json!(reminders))
+}
+
+pub fn skip_dca_reminder(path: &Path, reminder_id: &str, now: &str) -> Result<Value, LedgerError> {
+    update_dca_reminder_status(path, reminder_id, "skipped", None, now)
+}
+
+pub fn snooze_dca_reminder(
+    path: &Path,
+    reminder_id: &str,
+    input: Value,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "snooze input must be a JSON object".to_string(),
+        ]));
+    };
+    let mut errors = Vec::new();
+    let until = required_string(object, "until", &mut errors);
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    update_dca_reminder_status(path, reminder_id, "snoozed", until, now)
+}
+
 pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
     let document = load_or_initialize(path)?;
     let summary = summarize_accounts(&document, now)?;
@@ -392,6 +467,17 @@ pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
         .iter()
         .filter(|movement| movement.get("status").and_then(Value::as_str) == Some("in_transit"))
         .count();
+    let dca_due_count = document["dcaReminders"]
+        .as_array()
+        .expect("validated local ledger dcaReminders should be an array")
+        .iter()
+        .filter(|reminder| {
+            matches!(
+                reminder.get("status").and_then(Value::as_str),
+                Some("due" | "overdue")
+            )
+        })
+        .count();
 
     Ok(json!({
         "latestSnapshot": summary.latest_snapshot,
@@ -399,7 +485,7 @@ pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
         "pendingSummary": {
             "aiPendingCount": 0,
             "accountAnomalyCount": summary.account_anomaly_count,
-            "dcaDueCount": 0,
+            "dcaDueCount": dca_due_count,
             "inTransitCount": in_transit_count,
             "quoteProblemCount": summary.unpriceable_count,
             "syncProblemCount": 0
@@ -1138,6 +1224,88 @@ fn movement_from_create_input(
     Ok(movement)
 }
 
+fn dca_plan_from_create_input(
+    document: &Value,
+    input: &Value,
+    plan_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "create DCA plan input must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut errors = Vec::new();
+    let display_name = required_string(object, "displayName", &mut errors);
+    let target_instrument_id = required_string(object, "targetInstrumentId", &mut errors);
+    let funding_account_id = optional_string(object, "fundingAccountId", &mut errors);
+    if let Some(account_id) = funding_account_id.as_deref()
+        && !active_account_exists(document, account_id)
+    {
+        errors.push("fundingAccountId does not exist or is archived".to_string());
+    }
+    let planned_amount =
+        normalized_required_money(object.get("plannedAmount"), "plannedAmount", &mut errors);
+    let frequency = required_enum(
+        object,
+        "frequency",
+        &["weekly", "monthly", "custom"],
+        &mut errors,
+    );
+    let next_due_date = required_string(object, "nextDueDate", &mut errors);
+    let note = optional_string(object, "note", &mut errors);
+
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    let mut plan = json!({
+        "id": plan_id,
+        "displayName": display_name.expect("validated displayName"),
+        "targetInstrumentId": target_instrument_id.expect("validated targetInstrumentId"),
+        "plannedAmount": planned_amount.expect("validated plannedAmount"),
+        "frequency": frequency.expect("validated frequency"),
+        "nextDueDate": next_due_date.expect("validated nextDueDate"),
+        "reminderStatus": "active",
+        "lastActionAt": Value::Null,
+        "createdAt": now,
+        "updatedAt": now
+    });
+
+    if let Some(funding_account_id) = funding_account_id {
+        plan["fundingAccountId"] = json!(funding_account_id);
+    }
+    if let Some(note) = note {
+        plan["note"] = json!(note);
+    }
+
+    Ok(plan)
+}
+
+fn dca_reminder_from_plan(plan: &Value, reminder_id: &str) -> Value {
+    json!({
+        "id": reminder_id,
+        "planId": plan
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("validated DCA plan id should be string"),
+        "displayName": plan
+            .get("displayName")
+            .and_then(Value::as_str)
+            .expect("validated DCA displayName should be string"),
+        "plannedAmount": plan
+            .get("plannedAmount")
+            .expect("validated DCA plannedAmount should exist")
+            .clone(),
+        "dueDate": plan
+            .get("nextDueDate")
+            .and_then(Value::as_str)
+            .expect("validated DCA nextDueDate should be string"),
+        "status": "due"
+    })
+}
+
 fn project_account_for_api(account: &Value) -> Value {
     let mut projected = account.clone();
 
@@ -1810,6 +1978,17 @@ fn normalized_money(value: Option<&Value>, label: &str, errors: &mut Vec<String>
     }
 }
 
+fn normalized_required_money(
+    value: Option<&Value>,
+    label: &str,
+    errors: &mut Vec<String>,
+) -> Option<Value> {
+    if value.is_none() {
+        errors.push(format!("{label} is required"));
+    }
+    normalized_money(value, label, errors)
+}
+
 fn active_account_exists(document: &Value, account_id: &str) -> bool {
     document["accounts"]
         .as_array()
@@ -1902,6 +2081,55 @@ fn apply_account_cash_delta(
     }
     account["updatedAt"] = json!(now);
     Ok(())
+}
+
+fn update_dca_reminder_status(
+    path: &Path,
+    reminder_id: &str,
+    status: &str,
+    snoozed_until: Option<String>,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let reminder = document["dcaReminders"]
+        .as_array_mut()
+        .expect("validated local ledger dcaReminders should be an array")
+        .iter_mut()
+        .find(|reminder| reminder.get("id").and_then(Value::as_str) == Some(reminder_id))
+        .ok_or_else(|| {
+            LedgerError::NotFound(format!("DCA reminder does not exist: {reminder_id}"))
+        })?;
+
+    reminder["status"] = json!(status);
+    reminder["updatedAt"] = json!(now);
+    if let Some(until) = snoozed_until {
+        reminder["snoozedUntil"] = json!(until);
+    } else if let Some(object) = reminder.as_object_mut() {
+        object.remove("snoozedUntil");
+    }
+
+    let plan_id = reminder
+        .get("planId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let projected = reminder.clone();
+
+    if let Some(plan_id) = plan_id
+        && let Some(plan) = document["dcaPlans"]
+            .as_array_mut()
+            .expect("validated local ledger dcaPlans should be an array")
+            .iter_mut()
+            .find(|plan| plan.get("id").and_then(Value::as_str) == Some(plan_id.as_str()))
+    {
+        plan["lastActionAt"] = json!(now);
+        plan["updatedAt"] = json!(now);
+        if status == "snoozed" {
+            plan["reminderStatus"] = json!("snoozed");
+        }
+    }
+
+    write_document(path, &document)?;
+    Ok(projected)
 }
 
 fn validate_string_array(value: Option<&Value>, label: &str, errors: &mut Vec<String>) {

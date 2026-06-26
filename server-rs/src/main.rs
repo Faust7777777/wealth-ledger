@@ -622,7 +622,7 @@ fn app_with_state(state: AppState) -> Router {
             "/v1/atomic-groups/{atomic_group_id}/reject",
             post(reject_atomic_group),
         )
-        .route("/v1/dca/plans", get(dca_plans).post(not_implemented))
+        .route("/v1/dca/plans", get(dca_plans).post(create_dca_plan))
         .route("/v1/dca/plans/{plan_id}", any(not_implemented))
         .route("/v1/dca/reminders/due", get(dca_due_reminders))
         .route(
@@ -631,11 +631,11 @@ fn app_with_state(state: AppState) -> Router {
         )
         .route(
             "/v1/dca/reminders/{reminder_id}/skip",
-            post(not_implemented),
+            post(skip_dca_reminder),
         )
         .route(
             "/v1/dca/reminders/{reminder_id}/snooze",
-            post(not_implemented),
+            post(snooze_dca_reminder),
         )
         .route("/v1/ai/proposals/from-text", post(ai_proposal_from_text))
         .route("/v1/ai/proposals/from-image", post(ai_proposal_from_image))
@@ -1002,19 +1002,57 @@ async fn submit_movement_review(
 async fn dca_plans(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
-    envelope(state.ledger.dca_plans(DevScenario::from_query(&query)))
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_dca_plans(path) {
+            Ok(plans) => envelope(plans).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(state.ledger.dca_plans(DevScenario::from_query(&query))).into_response()
+}
+
+async fn create_dca_plan(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    let now = current_timestamp();
+    let plan_id = next_local_dca_plan_id();
+    let reminder_id = next_local_dca_reminder_id();
+
+    match local_ledger::create_dca_plan(path, input, &plan_id, &reminder_id, &now) {
+        Ok(plan) => (StatusCode::CREATED, envelope(plan)).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_dca_plan_input"),
+    }
 }
 
 async fn dca_due_reminders(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_due_dca_reminders(path) {
+            Ok(reminders) => envelope(reminders).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
     envelope(
         state
             .ledger
             .dca_due_reminders(DevScenario::from_query(&query)),
     )
+    .into_response()
 }
 
 async fn ai_pending(
@@ -1063,6 +1101,35 @@ async fn mark_dca_executed_as_proposal(
             "dca_reminder_not_found",
             "DCA reminder does not exist in this dev scenario.",
         ),
+    }
+}
+
+async fn skip_dca_reminder(
+    State(state): State<AppState>,
+    Path(reminder_id): Path<String>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::skip_dca_reminder(path, &reminder_id, &current_timestamp()) {
+        Ok(reminder) => envelope(reminder).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_dca_reminder_skip"),
+    }
+}
+
+async fn snooze_dca_reminder(
+    State(state): State<AppState>,
+    Path(reminder_id): Path<String>,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::snooze_dca_reminder(path, &reminder_id, input, &current_timestamp()) {
+        Ok(reminder) => envelope(reminder).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_dca_reminder_snooze"),
     }
 }
 
@@ -1275,6 +1342,14 @@ fn next_local_movement_id() -> String {
 
 fn next_local_atomic_group_id() -> String {
     next_local_id("ag_local")
+}
+
+fn next_local_dca_plan_id() -> String {
+    next_local_id("plan_local")
+}
+
+fn next_local_dca_reminder_id() -> String {
+    next_local_id("rem_local")
 }
 
 fn next_local_id(prefix: &str) -> String {
@@ -2237,6 +2312,130 @@ mod tests {
             request_json_body_from(router, Method::POST, "/v1/movements/drafts", draft_input).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_movement_draft_input");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_dca_plan_create_due_skip_and_snooze() {
+        let path = unique_test_ledger_path("dca_plan");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let account_input = json!({
+            "displayName": "定投资金账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "3000.00"}
+            ]
+        });
+        let (account_status, account_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", account_input)
+                .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id should be string")
+            .to_string();
+
+        let create_plan_input = json!({
+            "displayName": "沪深300ETF",
+            "targetInstrumentId": "inst_csi300_fund",
+            "fundingAccountId": account_id,
+            "plannedAmount": {"amount": "1000.00", "currency": "CNY"},
+            "frequency": "monthly",
+            "nextDueDate": "2026-07-10",
+            "note": "只提醒与记录，不下单。"
+        });
+        let (create_status, create_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/dca/plans",
+            create_plan_input,
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::CREATED);
+        assert_eq!(create_body["data"]["displayName"], "沪深300ETF");
+        assert_eq!(create_body["data"]["reminderStatus"], "active");
+
+        let (plans_status, plans_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/dca/plans").await;
+        assert_eq!(plans_status, StatusCode::OK);
+        assert_eq!(plans_body["data"][0]["plannedAmount"]["amount"], "1000.00");
+
+        let (due_status, due_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/dca/reminders/due").await;
+        assert_eq!(due_status, StatusCode::OK);
+        assert_eq!(due_body["data"][0]["displayName"], "沪深300ETF");
+        assert_eq!(due_body["data"][0]["status"], "due");
+        let reminder_id = due_body["data"][0]["id"]
+            .as_str()
+            .expect("reminder id should be string")
+            .to_string();
+
+        let (overview_status, overview_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_status, StatusCode::OK);
+        assert_eq!(overview_body["data"]["pendingSummary"]["dcaDueCount"], 1);
+
+        let (skip_status, skip_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/dca/reminders/{reminder_id}/skip"),
+        )
+        .await;
+        assert_eq!(skip_status, StatusCode::OK);
+        assert_eq!(skip_body["data"]["status"], "skipped");
+
+        let (due_after_skip_status, due_after_skip_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/dca/reminders/due").await;
+        assert_eq!(due_after_skip_status, StatusCode::OK);
+        assert_eq!(due_after_skip_body["data"], json!([]));
+
+        let second_plan_input = json!({
+            "displayName": "纳指ETF",
+            "targetInstrumentId": "inst_nasdaq_fund",
+            "plannedAmount": {"amount": "800.00", "currency": "CNY"},
+            "frequency": "monthly",
+            "nextDueDate": "2026-07-25"
+        });
+        let (second_status, _) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/dca/plans",
+            second_plan_input,
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::CREATED);
+        let (_, due_after_second_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/dca/reminders/due").await;
+        let second_reminder_id = due_after_second_body["data"][0]["id"]
+            .as_str()
+            .expect("second reminder id should be string")
+            .to_string();
+
+        let (snooze_status, snooze_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/dca/reminders/{second_reminder_id}/snooze"),
+            json!({"until": "2026-07-26T09:00:00+08:00"}),
+        )
+        .await;
+        assert_eq!(snooze_status, StatusCode::OK);
+        assert_eq!(snooze_body["data"]["status"], "snoozed");
+        assert_eq!(
+            snooze_body["data"]["snoozedUntil"],
+            "2026-07-26T09:00:00+08:00"
+        );
+
+        let persisted = local_ledger::read_document(&path).expect("ledger should persist DCA");
+        assert_eq!(persisted["dcaPlans"].as_array().expect("plans").len(), 2);
+        assert_eq!(persisted["dcaReminders"][0]["status"], "skipped");
+        assert_eq!(persisted["dcaReminders"][1]["status"], "snoozed");
 
         let _ = std::fs::remove_file(path);
     }
