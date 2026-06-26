@@ -22,34 +22,43 @@ class AccountsPage extends ConsumerWidget {
           ErrorStateView(message: '$e', onRetry: () => ref.invalidate(accountsProvider)),
       data: (accounts) {
         if (accounts.isEmpty) {
-          return const EmptyState(
+          return EmptyState(
             icon: Icons.account_balance_wallet_outlined,
             title: '还没有账户',
-            message: '从右下「记录」或账户管理添加你的第一个账户。',
+            message: '添加你的第一个账户，开始记录净资产。',
+            action: FilledButton(
+              onPressed: () => context.push('/accounts/new'),
+              child: const Text('添加账户'),
+            ),
           );
         }
-        return ListView.separated(
+        return ListView(
           padding: const EdgeInsets.all(AppSpacing.base),
-          itemCount: accounts.length,
-          separatorBuilder: (_, _) => const Divider(height: 1),
-          itemBuilder: (context, i) {
-            final a = accounts[i];
-            final v = a.value;
-            return ListTile(
-              leading: Icon(accountTypeIcon(a.accountType)),
-              title: Text(a.displayName),
-              subtitle: Text(
-                a.note == null
-                    ? accountTypeLabel(a.accountType)
-                    : '${accountTypeLabel(a.accountType)} · ${a.note}',
+          children: [
+            ListTile(
+              leading: const Icon(Icons.add),
+              title: const Text('添加账户'),
+              onTap: () => context.push('/accounts/new'),
+            ),
+            const Divider(height: 1),
+            for (final a in accounts) ...[
+              ListTile(
+                leading: Icon(accountTypeIcon(a.accountType)),
+                title: Text(a.displayName),
+                subtitle: Text(
+                  a.note == null
+                      ? accountTypeLabel(a.accountType)
+                      : '${accountTypeLabel(a.accountType)} · ${a.note}',
+                ),
+                trailing: Text(
+                  a.value == null ? '—' : formatValued(a.value!),
+                  style: AppType.moneyRow,
+                ),
+                onTap: () => context.push('/account/${a.id}'),
               ),
-              trailing: Text(
-                v == null ? '—' : formatValued(v),
-                style: AppType.moneyRow,
-              ),
-              onTap: () => context.push('/account/${a.id}'),
-            );
-          },
+              const Divider(height: 1),
+            ],
+          ],
         );
       },
     );

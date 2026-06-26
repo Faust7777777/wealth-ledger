@@ -24,6 +24,13 @@ class AccountDetailPage extends ConsumerWidget {
     return Scaffold(
       appBar: AppBar(
         title: Text(accountAsync.asData?.value?.displayName ?? '账户详情'),
+        actions: [
+          IconButton(
+            tooltip: '归档',
+            icon: const Icon(Icons.archive_outlined),
+            onPressed: () => _archive(context, ref),
+          ),
+        ],
       ),
       body: accountAsync.when(
         loading: () => const Center(child: CircularProgressIndicator()),
@@ -56,6 +63,32 @@ class AccountDetailPage extends ConsumerWidget {
         },
       ),
     );
+  }
+
+  Future<void> _archive(BuildContext context, WidgetRef ref) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('归档账户'),
+        content: const Text('归档后不再计入新记录（后端可恢复）。确认归档？'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('取消')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('归档')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await ref.read(accountRepositoryProvider).archiveAccount(accountId);
+      ref.invalidate(accountsProvider);
+      ref.invalidate(overviewProvider);
+      messenger.showSnackBar(const SnackBar(content: Text('账户已归档')));
+      if (navigator.canPop()) navigator.pop();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
   }
 }
 

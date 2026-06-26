@@ -13,6 +13,12 @@ class RealLocalAccountRepository implements AccountRepository {
   Future<AccountVm?> getAccount(Id id) async => null;
   @override
   Future<List<AccountAnomalyVm>> listAnomalies() async => const [];
+  @override
+  Future<AccountVm> createAccount(CreateAccountInput input) async =>
+      throw UnsupportedError('real_local 暂不支持建账户；请用 local_server');
+  @override
+  Future<void> archiveAccount(Id id) async =>
+      throw UnsupportedError('real_local 暂不支持归档；请用 local_server');
 }
 
 class RealLocalPortfolioRepository implements PortfolioRepository {

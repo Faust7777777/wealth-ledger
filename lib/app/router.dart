@@ -6,6 +6,7 @@ import 'package:go_router/go_router.dart';
 import '../data/providers.dart';
 import '../dev/tokens_preview.dart';
 import '../features/account_detail_page.dart';
+import '../features/account_form_page.dart';
 import '../features/accounts_page.dart';
 import '../features/ai_import_text_page.dart';
 import '../features/ai_review_page.dart';
@@ -41,6 +42,7 @@ final appRouter = GoRouter(
     ),
     GoRoute(path: '/ai-review', builder: (c, s) => const AiReviewPage()),
     GoRoute(path: '/ai-import/text', builder: (c, s) => const AiImportTextPage()),
+    GoRoute(path: '/accounts/new', builder: (c, s) => const AccountFormPage()),
     GoRoute(
       path: '/account/:id',
       builder: (c, s) => AccountDetailPage(accountId: s.pathParameters['id']!),

@@ -247,6 +247,12 @@ class FixtureAccountRepository implements AccountRepository {
       _accounts.where((a) => a.id == id).cast<AccountVm?>().firstWhere((a) => true, orElse: () => null);
   @override
   Future<List<AccountAnomalyVm>> listAnomalies() async => _anomalies;
+  @override
+  Future<AccountVm> createAccount(CreateAccountInput input) async =>
+      throw UnsupportedError('DEMO 演示只读，不支持账户写入；请用 local_server');
+  @override
+  Future<void> archiveAccount(Id id) async =>
+      throw UnsupportedError('DEMO 演示只读，不支持账户写入；请用 local_server');
 }
 
 class FixturePortfolioRepository implements PortfolioRepository {

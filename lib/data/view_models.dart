@@ -90,6 +90,24 @@ class AccountVm {
   final String? note;
 }
 
+/// 创建账户输入（对齐 APPLICATION_INTERFACES_V1.CreateAccountInput）。
+class CreateAccountInput {
+  const CreateAccountInput({
+    required this.displayName,
+    required this.accountType,
+    required this.defaultCurrency,
+    required this.balanceMode,
+    this.includeInNetWorth = true,
+    this.institutionName,
+  });
+  final String displayName;
+  final AccountType accountType;
+  final CurrencyCode defaultCurrency;
+  final String balanceMode; // cash_balance | holdings | liability | mixed
+  final bool includeInNetWorth;
+  final String? institutionName;
+}
+
 class HoldingVm {
   const HoldingVm({
     required this.id,

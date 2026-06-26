@@ -100,6 +100,19 @@ AccountType _acctType(Object? s) => switch (s) {
       'cash' => AccountType.cash,
       _ => AccountType.other,
     };
+String _acctTypeWire(AccountType t) => switch (t) {
+      AccountType.bank => 'bank',
+      AccountType.brokerage => 'brokerage',
+      AccountType.exchange => 'exchange',
+      AccountType.wallet => 'wallet',
+      AccountType.platformWallet => 'platform_wallet',
+      AccountType.virtualCard => 'virtual_card',
+      AccountType.socialSecurity => 'social_security',
+      AccountType.creditCard => 'credit_card',
+      AccountType.loan => 'loan',
+      AccountType.cash => 'cash',
+      AccountType.other => 'other',
+    };
 MovementType _movType(Object? s) => switch (s) {
       'income' => MovementType.income,
       'expense' => MovementType.expense,
@@ -410,6 +423,23 @@ class LocalServerAccountRepository implements AccountRepository {
   @override
   Future<List<AccountAnomalyVm>> listAnomalies() async =>
       [for (final a in _list(await _c.getData('/v1/accounts/anomalies'))) _anomaly(_m(a))];
+  @override
+  Future<AccountVm> createAccount(CreateAccountInput input) async {
+    final d = await _c.postData('/v1/accounts', body: {
+      'displayName': input.displayName,
+      'accountType': _acctTypeWire(input.accountType),
+      'defaultCurrency': input.defaultCurrency,
+      'supportedCurrencies': [input.defaultCurrency],
+      'includeInNetWorth': input.includeInNetWorth,
+      'balanceMode': input.balanceMode,
+      if (input.institutionName != null) 'institutionName': input.institutionName,
+    });
+    return _account(_m(d));
+  }
+  @override
+  Future<void> archiveAccount(Id id) async {
+    await _c.postData('/v1/accounts/$id/archive');
+  }
 }
 
 class LocalServerPortfolioRepository implements PortfolioRepository {
