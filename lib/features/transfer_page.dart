@@ -82,6 +82,8 @@ class _TransferPageState extends ConsumerState<TransferPage> {
       ref.invalidate(recentMovementsProvider);
       ref.invalidate(overviewProvider);
       ref.invalidate(accountsProvider);
+      ref.invalidate(allocationProvider);
+      ref.invalidate(snapshotsProvider);
       messenger.showSnackBar(const SnackBar(content: Text('转账已入账')));
       if (mounted) router.pop();
     } catch (e) {

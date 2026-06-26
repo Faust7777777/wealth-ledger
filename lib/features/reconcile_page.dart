@@ -199,6 +199,8 @@ class _ReconcilePageState extends ConsumerState<ReconcilePage> {
       ref.invalidate(recentMovementsProvider);
       ref.invalidate(overviewProvider);
       ref.invalidate(accountsProvider);
+      ref.invalidate(allocationProvider);
+      ref.invalidate(snapshotsProvider);
       messenger.showSnackBar(const SnackBar(content: Text('余额已校准')));
       if (mounted) router.pop();
     } catch (e) {
