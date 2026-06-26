@@ -1118,6 +1118,22 @@ async fn mark_dca_executed_as_proposal(
     State(state): State<AppState>,
     Path(reminder_id): Path<String>,
 ) -> Response {
+    if let Some(path) = state.local_ledger_path.as_ref() {
+        let now = current_timestamp();
+        let movement_id = next_local_movement_id();
+        let atomic_group_id = next_local_atomic_group_id();
+        return match local_ledger::mark_dca_executed_as_proposal(
+            path,
+            &reminder_id,
+            &movement_id,
+            &atomic_group_id,
+            &now,
+        ) {
+            Ok(group) => envelope(group).into_response(),
+            Err(error) => local_ledger_error(error, "invalid_dca_mark_executed"),
+        };
+    }
+
     match state.ledger.mark_dca_executed_as_proposal(&reminder_id) {
         Some(proposal) => envelope(proposal).into_response(),
         None => not_found(
@@ -2636,6 +2652,115 @@ mod tests {
         assert_eq!(persisted["dcaPlans"].as_array().expect("plans").len(), 2);
         assert_eq!(persisted["dcaReminders"][0]["status"], "skipped");
         assert_eq!(persisted["dcaReminders"][1]["status"], "snoozed");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_dca_mark_executed_creates_confirmable_holding_proposal() {
+        let path = unique_test_ledger_path("dca_mark_executed");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let account_input = json!({
+            "displayName": "基金现金账户",
+            "accountType": "brokerage",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "mixed",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "1000.00"}
+            ]
+        });
+        let (account_status, account_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", account_input)
+                .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id should be string")
+            .to_string();
+
+        let plan_input = json!({
+            "displayName": "沪深300ETF",
+            "targetInstrumentId": "inst_csi300_fund",
+            "fundingAccountId": account_id,
+            "plannedAmount": {"amount": "200.00", "currency": "CNY"},
+            "frequency": "monthly",
+            "nextDueDate": "2026-07-10"
+        });
+        let (plan_status, _) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/dca/plans", plan_input).await;
+        assert_eq!(plan_status, StatusCode::CREATED);
+        let (_, due_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/dca/reminders/due").await;
+        let reminder_id = due_body["data"][0]["id"]
+            .as_str()
+            .expect("reminder id should be string")
+            .to_string();
+
+        let (mark_status, mark_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/dca/reminders/{reminder_id}/mark-executed-as-proposal"),
+        )
+        .await;
+        assert_eq!(mark_status, StatusCode::OK);
+        assert_eq!(mark_body["data"]["status"], "pending");
+        assert_eq!(
+            mark_body["data"]["proposedMovements"][0]["status"],
+            "pending_review"
+        );
+        let atomic_group_id = mark_body["data"]["id"]
+            .as_str()
+            .expect("atomic group id should be string")
+            .to_string();
+
+        let (holdings_before_status, holdings_before_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(holdings_before_status, StatusCode::OK);
+        assert_eq!(holdings_before_body["data"], json!([]));
+
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{atomic_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK);
+        assert_eq!(confirm_body["data"]["ledgerWrite"], true);
+
+        let (account_after_status, account_after_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(account_after_status, StatusCode::OK);
+        assert_eq!(account_after_body["data"]["value"]["amount"], "1000.00");
+
+        let (holdings_after_status, holdings_after_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(holdings_after_status, StatusCode::OK);
+        assert_eq!(
+            holdings_after_body["data"][0]["instrumentId"],
+            "inst_csi300_fund"
+        );
+        assert_eq!(
+            holdings_after_body["data"][0]["marketValue"]["amount"],
+            "200.00"
+        );
+
+        let (due_after_status, due_after_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/dca/reminders/due").await;
+        assert_eq!(due_after_status, StatusCode::OK);
+        assert_eq!(due_after_body["data"], json!([]));
+
+        let persisted =
+            local_ledger::read_document(&path).expect("ledger should persist DCA execution");
+        assert_eq!(persisted["dcaReminders"][0]["status"], "recorded");
+        assert_eq!(persisted["holdings"][0]["quantity"], "200");
 
         let _ = std::fs::remove_file(path);
     }

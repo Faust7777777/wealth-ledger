@@ -5,6 +5,7 @@ use std::{
     ops::{Add, AddAssign, Neg, Sub},
     path::{Path, PathBuf},
 };
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const LEDGER_VERSION: i64 = 1;
 pub const DEFAULT_BASE_CURRENCY: &str = "CNY";
@@ -91,7 +92,7 @@ pub fn list_accounts(path: &Path) -> io::Result<Value> {
         .as_array()
         .expect("validated local ledger accounts should be an array")
         .iter()
-        .map(project_account_for_api)
+        .map(|account| project_account_for_api_with_document(&document, account))
         .collect::<Vec<_>>();
     Ok(json!(accounts))
 }
@@ -343,6 +344,7 @@ pub fn confirm_atomic_group(
                 movement["updatedAt"] = json!(now);
             }
         }
+        mark_dca_reminders_recorded_for_movements(&mut document, &candidate_movements, now);
     }
 
     write_document(path, &document)?;
@@ -472,6 +474,166 @@ pub fn snooze_dca_reminder(
     }
 
     update_dca_reminder_status(path, reminder_id, "snoozed", until, now)
+}
+
+pub fn mark_dca_executed_as_proposal(
+    path: &Path,
+    reminder_id: &str,
+    movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let reminder = document["dcaReminders"]
+        .as_array()
+        .expect("validated local ledger dcaReminders should be an array")
+        .iter()
+        .find(|reminder| reminder.get("id").and_then(Value::as_str) == Some(reminder_id))
+        .cloned()
+        .ok_or_else(|| {
+            LedgerError::NotFound(format!("DCA reminder does not exist: {reminder_id}"))
+        })?;
+
+    match reminder.get("status").and_then(Value::as_str) {
+        Some("due" | "overdue" | "snoozed") => {}
+        Some(status) => {
+            return Err(LedgerError::Conflict(format!(
+                "DCA reminder cannot be recorded from status: {status}"
+            )));
+        }
+        None => {
+            return Err(LedgerError::InvalidInput(vec![
+                "DCA reminder.status must be present".to_string(),
+            ]));
+        }
+    }
+
+    let plan_id = reminder
+        .get("planId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["DCA reminder.planId is missing".to_string()])
+        })?;
+    let plan = document["dcaPlans"]
+        .as_array()
+        .expect("validated local ledger dcaPlans should be an array")
+        .iter()
+        .find(|plan| plan.get("id").and_then(Value::as_str) == Some(plan_id))
+        .cloned()
+        .ok_or_else(|| LedgerError::NotFound(format!("DCA plan does not exist: {plan_id}")))?;
+    let funding_account_id = plan
+        .get("fundingAccountId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "DCA plan.fundingAccountId is required to record execution".to_string(),
+            ])
+        })?;
+    if !active_account_exists(&document, funding_account_id) {
+        return Err(LedgerError::NotFound(format!(
+            "DCA funding account does not exist or is archived: {funding_account_id}"
+        )));
+    }
+    let target_instrument_id = plan
+        .get("targetInstrumentId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["DCA plan.targetInstrumentId is required".to_string()])
+        })?;
+    let planned_amount = plan.get("plannedAmount").ok_or_else(|| {
+        LedgerError::InvalidInput(vec!["DCA plan.plannedAmount is required".to_string()])
+    })?;
+    let amount = planned_amount
+        .get("amount")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "DCA plan.plannedAmount.amount is required".to_string(),
+            ])
+        })?;
+    let currency = planned_amount
+        .get("currency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "DCA plan.plannedAmount.currency is required".to_string(),
+            ])
+        })?;
+    if !is_positive_decimal_string(amount) {
+        return Err(LedgerError::InvalidInput(vec![
+            "DCA plan.plannedAmount.amount must be a positive decimal string".to_string(),
+        ]));
+    }
+
+    let display_name = plan
+        .get("displayName")
+        .and_then(Value::as_str)
+        .unwrap_or(target_instrument_id);
+    let movement = json!({
+        "id": movement_id,
+        "atomicGroupId": atomic_group_id,
+        "type": "buy",
+        "occurredAt": now,
+        "recordedAt": now,
+        "status": "pending_review",
+        "title": format!("记录{display_name}定投"),
+        "description": "用户点击“记录已执行”后生成的候选记录；不下单、不转账。",
+        "entries": [
+            {
+                "id": format!("entry_{movement_id}_cash_out"),
+                "accountId": funding_account_id,
+                "amount": amount,
+                "currency": currency,
+                "direction": "out",
+                "role": "source"
+            },
+            {
+                "id": format!("entry_{movement_id}_holding_in"),
+                "accountId": funding_account_id,
+                "instrumentId": target_instrument_id,
+                "amount": amount,
+                "currency": currency,
+                "direction": "in",
+                "role": "destination"
+            }
+        ],
+        "categoryId": "cat_investment_dca",
+        "tags": ["dca"],
+        "source": {
+            "kind": "system",
+            "sourceId": reminder_id,
+            "createdBy": "system"
+        },
+        "createdAt": now,
+        "updatedAt": now
+    });
+
+    document["movements"]
+        .as_array_mut()
+        .expect("validated local ledger movements should be an array")
+        .push(movement.clone());
+    if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
+        let movement_entries = document["movementEntries"]
+            .as_array_mut()
+            .expect("validated local ledger movementEntries should be an array");
+        for entry in entries {
+            let mut indexed_entry = entry.clone();
+            indexed_entry["movementId"] = json!(movement_id);
+            indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+            movement_entries.push(indexed_entry);
+        }
+    }
+
+    let mut group = atomic_group_from_movement(&movement, "pending");
+    group["warnings"] = json!([
+        {
+            "code": "record_only_no_order",
+            "message": "该候选只记录用户已执行的定投，不连接券商、不下单、不转账。",
+            "severity": "info"
+        }
+    ]);
+    write_document(path, &document)?;
+    Ok(group)
 }
 
 pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
@@ -1438,6 +1600,18 @@ fn project_account_for_api(account: &Value) -> Value {
     projected
 }
 
+fn project_account_for_api_with_document(document: &Value, account: &Value) -> Value {
+    let mut projected = account.clone();
+    if let Some(value) = projected_account_value_with_holdings(document, account) {
+        projected["value"] = value;
+    } else if projected.get("value").is_none()
+        && let Some(value) = projected_account_value(account)
+    {
+        projected["value"] = value;
+    }
+    projected
+}
+
 fn project_movement_for_api(movement: &Value) -> Value {
     let mut projected = movement.clone();
 
@@ -1562,6 +1736,71 @@ fn projected_account_value(account: &Value) -> Option<Value> {
         "asOf": balance.get("asOf")?.clone(),
         "quality": balance.get("quality")?.clone()
     }))
+}
+
+fn projected_account_value_with_holdings(document: &Value, account: &Value) -> Option<Value> {
+    let currency = document
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_BASE_CURRENCY);
+    let account_id = account.get("id").and_then(Value::as_str)?;
+    let mut total = DecimalAmount::ZERO;
+    let mut has_value = false;
+    let mut quality = "exact";
+
+    for balance in account
+        .get("cashBalances")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|balance| balance.get("currency").and_then(Value::as_str) == Some(currency))
+    {
+        let amount = parse_decimal(balance.get("amount")?.as_str()?).ok()?;
+        total += amount;
+        has_value = true;
+        quality = combine_quality(
+            quality,
+            balance
+                .get("quality")
+                .and_then(Value::as_str)
+                .unwrap_or("exact"),
+        );
+    }
+
+    for holding in project_holdings_for_api(document)
+        .iter()
+        .filter(|holding| holding.get("accountId").and_then(Value::as_str) == Some(account_id))
+    {
+        let Some(market_value) = holding.get("marketValue") else {
+            quality = combine_quality(quality, "incomplete");
+            continue;
+        };
+        if market_value.get("currency").and_then(Value::as_str) != Some(currency) {
+            quality = combine_quality(quality, "incomplete");
+            continue;
+        }
+        let amount = parse_decimal(market_value.get("amount")?.as_str()?).ok()?;
+        total += amount;
+        has_value = true;
+        quality = combine_quality(
+            quality,
+            market_value
+                .get("quality")
+                .and_then(Value::as_str)
+                .unwrap_or("estimated"),
+        );
+    }
+
+    has_value.then(|| {
+        json!({
+            "amount": money_amount(total),
+            "currency": currency,
+            "asOf": OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .expect("RFC3339 formatting should succeed"),
+            "quality": quality
+        })
+    })
 }
 
 fn projected_movement_amount(movement: &Value) -> Option<Value> {
@@ -2370,6 +2609,58 @@ fn apply_holding_delta(
     }
 
     Ok(())
+}
+
+fn mark_dca_reminders_recorded_for_movements(document: &mut Value, movements: &[Value], now: &str) {
+    let reminder_ids = movements
+        .iter()
+        .filter(|movement| movement.get("type").and_then(Value::as_str) == Some("buy"))
+        .filter_map(|movement| {
+            let source = movement.get("source")?;
+            (source.get("kind").and_then(Value::as_str) == Some("system")
+                && source.get("createdBy").and_then(Value::as_str) == Some("system"))
+            .then(|| source.get("sourceId").and_then(Value::as_str))
+            .flatten()
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    if reminder_ids.is_empty() {
+        return;
+    }
+
+    let mut plan_ids = Vec::new();
+    for reminder in document["dcaReminders"]
+        .as_array_mut()
+        .expect("validated local ledger dcaReminders should be an array")
+        .iter_mut()
+        .filter(|reminder| {
+            reminder
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| reminder_ids.iter().any(|reminder_id| reminder_id == id))
+        })
+    {
+        reminder["status"] = json!("recorded");
+        reminder["updatedAt"] = json!(now);
+        if let Some(plan_id) = reminder.get("planId").and_then(Value::as_str) {
+            plan_ids.push(plan_id.to_string());
+        }
+    }
+
+    for plan in document["dcaPlans"]
+        .as_array_mut()
+        .expect("validated local ledger dcaPlans should be an array")
+        .iter_mut()
+        .filter(|plan| {
+            plan.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| plan_ids.iter().any(|plan_id| plan_id == id))
+        })
+    {
+        plan["lastActionAt"] = json!(now);
+        plan["updatedAt"] = json!(now);
+    }
 }
 
 fn apply_holding_money_delta(
