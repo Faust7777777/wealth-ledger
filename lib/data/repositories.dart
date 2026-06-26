@@ -30,6 +30,8 @@ abstract interface class MovementRepository {
   Future<MovementVm> createManualRecord(ManualRecordInput input);
   /// 转账：账户间转移（双分录草稿 → 复核 → 确认）。仅 local_server。
   Future<MovementVm> createTransfer(TransferInput input);
+  /// 余额观察/校准：对差额生成 adjustment 候选并确认入账。仅 local_server。
+  Future<MovementVm> reconcileBalance(ReconcileInput input);
 }
 
 abstract interface class DcaRepository {

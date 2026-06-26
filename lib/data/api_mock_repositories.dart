@@ -227,6 +227,17 @@ ValuedMoney _valued(Object? o) {
 ValuedMoney? _valuedOrNull(Object? o) => o == null ? null : _valued(o);
 
 // ———— 实体映射 ————
+Map<String, String> _cashBalances(Object? v) {
+  if (v is! List) return const {};
+  final m = <String, String>{};
+  for (final e in v) {
+    if (e is Map && e['currency'] != null && e['amount'] != null) {
+      m['${e['currency']}'] = '${e['amount']}';
+    }
+  }
+  return m;
+}
+
 AccountVm _account(Map<String, dynamic> j) {
   final type = _acctType(j['accountType']);
   final isLiab = j['role'] == 'liability' ||
@@ -244,6 +255,7 @@ AccountVm _account(Map<String, dynamic> j) {
     balanceMode: (j['balanceMode'] as String?) ?? 'cash_balance',
     includeInNetWorth: j['includeInNetWorth'] as bool? ?? true,
     institutionName: j['institutionName'] as String?,
+    cashBalances: _cashBalances(j['cashBalances']),
     isArchived: j['status'] == 'archived' || j['visibility'] == 'archived',
   );
 }
@@ -555,6 +567,29 @@ class LocalServerMovementRepository implements MovementRepository {
         'toAccountId': input.toAccountId,
         if (input.note != null && input.note!.isNotEmpty) 'note': input.note,
       },
+    });
+  }
+
+  @override
+  Future<MovementVm> reconcileBalance(ReconcileInput input) async {
+    final delta = subtractDecimal(input.observedBalance, input.currentBalance);
+    final isOut = delta.startsWith('-');
+    final amount = isOut ? delta.substring(1) : delta;
+    final hasNote = input.note?.isNotEmpty ?? false;
+    return _recordViaPipeline({
+      'type': 'adjustment',
+      'occurredAt': DateTime.now().toUtc().toIso8601String(),
+      'title': hasNote ? input.note! : '余额校准',
+      if (hasNote) 'description': input.note,
+      'entries': [
+        {
+          'accountId': input.accountId,
+          'amount': amount,
+          'currency': input.currency,
+          'direction': isOut ? 'out' : 'in',
+          'role': 'adjustment',
+        },
+      ],
     });
   }
 

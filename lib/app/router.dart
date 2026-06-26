@@ -17,6 +17,7 @@ import '../features/liabilities_page.dart';
 import '../features/manual_record_page.dart';
 import '../features/movement_detail_page.dart';
 import '../features/overview_page.dart';
+import '../features/reconcile_page.dart';
 import '../features/settings_page.dart';
 import '../features/snapshots_page.dart';
 import '../features/transfer_page.dart';
@@ -56,6 +57,7 @@ final appRouter = GoRouter(
     ),
     GoRoute(path: '/record/manual', builder: (c, s) => const ManualRecordPage()),
     GoRoute(path: '/record/transfer', builder: (c, s) => const TransferPage()),
+    GoRoute(path: '/record/reconcile', builder: (c, s) => const ReconcilePage()),
     GoRoute(path: '/anomalies', builder: (c, s) => const AnomaliesPage()),
     GoRoute(path: '/snapshots', builder: (c, s) => const SnapshotsPage()),
     GoRoute(path: '/settings', builder: (c, s) => const SettingsPage()),

@@ -58,6 +58,9 @@ class RealLocalMovementRepository implements MovementRepository {
   @override
   Future<MovementVm> createTransfer(TransferInput input) async =>
       throw UnsupportedError('real_local 暂不支持转账；请用 local_server');
+  @override
+  Future<MovementVm> reconcileBalance(ReconcileInput input) async =>
+      throw UnsupportedError('real_local 暂不支持余额校准；请用 local_server');
 }
 
 class RealLocalDcaRepository implements DcaRepository {

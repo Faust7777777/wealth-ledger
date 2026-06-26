@@ -86,6 +86,7 @@ class AccountVm {
     this.balanceMode = 'cash_balance',
     this.includeInNetWorth = true,
     this.institutionName,
+    this.cashBalances = const {},
   });
   final Id id;
   final String displayName;
@@ -98,6 +99,7 @@ class AccountVm {
   final String balanceMode; // cash_balance | holdings | liability | mixed
   final bool includeInNetWorth;
   final String? institutionName;
+  final Map<CurrencyCode, DecimalString> cashBalances; // 各币种现金余额（local_server）
 }
 
 /// 创建账户输入（对齐 APPLICATION_INTERFACES_V1.CreateAccountInput）。
@@ -156,6 +158,22 @@ class TransferInput {
   final String title;
   final String? note;
   final IsoDateTime? occurredAt;
+}
+
+/// 余额观察/校准输入：对（实际余额 − 当前余额）的差额生成 adjustment 候选。
+class ReconcileInput {
+  const ReconcileInput({
+    required this.accountId,
+    required this.currency,
+    required this.currentBalance,
+    required this.observedBalance,
+    this.note,
+  });
+  final Id accountId;
+  final CurrencyCode currency;
+  final DecimalString currentBalance;
+  final DecimalString observedBalance;
+  final String? note;
 }
 
 class HoldingVm {

@@ -19,7 +19,7 @@ Future<void> showRecordSheet(BuildContext context) {
           ),
           _RecordTile(sheetCtx: sheetCtx, pageCtx: context, icon: Icons.edit_outlined, label: '手动记账', route: '/record/manual'),
           _RecordTile(sheetCtx: sheetCtx, pageCtx: context, icon: Icons.swap_horiz, label: '转账', route: '/record/transfer'),
-          _RecordTile(sheetCtx: sheetCtx, pageCtx: context, icon: Icons.fact_check_outlined, label: '余额观察'),
+          _RecordTile(sheetCtx: sheetCtx, pageCtx: context, icon: Icons.fact_check_outlined, label: '余额观察', route: '/record/reconcile'),
           _RecordTile(
             sheetCtx: sheetCtx,
             pageCtx: context,
