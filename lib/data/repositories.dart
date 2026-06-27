@@ -66,6 +66,13 @@ abstract interface class AiProposalRepository {
     String? defaultCurrency,
   });
 
+  /// 图片导入：图片只作为 evidence 生成候选；确认前不写账本。
+  Future<void> createFromImage({
+    required String fileName,
+    required String imageBase64,
+    String? mimeType,
+  });
+
   /// 编辑候选：把（无金额的）文本候选补成结构化 movement，approve 前必需。仅 local_server。
   Future<void> editAtomicGroup(Id groupId, ManualRecordInput input);
 }

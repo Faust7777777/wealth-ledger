@@ -409,6 +409,16 @@ class FixtureAiProposalRepository implements AiProposalRepository {
   }) async {
     /* DEMO：模拟 CSV 候选（演示数据不变）*/
   }
+
+  @override
+  Future<void> createFromImage({
+    required String fileName,
+    required String imageBase64,
+    String? mimeType,
+  }) async {
+    /* DEMO：模拟图片候选（演示数据不变）*/
+  }
+
   @override
   Future<void> editAtomicGroup(Id groupId, ManualRecordInput input) async {
     /* DEMO：模拟编辑 */

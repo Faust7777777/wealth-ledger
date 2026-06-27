@@ -52,6 +52,13 @@ Future<void> showRecordSheet(BuildContext context) {
             label: 'CSV 导入',
             route: '/ai-import/csv',
           ),
+          _RecordTile(
+            sheetCtx: sheetCtx,
+            pageCtx: context,
+            icon: Icons.image_outlined,
+            label: '图片导入',
+            route: '/ai-import/image',
+          ),
           const SizedBox(height: AppSpacing.sm),
         ],
       ),

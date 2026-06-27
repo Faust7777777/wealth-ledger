@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/view_models.dart';
 import 'package:finwealth/features/ai_import_csv_page.dart';
+import 'package:finwealth/features/ai_import_image_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/reconcile_page.dart';
 import 'package:finwealth/features/transfer_page.dart';
@@ -72,6 +73,14 @@ void main() {
     expect(find.text('默认账户'), findsOneWidget);
     expect(find.textContaining('钱包'), findsWidgets);
     expect(find.text('CSV 内容'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, '生成候选'), findsOneWidget);
+  });
+
+  testWidgets('AiImportImagePage renders base64 form', (t) async {
+    await t.pumpWidget(_host(const AiImportImagePage(), const []));
+    await t.pumpAndSettle();
+    expect(find.text('图片文件名'), findsOneWidget);
+    expect(find.text('图片 Base64 / data URL'), findsOneWidget);
     expect(find.widgetWithText(FilledButton, '生成候选'), findsOneWidget);
   });
 }

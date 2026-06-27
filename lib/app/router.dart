@@ -11,6 +11,7 @@ import '../features/account_form_page.dart';
 import '../features/accounts_page.dart';
 import '../features/ai_edit_page.dart';
 import '../features/ai_import_csv_page.dart';
+import '../features/ai_import_image_page.dart';
 import '../features/ai_import_text_page.dart';
 import '../features/ai_review_page.dart';
 import '../features/anomalies_page.dart';
@@ -64,6 +65,10 @@ final appRouter = GoRouter(
     GoRoute(
       path: '/ai-import/text',
       builder: (c, s) => const AiImportTextPage(),
+    ),
+    GoRoute(
+      path: '/ai-import/image',
+      builder: (c, s) => const AiImportImagePage(),
     ),
     GoRoute(path: '/ai-import/csv', builder: (c, s) => const AiImportCsvPage()),
     GoRoute(path: '/accounts/new', builder: (c, s) => const AccountFormPage()),

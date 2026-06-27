@@ -754,6 +754,22 @@ class LocalServerAiProposalRepository implements AiProposalRepository {
   }
 
   @override
+  Future<void> createFromImage({
+    required String fileName,
+    required String imageBase64,
+    String? mimeType,
+  }) async {
+    final body = <String, Object>{
+      'fileName': fileName,
+      'imageBase64': imageBase64,
+    };
+    if (mimeType != null) {
+      body['mimeType'] = mimeType;
+    }
+    await _c.postData('/v1/ai/proposals/from-image', body: body);
+  }
+
+  @override
   Future<void> editAtomicGroup(Id groupId, ManualRecordInput input) async {
     final isIncome = input.type == MovementType.income;
     await _c.postData(
