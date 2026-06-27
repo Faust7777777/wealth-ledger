@@ -79,8 +79,9 @@ void main() {
   testWidgets('AiImportImagePage renders base64 form', (t) async {
     await t.pumpWidget(_host(const AiImportImagePage(), const []));
     await t.pumpAndSettle();
+    expect(find.widgetWithText(OutlinedButton, '选择图片'), findsOneWidget);
     expect(find.text('图片文件名'), findsOneWidget);
-    expect(find.text('图片 Base64 / data URL'), findsOneWidget);
+    expect(find.text('图片 Base64 / data URL（可选兜底）'), findsOneWidget);
     expect(find.widgetWithText(FilledButton, '生成候选'), findsOneWidget);
   });
 }
