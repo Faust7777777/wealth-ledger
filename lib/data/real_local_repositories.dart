@@ -133,4 +133,8 @@ class RealLocalSnapshotRepository implements SnapshotRepository {
   Future<NetWorthSnapshotVm?> getLatest() async => null;
   @override
   Future<List<NetWorthSnapshotVm>> listSnapshots() async => const [];
+  @override
+  Future<NetWorthSnapshotVm> createManualSnapshot({
+    required String reason,
+  }) async => throw UnsupportedError('real_local 暂不支持创建快照；请用 local_server');
 }

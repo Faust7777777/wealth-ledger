@@ -446,4 +446,8 @@ class FixtureSnapshotRepository implements SnapshotRepository {
     _latest,
     _previous,
   ];
+  @override
+  Future<NetWorthSnapshotVm> createManualSnapshot({
+    required String reason,
+  }) async => throw UnsupportedError('DEMO 演示只读，不支持创建快照；请用 local_server');
 }

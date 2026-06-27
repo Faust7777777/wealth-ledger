@@ -847,4 +847,15 @@ class LocalServerSnapshotRepository implements SnapshotRepository {
     final all = await listSnapshots();
     return all.isEmpty ? null : all.first;
   }
+
+  @override
+  Future<NetWorthSnapshotVm> createManualSnapshot({
+    required String reason,
+  }) async {
+    final d = await _c.postData(
+      '/v1/snapshots/manual',
+      body: {'reason': reason},
+    );
+    return _snapshot(_m(d));
+  }
 }

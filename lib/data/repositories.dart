@@ -83,4 +83,5 @@ abstract interface class AiProposalRepository {
 abstract interface class SnapshotRepository {
   Future<NetWorthSnapshotVm?> getLatest();
   Future<List<NetWorthSnapshotVm>> listSnapshots();
+  Future<NetWorthSnapshotVm> createManualSnapshot({required String reason});
 }
