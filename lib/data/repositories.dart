@@ -44,6 +44,8 @@ abstract interface class DcaRepository {
 
   /// 「记录已执行」：只生成待确认候选记录；不下单、不转账、不连券商。
   Future<void> markExecutedAsProposal(Id reminderId);
+  Future<void> skipReminder(Id reminderId);
+  Future<void> snoozeReminder(Id reminderId, {required IsoDate until});
 }
 
 abstract interface class QuoteRepository {

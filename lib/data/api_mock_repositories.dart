@@ -720,6 +720,19 @@ class LocalServerDcaRepository implements DcaRepository {
       '/v1/dca/reminders/$reminderId/mark-executed-as-proposal',
     );
   }
+
+  @override
+  Future<void> skipReminder(Id reminderId) async {
+    await _c.postData('/v1/dca/reminders/$reminderId/skip');
+  }
+
+  @override
+  Future<void> snoozeReminder(Id reminderId, {required IsoDate until}) async {
+    await _c.postData(
+      '/v1/dca/reminders/$reminderId/snooze',
+      body: {'until': until},
+    );
+  }
 }
 
 class LocalServerQuoteRepository implements QuoteRepository {

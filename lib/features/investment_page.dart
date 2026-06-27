@@ -139,23 +139,72 @@ class _ReminderTile extends ConsumerWidget {
       contentPadding: EdgeInsets.zero,
       leading: const Icon(Icons.event_repeat_outlined),
       title: Text(r.displayName),
-      subtitle: Text('每期 ${formatMoney(r.plannedAmount)} · 下次 ${r.dueDate}'),
-      trailing: OutlinedButton(
-        onPressed: () => _record(context, ref),
-        child: const Text('记录已执行'),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('每期 ${formatMoney(r.plannedAmount)} · 下次 ${r.dueDate}'),
+          const SizedBox(height: AppSpacing.sm),
+          Wrap(
+            spacing: AppSpacing.sm,
+            runSpacing: AppSpacing.xs,
+            children: [
+              OutlinedButton(
+                onPressed: () => _record(context, ref),
+                child: const Text('记录已执行'),
+              ),
+              TextButton(
+                onPressed: () => _skip(context, ref),
+                child: const Text('跳过本期'),
+              ),
+              TextButton(
+                onPressed: () => _snooze(context, ref),
+                child: const Text('明天提醒'),
+              ),
+            ],
+          ),
+        ],
       ),
     );
+  }
+
+  void _refresh(WidgetRef ref) {
+    ref.invalidate(dueRemindersProvider);
+    ref.invalidate(dcaPlansProvider);
+    ref.invalidate(overviewProvider);
   }
 
   Future<void> _record(BuildContext context, WidgetRef ref) async {
     final messenger = ScaffoldMessenger.of(context);
     try {
       await ref.read(dcaRepositoryProvider).markExecutedAsProposal(r.id);
-      ref.invalidate(dueRemindersProvider);
+      _refresh(ref);
       ref.invalidate(aiPendingProvider);
       messenger.showSnackBar(
         const SnackBar(content: Text('已生成待确认记录（不下单 / 不转账）；见 AI 待确认')),
       );
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _skip(BuildContext context, WidgetRef ref) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await ref.read(dcaRepositoryProvider).skipReminder(r.id);
+      _refresh(ref);
+      messenger.showSnackBar(const SnackBar(content: Text('已跳过本期定投提醒')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  Future<void> _snooze(BuildContext context, WidgetRef ref) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final until = _tomorrowIsoDate();
+    try {
+      await ref.read(dcaRepositoryProvider).snoozeReminder(r.id, until: until);
+      _refresh(ref);
+      messenger.showSnackBar(SnackBar(content: Text('已暂缓到 $until')));
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
     }
@@ -190,4 +239,10 @@ class _PlanTile extends StatelessWidget {
       ),
     );
   }
+}
+
+String _tomorrowIsoDate() {
+  final tomorrow = DateTime.now().add(const Duration(days: 1));
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${tomorrow.year}-${two(tomorrow.month)}-${two(tomorrow.day)}';
 }

@@ -77,6 +77,12 @@ class RealLocalDcaRepository implements DcaRepository {
   @override
   Future<void> markExecutedAsProposal(Id reminderId) async =>
       throw UnsupportedError('real_local 暂不支持写入；请用 local_server 联调');
+  @override
+  Future<void> skipReminder(Id reminderId) async =>
+      throw UnsupportedError('real_local 暂不支持跳过定投提醒；请用 local_server');
+  @override
+  Future<void> snoozeReminder(Id reminderId, {required IsoDate until}) async =>
+      throw UnsupportedError('real_local 暂不支持暂缓定投提醒；请用 local_server');
 }
 
 class RealLocalQuoteRepository implements QuoteRepository {

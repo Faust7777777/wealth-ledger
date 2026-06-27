@@ -374,6 +374,15 @@ class FixtureDcaRepository implements DcaRepository {
   Future<void> markExecutedAsProposal(Id reminderId) async {
     /* DEMO：模拟生成候选 */
   }
+  @override
+  Future<void> skipReminder(Id reminderId) async {
+    /* DEMO：模拟跳过 */
+  }
+
+  @override
+  Future<void> snoozeReminder(Id reminderId, {required IsoDate until}) async {
+    /* DEMO：模拟暂缓 */
+  }
 }
 
 class FixtureQuoteRepository implements QuoteRepository {
