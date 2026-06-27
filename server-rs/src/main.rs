@@ -679,7 +679,10 @@ fn app_with_state(state: AppState) -> Router {
             "/v1/counterparties/{counterparty_id}",
             get(counterparty_detail).patch(update_counterparty),
         )
-        .route("/v1/counterparties/merge-proposal", post(not_implemented))
+        .route(
+            "/v1/counterparties/merge-proposal",
+            post(create_counterparty_merge_proposal),
+        )
         .route("/v1/sync/bootstrap", get(sync_bootstrap))
         .route("/v1/sync/changes", get(sync_changes))
         .route("/v1/sync/push", post(sync_push))
@@ -1111,8 +1114,19 @@ async fn dca_due_reminders(
 async fn ai_pending(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
-    envelope(state.ledger.ai_pending(DevScenario::from_query(&query)))
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_pending_ai_proposals(path) {
+            Ok(proposals) => envelope(proposals).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(state.ledger.ai_pending(DevScenario::from_query(&query))).into_response()
 }
 
 async fn ai_proposal(
@@ -1120,6 +1134,21 @@ async fn ai_proposal(
     Path(proposal_id): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::get_ai_proposal(path, &proposal_id) {
+            Ok(Some(proposal)) => envelope(proposal).into_response(),
+            Ok(None) => not_found(
+                "ai_proposal_not_found",
+                "AI proposal does not exist in local ledger.",
+            ),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
     match state
         .ledger
         .ai_proposal(DevScenario::from_query(&query), &proposal_id)
@@ -1484,6 +1513,26 @@ async fn update_counterparty(
     }
 }
 
+async fn create_counterparty_merge_proposal(
+    State(state): State<AppState>,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::create_counterparty_merge_proposal(
+        path,
+        input,
+        &next_local_ai_proposal_id(),
+        &next_local_atomic_group_id(),
+        &current_timestamp(),
+    ) {
+        Ok(group) => envelope(group).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_counterparty_merge_proposal"),
+    }
+}
+
 async fn sync_bootstrap() -> Json<Value> {
     envelope(json!({"cursor": "rust_dev_cursor_0001"}))
 }
@@ -1578,6 +1627,10 @@ fn next_local_category_id() -> String {
 
 fn next_local_counterparty_id() -> String {
     next_local_id("cp_local")
+}
+
+fn next_local_ai_proposal_id() -> String {
+    next_local_id("proposal_local")
 }
 
 fn next_local_id(prefix: &str) -> String {
@@ -3032,6 +3085,195 @@ mod tests {
         let persisted = local_ledger::read_document(&path).expect("ledger should persist taxonomy");
         assert_eq!(persisted["categories"][0]["displayName"], "咖啡饮品");
         assert_eq!(persisted["counterparties"][0]["isUserMerged"], true);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_counterparty_merge_proposal_requires_confirmation() {
+        let path = unique_test_ledger_path("counterparty_merge");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (first_status, first_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/counterparties",
+            json!({"displayName": "瑞幸", "aliases": ["luckin"]}),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::CREATED);
+        let first_id = first_body["data"]["id"]
+            .as_str()
+            .expect("first counterparty id should be string")
+            .to_string();
+
+        let (second_status, second_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/counterparties",
+            json!({"displayName": "瑞幸咖啡", "aliases": ["Luckin Coffee"]}),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::CREATED);
+        let second_id = second_body["data"]["id"]
+            .as_str()
+            .expect("second counterparty id should be string")
+            .to_string();
+
+        let account_input = json!({
+            "displayName": "消费账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "100.00"}
+            ]
+        });
+        let (account_status, account_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", account_input)
+                .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id should be string")
+            .to_string();
+
+        let draft_input = json!({
+            "type": "expense",
+            "occurredAt": "2026-06-27T09:00:00+08:00",
+            "title": "瑞幸咖啡",
+            "counterpartyId": second_id.clone(),
+            "entries": [
+                {
+                    "accountId": account_id,
+                    "amount": "18.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }
+            ]
+        });
+        let (draft_status, draft_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            draft_input,
+        )
+        .await;
+        assert_eq!(draft_status, StatusCode::CREATED);
+        let movement_id = draft_body["data"]["id"]
+            .as_str()
+            .expect("movement id should be string")
+            .to_string();
+        let movement_group_id = draft_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("movement group id should be string")
+            .to_string();
+        let (movement_confirm_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{movement_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(movement_confirm_status, StatusCode::OK);
+
+        let (merge_status, merge_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/counterparties/merge-proposal",
+            json!({
+                "sourceCounterpartyIds": [first_id.clone(), second_id.clone()],
+                "targetDisplayName": "瑞幸咖啡"
+            }),
+        )
+        .await;
+        assert_eq!(merge_status, StatusCode::OK);
+        assert_eq!(merge_body["data"]["operation"], "merge");
+        assert_eq!(merge_body["data"]["targetType"], "counterparty");
+        assert_eq!(merge_body["data"]["status"], "pending");
+        let merge_group_id = merge_body["data"]["id"]
+            .as_str()
+            .expect("merge group id should be string")
+            .to_string();
+        let merged_id = merge_body["data"]["mergeMeta"]["targetCounterpartyId"]
+            .as_str()
+            .expect("target counterparty id should be string")
+            .to_string();
+
+        let (counterparties_before_status, counterparties_before_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/counterparties").await;
+        assert_eq!(counterparties_before_status, StatusCode::OK);
+        assert_eq!(
+            counterparties_before_body["data"]
+                .as_array()
+                .expect("counterparties")
+                .len(),
+            2
+        );
+
+        let (pending_status, pending_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/ai/proposals/pending").await;
+        assert_eq!(pending_status, StatusCode::OK);
+        assert_eq!(
+            pending_body["data"][0]["atomicGroups"][0]["id"],
+            merge_group_id
+        );
+
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{merge_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK);
+        assert_eq!(confirm_body["data"]["ledgerWrite"], true);
+        assert_eq!(confirm_body["data"]["mergedCounterpartyId"], merged_id);
+
+        let (counterparties_after_status, counterparties_after_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/counterparties").await;
+        assert_eq!(counterparties_after_status, StatusCode::OK);
+        assert_eq!(
+            counterparties_after_body["data"]
+                .as_array()
+                .expect("counterparties")
+                .len(),
+            1
+        );
+        assert_eq!(
+            counterparties_after_body["data"][0]["displayName"],
+            "瑞幸咖啡"
+        );
+        assert_eq!(counterparties_after_body["data"][0]["isUserMerged"], true);
+
+        let (movement_after_status, movement_after_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/movements/{movement_id}"),
+        )
+        .await;
+        assert_eq!(movement_after_status, StatusCode::OK);
+        assert_eq!(movement_after_body["data"]["counterpartyId"], merged_id);
+
+        let (pending_after_status, pending_after_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/ai/proposals/pending").await;
+        assert_eq!(pending_after_status, StatusCode::OK);
+        assert_eq!(pending_after_body["data"], json!([]));
+
+        let persisted = local_ledger::read_document(&path).expect("ledger should persist merge");
+        assert_eq!(
+            persisted["counterparties"]
+                .as_array()
+                .expect("counterparties")
+                .len(),
+            1
+        );
+        assert_eq!(
+            persisted["aiProposals"][0]["atomicGroups"][0]["status"],
+            "approved"
+        );
 
         let _ = std::fs::remove_file(path);
     }

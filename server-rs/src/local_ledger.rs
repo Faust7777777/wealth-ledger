@@ -380,6 +380,11 @@ pub fn confirm_atomic_group(
     now: &str,
 ) -> Result<Value, LedgerError> {
     let mut document = load_or_initialize(path)?;
+    if let Some(result) = confirm_counterparty_merge_atomic_group(&mut document, atomic_group_id)? {
+        write_document(path, &document)?;
+        return Ok(result);
+    }
+
     let candidate_movements = document["movements"]
         .as_array()
         .expect("validated local ledger movements should be an array")
@@ -471,6 +476,11 @@ pub fn reject_atomic_group(
     now: &str,
 ) -> Result<(), LedgerError> {
     let mut document = load_or_initialize(path)?;
+    if reject_ai_atomic_group(&mut document, atomic_group_id)? {
+        write_document(path, &document)?;
+        return Ok(());
+    }
+
     let mut found = false;
     let movements = document["movements"]
         .as_array_mut()
@@ -931,6 +941,65 @@ pub fn update_counterparty(
     let projected = counterparty.clone();
     write_document(path, &document)?;
     Ok(projected)
+}
+
+pub fn create_counterparty_merge_proposal(
+    path: &Path,
+    input: Value,
+    proposal_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let group = counterparty_merge_group_from_input(&document, &input, atomic_group_id)?;
+    let proposal = json!({
+        "id": proposal_id,
+        "status": "pending",
+        "source": {
+            "kind": "manual_import",
+            "evidenceRefs": []
+        },
+        "atomicGroups": [group.clone()],
+        "summary": group
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("对手方合并候选"),
+        "warnings": [],
+        "createdAt": now
+    });
+
+    document["aiProposals"]
+        .as_array_mut()
+        .expect("validated local ledger aiProposals should be an array")
+        .push(proposal);
+    write_document(path, &document)?;
+    Ok(group)
+}
+
+pub fn list_pending_ai_proposals(path: &Path) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    Ok(json!(
+        document["aiProposals"]
+            .as_array()
+            .expect("validated local ledger aiProposals should be an array")
+            .iter()
+            .filter(|proposal| {
+                proposal.get("status").and_then(Value::as_str) == Some("pending")
+                    && proposal_has_pending_group(proposal)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    ))
+}
+
+pub fn get_ai_proposal(path: &Path, proposal_id: &str) -> io::Result<Option<Value>> {
+    let document = load_or_initialize(path)?;
+    Ok(document["aiProposals"]
+        .as_array()
+        .expect("validated local ledger aiProposals should be an array")
+        .iter()
+        .find(|proposal| proposal.get("id").and_then(Value::as_str) == Some(proposal_id))
+        .cloned())
 }
 
 pub fn ensure_real_and_fixture_paths_separate(
@@ -2084,6 +2153,157 @@ fn apply_counterparty_patch(counterparty: &mut Value, patch: &Value) -> Result<(
     }
 }
 
+fn counterparty_merge_group_from_input(
+    document: &Value,
+    input: &Value,
+    atomic_group_id: &str,
+) -> Result<Value, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "counterparty merge input must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut errors = Vec::new();
+    let source_ids = match object.get("sourceCounterpartyIds").and_then(string_array) {
+        Some(items) if items.len() >= 2 => items,
+        _ => {
+            errors.push("sourceCounterpartyIds must contain at least two IDs".to_string());
+            Vec::new()
+        }
+    };
+    let target_display_name = required_string(object, "targetDisplayName", &mut errors);
+
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    let source_counterparties = source_ids
+        .iter()
+        .map(|id| {
+            find_counterparty(document, id)
+                .cloned()
+                .ok_or_else(|| LedgerError::NotFound(format!("counterparty does not exist: {id}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let target_id = source_ids
+        .first()
+        .expect("validated source IDs should not be empty")
+        .clone();
+    let target_display_name = target_display_name.expect("validated targetDisplayName");
+    let merged_aliases = merged_counterparty_aliases(&source_counterparties, &target_display_name);
+    let category_hint_id = source_counterparties.iter().find_map(|counterparty| {
+        counterparty
+            .get("categoryHintId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    let mut payload = json!({
+        "id": target_id,
+        "displayName": target_display_name,
+        "aliases": merged_aliases,
+        "normalizedName": normalize_name(&target_display_name, &target_id),
+        "isUserMerged": true
+    });
+    if let Some(category_hint_id) = category_hint_id {
+        payload["categoryHintId"] = json!(category_hint_id);
+    }
+
+    let source_names = source_counterparties
+        .iter()
+        .filter_map(|counterparty| counterparty.get("displayName").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(" / ");
+
+    Ok(json!({
+        "id": atomic_group_id,
+        "title": format!("合并对手方：{source_names}"),
+        "operation": "merge",
+        "targetType": "counterparty",
+        "targetId": target_id,
+        "proposedEntities": [
+            {
+                "id": target_id,
+                "entityType": "counterparty",
+                "payload": payload
+            }
+        ],
+        "diffs": [
+            {
+                "fieldPath": "counterparty.displayName",
+                "oldValue": source_names,
+                "newValue": target_display_name,
+                "severity": "important",
+                "reason": "用户请求将多个对手方归并为同一主体"
+            }
+        ],
+        "mergeMeta": {
+            "sourceCounterpartyIds": source_ids,
+            "targetCounterpartyId": target_id
+        },
+        "warnings": [
+            {
+                "code": "counterparty_merge_requires_confirmation",
+                "message": "该操作只创建合并候选；确认前不会修改对手方目录或历史记录。",
+                "severity": "info"
+            }
+        ],
+        "status": "pending",
+        "validation": {
+            "isValid": true,
+            "errors": []
+        }
+    }))
+}
+
+fn merged_counterparty_aliases(
+    source_counterparties: &[Value],
+    target_display_name: &str,
+) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for name in source_counterparties
+        .iter()
+        .filter_map(|counterparty| counterparty.get("displayName").and_then(Value::as_str))
+        .chain(std::iter::once(target_display_name))
+    {
+        push_unique_alias(&mut aliases, name);
+    }
+    for alias in source_counterparties
+        .iter()
+        .flat_map(|counterparty| {
+            counterparty
+                .get("aliases")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(Value::as_str)
+    {
+        push_unique_alias(&mut aliases, alias);
+    }
+    aliases
+}
+
+fn push_unique_alias(aliases: &mut Vec<String>, alias: &str) {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return;
+    }
+    if !aliases.iter().any(|item| item == alias) {
+        aliases.push(alias.to_string());
+    }
+}
+
+fn find_counterparty<'a>(document: &'a Value, counterparty_id: &str) -> Option<&'a Value> {
+    document["counterparties"]
+        .as_array()
+        .expect("validated local ledger counterparties should be an array")
+        .iter()
+        .find(|counterparty| {
+            counterparty.get("id").and_then(Value::as_str) == Some(counterparty_id)
+        })
+}
+
 fn normalize_name(display_name: &str, fallback: &str) -> String {
     let normalized = display_name
         .trim()
@@ -2096,6 +2316,20 @@ fn normalize_name(display_name: &str, fallback: &str) -> String {
     } else {
         normalized
     }
+}
+
+fn proposal_has_pending_group(proposal: &Value) -> bool {
+    proposal
+        .get("atomicGroups")
+        .and_then(Value::as_array)
+        .is_some_and(|groups| {
+            groups.iter().any(|group| {
+                matches!(
+                    group.get("status").and_then(Value::as_str),
+                    Some("pending" | "edited")
+                )
+            })
+        })
 }
 
 fn project_account_for_api(account: &Value) -> Value {
@@ -3170,6 +3404,219 @@ fn mark_dca_reminders_recorded_for_movements(document: &mut Value, movements: &[
     {
         plan["lastActionAt"] = json!(now);
         plan["updatedAt"] = json!(now);
+    }
+}
+
+fn confirm_counterparty_merge_atomic_group(
+    document: &mut Value,
+    atomic_group_id: &str,
+) -> Result<Option<Value>, LedgerError> {
+    let Some(group) = find_ai_atomic_group(document, atomic_group_id) else {
+        return Ok(None);
+    };
+    if group.get("operation").and_then(Value::as_str) != Some("merge")
+        || group.get("targetType").and_then(Value::as_str) != Some("counterparty")
+    {
+        return Ok(None);
+    }
+
+    match group.get("status").and_then(Value::as_str) {
+        Some("pending" | "edited") => {}
+        Some("approved") => {
+            return Ok(Some(json!({
+                "atomicGroupId": atomic_group_id,
+                "confirmedMovementIds": [],
+                "snapshotInvalidated": false,
+                "ledgerWrite": false,
+                "devOnly": false,
+                "warnings": [
+                    {
+                        "code": "counterparty_merge_already_approved",
+                        "message": "该对手方合并已确认。",
+                        "severity": "info"
+                    }
+                ]
+            })));
+        }
+        Some(status) => {
+            return Err(LedgerError::Conflict(format!(
+                "counterparty merge cannot be confirmed from status: {status}"
+            )));
+        }
+        None => {
+            return Err(LedgerError::InvalidInput(vec![
+                "atomic group status must be present".to_string(),
+            ]));
+        }
+    }
+
+    let source_ids = group
+        .get("mergeMeta")
+        .and_then(|meta| meta.get("sourceCounterpartyIds"))
+        .and_then(string_array)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "counterparty merge group must include mergeMeta.sourceCounterpartyIds".to_string(),
+            ])
+        })?;
+    let target_id = group
+        .get("mergeMeta")
+        .and_then(|meta| meta.get("targetCounterpartyId"))
+        .and_then(Value::as_str)
+        .or_else(|| source_ids.first().map(String::as_str))
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "counterparty merge group must include a targetCounterpartyId".to_string(),
+            ])
+        })?
+        .to_string();
+    let payload = group
+        .get("proposedEntities")
+        .and_then(Value::as_array)
+        .and_then(|entities| entities.first())
+        .and_then(|entity| entity.get("payload"))
+        .cloned()
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "counterparty merge group must include proposedEntities[0].payload".to_string(),
+            ])
+        })?;
+
+    let counterparties = document["counterparties"]
+        .as_array_mut()
+        .expect("validated local ledger counterparties should be an array");
+    if !counterparties.iter().any(|counterparty| {
+        counterparty.get("id").and_then(Value::as_str) == Some(target_id.as_str())
+    }) {
+        return Err(LedgerError::NotFound(format!(
+            "target counterparty does not exist: {target_id}"
+        )));
+    }
+
+    for counterparty in counterparties.iter_mut() {
+        if counterparty.get("id").and_then(Value::as_str) == Some(target_id.as_str()) {
+            *counterparty = payload.clone();
+            break;
+        }
+    }
+    counterparties.retain(|counterparty| {
+        let id = counterparty.get("id").and_then(Value::as_str);
+        id == Some(target_id.as_str())
+            || !id.is_some_and(|id| source_ids.iter().any(|source_id| source_id == id))
+    });
+
+    for movement in document["movements"]
+        .as_array_mut()
+        .expect("validated local ledger movements should be an array")
+    {
+        if movement
+            .get("counterpartyId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id != target_id && source_ids.iter().any(|source_id| source_id == id))
+        {
+            movement["counterpartyId"] = json!(target_id);
+        }
+    }
+
+    set_ai_atomic_group_status(document, atomic_group_id, "approved")?;
+    Ok(Some(json!({
+        "atomicGroupId": atomic_group_id,
+        "confirmedMovementIds": [],
+        "snapshotInvalidated": false,
+        "ledgerWrite": true,
+        "mergedCounterpartyId": target_id,
+        "devOnly": false
+    })))
+}
+
+fn reject_ai_atomic_group(
+    document: &mut Value,
+    atomic_group_id: &str,
+) -> Result<bool, LedgerError> {
+    let Some(group) = find_ai_atomic_group(document, atomic_group_id) else {
+        return Ok(false);
+    };
+    match group.get("status").and_then(Value::as_str) {
+        Some("pending" | "edited") => {
+            set_ai_atomic_group_status(document, atomic_group_id, "rejected")?;
+            Ok(true)
+        }
+        Some("rejected") => Ok(true),
+        Some(status) => Err(LedgerError::Conflict(format!(
+            "AI atomic group cannot be rejected from status: {status}"
+        ))),
+        None => Err(LedgerError::InvalidInput(vec![
+            "atomic group status must be present".to_string(),
+        ])),
+    }
+}
+
+fn find_ai_atomic_group(document: &Value, atomic_group_id: &str) -> Option<Value> {
+    document["aiProposals"]
+        .as_array()
+        .expect("validated local ledger aiProposals should be an array")
+        .iter()
+        .flat_map(|proposal| {
+            proposal
+                .get("atomicGroups")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .find(|group| group.get("id").and_then(Value::as_str) == Some(atomic_group_id))
+        .cloned()
+}
+
+fn set_ai_atomic_group_status(
+    document: &mut Value,
+    atomic_group_id: &str,
+    status: &str,
+) -> Result<(), LedgerError> {
+    let mut found = false;
+    for proposal in document["aiProposals"]
+        .as_array_mut()
+        .expect("validated local ledger aiProposals should be an array")
+    {
+        let mut proposal_has_group = false;
+        if let Some(groups) = proposal
+            .get_mut("atomicGroups")
+            .and_then(Value::as_array_mut)
+        {
+            for group in groups {
+                if group.get("id").and_then(Value::as_str) == Some(atomic_group_id) {
+                    group["status"] = json!(status);
+                    found = true;
+                    proposal_has_group = true;
+                }
+            }
+        }
+        if proposal_has_group {
+            proposal["status"] = json!(status_to_proposal_status(status));
+            if status == "approved" || status == "rejected" {
+                proposal["reviewedAt"] = json!(
+                    OffsetDateTime::now_utc()
+                        .format(&Rfc3339)
+                        .expect("RFC3339 formatting should succeed")
+                );
+            }
+        }
+    }
+
+    if found {
+        Ok(())
+    } else {
+        Err(LedgerError::NotFound(format!(
+            "AI atomic group does not exist: {atomic_group_id}"
+        )))
+    }
+}
+
+fn status_to_proposal_status(status: &str) -> &'static str {
+    match status {
+        "approved" => "approved",
+        "rejected" => "rejected",
+        "edited" => "edited",
+        _ => "pending",
     }
 }
 
