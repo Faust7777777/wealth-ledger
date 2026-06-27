@@ -2,6 +2,24 @@
 import 'package:flutter/material.dart';
 import '../theme/app_dimens.dart';
 
+/// 宽屏内容限宽居中（桌面可读性；窄屏宽度 < maxWidth 时无副作用）。
+class ContentMaxWidth extends StatelessWidget {
+  const ContentMaxWidth({
+    super.key,
+    required this.child,
+    this.maxWidth = AppLayout.contentMax,
+  });
+  final Widget child;
+  final double maxWidth;
+  @override
+  Widget build(BuildContext context) => Center(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxWidth: maxWidth),
+          child: child,
+        ),
+      );
+}
+
 /// 空状态：图标 + 一句话 + 可选动作。
 class EmptyState extends StatelessWidget {
   const EmptyState({

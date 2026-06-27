@@ -7,6 +7,7 @@ import 'package:go_router/go_router.dart';
 
 import '../data/providers.dart';
 import '../features/record_sheet.dart';
+import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
 
 typedef _Dest = ({IconData icon, IconData selected, String label});
@@ -84,7 +85,7 @@ class HomeShell extends ConsumerWidget {
               ],
             ),
             const VerticalDivider(width: 1),
-            Expanded(child: navigationShell),
+            Expanded(child: ContentMaxWidth(child: navigationShell)),
           ],
         ),
       );
@@ -92,7 +93,7 @@ class HomeShell extends ConsumerWidget {
 
     return Scaffold(
       appBar: appBar,
-      body: navigationShell,
+      body: ContentMaxWidth(child: navigationShell),
       floatingActionButton: fab,
       bottomNavigationBar: NavigationBar(
         selectedIndex: navigationShell.currentIndex,
