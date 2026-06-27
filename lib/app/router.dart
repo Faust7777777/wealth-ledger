@@ -15,6 +15,7 @@ import '../features/ai_import_image_page.dart';
 import '../features/ai_import_text_page.dart';
 import '../features/ai_review_page.dart';
 import '../features/anomalies_page.dart';
+import '../features/dca_plan_form_page.dart';
 import '../features/investment_page.dart';
 import '../features/liabilities_page.dart';
 import '../features/manual_record_page.dart';
@@ -88,6 +89,10 @@ final appRouter = GoRouter(
     GoRoute(
       path: '/record/reconcile',
       builder: (c, s) => const ReconcilePage(),
+    ),
+    GoRoute(
+      path: '/investment/dca/new',
+      builder: (c, s) => const DcaPlanFormPage(),
     ),
     GoRoute(
       path: '/ai-edit/:groupId',

@@ -368,6 +368,9 @@ class FixtureDcaRepository implements DcaRepository {
   @override
   Future<List<DcaPlanVm>> listPlans() async => _dcaPlans;
   @override
+  Future<DcaPlanVm> createPlan(CreateDcaPlanInput input) async =>
+      throw UnsupportedError('DEMO 演示只读，不支持创建定投计划；请用 local_server');
+  @override
   Future<void> markExecutedAsProposal(Id reminderId) async {
     /* DEMO：模拟生成候选 */
   }

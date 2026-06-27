@@ -133,6 +133,11 @@ String _movementTypeWire(MovementType t) => switch (t) {
   MovementType.loanRepayment => 'loan_repayment',
   MovementType.correction => 'correction',
 };
+String _dcaFrequencyWire(DcaFrequency f) => switch (f) {
+  DcaFrequency.weekly => 'weekly',
+  DcaFrequency.monthly => 'monthly',
+  DcaFrequency.custom => 'custom',
+};
 MovementType _movType(Object? s) => switch (s) {
   'income' => MovementType.income,
   'expense' => MovementType.expense,
@@ -689,6 +694,26 @@ class LocalServerDcaRepository implements DcaRepository {
   Future<List<DcaPlanVm>> listPlans() async => [
     for (final p in _list(await _c.getData('/v1/dca/plans'))) _plan(_m(p)),
   ];
+  @override
+  Future<DcaPlanVm> createPlan(CreateDcaPlanInput input) async {
+    final d = await _c.postData(
+      '/v1/dca/plans',
+      body: {
+        'displayName': input.displayName,
+        'targetInstrumentId': input.targetInstrumentId,
+        'fundingAccountId': input.fundingAccountId,
+        'plannedAmount': {
+          'amount': input.plannedAmount.amount,
+          'currency': input.plannedAmount.currency,
+        },
+        'frequency': _dcaFrequencyWire(input.frequency),
+        'nextDueDate': input.nextDueDate,
+        if (input.note != null && input.note!.isNotEmpty) 'note': input.note,
+      },
+    );
+    return _plan(_m(d));
+  }
+
   @override
   Future<void> markExecutedAsProposal(Id reminderId) async {
     await _c.postData(

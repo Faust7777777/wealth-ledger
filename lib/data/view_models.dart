@@ -47,7 +47,14 @@ enum DcaReminderStatus { due, overdue, snoozed, recorded, skipped }
 
 enum AiOperation { create, modify, correction, merge, classify }
 
-enum AiTargetType { account, holding, movement, dcaPlan, category, counterparty }
+enum AiTargetType {
+  account,
+  holding,
+  movement,
+  dcaPlan,
+  category,
+  counterparty,
+}
 
 enum AiGroupStatus { pending, approved, rejected, edited }
 
@@ -205,7 +212,11 @@ class HoldingVm {
 
 /// 交易金额拆分（优惠券/免单仅作字段，非功能模块）。paidAmount = gross − savings。
 class TransactionAmountBreakdownVm {
-  const TransactionAmountBreakdownVm({this.gross, this.savings, required this.paid});
+  const TransactionAmountBreakdownVm({
+    this.gross,
+    this.savings,
+    required this.paid,
+  });
   final Money? gross;
   final Money? savings;
   final Money paid;
@@ -252,7 +263,8 @@ class MovementEntryVm {
   final DecimalString amount;
   final CurrencyCode currency;
   final String direction; // in | out
-  final String role; // source | destination | fee | discount | pnl | tax | adjustment
+  // source | destination | fee | discount | pnl | tax | adjustment
+  final String role;
   final String? instrumentId;
 }
 
@@ -276,6 +288,25 @@ class DcaReminderVm {
 enum DcaFrequency { weekly, monthly, custom }
 
 enum DcaPlanStatus { active, snoozed, paused, completed }
+
+class CreateDcaPlanInput {
+  const CreateDcaPlanInput({
+    required this.displayName,
+    required this.targetInstrumentId,
+    required this.fundingAccountId,
+    required this.plannedAmount,
+    required this.frequency,
+    required this.nextDueDate,
+    this.note,
+  });
+  final String displayName;
+  final String targetInstrumentId;
+  final Id fundingAccountId;
+  final Money plannedAmount;
+  final DcaFrequency frequency;
+  final IsoDate nextDueDate;
+  final String? note;
+}
 
 class DcaPlanVm {
   const DcaPlanVm({

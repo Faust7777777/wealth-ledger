@@ -19,28 +19,40 @@ class InvestmentPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final holdings = ref.watch(holdingsProvider);
     final reminders = ref.watch(dueRemindersProvider);
-    final plans = ref.watch(dcaPlansProvider).asData?.value ?? const <DcaPlanVm>[];
+    final plans =
+        ref.watch(dcaPlansProvider).asData?.value ?? const <DcaPlanVm>[];
 
     return holdings.when(
       loading: () => const Center(child: CircularProgressIndicator()),
-      error: (e, _) =>
-          ErrorStateView(message: '$e', onRetry: () => ref.invalidate(holdingsProvider)),
+      error: (e, _) => ErrorStateView(
+        message: '$e',
+        onRetry: () => ref.invalidate(holdingsProvider),
+      ),
       data: (hs) {
         final rs = reminders.asData?.value ?? const <DcaReminderVm>[];
         if (hs.isEmpty && rs.isEmpty && plans.isEmpty) {
           return EmptyState(
             icon: Icons.trending_up_outlined,
             title: '还没有投资持仓',
-            message: '添加券商 / 交易所账户与持仓后，这里显示市值与浮盈亏（事实统计，非投资建议）。',
+            message: '可以先创建定投计划，或添加券商 / 交易所账户与持仓。这里只展示事实统计，非投资建议。',
             action: FilledButton(
-              onPressed: () => context.push('/accounts/new'),
-              child: const Text('添加投资账户'),
+              onPressed: () => context.push('/investment/dca/new'),
+              child: const Text('新建定投计划'),
             ),
           );
         }
         return ListView(
           padding: const EdgeInsets.all(AppSpacing.base),
           children: [
+            Align(
+              alignment: Alignment.centerLeft,
+              child: FilledButton.icon(
+                onPressed: () => context.push('/investment/dca/new'),
+                icon: const Icon(Icons.add),
+                label: const Text('新建定投计划'),
+              ),
+            ),
+            const SizedBox(height: AppSpacing.base),
             if (hs.isNotEmpty) ...[
               const SectionHeader(title: '主要持仓'),
               for (final h in hs) _HoldingTile(h: h),
@@ -49,7 +61,10 @@ class InvestmentPage extends ConsumerWidget {
             if (rs.isEmpty)
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
-                child: Text('暂无到期定投', style: Theme.of(context).textTheme.bodySmall),
+                child: Text(
+                  '暂无到期定投',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
               )
             else
               for (final r in rs) _ReminderTile(r: r),
@@ -71,7 +86,9 @@ class _HoldingTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final dark = Theme.of(context).brightness == Brightness.dark;
-    final cost = h.costBasisTotal == null ? '成本未记录' : '成本 ${formatMoney(h.costBasisTotal!)}';
+    final cost = h.costBasisTotal == null
+        ? '成本未记录'
+        : '成本 ${formatMoney(h.costBasisTotal!)}';
     final mv = h.marketValue;
     String pnl = '';
     Color? color;
@@ -80,7 +97,8 @@ class _HoldingTile extends StatelessWidget {
       final down = p.amount.startsWith('-');
       final abs = p.amount.replaceFirst(RegExp(r'^[+-]'), '');
       final rate = h.unrealizedPnlRate;
-      pnl = '浮 ${down ? '−' : '+'}¥${formatDecimalThousands(abs)}'
+      pnl =
+          '浮 ${down ? '−' : '+'}¥${formatDecimalThousands(abs)}'
           '${rate == null ? '' : '  ${_pct(rate)}'}';
       color = down
           ? (dark ? AppColors.negative : AppColorsLight.negative)
@@ -88,12 +106,18 @@ class _HoldingTile extends StatelessWidget {
     }
     return ListTile(
       contentPadding: EdgeInsets.zero,
-      title: Text('${h.displayName} · ${h.symbol} · ${h.quantity}', style: AppType.bodyStrong),
+      title: Text(
+        '${h.displayName} · ${h.symbol} · ${h.quantity}',
+        style: AppType.bodyStrong,
+      ),
       subtitle: Text(
         pnl.isEmpty ? cost : '$cost   $pnl',
         style: AppType.caption.copyWith(color: color),
       ),
-      trailing: Text(mv == null ? '—' : formatValued(mv), style: AppType.moneyRow),
+      trailing: Text(
+        mv == null ? '—' : formatValued(mv),
+        style: AppType.moneyRow,
+      ),
     );
   }
 
@@ -143,17 +167,17 @@ class _PlanTile extends StatelessWidget {
   final DcaPlanVm p;
 
   String get _freq => switch (p.frequency) {
-        DcaFrequency.weekly => '每周',
-        DcaFrequency.monthly => '每月',
-        DcaFrequency.custom => '自定义',
-      };
+    DcaFrequency.weekly => '每周',
+    DcaFrequency.monthly => '每月',
+    DcaFrequency.custom => '自定义',
+  };
 
   String get _status => switch (p.status) {
-        DcaPlanStatus.active => '进行中',
-        DcaPlanStatus.snoozed => '已暂缓',
-        DcaPlanStatus.paused => '已暂停',
-        DcaPlanStatus.completed => '已完成',
-      };
+    DcaPlanStatus.active => '进行中',
+    DcaPlanStatus.snoozed => '已暂缓',
+    DcaPlanStatus.paused => '已暂停',
+    DcaPlanStatus.completed => '已完成',
+  };
 
   @override
   Widget build(BuildContext context) {
@@ -161,7 +185,9 @@ class _PlanTile extends StatelessWidget {
       contentPadding: EdgeInsets.zero,
       leading: const Icon(Icons.repeat),
       title: Text(p.displayName),
-      subtitle: Text('$_freq ${formatMoney(p.plannedAmount)} · 下次 ${p.nextDueDate} · $_status'),
+      subtitle: Text(
+        '$_freq ${formatMoney(p.plannedAmount)} · 下次 ${p.nextDueDate} · $_status',
+      ),
     );
   }
 }

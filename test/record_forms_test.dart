@@ -7,6 +7,7 @@ import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/view_models.dart';
 import 'package:finwealth/features/ai_import_csv_page.dart';
 import 'package:finwealth/features/ai_import_image_page.dart';
+import 'package:finwealth/features/dca_plan_form_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/reconcile_page.dart';
 import 'package:finwealth/features/transfer_page.dart';
@@ -83,5 +84,17 @@ void main() {
     expect(find.text('图片文件名'), findsOneWidget);
     expect(find.text('图片 Base64 / data URL（可选兜底）'), findsOneWidget);
     expect(find.widgetWithText(FilledButton, '生成候选'), findsOneWidget);
+  });
+
+  testWidgets('DcaPlanFormPage renders with funding account', (t) async {
+    await t.pumpWidget(_host(const DcaPlanFormPage(), [_acct('a1', '钱包')]));
+    await t.pumpAndSettle();
+    expect(find.text('计划名称'), findsOneWidget);
+    expect(find.text('投资目标'), findsOneWidget);
+    expect(find.text('资金账户'), findsOneWidget);
+    expect(find.text('每期金额'), findsOneWidget);
+    await t.drag(find.byType(ListView), const Offset(0, -700));
+    await t.pumpAndSettle();
+    expect(find.widgetWithText(FilledButton, '创建定投计划'), findsOneWidget);
   });
 }

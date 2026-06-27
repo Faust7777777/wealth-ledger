@@ -40,6 +40,7 @@ abstract interface class MovementRepository {
 abstract interface class DcaRepository {
   Future<List<DcaReminderVm>> listDueReminders();
   Future<List<DcaPlanVm>> listPlans();
+  Future<DcaPlanVm> createPlan(CreateDcaPlanInput input);
 
   /// 「记录已执行」：只生成待确认候选记录；不下单、不转账、不连券商。
   Future<void> markExecutedAsProposal(Id reminderId);
