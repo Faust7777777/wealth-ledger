@@ -669,6 +669,30 @@ class LocalServerAiProposalRepository implements AiProposalRepository {
   Future<void> createFromText(String text) async {
     await _c.postData('/v1/ai/proposals/from-text', body: {'text': text});
   }
+
+  @override
+  Future<void> editAtomicGroup(Id groupId, ManualRecordInput input) async {
+    final isIncome = input.type == MovementType.income;
+    await _c.postData('/v1/ai/atomic-groups/$groupId/edit', body: {
+      'proposedMovement': {
+        'type': _movementTypeWire(input.type),
+        'occurredAt':
+            input.occurredAt ?? DateTime.now().toUtc().toIso8601String(),
+        'title': input.title,
+        if (input.description != null && input.description!.isNotEmpty)
+          'description': input.description,
+        'entries': [
+          {
+            'accountId': input.accountId,
+            'amount': input.amount,
+            'currency': input.currency,
+            'direction': isIncome ? 'in' : 'out',
+            'role': 'source',
+          },
+        ],
+      },
+    });
+  }
 }
 
 class LocalServerSnapshotRepository implements SnapshotRepository {

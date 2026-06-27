@@ -53,6 +53,8 @@ abstract interface class AiProposalRepository {
   Future<void> rejectAtomicGroup(Id groupId, {String? reason});
   /// 文本导入：AI 只生成候选 proposal，用户确认后才入账。
   Future<void> createFromText(String text);
+  /// 编辑候选：把（无金额的）文本候选补成结构化 movement，approve 前必需。仅 local_server。
+  Future<void> editAtomicGroup(Id groupId, ManualRecordInput input);
 }
 
 abstract interface class SnapshotRepository {

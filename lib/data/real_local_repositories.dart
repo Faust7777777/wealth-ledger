@@ -95,6 +95,9 @@ class RealLocalAiProposalRepository implements AiProposalRepository {
   @override
   Future<void> createFromText(String text) async =>
       throw UnsupportedError('real_local 暂不支持 AI 导入；请用 local_server 联调');
+  @override
+  Future<void> editAtomicGroup(Id groupId, ManualRecordInput input) async =>
+      throw UnsupportedError('real_local 暂不支持 AI 编辑；请用 local_server 联调');
 }
 
 class RealLocalSnapshotRepository implements SnapshotRepository {
