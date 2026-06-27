@@ -10,6 +10,7 @@ import 'package:finwealth/features/ai_import_image_page.dart';
 import 'package:finwealth/features/dca_plan_form_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/reconcile_page.dart';
+import 'package:finwealth/features/taxonomy_page.dart';
 import 'package:finwealth/features/transfer_page.dart';
 
 AccountVm _acct(
@@ -27,7 +28,33 @@ AccountVm _acct(
 );
 
 Widget _host(Widget page, List<AccountVm> accounts) => ProviderScope(
-  overrides: [accountsProvider.overrideWith((ref) async => accounts)],
+  overrides: [
+    accountsProvider.overrideWith((ref) async => accounts),
+    categoriesProvider.overrideWith(
+      (ref) async => const [
+        CategoryVm(
+          id: 'cat_coffee',
+          displayName: '咖啡饮品',
+          kind: CategoryKind.expense,
+        ),
+        CategoryVm(
+          id: 'cat_salary',
+          displayName: '工资收入',
+          kind: CategoryKind.income,
+        ),
+      ],
+    ),
+    counterpartiesProvider.overrideWith(
+      (ref) async => const [
+        CounterpartyVm(
+          id: 'cp_luckin',
+          displayName: '瑞幸咖啡',
+          aliases: ['瑞幸'],
+          categoryHintId: 'cat_coffee',
+        ),
+      ],
+    ),
+  ],
   child: MaterialApp(home: page),
 );
 
@@ -37,8 +64,12 @@ void main() {
     await t.pumpAndSettle();
     expect(find.text('支出'), findsOneWidget);
     expect(find.text('收入'), findsOneWidget);
-    expect(find.widgetWithText(FilledButton, '记一笔'), findsOneWidget);
     expect(find.text('钱包'), findsWidgets);
+    expect(find.text('分类（可选）'), findsOneWidget);
+    expect(find.text('对手方（可选）'), findsOneWidget);
+    await t.drag(find.byType(ListView), const Offset(0, -500));
+    await t.pumpAndSettle();
+    expect(find.widgetWithText(FilledButton, '记一笔'), findsOneWidget);
   });
 
   testWidgets('TransferPage renders with two accounts', (t) async {
@@ -96,5 +127,18 @@ void main() {
     await t.drag(find.byType(ListView), const Offset(0, -700));
     await t.pumpAndSettle();
     expect(find.widgetWithText(FilledButton, '创建定投计划'), findsOneWidget);
+  });
+
+  testWidgets('TaxonomyPage renders categories and counterparties', (t) async {
+    await t.pumpWidget(_host(const TaxonomyPage(), const []));
+    await t.pumpAndSettle();
+    expect(find.text('分类'), findsOneWidget);
+    expect(find.text('新增分类'), findsOneWidget);
+    await t.drag(find.byType(ListView), const Offset(0, -900));
+    await t.pumpAndSettle();
+    expect(find.text('对手方'), findsOneWidget);
+    expect(find.text('新增对手方'), findsOneWidget);
+    expect(find.text('咖啡饮品'), findsWidgets);
+    expect(find.text('瑞幸咖啡'), findsWidgets);
   });
 }

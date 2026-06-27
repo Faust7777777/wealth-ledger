@@ -15,6 +15,13 @@ abstract interface class AccountRepository {
   Future<void> archiveAccount(Id id);
 }
 
+abstract interface class TaxonomyRepository {
+  Future<List<CategoryVm>> listCategories();
+  Future<CategoryVm> createCategory(CreateCategoryInput input);
+  Future<List<CounterpartyVm>> listCounterparties();
+  Future<CounterpartyVm> createCounterparty(CreateCounterpartyInput input);
+}
+
 abstract interface class PortfolioRepository {
   Future<PortfolioOverviewVm> getOverview();
   Future<List<HoldingVm>> listHoldings();

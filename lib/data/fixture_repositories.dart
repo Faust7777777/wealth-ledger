@@ -151,6 +151,44 @@ const List<MovementVm> _movements = [
   ),
 ];
 
+const List<CategoryVm> _categories = [
+  CategoryVm(
+    id: 'cat_salary',
+    displayName: '工资收入',
+    kind: CategoryKind.income,
+    aiDescription: '工资、劳务收入、平台结算收入',
+  ),
+  CategoryVm(
+    id: 'cat_coffee',
+    displayName: '咖啡饮品',
+    kind: CategoryKind.expense,
+    aiDescription: '咖啡、奶茶、饮品消费',
+  ),
+  CategoryVm(
+    id: 'cat_investment_dca',
+    displayName: '定投投入',
+    kind: CategoryKind.investment,
+    aiDescription: '定投、买入基金或股票的资金投入记录',
+  ),
+];
+
+const List<CounterpartyVm> _counterparties = [
+  CounterpartyVm(
+    id: 'cp_luckin',
+    displayName: '瑞幸咖啡',
+    aliases: ['瑞幸', 'Luckin Coffee'],
+    normalizedName: '瑞幸咖啡',
+    categoryHintId: 'cat_coffee',
+  ),
+  CounterpartyVm(
+    id: 'cp_salary',
+    displayName: '工资发放方',
+    aliases: ['公司', '雇主'],
+    normalizedName: '工资发放方',
+    categoryHintId: 'cat_salary',
+  ),
+];
+
 const List<DcaReminderVm> _dcaReminders = [
   DcaReminderVm(
     id: 'rem_csi300_0710',
@@ -359,6 +397,21 @@ class FixtureMovementRepository implements MovementRepository {
   @override
   Future<MovementVm> reconcileBalance(ReconcileInput input) async =>
       throw UnsupportedError('DEMO 演示只读，不支持余额校准；请用 local_server');
+}
+
+class FixtureTaxonomyRepository implements TaxonomyRepository {
+  const FixtureTaxonomyRepository();
+  @override
+  Future<List<CategoryVm>> listCategories() async => _categories;
+  @override
+  Future<CategoryVm> createCategory(CreateCategoryInput input) async =>
+      throw UnsupportedError('DEMO 演示只读，不支持创建分类；请用 local_server');
+  @override
+  Future<List<CounterpartyVm>> listCounterparties() async => _counterparties;
+  @override
+  Future<CounterpartyVm> createCounterparty(
+    CreateCounterpartyInput input,
+  ) async => throw UnsupportedError('DEMO 演示只读，不支持创建对手方；请用 local_server');
 }
 
 class FixtureDcaRepository implements DcaRepository {

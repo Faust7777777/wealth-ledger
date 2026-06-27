@@ -133,6 +133,14 @@ String _movementTypeWire(MovementType t) => switch (t) {
   MovementType.loanRepayment => 'loan_repayment',
   MovementType.correction => 'correction',
 };
+String _categoryKindWire(CategoryKind k) => switch (k) {
+  CategoryKind.income => 'income',
+  CategoryKind.expense => 'expense',
+  CategoryKind.transfer => 'transfer',
+  CategoryKind.investment => 'investment',
+  CategoryKind.liability => 'liability',
+  CategoryKind.system => 'system',
+};
 String _dcaFrequencyWire(DcaFrequency f) => switch (f) {
   DcaFrequency.weekly => 'weekly',
   DcaFrequency.monthly => 'monthly',
@@ -159,6 +167,14 @@ MovementStatus _movStatus(Object? s) => switch (s) {
   'cancelled' => MovementStatus.cancelled,
   'reversed' => MovementStatus.reversed,
   _ => MovementStatus.confirmed,
+};
+CategoryKind _catKind(Object? s) => switch (s) {
+  'income' => CategoryKind.income,
+  'transfer' => CategoryKind.transfer,
+  'investment' => CategoryKind.investment,
+  'liability' => CategoryKind.liability,
+  'system' => CategoryKind.system,
+  _ => CategoryKind.expense,
 };
 DcaReminderStatus _remStatus(Object? s) => switch (s) {
   'overdue' => DcaReminderStatus.overdue,
@@ -272,6 +288,24 @@ AccountVm _account(Map<String, dynamic> j) {
   );
 }
 
+CategoryVm _category(Map<String, dynamic> j) => CategoryVm(
+  id: '${j['id']}',
+  displayName: '${j['displayName']}',
+  kind: _catKind(j['kind']),
+  parentId: j['parentId'] as String?,
+  isSystem: j['isSystem'] as bool? ?? false,
+  aiDescription: j['aiDescription'] as String?,
+);
+
+CounterpartyVm _counterparty(Map<String, dynamic> j) => CounterpartyVm(
+  id: '${j['id']}',
+  displayName: '${j['displayName']}',
+  aliases: [for (final a in _list(j['aliases'])) '$a'],
+  normalizedName: j['normalizedName'] as String?,
+  categoryHintId: j['categoryHintId'] as String?,
+  isUserMerged: j['isUserMerged'] as bool? ?? false,
+);
+
 HoldingVm _holding(Map<String, dynamic> j) {
   final inst = j['instrument'] is Map
       ? _m(j['instrument'])
@@ -345,6 +379,8 @@ MovementVm _movement(Map<String, dynamic> j) {
     description: j['description'] as String?,
     amountBreakdown: _breakdown(j['amountBreakdown']),
     entries: _entries(j['entries']),
+    categoryId: j['categoryId'] as String?,
+    counterpartyId: j['counterpartyId'] as String?,
   );
 }
 
@@ -556,6 +592,56 @@ class LocalServerAccountRepository implements AccountRepository {
   }
 }
 
+class LocalServerTaxonomyRepository implements TaxonomyRepository {
+  LocalServerTaxonomyRepository(this._c);
+  final DevApiClient _c;
+
+  @override
+  Future<List<CategoryVm>> listCategories() async => [
+    for (final c in _list(await _c.getData('/v1/categories'))) _category(_m(c)),
+  ];
+
+  @override
+  Future<CategoryVm> createCategory(CreateCategoryInput input) async {
+    final d = await _c.postData(
+      '/v1/categories',
+      body: {
+        'displayName': input.displayName,
+        'kind': _categoryKindWire(input.kind),
+        if (input.parentId != null && input.parentId!.isNotEmpty)
+          'parentId': input.parentId,
+        if (input.aiDescription != null && input.aiDescription!.isNotEmpty)
+          'aiDescription': input.aiDescription,
+      },
+    );
+    return _category(_m(d));
+  }
+
+  @override
+  Future<List<CounterpartyVm>> listCounterparties() async => [
+    for (final c in _list(await _c.getData('/v1/counterparties')))
+      _counterparty(_m(c)),
+  ];
+
+  @override
+  Future<CounterpartyVm> createCounterparty(
+    CreateCounterpartyInput input,
+  ) async {
+    final d = await _c.postData(
+      '/v1/counterparties',
+      body: {
+        'displayName': input.displayName,
+        'aliases': input.aliases,
+        if (input.normalizedName != null && input.normalizedName!.isNotEmpty)
+          'normalizedName': input.normalizedName,
+        if (input.categoryHintId != null && input.categoryHintId!.isNotEmpty)
+          'categoryHintId': input.categoryHintId,
+      },
+    );
+    return _counterparty(_m(d));
+  }
+}
+
 class LocalServerPortfolioRepository implements PortfolioRepository {
   LocalServerPortfolioRepository(this._c);
   final DevApiClient _c;
@@ -602,6 +688,8 @@ class LocalServerMovementRepository implements MovementRepository {
       'title': input.title,
       if (input.description != null && input.description!.isNotEmpty)
         'description': input.description,
+      if (input.categoryId != null) 'categoryId': input.categoryId,
+      if (input.counterpartyId != null) 'counterpartyId': input.counterpartyId,
       'entries': [
         {
           'accountId': input.accountId,
@@ -820,6 +908,9 @@ class LocalServerAiProposalRepository implements AiProposalRepository {
           'title': input.title,
           if (input.description != null && input.description!.isNotEmpty)
             'description': input.description,
+          if (input.categoryId != null) 'categoryId': input.categoryId,
+          if (input.counterpartyId != null)
+            'counterpartyId': input.counterpartyId,
           'entries': [
             {
               'accountId': input.accountId,

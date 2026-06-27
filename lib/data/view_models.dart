@@ -43,6 +43,8 @@ enum MovementStatus {
   reversed,
 }
 
+enum CategoryKind { income, expense, transfer, investment, liability, system }
+
 enum DcaReminderStatus { due, overdue, snoozed, recorded, skipped }
 
 enum AiOperation { create, modify, correction, merge, classify }
@@ -127,6 +129,68 @@ class CreateAccountInput {
   final String? institutionName;
 }
 
+/// 用户维护的分类词表。不是封闭目录；AI 可读取并填充，用户确认后才入账。
+class CategoryVm {
+  const CategoryVm({
+    required this.id,
+    required this.displayName,
+    required this.kind,
+    this.parentId,
+    this.isSystem = false,
+    this.aiDescription,
+  });
+  final Id id;
+  final String displayName;
+  final CategoryKind kind;
+  final Id? parentId;
+  final bool isSystem;
+  final String? aiDescription;
+}
+
+class CreateCategoryInput {
+  const CreateCategoryInput({
+    required this.displayName,
+    required this.kind,
+    this.parentId,
+    this.aiDescription,
+  });
+  final String displayName;
+  final CategoryKind kind;
+  final Id? parentId;
+  final String? aiDescription;
+}
+
+/// 对手方词表。名字不要求穷举；后续合并/归档基于这些实体继续做。
+class CounterpartyVm {
+  const CounterpartyVm({
+    required this.id,
+    required this.displayName,
+    this.aliases = const [],
+    this.normalizedName,
+    this.categoryHintId,
+    this.isUserMerged = false,
+  });
+  final Id id;
+  final String displayName;
+  final List<String> aliases;
+  final String? normalizedName;
+  final Id? categoryHintId;
+  final bool isUserMerged;
+}
+
+class CreateCounterpartyInput {
+  const CreateCounterpartyInput({
+    required this.displayName,
+    this.aliases = const [],
+    this.normalizedName,
+    this.categoryHintId,
+  });
+  final String displayName;
+  final List<String> aliases;
+  final String? normalizedName;
+  final Id? categoryHintId;
+}
+
 /// 手动记账输入（income/expense 单分录 MVP）。direction/role 由仓库按 type 推导。
 class ManualRecordInput {
   const ManualRecordInput({
@@ -137,6 +201,8 @@ class ManualRecordInput {
     required this.title,
     this.description,
     this.occurredAt,
+    this.categoryId,
+    this.counterpartyId,
   });
   final MovementType type; // income | expense（单分录）
   final Id accountId;
@@ -145,6 +211,8 @@ class ManualRecordInput {
   final String title;
   final String? description;
   final IsoDateTime? occurredAt; // null → 仓库用当前时间
+  final Id? categoryId;
+  final Id? counterpartyId;
 }
 
 /// 转账输入（同币种、同额双分录 MVP；暂不做跨币种折算）。
@@ -235,6 +303,8 @@ class MovementVm {
     this.description,
     this.amountBreakdown,
     this.entries = const [],
+    this.categoryId,
+    this.counterpartyId,
   });
   final Id id;
   final Id atomicGroupId;
@@ -247,6 +317,8 @@ class MovementVm {
   final String? description;
   final TransactionAmountBreakdownVm? amountBreakdown;
   final List<MovementEntryVm> entries;
+  final Id? categoryId;
+  final Id? counterpartyId;
 }
 
 /// 分录（双分录账本的一条腿）：方向 in/out、角色、所属账户。

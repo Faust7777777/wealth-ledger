@@ -24,6 +24,21 @@ class RealLocalAccountRepository implements AccountRepository {
       throw UnsupportedError('real_local 暂不支持归档；请用 local_server');
 }
 
+class RealLocalTaxonomyRepository implements TaxonomyRepository {
+  const RealLocalTaxonomyRepository();
+  @override
+  Future<List<CategoryVm>> listCategories() async => const [];
+  @override
+  Future<CategoryVm> createCategory(CreateCategoryInput input) async =>
+      throw UnsupportedError('real_local 暂不支持创建分类；请用 local_server');
+  @override
+  Future<List<CounterpartyVm>> listCounterparties() async => const [];
+  @override
+  Future<CounterpartyVm> createCounterparty(
+    CreateCounterpartyInput input,
+  ) async => throw UnsupportedError('real_local 暂不支持创建对手方；请用 local_server');
+}
+
 class RealLocalPortfolioRepository implements PortfolioRepository {
   const RealLocalPortfolioRepository();
   @override

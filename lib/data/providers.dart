@@ -10,7 +10,8 @@ import 'real_local_repositories.dart';
 import 'repositories.dart';
 import 'view_models.dart';
 
-DataSourceMode _mode(Ref ref) => ref.watch(appEnvironmentProvider).dataSourceMode;
+DataSourceMode _mode(Ref ref) =>
+    ref.watch(appEnvironmentProvider).dataSourceMode;
 
 final devApiClientProvider = Provider<DevApiClient>((ref) {
   final env = ref.watch(appEnvironmentProvider);
@@ -22,56 +23,77 @@ T _pick<T>(
   required T Function() real,
   required T Function() fixture,
   required T Function() api,
-}) =>
-    switch (_mode(ref)) {
-      DataSourceMode.debugFixture => fixture(),
-      DataSourceMode.localServer => api(),
-      _ => real(),
-    };
+}) => switch (_mode(ref)) {
+  DataSourceMode.debugFixture => fixture(),
+  DataSourceMode.localServer => api(),
+  _ => real(),
+};
 
 // —— 仓库 provider（按 mode 选实现：real_local / debug_fixture / local_server）——
-final accountRepositoryProvider = Provider<AccountRepository>((ref) => _pick(
-      ref,
-      real: () => const RealLocalAccountRepository(),
-      fixture: () => const FixtureAccountRepository(),
-      api: () => LocalServerAccountRepository(ref.watch(devApiClientProvider)),
-    ));
-final portfolioRepositoryProvider = Provider<PortfolioRepository>((ref) => _pick(
-      ref,
-      real: () => const RealLocalPortfolioRepository(),
-      fixture: () => const FixturePortfolioRepository(),
-      api: () => LocalServerPortfolioRepository(ref.watch(devApiClientProvider)),
-    ));
-final movementRepositoryProvider = Provider<MovementRepository>((ref) => _pick(
-      ref,
-      real: () => const RealLocalMovementRepository(),
-      fixture: () => const FixtureMovementRepository(),
-      api: () => LocalServerMovementRepository(ref.watch(devApiClientProvider)),
-    ));
-final dcaRepositoryProvider = Provider<DcaRepository>((ref) => _pick(
-      ref,
-      real: () => const RealLocalDcaRepository(),
-      fixture: () => const FixtureDcaRepository(),
-      api: () => LocalServerDcaRepository(ref.watch(devApiClientProvider)),
-    ));
-final quoteRepositoryProvider = Provider<QuoteRepository>((ref) => _pick(
-      ref,
-      real: () => const RealLocalQuoteRepository(),
-      fixture: () => const FixtureQuoteRepository(),
-      api: () => LocalServerQuoteRepository(ref.watch(devApiClientProvider)),
-    ));
-final aiProposalRepositoryProvider = Provider<AiProposalRepository>((ref) => _pick(
-      ref,
-      real: () => const RealLocalAiProposalRepository(),
-      fixture: () => const FixtureAiProposalRepository(),
-      api: () => LocalServerAiProposalRepository(ref.watch(devApiClientProvider)),
-    ));
-final snapshotRepositoryProvider = Provider<SnapshotRepository>((ref) => _pick(
-      ref,
-      real: () => const RealLocalSnapshotRepository(),
-      fixture: () => const FixtureSnapshotRepository(),
-      api: () => LocalServerSnapshotRepository(ref.watch(devApiClientProvider)),
-    ));
+final accountRepositoryProvider = Provider<AccountRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalAccountRepository(),
+    fixture: () => const FixtureAccountRepository(),
+    api: () => LocalServerAccountRepository(ref.watch(devApiClientProvider)),
+  ),
+);
+final taxonomyRepositoryProvider = Provider<TaxonomyRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalTaxonomyRepository(),
+    fixture: () => const FixtureTaxonomyRepository(),
+    api: () => LocalServerTaxonomyRepository(ref.watch(devApiClientProvider)),
+  ),
+);
+final portfolioRepositoryProvider = Provider<PortfolioRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalPortfolioRepository(),
+    fixture: () => const FixturePortfolioRepository(),
+    api: () => LocalServerPortfolioRepository(ref.watch(devApiClientProvider)),
+  ),
+);
+final movementRepositoryProvider = Provider<MovementRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalMovementRepository(),
+    fixture: () => const FixtureMovementRepository(),
+    api: () => LocalServerMovementRepository(ref.watch(devApiClientProvider)),
+  ),
+);
+final dcaRepositoryProvider = Provider<DcaRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalDcaRepository(),
+    fixture: () => const FixtureDcaRepository(),
+    api: () => LocalServerDcaRepository(ref.watch(devApiClientProvider)),
+  ),
+);
+final quoteRepositoryProvider = Provider<QuoteRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalQuoteRepository(),
+    fixture: () => const FixtureQuoteRepository(),
+    api: () => LocalServerQuoteRepository(ref.watch(devApiClientProvider)),
+  ),
+);
+final aiProposalRepositoryProvider = Provider<AiProposalRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalAiProposalRepository(),
+    fixture: () => const FixtureAiProposalRepository(),
+    api: () => LocalServerAiProposalRepository(ref.watch(devApiClientProvider)),
+  ),
+);
+final snapshotRepositoryProvider = Provider<SnapshotRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalSnapshotRepository(),
+    fixture: () => const FixtureSnapshotRepository(),
+    api: () => LocalServerSnapshotRepository(ref.watch(devApiClientProvider)),
+  ),
+);
 
 // —— 功能数据 provider ——
 final overviewProvider = FutureProvider<PortfolioOverviewVm>(
@@ -109,14 +131,22 @@ final recentMovementsProvider = FutureProvider<List<MovementVm>>(
 final snapshotsProvider = FutureProvider<List<NetWorthSnapshotVm>>(
   (ref) => ref.watch(snapshotRepositoryProvider).listSnapshots(),
 );
+final categoriesProvider = FutureProvider<List<CategoryVm>>(
+  (ref) => ref.watch(taxonomyRepositoryProvider).listCategories(),
+);
+final counterpartiesProvider = FutureProvider<List<CounterpartyVm>>(
+  (ref) => ref.watch(taxonomyRepositoryProvider).listCounterparties(),
+);
 
 // —— 账户详情 family ——
 final accountByIdProvider = FutureProvider.family<AccountVm?, String>(
   (ref, id) => ref.watch(accountRepositoryProvider).getAccount(id),
 );
-final holdingsByAccountProvider = FutureProvider.family<List<HoldingVm>, String>(
-  (ref, id) => ref.watch(portfolioRepositoryProvider).listHoldingsByAccount(id),
-);
+final holdingsByAccountProvider =
+    FutureProvider.family<List<HoldingVm>, String>(
+      (ref, id) =>
+          ref.watch(portfolioRepositoryProvider).listHoldingsByAccount(id),
+    );
 final movementByIdProvider = FutureProvider.family<MovementVm?, String>(
   (ref, id) => ref.watch(movementRepositoryProvider).getMovement(id),
 );
@@ -130,5 +160,6 @@ class ThemeModeNotifier extends Notifier<ThemeMode> {
   void set(ThemeMode mode) => state = mode;
 }
 
-final themeModeProvider =
-    NotifierProvider<ThemeModeNotifier, ThemeMode>(ThemeModeNotifier.new);
+final themeModeProvider = NotifierProvider<ThemeModeNotifier, ThemeMode>(
+  ThemeModeNotifier.new,
+);

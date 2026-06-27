@@ -24,6 +24,7 @@ import '../features/overview_page.dart';
 import '../features/reconcile_page.dart';
 import '../features/settings_page.dart';
 import '../features/snapshots_page.dart';
+import '../features/taxonomy_page.dart';
 import '../features/transfer_page.dart';
 import 'home_shell.dart';
 
@@ -101,6 +102,7 @@ final appRouter = GoRouter(
     GoRoute(path: '/anomalies', builder: (c, s) => const AnomaliesPage()),
     GoRoute(path: '/snapshots', builder: (c, s) => const SnapshotsPage()),
     GoRoute(path: '/settings', builder: (c, s) => const SettingsPage()),
+    GoRoute(path: '/taxonomy', builder: (c, s) => const TaxonomyPage()),
     GoRoute(
       path: '/movement/:id',
       builder: (c, s) =>

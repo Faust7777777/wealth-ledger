@@ -1,17 +1,19 @@
 // Wealth Ledger — 设置（主题 / 数据源状态 / 关于）。
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../core/env.dart';
 import '../data/providers.dart';
 import '../theme/app_dimens.dart';
 
 String _modeLabel(DataSourceMode m) => switch (m) {
-      DataSourceMode.realLocal => '真实本地账本（默认；当前为空账本）',
-      DataSourceMode.debugFixture => 'DEMO 演示数据（隔离；不写真实账本、不同步）',
-      DataSourceMode.localServer => '本地 Rust 服务（dev/local server；可连 --ledger-path 真实账本）',
-      DataSourceMode.apiRemote => '远端 API（未接入）',
-    };
+  DataSourceMode.realLocal => '真实本地账本（默认；当前为空账本）',
+  DataSourceMode.debugFixture => 'DEMO 演示数据（隔离；不写真实账本、不同步）',
+  DataSourceMode.localServer =>
+    '本地 Rust 服务（dev/local server；可连 --ledger-path 真实账本）',
+  DataSourceMode.apiRemote => '远端 API（未接入）',
+};
 
 class SettingsPage extends ConsumerWidget {
   const SettingsPage({super.key});
@@ -44,7 +46,18 @@ class SettingsPage extends ConsumerWidget {
             contentPadding: EdgeInsets.zero,
             title: const Text('数据源'),
             subtitle: Text(_modeLabel(env.dataSourceMode)),
-            trailing: env.devBannerLabel == null ? null : Chip(label: Text(env.devBannerLabel!)),
+            trailing: env.devBannerLabel == null
+                ? null
+                : Chip(label: Text(env.devBannerLabel!)),
+          ),
+          const Divider(),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.label_outline),
+            title: const Text('分类与对手方'),
+            subtitle: const Text('维护 AI 可读取的分类词表、商户/平台/发薪方等对手方'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => context.push('/taxonomy'),
           ),
           const Divider(),
           const ListTile(
