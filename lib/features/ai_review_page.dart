@@ -2,6 +2,7 @@
 // 强约束：最小确认单位=atomic_group；整组接受或整组拒绝；确认前不进余额/流水/净值。
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../data/providers.dart';
 import '../data/view_models.dart';
@@ -114,9 +115,7 @@ class _GroupBlock extends ConsumerWidget {
               ),
               const Spacer(),
               TextButton(
-                onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('编辑表单：后续批次（编辑后重新校验再提交）')),
-                ),
+                onPressed: () => context.push('/ai-edit/${g.id}'),
                 child: const Text('编辑'),
               ),
               const SizedBox(width: AppSpacing.sm),

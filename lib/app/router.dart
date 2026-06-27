@@ -9,6 +9,7 @@ import '../dev/tokens_preview.dart';
 import '../features/account_detail_page.dart';
 import '../features/account_form_page.dart';
 import '../features/accounts_page.dart';
+import '../features/ai_edit_page.dart';
 import '../features/ai_import_text_page.dart';
 import '../features/ai_review_page.dart';
 import '../features/anomalies_page.dart';
@@ -58,6 +59,10 @@ final appRouter = GoRouter(
     GoRoute(path: '/record/manual', builder: (c, s) => const ManualRecordPage()),
     GoRoute(path: '/record/transfer', builder: (c, s) => const TransferPage()),
     GoRoute(path: '/record/reconcile', builder: (c, s) => const ReconcilePage()),
+    GoRoute(
+      path: '/ai-edit/:groupId',
+      builder: (c, s) => AiEditPage(groupId: s.pathParameters['groupId']!),
+    ),
     GoRoute(path: '/anomalies', builder: (c, s) => const AnomaliesPage()),
     GoRoute(path: '/snapshots', builder: (c, s) => const SnapshotsPage()),
     GoRoute(path: '/settings', builder: (c, s) => const SettingsPage()),
