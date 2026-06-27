@@ -384,6 +384,10 @@ pub fn confirm_atomic_group(
         write_document(path, &document)?;
         return Ok(result);
     }
+    if let Some(result) = confirm_ai_movement_atomic_group(&mut document, atomic_group_id, now)? {
+        write_document(path, &document)?;
+        return Ok(result);
+    }
 
     let candidate_movements = document["movements"]
         .as_array()
@@ -976,6 +980,71 @@ pub fn create_counterparty_merge_proposal(
     Ok(group)
 }
 
+pub fn create_ai_import_proposal(
+    path: &Path,
+    input: Value,
+    source_kind: &str,
+    proposal_id: &str,
+    atomic_group_id: &str,
+    movement_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let group = ai_import_group_from_input(
+        &document,
+        &input,
+        source_kind,
+        proposal_id,
+        atomic_group_id,
+        movement_id,
+        now,
+    )?;
+    let proposal = ai_import_proposal_from_group(&input, source_kind, proposal_id, &group, now);
+
+    document["aiProposals"]
+        .as_array_mut()
+        .expect("validated local ledger aiProposals should be an array")
+        .push(proposal.clone());
+    write_document(path, &document)?;
+    Ok(proposal)
+}
+
+pub fn edit_ai_atomic_group(
+    path: &Path,
+    atomic_group_id: &str,
+    patch: Value,
+    movement_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let source_id = find_ai_proposal_id_for_group(&document, atomic_group_id).ok_or_else(|| {
+        LedgerError::NotFound(format!("AI atomic group does not exist: {atomic_group_id}"))
+    })?;
+    let group = find_ai_atomic_group(&document, atomic_group_id).ok_or_else(|| {
+        LedgerError::NotFound(format!("AI atomic group does not exist: {atomic_group_id}"))
+    })?;
+
+    match group.get("status").and_then(Value::as_str) {
+        Some("pending" | "edited") => {}
+        Some(status) => {
+            return Err(LedgerError::Conflict(format!(
+                "AI atomic group cannot be edited from status: {status}"
+            )));
+        }
+        None => {
+            return Err(LedgerError::InvalidInput(vec![
+                "atomic group status must be present".to_string(),
+            ]));
+        }
+    }
+
+    let edited_group =
+        edited_ai_atomic_group_from_patch(&document, &group, &patch, &source_id, movement_id, now)?;
+    replace_ai_atomic_group(&mut document, atomic_group_id, edited_group.clone())?;
+    write_document(path, &document)?;
+    Ok(edited_group)
+}
+
 pub fn list_pending_ai_proposals(path: &Path) -> io::Result<Value> {
     let document = load_or_initialize(path)?;
     Ok(json!(
@@ -984,8 +1053,10 @@ pub fn list_pending_ai_proposals(path: &Path) -> io::Result<Value> {
             .expect("validated local ledger aiProposals should be an array")
             .iter()
             .filter(|proposal| {
-                proposal.get("status").and_then(Value::as_str) == Some("pending")
-                    && proposal_has_pending_group(proposal)
+                matches!(
+                    proposal.get("status").and_then(Value::as_str),
+                    Some("pending" | "edited")
+                ) && proposal_has_pending_group(proposal)
             })
             .cloned()
             .collect::<Vec<_>>()
@@ -3405,6 +3476,465 @@ fn mark_dca_reminders_recorded_for_movements(document: &mut Value, movements: &[
         plan["lastActionAt"] = json!(now);
         plan["updatedAt"] = json!(now);
     }
+}
+
+fn ai_import_group_from_input(
+    document: &Value,
+    input: &Value,
+    source_kind: &str,
+    proposal_id: &str,
+    atomic_group_id: &str,
+    movement_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    if let Some(movement_input) = ai_import_movement_input(input) {
+        let movement = ai_proposed_movement_from_input(
+            document,
+            &movement_input,
+            proposal_id,
+            movement_id,
+            atomic_group_id,
+            now,
+        )?;
+        let mut group = atomic_group_from_movement(&movement, "pending");
+        let title = movement
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("AI 候选记录");
+        group["title"] = json!(format!("新增：{title}"));
+        group["diffs"] = json!([]);
+        group["warnings"] = json!([
+            {
+                "code": "ai_import_requires_user_confirmation",
+                "message": "AI 导入只生成候选；确认前不会写入账本。",
+                "severity": "info"
+            }
+        ]);
+        group["sourceEvidence"] = json!([ai_evidence_ref(source_kind, proposal_id, input)]);
+        return Ok(group);
+    }
+
+    Ok(json!({
+        "id": atomic_group_id,
+        "title": format!("{}：待编辑候选", ai_source_label(source_kind, input)),
+        "operation": "create",
+        "targetType": "movement",
+        "targetId": movement_id,
+        "proposedMovements": [],
+        "diffs": [],
+        "warnings": [
+            {
+                "code": "local_ai_requires_structured_movement",
+                "message": "本地账本模式不会猜金额；请编辑候选并补全结构化记录后再确认。",
+                "severity": "warning"
+            }
+        ],
+        "status": "pending",
+        "validation": {
+            "isValid": false,
+            "errors": [
+                {
+                    "code": "structured_movement_required",
+                    "message": "需要结构化 movement 后才能确认写入账本。"
+                }
+            ]
+        },
+        "sourceEvidence": [ai_evidence_ref(source_kind, proposal_id, input)]
+    }))
+}
+
+fn ai_import_proposal_from_group(
+    input: &Value,
+    source_kind: &str,
+    proposal_id: &str,
+    group: &Value,
+    now: &str,
+) -> Value {
+    json!({
+        "id": proposal_id,
+        "status": "pending",
+        "source": {
+            "kind": source_kind,
+            "evidenceRefs": [ai_evidence_ref(source_kind, proposal_id, input)]
+        },
+        "atomicGroups": [group.clone()],
+        "summary": group
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("AI 导入候选"),
+        "warnings": [],
+        "createdAt": now
+    })
+}
+
+fn ai_import_movement_input(input: &Value) -> Option<Value> {
+    for key in ["movement", "draftMovement", "proposedMovement"] {
+        if let Some(value) = input.get(key).filter(|value| value.is_object()) {
+            return Some(value.clone());
+        }
+    }
+
+    if let Some(value) = input
+        .get("proposedMovements")
+        .and_then(Value::as_array)
+        .and_then(|items| items.iter().find(|item| item.is_object()))
+    {
+        return Some(value.clone());
+    }
+
+    input
+        .get("atomicGroups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("proposedMovements").and_then(Value::as_array))
+        .flatten()
+        .find(|movement| movement.is_object())
+        .cloned()
+}
+
+fn ai_proposed_movement_from_input(
+    document: &Value,
+    input: &Value,
+    proposal_id: &str,
+    movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let movement_id = input
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or(movement_id);
+    let mut movement =
+        movement_from_create_input(document, input, movement_id, atomic_group_id, now)?;
+    movement["status"] = json!("pending_review");
+    movement["source"] = json!({
+        "kind": "ai_proposal",
+        "sourceId": proposal_id,
+        "createdBy": "ai"
+    });
+    Ok(movement)
+}
+
+fn edited_ai_atomic_group_from_patch(
+    document: &Value,
+    group: &Value,
+    patch: &Value,
+    proposal_id: &str,
+    movement_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let Some(movement_input) = ai_import_movement_input(patch) else {
+        return Err(LedgerError::InvalidInput(vec![
+            "AI atomic group edit patch must include movement, draftMovement, proposedMovement, or proposedMovements[0]".to_string(),
+        ]));
+    };
+
+    let fallback_movement_id = group
+        .get("targetId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or(movement_id);
+    let movement = ai_proposed_movement_from_input(
+        document,
+        &movement_input,
+        proposal_id,
+        fallback_movement_id,
+        group
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("AI atomic group id should be present"),
+        now,
+    )?;
+    let mut edited = atomic_group_from_movement(&movement, "edited");
+    edited["title"] = json!(format!(
+        "新增：{}",
+        movement
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("AI 候选记录")
+    ));
+    edited["diffs"] = patch.get("diffs").cloned().unwrap_or_else(|| json!([]));
+    edited["warnings"] = json!([
+        {
+            "code": "ai_edit_requires_user_confirmation",
+            "message": "编辑后的候选仍需用户接受整组才会写入账本。",
+            "severity": "info"
+        }
+    ]);
+    if let Some(source_evidence) = group.get("sourceEvidence") {
+        edited["sourceEvidence"] = source_evidence.clone();
+    }
+    Ok(edited)
+}
+
+fn ai_evidence_ref(source_kind: &str, proposal_id: &str, input: &Value) -> Value {
+    let mut evidence = json!({
+        "id": format!("ev_{proposal_id}"),
+        "kind": source_kind,
+        "label": ai_source_label(source_kind, input)
+    });
+    if let Some(preview) = ai_input_preview(input) {
+        evidence["preview"] = json!(preview);
+    }
+    evidence
+}
+
+fn ai_source_label(source_kind: &str, input: &Value) -> String {
+    if let Some(file_name) = input
+        .get("fileName")
+        .or_else(|| input.get("filename"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return file_name.to_string();
+    }
+
+    match source_kind {
+        "user_text" => "文本输入".to_string(),
+        "user_image" => "图片输入".to_string(),
+        "csv_import" => "CSV 导入".to_string(),
+        _ => "AI 输入".to_string(),
+    }
+}
+
+fn ai_input_preview(input: &Value) -> Option<String> {
+    let raw = input
+        .get("text")
+        .or_else(|| input.get("content"))
+        .or_else(|| input.get("csv"))
+        .and_then(Value::as_str)?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut preview = raw.chars().take(80).collect::<String>();
+    if raw.chars().count() > 80 {
+        preview.push('…');
+    }
+    Some(preview)
+}
+
+fn confirm_ai_movement_atomic_group(
+    document: &mut Value,
+    atomic_group_id: &str,
+    now: &str,
+) -> Result<Option<Value>, LedgerError> {
+    let Some(group) = find_ai_atomic_group(document, atomic_group_id) else {
+        return Ok(None);
+    };
+    if group.get("operation").and_then(Value::as_str) != Some("create")
+        || group.get("targetType").and_then(Value::as_str) != Some("movement")
+    {
+        return Ok(None);
+    }
+
+    match group.get("status").and_then(Value::as_str) {
+        Some("pending" | "edited") => {}
+        Some("approved") => {
+            return Ok(Some(json!({
+                "atomicGroupId": atomic_group_id,
+                "confirmedMovementIds": [],
+                "snapshotInvalidated": false,
+                "ledgerWrite": false,
+                "devOnly": false
+            })));
+        }
+        Some("rejected") => {
+            return Err(LedgerError::Conflict(
+                "AI atomic group has already been rejected".to_string(),
+            ));
+        }
+        Some(status) => {
+            return Err(LedgerError::Conflict(format!(
+                "AI atomic group cannot be confirmed from status: {status}"
+            )));
+        }
+        None => {
+            return Err(LedgerError::InvalidInput(vec![
+                "atomic group status must be present".to_string(),
+            ]));
+        }
+    }
+
+    let proposed_movements = group
+        .get("proposedMovements")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if proposed_movements.is_empty() || !ai_group_validation_is_valid(&group) {
+        return Err(LedgerError::InvalidInput(vec![
+            "AI movement atomic group must be edited into a valid proposed movement before approval".to_string(),
+        ]));
+    }
+
+    let existing_ids = document["movements"]
+        .as_array()
+        .expect("validated local ledger movements should be an array")
+        .iter()
+        .filter_map(|movement| movement.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    let mut confirmed_movement_ids = Vec::new();
+    let mut movements_to_append = Vec::new();
+    for proposed in proposed_movements {
+        let movement_id = proposed
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["proposed movement id is missing".to_string()])
+            })?
+            .to_string();
+        if existing_ids.iter().any(|id| id == &movement_id)
+            || movements_to_append.iter().any(|movement: &Value| {
+                movement.get("id").and_then(Value::as_str) == Some(movement_id.as_str())
+            })
+        {
+            return Err(LedgerError::Conflict(format!(
+                "movement already exists: {movement_id}"
+            )));
+        }
+
+        let entries = required_movement_entries(&proposed)?;
+        apply_movement_entries(document, &entries, now)?;
+
+        let mut movement = proposed.clone();
+        movement["atomicGroupId"] = json!(atomic_group_id);
+        movement["status"] = json!(confirmed_status_for_movement(&movement));
+        movement["updatedAt"] = json!(now);
+        if movement.get("recordedAt").is_none() {
+            movement["recordedAt"] = json!(now);
+        }
+        if movement.get("createdAt").is_none() {
+            movement["createdAt"] = json!(now);
+        }
+        if movement.get("source").is_none() {
+            movement["source"] = json!({
+                "kind": "ai_proposal",
+                "sourceId": atomic_group_id,
+                "createdBy": "ai"
+            });
+        }
+        confirmed_movement_ids.push(movement_id);
+        movements_to_append.push(movement);
+    }
+
+    for movement in &movements_to_append {
+        append_movement_with_entries(document, movement)?;
+    }
+    set_ai_atomic_group_status(document, atomic_group_id, "approved")?;
+
+    Ok(Some(json!({
+        "atomicGroupId": atomic_group_id,
+        "confirmedMovementIds": confirmed_movement_ids,
+        "snapshotInvalidated": true,
+        "ledgerWrite": true,
+        "devOnly": false
+    })))
+}
+
+fn ai_group_validation_is_valid(group: &Value) -> bool {
+    group
+        .get("validation")
+        .and_then(|validation| validation.get("isValid"))
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            group
+                .get("proposedMovements")
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+        })
+}
+
+fn required_movement_entries(movement: &Value) -> Result<Vec<Value>, LedgerError> {
+    movement
+        .get("entries")
+        .and_then(Value::as_array)
+        .filter(|entries| !entries.is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "proposed movement entries must be a non-empty array".to_string(),
+            ])
+        })
+}
+
+fn append_movement_with_entries(document: &mut Value, movement: &Value) -> Result<(), LedgerError> {
+    let movement_id = movement
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::InvalidInput(vec!["movement id is missing".to_string()]))?;
+    let atomic_group_id = movement
+        .get("atomicGroupId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["movement atomicGroupId is missing".to_string()])
+        })?;
+
+    document["movements"]
+        .as_array_mut()
+        .expect("validated local ledger movements should be an array")
+        .push(movement.clone());
+
+    let movement_entries = document["movementEntries"]
+        .as_array_mut()
+        .expect("validated local ledger movementEntries should be an array");
+    for entry in required_movement_entries(movement)? {
+        let mut indexed_entry = entry;
+        indexed_entry["movementId"] = json!(movement_id);
+        indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+        movement_entries.push(indexed_entry);
+    }
+    Ok(())
+}
+
+fn find_ai_proposal_id_for_group(document: &Value, atomic_group_id: &str) -> Option<String> {
+    document["aiProposals"]
+        .as_array()
+        .expect("validated local ledger aiProposals should be an array")
+        .iter()
+        .find(|proposal| {
+            proposal
+                .get("atomicGroups")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|group| group.get("id").and_then(Value::as_str) == Some(atomic_group_id))
+        })
+        .and_then(|proposal| proposal.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn replace_ai_atomic_group(
+    document: &mut Value,
+    atomic_group_id: &str,
+    edited_group: Value,
+) -> Result<(), LedgerError> {
+    for proposal in document["aiProposals"]
+        .as_array_mut()
+        .expect("validated local ledger aiProposals should be an array")
+    {
+        if let Some(groups) = proposal
+            .get_mut("atomicGroups")
+            .and_then(Value::as_array_mut)
+        {
+            for group in groups {
+                if group.get("id").and_then(Value::as_str) == Some(atomic_group_id) {
+                    *group = edited_group;
+                    proposal["status"] = json!("edited");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    Err(LedgerError::NotFound(format!(
+        "AI atomic group does not exist: {atomic_group_id}"
+    )))
 }
 
 fn confirm_counterparty_merge_atomic_group(

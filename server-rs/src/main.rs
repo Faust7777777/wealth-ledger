@@ -1161,16 +1161,41 @@ async fn ai_proposal(
     }
 }
 
-async fn ai_proposal_from_text(State(state): State<AppState>) -> Json<Value> {
-    envelope(state.ledger.create_ai_proposal("user_text"))
+async fn ai_proposal_from_text(
+    State(state): State<AppState>,
+    Json(input): Json<Value>,
+) -> Response {
+    create_ai_import_proposal(state, input, "user_text").await
 }
 
-async fn ai_proposal_from_image(State(state): State<AppState>) -> Json<Value> {
-    envelope(state.ledger.create_ai_proposal("user_image"))
+async fn ai_proposal_from_image(
+    State(state): State<AppState>,
+    Json(input): Json<Value>,
+) -> Response {
+    create_ai_import_proposal(state, input, "user_image").await
 }
 
-async fn ai_proposal_from_csv(State(state): State<AppState>) -> Json<Value> {
-    envelope(state.ledger.create_ai_proposal("csv_import"))
+async fn ai_proposal_from_csv(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+    create_ai_import_proposal(state, input, "csv_import").await
+}
+
+async fn create_ai_import_proposal(state: AppState, input: Value, source_kind: &str) -> Response {
+    if let Some(path) = state.local_ledger_path.as_ref() {
+        return match local_ledger::create_ai_import_proposal(
+            path,
+            input,
+            source_kind,
+            &next_local_ai_proposal_id(),
+            &next_local_atomic_group_id(),
+            &next_local_movement_id(),
+            &current_timestamp(),
+        ) {
+            Ok(proposal) => envelope(proposal).into_response(),
+            Err(error) => local_ledger_error(error, "invalid_ai_import_proposal"),
+        };
+    }
+
+    envelope(state.ledger.create_ai_proposal(source_kind)).into_response()
 }
 
 async fn mark_dca_executed_as_proposal(
@@ -1280,7 +1305,21 @@ async fn reject_atomic_group(
 async fn edit_atomic_group(
     State(state): State<AppState>,
     Path(atomic_group_id): Path<String>,
+    Json(patch): Json<Value>,
 ) -> Response {
+    if let Some(path) = state.local_ledger_path.as_ref() {
+        return match local_ledger::edit_ai_atomic_group(
+            path,
+            &atomic_group_id,
+            patch,
+            &next_local_movement_id(),
+            &current_timestamp(),
+        ) {
+            Ok(group) => envelope(group).into_response(),
+            Err(error) => local_ledger_error(error, "invalid_ai_atomic_group_edit"),
+        };
+    }
+
     match state.ledger.edit_atomic_group(&atomic_group_id) {
         Some(group) => envelope(group).into_response(),
         None => not_found(
@@ -3672,6 +3711,172 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["ok"], false);
         assert_eq!(body["error"]["code"], "dca_reminder_not_found");
+    }
+
+    #[tokio::test]
+    async fn local_ledger_ai_text_import_requires_structured_edit_before_approval() {
+        let path = unique_test_ledger_path("ai_text_requires_edit");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (proposal_status, proposal_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/ai/proposals/from-text",
+            json!({"text": "午餐 18 元"}),
+        )
+        .await;
+        assert_eq!(proposal_status, StatusCode::OK);
+        assert_eq!(proposal_body["data"]["source"]["kind"], "user_text");
+        assert_eq!(proposal_body["data"]["status"], "pending");
+        assert_eq!(
+            proposal_body["data"]["atomicGroups"][0]["validation"]["isValid"],
+            false
+        );
+        let group_id = proposal_body["data"]["atomicGroups"][0]["id"]
+            .as_str()
+            .expect("AI group id should be string")
+            .to_string();
+
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/ai/atomic-groups/{group_id}/approve"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            confirm_body["error"]["code"],
+            "invalid_atomic_group_confirm"
+        );
+
+        let (pending_status, pending_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/ai/proposals/pending").await;
+        assert_eq!(pending_status, StatusCode::OK);
+        assert_eq!(
+            pending_body["data"]
+                .as_array()
+                .expect("pending proposals should be an array")
+                .len(),
+            1
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_ai_text_import_edit_then_approve_writes_movement() {
+        let path = unique_test_ledger_path("ai_text_edit_approve");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "消费账户",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [
+                    {"currency": "CNY", "amount": "100.00"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id should be string")
+            .to_string();
+
+        let (proposal_status, proposal_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/ai/proposals/from-text",
+            json!({"text": "午餐 18 元"}),
+        )
+        .await;
+        assert_eq!(proposal_status, StatusCode::OK);
+        let group_id = proposal_body["data"]["atomicGroups"][0]["id"]
+            .as_str()
+            .expect("AI group id should be string")
+            .to_string();
+
+        let edit_body = json!({
+            "proposedMovements": [
+                {
+                    "type": "expense",
+                    "occurredAt": "2026-06-27T12:00:00+08:00",
+                    "title": "AI 整理：午餐",
+                    "entries": [
+                        {
+                            "accountId": account_id,
+                            "amount": "18.00",
+                            "currency": "CNY",
+                            "direction": "out",
+                            "role": "source"
+                        }
+                    ],
+                    "amountBreakdown": {
+                        "paidAmount": {"amount": "18.00", "currency": "CNY"}
+                    },
+                    "tags": ["ai_import"]
+                }
+            ]
+        });
+        let (edit_status, edit_response) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/ai/atomic-groups/{group_id}/edit"),
+            edit_body,
+        )
+        .await;
+        assert_eq!(edit_status, StatusCode::OK);
+        assert_eq!(edit_response["data"]["status"], "edited");
+        assert_eq!(edit_response["data"]["validation"]["isValid"], true);
+
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/ai/atomic-groups/{group_id}/approve"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK);
+        assert_eq!(confirm_body["data"]["ledgerWrite"], true);
+        assert_eq!(
+            confirm_body["data"]["confirmedMovementIds"]
+                .as_array()
+                .expect("confirmed movement ids should be an array")
+                .len(),
+            1
+        );
+
+        let (account_after_status, account_after_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(account_after_status, StatusCode::OK);
+        assert_eq!(
+            account_after_body["data"]["cashBalances"][0]["amount"],
+            "82.00"
+        );
+
+        let (pending_after_status, pending_after_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/ai/proposals/pending").await;
+        assert_eq!(pending_after_status, StatusCode::OK);
+        assert_eq!(pending_after_body["data"], json!([]));
+
+        let persisted = local_ledger::read_document(&path).expect("ledger should persist AI write");
+        assert_eq!(persisted["movements"][0]["source"]["kind"], "ai_proposal");
+        assert_eq!(persisted["aiProposals"][0]["status"], "approved");
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
