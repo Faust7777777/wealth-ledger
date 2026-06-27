@@ -13,28 +13,48 @@ const List<AccountVm> _accounts = [
     displayName: '招行储蓄卡',
     accountType: AccountType.bank,
     isLiability: false,
-    value: ValuedMoney(amount: '38240.33', currency: 'CNY', asOf: _asOf, quality: ValueQuality.exact),
+    value: ValuedMoney(
+      amount: '38240.33',
+      currency: 'CNY',
+      asOf: _asOf,
+      quality: ValueQuality.exact,
+    ),
   ),
   AccountVm(
     id: 'acct_us_broker',
     displayName: '美股券商',
     accountType: AccountType.brokerage,
     isLiability: false,
-    value: ValuedMoney(amount: '110320.00', currency: 'CNY', asOf: _asOf, quality: ValueQuality.estimated),
+    value: ValuedMoney(
+      amount: '110320.00',
+      currency: 'CNY',
+      asOf: _asOf,
+      quality: ValueQuality.estimated,
+    ),
   ),
   AccountVm(
     id: 'acct_crypto',
     displayName: '数字资产',
     accountType: AccountType.exchange,
     isLiability: false,
-    value: ValuedMoney(amount: '31870.00', currency: 'CNY', asOf: _asOf, quality: ValueQuality.estimated),
+    value: ValuedMoney(
+      amount: '31870.00',
+      currency: 'CNY',
+      asOf: _asOf,
+      quality: ValueQuality.estimated,
+    ),
   ),
   AccountVm(
     id: 'acct_psbc_loan',
     displayName: '邮储助学贷款',
     accountType: AccountType.loan,
     isLiability: true,
-    value: ValuedMoney(amount: '-9620.00', currency: 'CNY', asOf: _asOf, quality: ValueQuality.exact),
+    value: ValuedMoney(
+      amount: '-9620.00',
+      currency: 'CNY',
+      asOf: _asOf,
+      quality: ValueQuality.exact,
+    ),
     note: '在校贴息',
   ),
 ];
@@ -48,7 +68,12 @@ const List<HoldingVm> _holdings = [
     quantity: '12',
     quoteStatus: QuoteStatus.stale,
     costBasisTotal: Money(amount: '61800.00', currency: 'CNY'),
-    marketValue: ValuedMoney(amount: '65000.00', currency: 'CNY', asOf: _asOf, quality: ValueQuality.estimated),
+    marketValue: ValuedMoney(
+      amount: '65000.00',
+      currency: 'CNY',
+      asOf: _asOf,
+      quality: ValueQuality.estimated,
+    ),
     dayChange: Money(amount: '520.00', currency: 'CNY'),
     unrealizedPnl: Money(amount: '3200.00', currency: 'CNY'),
     unrealizedPnlRate: '0.0518',
@@ -61,7 +86,12 @@ const List<HoldingVm> _holdings = [
     quantity: '20',
     quoteStatus: QuoteStatus.stale,
     costBasisTotal: Money(amount: '40640.00', currency: 'CNY'),
-    marketValue: ValuedMoney(amount: '40000.00', currency: 'CNY', asOf: _asOf, quality: ValueQuality.estimated),
+    marketValue: ValuedMoney(
+      amount: '40000.00',
+      currency: 'CNY',
+      asOf: _asOf,
+      quality: ValueQuality.estimated,
+    ),
     dayChange: Money(amount: '-120.00', currency: 'CNY'),
     unrealizedPnl: Money(amount: '-640.00', currency: 'CNY'),
     unrealizedPnlRate: '-0.0157',
@@ -74,7 +104,12 @@ const List<HoldingVm> _holdings = [
     quantity: '0.0300',
     quoteStatus: QuoteStatus.fresh,
     costBasisTotal: Money(amount: '17770.00', currency: 'CNY'),
-    marketValue: ValuedMoney(amount: '18870.00', currency: 'CNY', asOf: _asOf, quality: ValueQuality.estimated),
+    marketValue: ValuedMoney(
+      amount: '18870.00',
+      currency: 'CNY',
+      asOf: _asOf,
+      quality: ValueQuality.estimated,
+    ),
     unrealizedPnl: Money(amount: '1100.00', currency: 'CNY'),
     unrealizedPnlRate: '0.0619',
   ),
@@ -159,9 +194,25 @@ const List<AiProposalVm> _proposals = [
         operation: AiOperation.modify,
         status: AiGroupStatus.pending,
         diffs: [
-          AiFieldDiffVm(fieldPath: '金额', oldValue: '¥18.00', newValue: '¥21.00', changed: true, severity: AiDiffSeverity.important),
-          AiFieldDiffVm(fieldPath: '对方', oldValue: '瑞幸', newValue: '瑞幸咖啡(臻选店)', changed: true),
-          AiFieldDiffVm(fieldPath: '分类', oldValue: '餐饮/咖啡', newValue: '餐饮/咖啡', changed: false),
+          AiFieldDiffVm(
+            fieldPath: '金额',
+            oldValue: '¥18.00',
+            newValue: '¥21.00',
+            changed: true,
+            severity: AiDiffSeverity.important,
+          ),
+          AiFieldDiffVm(
+            fieldPath: '对方',
+            oldValue: '瑞幸',
+            newValue: '瑞幸咖啡(臻选店)',
+            changed: true,
+          ),
+          AiFieldDiffVm(
+            fieldPath: '分类',
+            oldValue: '餐饮/咖啡',
+            newValue: '餐饮/咖啡',
+            changed: false,
+          ),
         ],
       ),
     ],
@@ -228,10 +279,26 @@ const PortfolioOverviewVm _overview = PortfolioOverviewVm(
 
 const AssetAllocationVm _allocation = AssetAllocationVm(
   slices: [
-    AllocationSliceVm(category: '现金与活期', percent: '30.5', value: Money(amount: '77900.45', currency: 'CNY')),
-    AllocationSliceVm(category: '美股', percent: '43.2', value: Money(amount: '110320.00', currency: 'CNY')),
-    AllocationSliceVm(category: '数字资产', percent: '12.5', value: Money(amount: '31870.00', currency: 'CNY')),
-    AllocationSliceVm(category: '其他资产', percent: '13.8', value: Money(amount: '35208.45', currency: 'CNY')),
+    AllocationSliceVm(
+      category: '现金与活期',
+      percent: '30.5',
+      value: Money(amount: '77900.45', currency: 'CNY'),
+    ),
+    AllocationSliceVm(
+      category: '美股',
+      percent: '43.2',
+      value: Money(amount: '110320.00', currency: 'CNY'),
+    ),
+    AllocationSliceVm(
+      category: '数字资产',
+      percent: '12.5',
+      value: Money(amount: '31870.00', currency: 'CNY'),
+    ),
+    AllocationSliceVm(
+      category: '其他资产',
+      percent: '13.8',
+      value: Money(amount: '35208.45', currency: 'CNY'),
+    ),
   ],
   totalAssets: Money(amount: '255298.90', currency: 'CNY'),
   totalLiabilities: Money(amount: '9620.00', currency: 'CNY'),
@@ -243,8 +310,10 @@ class FixtureAccountRepository implements AccountRepository {
   @override
   Future<List<AccountVm>> listAccounts() async => _accounts;
   @override
-  Future<AccountVm?> getAccount(Id id) async =>
-      _accounts.where((a) => a.id == id).cast<AccountVm?>().firstWhere((a) => true, orElse: () => null);
+  Future<AccountVm?> getAccount(Id id) async => _accounts
+      .where((a) => a.id == id)
+      .cast<AccountVm?>()
+      .firstWhere((a) => true, orElse: () => null);
   @override
   Future<List<AccountAnomalyVm>> listAnomalies() async => _anomalies;
   @override
@@ -277,8 +346,10 @@ class FixtureMovementRepository implements MovementRepository {
   Future<List<MovementVm>> listRecentMovements({int limit = 20}) async =>
       _movements.take(limit).toList();
   @override
-  Future<MovementVm?> getMovement(Id id) async =>
-      _movements.where((m) => m.id == id).cast<MovementVm?>().firstWhere((m) => true, orElse: () => null);
+  Future<MovementVm?> getMovement(Id id) async => _movements
+      .where((m) => m.id == id)
+      .cast<MovementVm?>()
+      .firstWhere((m) => true, orElse: () => null);
   @override
   Future<MovementVm> createManualRecord(ManualRecordInput input) async =>
       throw UnsupportedError('DEMO 演示只读，不支持手动记账；请用 local_server');
@@ -297,7 +368,9 @@ class FixtureDcaRepository implements DcaRepository {
   @override
   Future<List<DcaPlanVm>> listPlans() async => _dcaPlans;
   @override
-  Future<void> markExecutedAsProposal(Id reminderId) async {/* DEMO：模拟生成候选 */}
+  Future<void> markExecutedAsProposal(Id reminderId) async {
+    /* DEMO：模拟生成候选 */
+  }
 }
 
 class FixtureQuoteRepository implements QuoteRepository {
@@ -312,16 +385,34 @@ class FixtureAiProposalRepository implements AiProposalRepository {
   @override
   Future<List<AiProposalVm>> listPending() async => _proposals;
   @override
-  Future<AiProposalVm?> getProposal(Id id) async =>
-      _proposals.where((p) => p.id == id).cast<AiProposalVm?>().firstWhere((p) => true, orElse: () => null);
+  Future<AiProposalVm?> getProposal(Id id) async => _proposals
+      .where((p) => p.id == id)
+      .cast<AiProposalVm?>()
+      .firstWhere((p) => true, orElse: () => null);
   @override
-  Future<void> approveAtomicGroup(Id groupId) async {/* DEMO：模拟接受，演示数据不变 */}
+  Future<void> approveAtomicGroup(Id groupId) async {
+    /* DEMO：模拟接受，演示数据不变 */
+  }
   @override
-  Future<void> rejectAtomicGroup(Id groupId, {String? reason}) async {/* DEMO：模拟拒绝 */}
+  Future<void> rejectAtomicGroup(Id groupId, {String? reason}) async {
+    /* DEMO：模拟拒绝 */
+  }
   @override
-  Future<void> createFromText(String text) async {/* DEMO：模拟生成候选（演示数据不变）*/}
+  Future<void> createFromText(String text) async {
+    /* DEMO：模拟生成候选（演示数据不变）*/
+  }
   @override
-  Future<void> editAtomicGroup(Id groupId, ManualRecordInput input) async {/* DEMO：模拟编辑 */}
+  Future<void> createFromCsv(
+    String csv, {
+    Id? defaultAccountId,
+    String? defaultCurrency,
+  }) async {
+    /* DEMO：模拟 CSV 候选（演示数据不变）*/
+  }
+  @override
+  Future<void> editAtomicGroup(Id groupId, ManualRecordInput input) async {
+    /* DEMO：模拟编辑 */
+  }
 }
 
 class FixtureSnapshotRepository implements SnapshotRepository {
@@ -329,5 +420,8 @@ class FixtureSnapshotRepository implements SnapshotRepository {
   @override
   Future<NetWorthSnapshotVm?> getLatest() async => _latest;
   @override
-  Future<List<NetWorthSnapshotVm>> listSnapshots() async => const [_latest, _previous];
+  Future<List<NetWorthSnapshotVm>> listSnapshots() async => const [
+    _latest,
+    _previous,
+  ];
 }

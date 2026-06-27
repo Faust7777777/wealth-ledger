@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/view_models.dart';
+import 'package:finwealth/features/ai_import_csv_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/reconcile_page.dart';
 import 'package:finwealth/features/transfer_page.dart';
@@ -14,20 +15,19 @@ AccountVm _acct(
   String name, {
   String cur = 'CNY',
   Map<String, String> cash = const {},
-}) =>
-    AccountVm(
-      id: id,
-      displayName: name,
-      accountType: AccountType.bank,
-      isLiability: false,
-      defaultCurrency: cur,
-      cashBalances: cash,
-    );
+}) => AccountVm(
+  id: id,
+  displayName: name,
+  accountType: AccountType.bank,
+  isLiability: false,
+  defaultCurrency: cur,
+  cashBalances: cash,
+);
 
 Widget _host(Widget page, List<AccountVm> accounts) => ProviderScope(
-      overrides: [accountsProvider.overrideWith((ref) async => accounts)],
-      child: MaterialApp(home: page),
-    );
+  overrides: [accountsProvider.overrideWith((ref) async => accounts)],
+  child: MaterialApp(home: page),
+);
 
 void main() {
   testWidgets('ManualRecordPage renders form with accounts', (t) async {
@@ -57,10 +57,21 @@ void main() {
 
   testWidgets('ReconcilePage shows current balance', (t) async {
     await t.pumpWidget(
-      _host(const ReconcilePage(), [_acct('a1', '钱包', cash: {'CNY': '1000.00'})]),
+      _host(const ReconcilePage(), [
+        _acct('a1', '钱包', cash: {'CNY': '1000.00'}),
+      ]),
     );
     await t.pumpAndSettle();
     expect(find.text('当前记录余额'), findsOneWidget);
     expect(find.textContaining('1,000.00'), findsWidgets);
+  });
+
+  testWidgets('AiImportCsvPage renders with default account', (t) async {
+    await t.pumpWidget(_host(const AiImportCsvPage(), [_acct('a1', '钱包')]));
+    await t.pumpAndSettle();
+    expect(find.text('默认账户'), findsOneWidget);
+    expect(find.textContaining('钱包'), findsWidgets);
+    expect(find.text('CSV 内容'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, '生成候选'), findsOneWidget);
   });
 }

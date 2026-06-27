@@ -28,17 +28,18 @@ class RealLocalPortfolioRepository implements PortfolioRepository {
   const RealLocalPortfolioRepository();
   @override
   Future<PortfolioOverviewVm> getOverview() async => const PortfolioOverviewVm(
-        pendingSummary: PendingSummaryVm(),
-        quoteStatusSummary: QuoteStatusSummaryVm(),
-        primaryHoldings: [],
-        recentMovements: [],
-      );
+    pendingSummary: PendingSummaryVm(),
+    quoteStatusSummary: QuoteStatusSummaryVm(),
+    primaryHoldings: [],
+    recentMovements: [],
+  );
   @override
   Future<List<HoldingVm>> listHoldings() async => const [];
   @override
   Future<List<HoldingVm>> listHoldingsByAccount(Id accountId) async => const [];
   @override
-  Future<AssetAllocationVm> getAssetAllocation() async => const AssetAllocationVm(
+  Future<AssetAllocationVm> getAssetAllocation() async =>
+      const AssetAllocationVm(
         slices: [],
         totalAssets: Money(amount: '0', currency: 'CNY'),
         totalLiabilities: Money(amount: '0', currency: 'CNY'),
@@ -49,7 +50,8 @@ class RealLocalPortfolioRepository implements PortfolioRepository {
 class RealLocalMovementRepository implements MovementRepository {
   const RealLocalMovementRepository();
   @override
-  Future<List<MovementVm>> listRecentMovements({int limit = 20}) async => const [];
+  Future<List<MovementVm>> listRecentMovements({int limit = 20}) async =>
+      const [];
   @override
   Future<MovementVm?> getMovement(Id id) async => null;
   @override
@@ -77,7 +79,8 @@ class RealLocalDcaRepository implements DcaRepository {
 class RealLocalQuoteRepository implements QuoteRepository {
   const RealLocalQuoteRepository();
   @override
-  Future<QuoteStatusSummaryVm> getQuoteSummary() async => const QuoteStatusSummaryVm();
+  Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
+      const QuoteStatusSummaryVm();
 }
 
 class RealLocalAiProposalRepository implements AiProposalRepository {
@@ -95,6 +98,13 @@ class RealLocalAiProposalRepository implements AiProposalRepository {
   @override
   Future<void> createFromText(String text) async =>
       throw UnsupportedError('real_local 暂不支持 AI 导入；请用 local_server 联调');
+  @override
+  Future<void> createFromCsv(
+    String csv, {
+    Id? defaultAccountId,
+    String? defaultCurrency,
+  }) async =>
+      throw UnsupportedError('real_local 暂不支持 CSV 导入；请用 local_server 联调');
   @override
   Future<void> editAtomicGroup(Id groupId, ManualRecordInput input) async =>
       throw UnsupportedError('real_local 暂不支持 AI 编辑；请用 local_server 联调');
