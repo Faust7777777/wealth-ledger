@@ -26,6 +26,22 @@ class HomeShell extends ConsumerWidget {
   void _go(int index) =>
       navigationShell.goBranch(index, initialLocation: index == navigationShell.currentIndex);
 
+  void _refresh(BuildContext context, WidgetRef ref) {
+    ref.invalidate(overviewProvider);
+    ref.invalidate(accountsProvider);
+    ref.invalidate(holdingsProvider);
+    ref.invalidate(allocationProvider);
+    ref.invalidate(recentMovementsProvider);
+    ref.invalidate(snapshotsProvider);
+    ref.invalidate(anomaliesProvider);
+    ref.invalidate(dueRemindersProvider);
+    ref.invalidate(dcaPlansProvider);
+    ref.invalidate(aiPendingProvider);
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('已刷新')),
+    );
+  }
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final useRail = MediaQuery.sizeOf(context).width >= AppLayout.bpRailIcon;
@@ -40,9 +56,9 @@ class HomeShell extends ConsumerWidget {
       title: const Text('Wealth Ledger'),
       actions: [
         IconButton(
-          onPressed: () {},
+          onPressed: () => _refresh(context, ref),
           icon: const Icon(Icons.refresh),
-          tooltip: '刷新报价',
+          tooltip: '刷新',
         ),
         IconButton(
           onPressed: () => context.push('/ai-review'),
