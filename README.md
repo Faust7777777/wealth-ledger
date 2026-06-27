@@ -54,6 +54,12 @@ critical contract responses, then shuts them down:
 python tools/server_smoke.py
 ```
 
+Runs a write-capable smoke against a temporary real-local JSON ledger:
+
+```bash
+python tools/local_ledger_smoke.py
+```
+
 ## Rust server skeleton
 
 ```bash
@@ -65,6 +71,26 @@ Default:
 ```text
 http://127.0.0.1:8790
 ```
+
+## Self-use local run
+
+Start the Rust server with a persistent local JSON ledger:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\run_local_server.ps1
+```
+
+In a second terminal, start the Windows Flutter app against that server:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\run_windows_local.ps1
+```
+
+Defaults:
+
+- API: `http://127.0.0.1:8791`
+- ledger file: `tmp\ledger.json`
+- Flutter data source: `local_server`
 
 ## Product boundaries
 

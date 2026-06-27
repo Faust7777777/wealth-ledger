@@ -41,7 +41,9 @@ cargo run --manifest-path server-rs/Cargo.toml -- --port 8791 --ledger-path .\tm
 
 - localhost only
 - no persistence by default
-- `--ledger-path` enables real-local JSON persistence for accounts only
+- `--ledger-path` enables real-local JSON persistence for accounts, movements,
+  DCA plans/reminders, AI proposals, snapshots, categories, counterparties, and
+  derived portfolio read models
 - no real auth
 - no real AI
 - no real quotes
@@ -102,12 +104,20 @@ cargo run --manifest-path server-rs/Cargo.toml -- --validate-ledger .\tmp\ledger
 cargo run --manifest-path server-rs/Cargo.toml -- --check-ledger-paths .\tmp\ledger.json .\tmp\ledger.fixture.json
 ```
 
-Running the server with `--ledger-path` makes `GET /v1/accounts`,
-`POST /v1/accounts`, `GET /v1/accounts/{account_id}`,
-`PATCH /v1/accounts/{account_id}`, and
-`POST /v1/accounts/{account_id}/archive` use the JSON ledger when no
-`?scenario=` query is present. Passing `?scenario=degraded` still uses the
-virtual dev dataset for frontend demo integration.
+Running the server with `--ledger-path` makes the first self-use write paths use
+the JSON ledger when no `?scenario=` query is present:
+
+- accounts: list/create/detail/update/archive
+- movements: draft → submit review → confirm/reject, detail, list
+- DCA: create plan, list due reminders, skip/snooze, record executed as a
+  confirmable proposal
+- AI proposal review: text/image/CSV import proposals, edit, approve/reject
+- snapshots: latest/list/manual baseline
+- taxonomy: categories, counterparties, counterparty merge proposal
+- portfolio read models: overview, allocation, holdings, quote summary
+
+Passing `?scenario=degraded` still uses the virtual dev dataset for frontend
+demo integration.
 
 The validator rejects debug fixture markers and basic invalid money shapes so a
 real-local file cannot silently become demo data.
@@ -120,7 +130,7 @@ GET /v1/holdings?scenario=degraded          # canonical: /v1/portfolio/holdings
 GET /v1/movements/recent?scenario=degraded  # canonical: /v1/movements
 ```
 
-## Dev proposal write paths
+## Dev proposal write paths without `--ledger-path`
 
 The following POST routes validate frontend flow shape but do not persist state
 and do not write the confirmed ledger:
@@ -144,6 +154,20 @@ real local ledger store exists.
 Within a running dev-server process, proposal create / approve / reject / edit
 state is tracked in memory so the frontend can verify review flows. Restarting
 the server clears this state.
+
+## Real-local ledger smoke
+
+This runs the write-capable local ledger flow against a temporary file and
+removes it afterwards:
+
+```powershell
+python tools\local_ledger_smoke.py
+```
+
+It verifies account create/update, manual movement confirmation, DCA
+record-executed confirmation, CSV/image proposal creation, AI approval, snapshot
+creation, derived overview/allocation values, forbidden broker endpoints, and
+on-disk persistence.
 
 ## Checks
 

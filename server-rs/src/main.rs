@@ -3937,6 +3937,14 @@ mod tests {
             "income"
         );
 
+        let (overview_pending_status, overview_pending_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_pending_status, StatusCode::OK);
+        assert_eq!(
+            overview_pending_body["data"]["pendingSummary"]["aiPendingCount"],
+            1
+        );
+
         let first_group_id = proposal_body["data"]["atomicGroups"][0]["id"]
             .as_str()
             .expect("first group id should be string")
@@ -3989,6 +3997,14 @@ mod tests {
             request_json_from(router.clone(), Method::GET, "/v1/ai/proposals/pending").await;
         assert_eq!(pending_after_status, StatusCode::OK);
         assert_eq!(pending_after_body["data"], json!([]));
+
+        let (overview_done_status, overview_done_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_done_status, StatusCode::OK);
+        assert_eq!(
+            overview_done_body["data"]["pendingSummary"]["aiPendingCount"],
+            0
+        );
 
         let persisted =
             local_ledger::read_document(&path).expect("ledger should persist CSV import");

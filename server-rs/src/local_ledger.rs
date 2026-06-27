@@ -761,6 +761,7 @@ pub fn mark_dca_executed_as_proposal(
 pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
     let document = load_or_initialize(path)?;
     let summary = summarize_accounts(&document, now)?;
+    let ai_pending_count = pending_ai_proposal_count(&document);
     let recent_movements = recent_movements_from_document(&document);
     let in_transit_count = recent_movements
         .iter()
@@ -782,7 +783,7 @@ pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
         "latestSnapshot": summary.latest_snapshot,
         "previousSnapshot": Value::Null,
         "pendingSummary": {
-            "aiPendingCount": 0,
+            "aiPendingCount": ai_pending_count,
             "accountAnomalyCount": summary.account_anomaly_count,
             "dcaDueCount": dca_due_count,
             "inTransitCount": in_transit_count,
@@ -1052,15 +1053,26 @@ pub fn list_pending_ai_proposals(path: &Path) -> io::Result<Value> {
             .as_array()
             .expect("validated local ledger aiProposals should be an array")
             .iter()
-            .filter(|proposal| {
-                matches!(
-                    proposal.get("status").and_then(Value::as_str),
-                    Some("pending" | "edited" | "partially_reviewed")
-                ) && proposal_has_pending_group(proposal)
-            })
+            .filter(|proposal| is_pending_ai_proposal(proposal))
             .cloned()
             .collect::<Vec<_>>()
     ))
+}
+
+fn pending_ai_proposal_count(document: &Value) -> usize {
+    document["aiProposals"]
+        .as_array()
+        .expect("validated local ledger aiProposals should be an array")
+        .iter()
+        .filter(|proposal| is_pending_ai_proposal(proposal))
+        .count()
+}
+
+fn is_pending_ai_proposal(proposal: &Value) -> bool {
+    matches!(
+        proposal.get("status").and_then(Value::as_str),
+        Some("pending" | "edited" | "partially_reviewed")
+    ) && proposal_has_pending_group(proposal)
 }
 
 pub fn get_ai_proposal(path: &Path, proposal_id: &str) -> io::Result<Option<Value>> {
