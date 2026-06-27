@@ -22,10 +22,14 @@ class LiabilitiesPage extends ConsumerWidget {
           ErrorStateView(message: '$e', onRetry: () => ref.invalidate(liabilitiesProvider)),
       data: (items) {
         if (items.isEmpty) {
-          return const EmptyState(
+          return EmptyState(
             icon: Icons.account_balance_outlined,
             title: '没有负债',
             message: '信用卡、贷款等负债会显示在这里；负债余额为负是正常的。',
+            action: FilledButton(
+              onPressed: () => context.push('/accounts/new'),
+              child: const Text('添加负债账户'),
+            ),
           );
         }
         return ListView.separated(

@@ -2,6 +2,7 @@
 // 持仓为事实统计（成本/市值/浮盈亏），不做投资建议。定投只提醒，不下单。
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 
 import '../core/format.dart';
 import '../data/providers.dart';
@@ -27,10 +28,14 @@ class InvestmentPage extends ConsumerWidget {
       data: (hs) {
         final rs = reminders.asData?.value ?? const <DcaReminderVm>[];
         if (hs.isEmpty && rs.isEmpty && plans.isEmpty) {
-          return const EmptyState(
+          return EmptyState(
             icon: Icons.trending_up_outlined,
             title: '还没有投资持仓',
             message: '添加券商 / 交易所账户与持仓后，这里显示市值与浮盈亏（事实统计，非投资建议）。',
+            action: FilledButton(
+              onPressed: () => context.push('/accounts/new'),
+              child: const Text('添加投资账户'),
+            ),
           );
         }
         return ListView(
