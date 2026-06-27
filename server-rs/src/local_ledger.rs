@@ -990,7 +990,7 @@ pub fn create_ai_import_proposal(
     now: &str,
 ) -> Result<Value, LedgerError> {
     let mut document = load_or_initialize(path)?;
-    let group = ai_import_group_from_input(
+    let groups = ai_import_groups_from_input(
         &document,
         &input,
         source_kind,
@@ -999,7 +999,7 @@ pub fn create_ai_import_proposal(
         movement_id,
         now,
     )?;
-    let proposal = ai_import_proposal_from_group(&input, source_kind, proposal_id, &group, now);
+    let proposal = ai_import_proposal_from_groups(&input, source_kind, proposal_id, groups, now);
 
     document["aiProposals"]
         .as_array_mut()
@@ -1055,7 +1055,7 @@ pub fn list_pending_ai_proposals(path: &Path) -> io::Result<Value> {
             .filter(|proposal| {
                 matches!(
                     proposal.get("status").and_then(Value::as_str),
-                    Some("pending" | "edited")
+                    Some("pending" | "edited" | "partially_reviewed")
                 ) && proposal_has_pending_group(proposal)
             })
             .cloned()
@@ -3478,6 +3478,39 @@ fn mark_dca_reminders_recorded_for_movements(document: &mut Value, movements: &[
     }
 }
 
+fn ai_import_groups_from_input(
+    document: &Value,
+    input: &Value,
+    source_kind: &str,
+    proposal_id: &str,
+    atomic_group_id: &str,
+    movement_id: &str,
+    now: &str,
+) -> Result<Vec<Value>, LedgerError> {
+    if source_kind == "csv_import"
+        && let Some(groups) = csv_import_groups_from_input(
+            document,
+            input,
+            proposal_id,
+            atomic_group_id,
+            movement_id,
+            now,
+        )?
+    {
+        return Ok(groups);
+    }
+
+    Ok(vec![ai_import_group_from_input(
+        document,
+        input,
+        source_kind,
+        proposal_id,
+        atomic_group_id,
+        movement_id,
+        now,
+    )?])
+}
+
 fn ai_import_group_from_input(
     document: &Value,
     input: &Value,
@@ -3543,13 +3576,27 @@ fn ai_import_group_from_input(
     }))
 }
 
-fn ai_import_proposal_from_group(
+fn ai_import_proposal_from_groups(
     input: &Value,
     source_kind: &str,
     proposal_id: &str,
-    group: &Value,
+    groups: Vec<Value>,
     now: &str,
 ) -> Value {
+    let summary = if groups.len() == 1 {
+        groups[0]
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("AI 导入候选")
+            .to_string()
+    } else {
+        format!(
+            "{} 生成 {} 个候选",
+            ai_source_label(source_kind, input),
+            groups.len()
+        )
+    };
+
     json!({
         "id": proposal_id,
         "status": "pending",
@@ -3557,13 +3604,429 @@ fn ai_import_proposal_from_group(
             "kind": source_kind,
             "evidenceRefs": [ai_evidence_ref(source_kind, proposal_id, input)]
         },
-        "atomicGroups": [group.clone()],
-        "summary": group
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("AI 导入候选"),
+        "atomicGroups": groups,
+        "summary": summary,
         "warnings": [],
         "createdAt": now
+    })
+}
+
+fn csv_import_groups_from_input(
+    document: &Value,
+    input: &Value,
+    proposal_id: &str,
+    atomic_group_id: &str,
+    movement_id: &str,
+    now: &str,
+) -> Result<Option<Vec<Value>>, LedgerError> {
+    let Some(csv) = input
+        .get("csv")
+        .or_else(|| input.get("content"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let rows = parse_csv_rows(csv)?;
+    if rows.len() < 2 {
+        return Ok(Some(vec![invalid_ai_import_group(
+            "csv_import",
+            proposal_id,
+            atomic_group_id,
+            movement_id,
+            input,
+            "CSV：待编辑候选",
+            vec!["CSV must contain a header row and at least one data row".to_string()],
+        )]));
+    }
+
+    let headers = rows[0]
+        .iter()
+        .map(|header| normalize_csv_header(header))
+        .collect::<Vec<_>>();
+    let default_account_id = csv_default_account_id(input);
+    let default_currency = input
+        .get("defaultCurrency")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_BASE_CURRENCY);
+
+    let mut groups = Vec::new();
+    for (row_offset, row) in rows.iter().skip(1).enumerate() {
+        if row.iter().all(|field| field.trim().is_empty()) {
+            continue;
+        }
+
+        let row_number = row_offset + 2;
+        let record = csv_record_from_row(&headers, row);
+        let group_id = indexed_local_id(atomic_group_id, row_offset);
+        let row_movement_id = indexed_local_id(movement_id, row_offset);
+
+        match csv_movement_input_from_record(
+            &record,
+            row_number,
+            default_account_id.as_deref(),
+            default_currency,
+            now,
+        ) {
+            Ok(movement_input) => {
+                let movement = ai_proposed_movement_from_input(
+                    document,
+                    &movement_input,
+                    proposal_id,
+                    &row_movement_id,
+                    &group_id,
+                    now,
+                )?;
+                let mut group = atomic_group_from_movement(&movement, "pending");
+                let title = movement
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("CSV 候选记录");
+                group["title"] = json!(format!("CSV 第{row_number}行：{title}"));
+                group["diffs"] = json!([]);
+                group["warnings"] = json!([
+                    {
+                        "code": "csv_import_requires_user_confirmation",
+                        "message": "CSV 导入只生成候选；确认前不会写入账本。",
+                        "severity": "info"
+                    }
+                ]);
+                group["sourceEvidence"] =
+                    json!([ai_evidence_ref("csv_import", proposal_id, input)]);
+                groups.push(group);
+            }
+            Err(errors) => groups.push(invalid_ai_import_group(
+                "csv_import",
+                proposal_id,
+                &group_id,
+                &row_movement_id,
+                input,
+                &format!("CSV 第{row_number}行：待编辑候选"),
+                errors,
+            )),
+        }
+    }
+
+    if groups.is_empty() {
+        groups.push(invalid_ai_import_group(
+            "csv_import",
+            proposal_id,
+            atomic_group_id,
+            movement_id,
+            input,
+            "CSV：待编辑候选",
+            vec!["CSV contains no non-empty data rows".to_string()],
+        ));
+    }
+
+    Ok(Some(groups))
+}
+
+fn csv_default_account_id(input: &Value) -> Option<String> {
+    input
+        .get("defaultAccountId")
+        .or_else(|| input.get("accountId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            input
+                .get("selectedAccountIds")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find_map(|value| value.as_str().filter(|id| !id.trim().is_empty()))
+                .map(str::to_string)
+        })
+}
+
+fn csv_record_from_row(headers: &[String], row: &[String]) -> BTreeMap<String, String> {
+    let mut record = BTreeMap::new();
+    for (index, header) in headers.iter().enumerate() {
+        if header.is_empty() {
+            continue;
+        }
+        record.insert(header.clone(), row.get(index).cloned().unwrap_or_default());
+    }
+    record
+}
+
+fn csv_movement_input_from_record(
+    record: &BTreeMap<String, String>,
+    row_number: usize,
+    default_account_id: Option<&str>,
+    default_currency: &str,
+    now: &str,
+) -> Result<Value, Vec<String>> {
+    let mut errors = Vec::new();
+    let raw_amount = csv_value(record, &["amount", "金额", "money", "value"])
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_default();
+    let (amount, amount_sign) = normalized_csv_amount(raw_amount).unwrap_or_else(|| {
+        errors.push(format!(
+            "CSV row {row_number}: amount must be a decimal string"
+        ));
+        ("".to_string(), 0)
+    });
+
+    let direction = csv_direction(record, amount_sign).unwrap_or_else(|| {
+        errors.push(format!(
+            "CSV row {row_number}: direction/type/sign is required to avoid guessing"
+        ));
+        "out".to_string()
+    });
+    let movement_type = csv_movement_type(record, &direction).unwrap_or_else(|| {
+        errors.push(format!("CSV row {row_number}: type is unsupported"));
+        "expense".to_string()
+    });
+    let account_id = csv_value(record, &["accountId", "account", "账户id", "账户ID"])
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| default_account_id.map(str::to_string))
+        .unwrap_or_else(|| {
+            errors.push(format!(
+                "CSV row {row_number}: accountId or selectedAccountIds[0] is required"
+            ));
+            String::new()
+        });
+    let currency = csv_value(record, &["currency", "币种"])
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(default_currency);
+    let occurred_at = csv_value(record, &["occurredAt", "date", "time", "日期", "交易时间"])
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(now);
+    let title = csv_value(
+        record,
+        &[
+            "title",
+            "description",
+            "merchant",
+            "counterparty",
+            "摘要",
+            "描述",
+            "商户",
+            "对手方",
+        ],
+    )
+    .filter(|value| !value.trim().is_empty())
+    .map(str::to_string)
+    .unwrap_or_else(|| format!("CSV 第{row_number}行"));
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    let tags = csv_value(record, &["tags", "标签"])
+        .map(csv_tags)
+        .unwrap_or_else(|| vec!["csv_import".to_string()]);
+
+    Ok(json!({
+        "type": movement_type,
+        "occurredAt": occurred_at,
+        "title": title,
+        "entries": [
+            {
+                "accountId": account_id,
+                "amount": amount,
+                "currency": currency,
+                "direction": direction,
+                "role": "source"
+            }
+        ],
+        "amountBreakdown": {
+            "paidAmount": {
+                "amount": amount,
+                "currency": currency
+            }
+        },
+        "tags": tags
+    }))
+}
+
+fn csv_value<'a>(record: &'a BTreeMap<String, String>, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| record.get(*key).map(String::as_str))
+}
+
+fn normalized_csv_amount(raw: &str) -> Option<(String, i8)> {
+    let value = raw.trim().replace(',', "");
+    let (sign, unsigned) = if let Some(unsigned) = value.strip_prefix('-') {
+        (-1, unsigned)
+    } else if let Some(unsigned) = value.strip_prefix('+') {
+        (1, unsigned)
+    } else {
+        (0, value.as_str())
+    };
+
+    is_positive_decimal_string(unsigned).then(|| (unsigned.to_string(), sign))
+}
+
+fn csv_direction(record: &BTreeMap<String, String>, amount_sign: i8) -> Option<String> {
+    if amount_sign < 0 {
+        return Some("out".to_string());
+    }
+    if amount_sign > 0 {
+        return Some("in".to_string());
+    }
+
+    let raw = csv_value(record, &["direction", "收支", "方向"])?.trim();
+    match raw.to_ascii_lowercase().as_str() {
+        "in" | "income" | "收入" | "入" => Some("in".to_string()),
+        "out" | "expense" | "支出" | "出" => Some("out".to_string()),
+        _ => None,
+    }
+}
+
+fn csv_movement_type(record: &BTreeMap<String, String>, direction: &str) -> Option<String> {
+    let Some(raw) = csv_value(record, &["type", "类型"]).map(str::trim) else {
+        return match direction {
+            "in" => Some("income".to_string()),
+            "out" => Some("expense".to_string()),
+            _ => None,
+        };
+    };
+
+    match raw.to_ascii_lowercase().as_str() {
+        "" => csv_movement_type(&BTreeMap::new(), direction),
+        "income" | "收入" => Some("income".to_string()),
+        "expense" | "支出" => Some("expense".to_string()),
+        "fee" | "手续费" => Some("fee".to_string()),
+        "interest" | "利息" => Some("interest".to_string()),
+        "dividend" | "分红" => Some("dividend".to_string()),
+        "buy" | "买入" => Some("buy".to_string()),
+        "sell" | "卖出" => Some("sell".to_string()),
+        "adjustment" | "余额观察" | "调整" => Some("adjustment".to_string()),
+        "loan_disbursement" | "贷款发放" => Some("loan_disbursement".to_string()),
+        "loan_repayment" | "还款" => Some("loan_repayment".to_string()),
+        _ => None,
+    }
+}
+
+fn csv_tags(raw: &str) -> Vec<String> {
+    let tags = raw
+        .split([';', '|'])
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if tags.is_empty() {
+        vec!["csv_import".to_string()]
+    } else {
+        tags
+    }
+}
+
+fn normalize_csv_header(header: &str) -> String {
+    let compact = header
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !matches!(ch, ' ' | '_' | '-'))
+        .collect::<String>();
+
+    match compact.as_str() {
+        "accountid" | "账户id" => "accountId".to_string(),
+        "occurredat" | "date" | "time" | "日期" | "交易时间" => "occurredAt".to_string(),
+        "title" | "description" | "merchant" | "counterparty" | "摘要" | "描述" | "商户"
+        | "对手方" => compact,
+        "amount" | "money" | "value" | "金额" => "amount".to_string(),
+        "currency" | "币种" => "currency".to_string(),
+        "direction" | "收支" | "方向" => "direction".to_string(),
+        "type" | "类型" => "type".to_string(),
+        "tags" | "标签" => "tags".to_string(),
+        _ => compact,
+    }
+}
+
+fn parse_csv_rows(raw: &str) -> Result<Vec<Vec<String>>, LedgerError> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut chars = raw.chars().peekable();
+    let mut in_quotes = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if in_quotes && chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                row.push(field.trim().to_string());
+                field.clear();
+            }
+            '\n' if !in_quotes => {
+                row.push(field.trim_end_matches('\r').trim().to_string());
+                field.clear();
+                if row.iter().any(|value| !value.is_empty()) {
+                    rows.push(row);
+                }
+                row = Vec::new();
+            }
+            _ => field.push(ch),
+        }
+    }
+
+    if in_quotes {
+        return Err(LedgerError::InvalidInput(vec![
+            "CSV contains an unclosed quoted field".to_string(),
+        ]));
+    }
+
+    row.push(field.trim_end_matches('\r').trim().to_string());
+    if row.iter().any(|value| !value.is_empty()) {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn indexed_local_id(base: &str, index: usize) -> String {
+    if index == 0 {
+        base.to_string()
+    } else {
+        format!("{base}_{:03}", index + 1)
+    }
+}
+
+fn invalid_ai_import_group(
+    source_kind: &str,
+    proposal_id: &str,
+    atomic_group_id: &str,
+    movement_id: &str,
+    input: &Value,
+    title: &str,
+    errors: Vec<String>,
+) -> Value {
+    json!({
+        "id": atomic_group_id,
+        "title": title,
+        "operation": "create",
+        "targetType": "movement",
+        "targetId": movement_id,
+        "proposedMovements": [],
+        "diffs": [],
+        "warnings": [
+            {
+                "code": "local_ai_requires_structured_movement",
+                "message": "本地账本模式不会猜金额；请编辑候选并补全结构化记录后再确认。",
+                "severity": "warning"
+            }
+        ],
+        "status": "pending",
+        "validation": {
+            "isValid": false,
+            "errors": errors
+                .into_iter()
+                .map(|message| json!({
+                    "code": "structured_movement_required",
+                    "message": message
+                }))
+                .collect::<Vec<_>>()
+        },
+        "sourceEvidence": [ai_evidence_ref(source_kind, proposal_id, input)]
     })
 }
 
@@ -3921,14 +4384,13 @@ fn replace_ai_atomic_group(
         if let Some(groups) = proposal
             .get_mut("atomicGroups")
             .and_then(Value::as_array_mut)
+            && let Some(index) = groups
+                .iter()
+                .position(|group| group.get("id").and_then(Value::as_str) == Some(atomic_group_id))
         {
-            for group in groups {
-                if group.get("id").and_then(Value::as_str) == Some(atomic_group_id) {
-                    *group = edited_group;
-                    proposal["status"] = json!("edited");
-                    return Ok(());
-                }
-            }
+            groups[index] = edited_group;
+            proposal["status"] = json!(proposal_status_from_groups(groups));
+            return Ok(());
         }
     }
 
@@ -4121,7 +4583,12 @@ fn set_ai_atomic_group_status(
             }
         }
         if proposal_has_group {
-            proposal["status"] = json!(status_to_proposal_status(status));
+            proposal["status"] = json!(proposal_status_from_groups(
+                proposal
+                    .get("atomicGroups")
+                    .and_then(Value::as_array)
+                    .expect("proposal atomicGroups should remain an array")
+            ));
             if status == "approved" || status == "rejected" {
                 proposal["reviewedAt"] = json!(
                     OffsetDateTime::now_utc()
@@ -4141,12 +4608,37 @@ fn set_ai_atomic_group_status(
     }
 }
 
-fn status_to_proposal_status(status: &str) -> &'static str {
-    match status {
-        "approved" => "approved",
-        "rejected" => "rejected",
-        "edited" => "edited",
-        _ => "pending",
+fn proposal_status_from_groups(groups: &[Value]) -> &'static str {
+    let has_pending = groups.iter().any(|group| {
+        matches!(
+            group.get("status").and_then(Value::as_str),
+            Some("pending" | "edited")
+        )
+    });
+    let has_edited = groups
+        .iter()
+        .any(|group| group.get("status").and_then(Value::as_str) == Some("edited"));
+    let has_approved = groups
+        .iter()
+        .any(|group| group.get("status").and_then(Value::as_str) == Some("approved"));
+    let has_rejected = groups
+        .iter()
+        .any(|group| group.get("status").and_then(Value::as_str) == Some("rejected"));
+
+    if has_pending && (has_approved || has_rejected) {
+        "partially_reviewed"
+    } else if has_edited {
+        "edited"
+    } else if has_pending {
+        "pending"
+    } else if has_approved && has_rejected {
+        "partially_reviewed"
+    } else if has_approved {
+        "approved"
+    } else if has_rejected {
+        "rejected"
+    } else {
+        "pending"
     }
 }
 

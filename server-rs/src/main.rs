@@ -3880,6 +3880,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ledger_csv_import_creates_confirmable_groups_per_row() {
+        let path = unique_test_ledger_path("csv_import");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "CSV 账户",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [
+                    {"currency": "CNY", "amount": "100.00"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id should be string")
+            .to_string();
+
+        let csv = "occurredAt,title,amount,currency\n2026-06-27T08:00:00+08:00,早餐,-18.00,CNY\n2026-06-27T18:00:00+08:00,报销,+50.00,CNY\n";
+        let (proposal_status, proposal_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/ai/proposals/from-csv",
+            json!({
+                "csv": csv,
+                "selectedAccountIds": [account_id]
+            }),
+        )
+        .await;
+        assert_eq!(proposal_status, StatusCode::OK);
+        assert_eq!(proposal_body["data"]["source"]["kind"], "csv_import");
+        assert_eq!(
+            proposal_body["data"]["atomicGroups"]
+                .as_array()
+                .expect("CSV proposal groups should be an array")
+                .len(),
+            2
+        );
+        assert_eq!(
+            proposal_body["data"]["atomicGroups"][0]["proposedMovements"][0]["type"],
+            "expense"
+        );
+        assert_eq!(
+            proposal_body["data"]["atomicGroups"][1]["proposedMovements"][0]["type"],
+            "income"
+        );
+
+        let first_group_id = proposal_body["data"]["atomicGroups"][0]["id"]
+            .as_str()
+            .expect("first group id should be string")
+            .to_string();
+        let second_group_id = proposal_body["data"]["atomicGroups"][1]["id"]
+            .as_str()
+            .expect("second group id should be string")
+            .to_string();
+
+        let (first_confirm_status, first_confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/ai/atomic-groups/{first_group_id}/approve"),
+        )
+        .await;
+        assert_eq!(first_confirm_status, StatusCode::OK);
+        assert_eq!(first_confirm_body["data"]["ledgerWrite"], true);
+
+        let (pending_mid_status, pending_mid_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/ai/proposals/pending").await;
+        assert_eq!(pending_mid_status, StatusCode::OK);
+        assert_eq!(pending_mid_body["data"][0]["status"], "partially_reviewed");
+        assert_eq!(
+            pending_mid_body["data"][0]["atomicGroups"][1]["status"],
+            "pending"
+        );
+
+        let (second_confirm_status, second_confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/ai/atomic-groups/{second_group_id}/approve"),
+        )
+        .await;
+        assert_eq!(second_confirm_status, StatusCode::OK);
+        assert_eq!(second_confirm_body["data"]["ledgerWrite"], true);
+
+        let (account_after_status, account_after_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(account_after_status, StatusCode::OK);
+        assert_eq!(
+            account_after_body["data"]["cashBalances"][0]["amount"],
+            "132.00"
+        );
+
+        let (pending_after_status, pending_after_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/ai/proposals/pending").await;
+        assert_eq!(pending_after_status, StatusCode::OK);
+        assert_eq!(pending_after_body["data"], json!([]));
+
+        let persisted =
+            local_ledger::read_document(&path).expect("ledger should persist CSV import");
+        assert_eq!(
+            persisted["movements"]
+                .as_array()
+                .expect("persisted movements should be an array")
+                .len(),
+            2
+        );
+        assert_eq!(persisted["aiProposals"][0]["status"], "approved");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn ai_proposal_sources_keep_diff_and_do_not_write_ledger() {
         for (uri, source_kind) in [
             ("/v1/ai/proposals/from-text", "user_text"),
