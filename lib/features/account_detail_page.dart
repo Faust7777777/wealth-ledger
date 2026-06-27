@@ -41,7 +41,8 @@ class AccountDetailPage extends ConsumerWidget {
           ),
         ],
       ),
-      body: accountAsync.when(
+      body: ContentMaxWidth(
+          child: accountAsync.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => ErrorStateView(
           message: '$e',
@@ -82,7 +83,7 @@ class AccountDetailPage extends ConsumerWidget {
             ],
           );
         },
-      ),
+      )),
     );
   }
 

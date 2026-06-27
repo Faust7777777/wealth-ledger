@@ -62,7 +62,8 @@ class MovementDetailPage extends ConsumerWidget {
     final nameById = {for (final a in accounts) a.id: a.displayName};
     return Scaffold(
       appBar: AppBar(title: const Text('交易详情')),
-      body: async.when(
+      body: ContentMaxWidth(
+          child: async.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => ErrorStateView(
           message: '$e',
@@ -115,7 +116,7 @@ class MovementDetailPage extends ConsumerWidget {
             ],
           );
         },
-      ),
+      )),
     );
   }
 
