@@ -5,6 +5,7 @@ import 'package:go_router/go_router.dart';
 
 import '../data/providers.dart';
 import '../data/view_models.dart';
+import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
 import 'account_visuals.dart';
 
@@ -104,7 +105,8 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
     ];
     return Scaffold(
       appBar: AppBar(title: Text(_isEdit ? '编辑账户' : '新建账户')),
-      body: ListView(
+      body: ContentMaxWidth(
+          child: ListView(
         padding: const EdgeInsets.all(AppSpacing.base),
         children: [
           TextField(
@@ -178,7 +180,7 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
             ),
           ),
         ],
-      ),
+      )),
     );
   }
 }

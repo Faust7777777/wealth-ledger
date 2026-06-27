@@ -98,7 +98,8 @@ class _TransferPageState extends ConsumerState<TransferPage> {
     final accountsAsync = ref.watch(accountsProvider);
     return Scaffold(
       appBar: AppBar(title: const Text('转账')),
-      body: accountsAsync.when(
+      body: ContentMaxWidth(
+          child: accountsAsync.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => ErrorStateView(
           message: '$e',
@@ -211,7 +212,7 @@ class _TransferPageState extends ConsumerState<TransferPage> {
             ],
           );
         },
-      ),
+      )),
     );
   }
 }
