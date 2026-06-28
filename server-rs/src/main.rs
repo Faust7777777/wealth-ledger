@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{any, get, post},
+    routing::{any, get, patch, post},
 };
 mod local_ledger;
 
@@ -623,7 +623,7 @@ fn app_with_state(state: AppState) -> Router {
             post(reject_atomic_group),
         )
         .route("/v1/dca/plans", get(dca_plans).post(create_dca_plan))
-        .route("/v1/dca/plans/{plan_id}", any(not_implemented))
+        .route("/v1/dca/plans/{plan_id}", patch(update_dca_plan))
         .route("/v1/dca/reminders/due", get(dca_due_reminders))
         .route(
             "/v1/dca/reminders/{reminder_id}/mark-executed-as-proposal",
@@ -1085,6 +1085,21 @@ async fn create_dca_plan(State(state): State<AppState>, Json(input): Json<Value>
     match local_ledger::create_dca_plan(path, input, &plan_id, &reminder_id, &now) {
         Ok(plan) => (StatusCode::CREATED, envelope(plan)).into_response(),
         Err(error) => local_ledger_error(error, "invalid_dca_plan_input"),
+    }
+}
+
+async fn update_dca_plan(
+    State(state): State<AppState>,
+    Path(plan_id): Path<String>,
+    Json(patch): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::update_dca_plan(path, &plan_id, patch, &current_timestamp()) {
+        Ok(plan) => envelope(plan).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_dca_plan_patch"),
     }
 }
 
@@ -2920,6 +2935,116 @@ mod tests {
         assert_eq!(persisted["dcaPlans"].as_array().expect("plans").len(), 2);
         assert_eq!(persisted["dcaReminders"][0]["status"], "skipped");
         assert_eq!(persisted["dcaReminders"][1]["status"], "snoozed");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_dca_plan_patch_controls_due_reminders() {
+        let path = unique_test_ledger_path("dca_plan_patch");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let account_input = json!({
+            "displayName": "定投资金账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "3000.00"}
+            ]
+        });
+        let (account_status, account_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", account_input)
+                .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id should be string")
+            .to_string();
+
+        let plan_input = json!({
+            "displayName": "沪深300ETF",
+            "targetInstrumentId": "inst_csi300_fund",
+            "fundingAccountId": account_id,
+            "plannedAmount": {"amount": "1000.00", "currency": "CNY"},
+            "frequency": "monthly",
+            "nextDueDate": "2026-07-10",
+            "note": "只提醒与记录，不下单。"
+        });
+        let (create_status, create_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/dca/plans", plan_input).await;
+        assert_eq!(create_status, StatusCode::CREATED);
+        let plan_id = create_body["data"]["id"]
+            .as_str()
+            .expect("plan id should be string")
+            .to_string();
+
+        let (_, due_before_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/dca/reminders/due").await;
+        assert_eq!(due_before_body["data"].as_array().expect("due").len(), 1);
+
+        let (pause_status, pause_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/dca/plans/{plan_id}"),
+            json!({"reminderStatus": "paused"}),
+        )
+        .await;
+        assert_eq!(pause_status, StatusCode::OK);
+        assert_eq!(pause_body["data"]["reminderStatus"], "paused");
+
+        let (due_paused_status, due_paused_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/dca/reminders/due").await;
+        assert_eq!(due_paused_status, StatusCode::OK);
+        assert_eq!(due_paused_body["data"], json!([]));
+
+        let (overview_status, overview_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_status, StatusCode::OK);
+        assert_eq!(overview_body["data"]["pendingSummary"]["dcaDueCount"], 0);
+
+        let (resume_status, resume_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/dca/plans/{plan_id}"),
+            json!({
+                "displayName": "沪深300增强",
+                "plannedAmount": {"amount": "1200.00", "currency": "CNY"},
+                "nextDueDate": "2026-08-10",
+                "reminderStatus": "active",
+                "note": null
+            }),
+        )
+        .await;
+        assert_eq!(resume_status, StatusCode::OK);
+        assert_eq!(resume_body["data"]["displayName"], "沪深300增强");
+        assert_eq!(resume_body["data"]["plannedAmount"]["amount"], "1200.00");
+        assert_eq!(resume_body["data"]["nextDueDate"], "2026-08-10");
+        assert!(resume_body["data"].get("note").is_none());
+
+        let (due_resumed_status, due_resumed_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/dca/reminders/due").await;
+        assert_eq!(due_resumed_status, StatusCode::OK);
+        assert_eq!(due_resumed_body["data"].as_array().expect("due").len(), 1);
+        assert_eq!(due_resumed_body["data"][0]["displayName"], "沪深300增强");
+        assert_eq!(
+            due_resumed_body["data"][0]["plannedAmount"]["amount"],
+            "1200.00"
+        );
+        assert_eq!(due_resumed_body["data"][0]["dueDate"], "2026-08-10");
+
+        let persisted =
+            local_ledger::read_document(&path).expect("ledger should persist DCA patch");
+        assert_eq!(persisted["dcaPlans"][0]["reminderStatus"], "active");
+        assert_eq!(
+            persisted["dcaPlans"][0]["plannedAmount"]["amount"],
+            "1200.00"
+        );
+        assert_eq!(persisted["dcaReminders"][0]["displayName"], "沪深300增强");
+        assert_eq!(persisted["dcaReminders"][0]["dueDate"], "2026-08-10");
 
         let _ = std::fs::remove_file(path);
     }

@@ -557,6 +557,40 @@ pub fn create_dca_plan(
     Ok(plan)
 }
 
+pub fn update_dca_plan(
+    path: &Path,
+    plan_id: &str,
+    patch: Value,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+
+    if let Some(object) = patch.as_object()
+        && let Some(Value::String(funding_account_id)) = object.get("fundingAccountId")
+        && !active_account_exists(&document, funding_account_id)
+    {
+        return Err(LedgerError::InvalidInput(vec![
+            "fundingAccountId does not exist or is archived".to_string(),
+        ]));
+    }
+
+    let projected = {
+        let plan = document["dcaPlans"]
+            .as_array_mut()
+            .expect("validated local ledger dcaPlans should be an array")
+            .iter_mut()
+            .find(|plan| plan.get("id").and_then(Value::as_str) == Some(plan_id))
+            .ok_or_else(|| LedgerError::NotFound(format!("DCA plan does not exist: {plan_id}")))?;
+
+        apply_dca_plan_patch(plan, &patch, now)?;
+        plan.clone()
+    };
+
+    sync_open_dca_reminders_for_plan(&mut document, plan_id, &projected, now);
+    write_document(path, &document)?;
+    Ok(projected)
+}
+
 pub fn list_due_dca_reminders(path: &Path) -> io::Result<Value> {
     let document = load_or_initialize(path)?;
     let reminders = document["dcaReminders"]
@@ -567,7 +601,10 @@ pub fn list_due_dca_reminders(path: &Path) -> io::Result<Value> {
             matches!(
                 reminder.get("status").and_then(Value::as_str),
                 Some("due" | "overdue")
-            )
+            ) && reminder
+                .get("planId")
+                .and_then(Value::as_str)
+                .is_some_and(|plan_id| is_dca_plan_active(&document, plan_id))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -775,7 +812,10 @@ pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
             matches!(
                 reminder.get("status").and_then(Value::as_str),
                 Some("due" | "overdue")
-            )
+            ) && reminder
+                .get("planId")
+                .and_then(Value::as_str)
+                .is_some_and(|plan_id| is_dca_plan_active(&document, plan_id))
         })
         .count();
 
@@ -2013,6 +2053,130 @@ fn dca_plan_from_create_input(
     }
 
     Ok(plan)
+}
+
+fn apply_dca_plan_patch(plan: &mut Value, patch: &Value, now: &str) -> Result<(), LedgerError> {
+    let Some(object) = patch.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "DCA plan patch must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut errors = Vec::new();
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "displayName"
+                | "targetInstrumentId"
+                | "fundingAccountId"
+                | "plannedAmount"
+                | "frequency"
+                | "nextDueDate"
+                | "reminderStatus"
+                | "note"
+        ) {
+            errors.push(format!("{key} is not an updatable DCA plan field"));
+        }
+    }
+
+    if let Some(value) = object.get("displayName") {
+        match value.as_str().filter(|value| !value.trim().is_empty()) {
+            Some(value) => plan["displayName"] = json!(value),
+            None => errors.push("displayName must be a non-empty string".to_string()),
+        }
+    }
+
+    if let Some(value) = object.get("targetInstrumentId") {
+        match value.as_str().filter(|value| !value.trim().is_empty()) {
+            Some(value) => plan["targetInstrumentId"] = json!(value),
+            None => errors.push("targetInstrumentId must be a non-empty string".to_string()),
+        }
+    }
+
+    if object.contains_key("fundingAccountId") {
+        patch_optional_string(plan, object, "fundingAccountId", &mut errors);
+    }
+
+    if let Some(value) = object.get("plannedAmount")
+        && let Some(planned_amount) =
+            normalized_required_money(Some(value), "plannedAmount", &mut errors)
+    {
+        plan["plannedAmount"] = planned_amount;
+    }
+
+    if let Some(value) = object.get("frequency") {
+        match value.as_str() {
+            Some(value @ ("weekly" | "monthly" | "custom")) => plan["frequency"] = json!(value),
+            _ => errors.push("frequency must be weekly, monthly, or custom".to_string()),
+        }
+    }
+
+    if let Some(value) = object.get("nextDueDate") {
+        match value.as_str().filter(|value| !value.trim().is_empty()) {
+            Some(value) => plan["nextDueDate"] = json!(value),
+            None => errors.push("nextDueDate must be a non-empty ISO date".to_string()),
+        }
+    }
+
+    if let Some(value) = object.get("reminderStatus") {
+        match value.as_str() {
+            Some(value @ ("active" | "snoozed" | "paused" | "completed")) => {
+                plan["reminderStatus"] = json!(value)
+            }
+            _ => errors
+                .push("reminderStatus must be active, snoozed, paused, or completed".to_string()),
+        }
+    }
+
+    if object.contains_key("note") {
+        patch_optional_string(plan, object, "note", &mut errors);
+    }
+
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    plan["updatedAt"] = json!(now);
+    Ok(())
+}
+
+fn sync_open_dca_reminders_for_plan(document: &mut Value, plan_id: &str, plan: &Value, now: &str) {
+    let display_name = plan.get("displayName").cloned();
+    let planned_amount = plan.get("plannedAmount").cloned();
+    let due_date = plan.get("nextDueDate").cloned();
+
+    for reminder in document["dcaReminders"]
+        .as_array_mut()
+        .expect("validated local ledger dcaReminders should be an array")
+        .iter_mut()
+        .filter(|reminder| reminder.get("planId").and_then(Value::as_str) == Some(plan_id))
+        .filter(|reminder| {
+            matches!(
+                reminder.get("status").and_then(Value::as_str),
+                Some("due" | "overdue" | "snoozed")
+            )
+        })
+    {
+        if let Some(display_name) = display_name.clone() {
+            reminder["displayName"] = display_name;
+        }
+        if let Some(planned_amount) = planned_amount.clone() {
+            reminder["plannedAmount"] = planned_amount;
+        }
+        if let Some(due_date) = due_date.clone() {
+            reminder["dueDate"] = due_date;
+        }
+        reminder["updatedAt"] = json!(now);
+    }
+}
+
+fn is_dca_plan_active(document: &Value, plan_id: &str) -> bool {
+    document["dcaPlans"]
+        .as_array()
+        .expect("validated local ledger dcaPlans should be an array")
+        .iter()
+        .find(|plan| plan.get("id").and_then(Value::as_str) == Some(plan_id))
+        .is_some_and(|plan| plan.get("reminderStatus").and_then(Value::as_str) == Some("active"))
 }
 
 fn dca_reminder_from_plan(plan: &Value, reminder_id: &str) -> Value {
