@@ -52,6 +52,11 @@ Widget _host(Widget page, List<AccountVm> accounts) => ProviderScope(
           aliases: ['瑞幸'],
           categoryHintId: 'cat_coffee',
         ),
+        CounterpartyVm(
+          id: 'cp_luckin_short',
+          displayName: '瑞幸',
+          categoryHintId: 'cat_coffee',
+        ),
       ],
     ),
   ],
@@ -134,11 +139,15 @@ void main() {
     await t.pumpAndSettle();
     expect(find.text('分类'), findsOneWidget);
     expect(find.text('新增分类'), findsOneWidget);
-    await t.drag(find.byType(ListView), const Offset(0, -900));
-    await t.pumpAndSettle();
-    expect(find.text('对手方'), findsOneWidget);
-    expect(find.text('新增对手方'), findsOneWidget);
     expect(find.text('咖啡饮品'), findsWidgets);
+    await t.dragUntilVisible(
+      find.text('新增对手方'),
+      find.byType(ListView),
+      const Offset(0, -300),
+    );
+    await t.pumpAndSettle();
+    expect(find.text('新增对手方'), findsOneWidget);
+    expect(find.text('合并对手方'), findsOneWidget);
     expect(find.text('瑞幸咖啡'), findsWidgets);
   });
 }

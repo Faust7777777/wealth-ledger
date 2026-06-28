@@ -640,6 +640,20 @@ class LocalServerTaxonomyRepository implements TaxonomyRepository {
     );
     return _counterparty(_m(d));
   }
+
+  @override
+  Future<void> createCounterpartyMergeProposal({
+    required List<Id> sourceCounterpartyIds,
+    required String targetDisplayName,
+  }) async {
+    await _c.postData(
+      '/v1/counterparties/merge-proposal',
+      body: {
+        'sourceCounterpartyIds': sourceCounterpartyIds,
+        'targetDisplayName': targetDisplayName,
+      },
+    );
+  }
 }
 
 class LocalServerPortfolioRepository implements PortfolioRepository {

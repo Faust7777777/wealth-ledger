@@ -412,6 +412,13 @@ class FixtureTaxonomyRepository implements TaxonomyRepository {
   Future<CounterpartyVm> createCounterparty(
     CreateCounterpartyInput input,
   ) async => throw UnsupportedError('DEMO 演示只读，不支持创建对手方；请用 local_server');
+  @override
+  Future<void> createCounterpartyMergeProposal({
+    required List<Id> sourceCounterpartyIds,
+    required String targetDisplayName,
+  }) async {
+    /* DEMO：模拟生成合并候选，演示数据不变 */
+  }
 }
 
 class FixtureDcaRepository implements DcaRepository {

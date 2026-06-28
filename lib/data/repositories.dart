@@ -20,6 +20,12 @@ abstract interface class TaxonomyRepository {
   Future<CategoryVm> createCategory(CreateCategoryInput input);
   Future<List<CounterpartyVm>> listCounterparties();
   Future<CounterpartyVm> createCounterparty(CreateCounterpartyInput input);
+
+  /// 对手方合并：只生成 AI/atomic group 候选；确认前不改对手方、不改历史记录。
+  Future<void> createCounterpartyMergeProposal({
+    required List<Id> sourceCounterpartyIds,
+    required String targetDisplayName,
+  });
 }
 
 abstract interface class PortfolioRepository {

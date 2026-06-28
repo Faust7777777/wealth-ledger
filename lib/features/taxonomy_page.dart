@@ -95,6 +95,8 @@ class TaxonomyPage extends ConsumerWidget {
             SectionHeader(title: '对手方'),
             _CounterpartyCreateCard(categories: categories),
             const SizedBox(height: AppSpacing.sm),
+            _CounterpartyMergeCard(counterparties: counterparties),
+            const SizedBox(height: AppSpacing.sm),
             if (counterparties.isEmpty)
               const Card(
                 child: ListTile(
@@ -335,6 +337,120 @@ class _CounterpartyCreateCardState
                 child: Text(_busy ? '创建中…' : '创建对手方'),
               ),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _CounterpartyMergeCard extends ConsumerStatefulWidget {
+  const _CounterpartyMergeCard({required this.counterparties});
+  final List<CounterpartyVm> counterparties;
+
+  @override
+  ConsumerState<_CounterpartyMergeCard> createState() =>
+      _CounterpartyMergeCardState();
+}
+
+class _CounterpartyMergeCardState
+    extends ConsumerState<_CounterpartyMergeCard> {
+  final _targetName = TextEditingController();
+  final Set<String> _selectedIds = <String>{};
+  bool _busy = false;
+
+  @override
+  void dispose() {
+    _targetName.dispose();
+    super.dispose();
+  }
+
+  bool get _canSubmit =>
+      widget.counterparties.length >= 2 &&
+      _selectedIds.length >= 2 &&
+      _targetName.text.trim().isNotEmpty &&
+      !_busy;
+
+  Future<void> _submit() async {
+    if (!_canSubmit) return;
+    setState(() => _busy = true);
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await ref
+          .read(taxonomyRepositoryProvider)
+          .createCounterpartyMergeProposal(
+            sourceCounterpartyIds: _selectedIds.toList(),
+            targetDisplayName: _targetName.text.trim(),
+          );
+      ref.invalidate(aiPendingProvider);
+      messenger.showSnackBar(
+        const SnackBar(content: Text('已生成合并候选，请到 AI 复核确认')),
+      );
+      _selectedIds.clear();
+      _targetName.clear();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final disabled = widget.counterparties.length < 2;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.base),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('合并对手方', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: AppSpacing.xs),
+            Text(
+              disabled
+                  ? '至少需要两个对手方，才能生成合并候选。'
+                  : '用于把“瑞幸 / 瑞幸咖啡”这类同一对象归并；这里只生成候选，确认前不改历史记录。',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            if (!disabled) ...[
+              const SizedBox(height: AppSpacing.sm),
+              for (final p in widget.counterparties)
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: _selectedIds.contains(p.id),
+                  title: Text(p.displayName),
+                  subtitle: p.aliases.isEmpty
+                      ? null
+                      : Text('别名：${p.aliases.join('、')}'),
+                  onChanged: (v) => setState(() {
+                    if (v == true) {
+                      _selectedIds.add(p.id);
+                      if (_targetName.text.trim().isEmpty) {
+                        _targetName.text = p.displayName;
+                      }
+                    } else {
+                      _selectedIds.remove(p.id);
+                    }
+                  }),
+                ),
+              const SizedBox(height: AppSpacing.sm),
+              TextField(
+                controller: _targetName,
+                decoration: const InputDecoration(
+                  labelText: '合并后的显示名',
+                  border: OutlineInputBorder(),
+                ),
+                onChanged: (_) => setState(() {}),
+              ),
+              const SizedBox(height: AppSpacing.sm),
+              Align(
+                alignment: Alignment.centerRight,
+                child: FilledButton(
+                  onPressed: _canSubmit ? _submit : null,
+                  child: Text(_busy ? '生成中…' : '生成合并候选'),
+                ),
+              ),
+            ],
           ],
         ),
       ),

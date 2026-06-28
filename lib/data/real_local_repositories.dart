@@ -37,6 +37,11 @@ class RealLocalTaxonomyRepository implements TaxonomyRepository {
   Future<CounterpartyVm> createCounterparty(
     CreateCounterpartyInput input,
   ) async => throw UnsupportedError('real_local 暂不支持创建对手方；请用 local_server');
+  @override
+  Future<void> createCounterpartyMergeProposal({
+    required List<Id> sourceCounterpartyIds,
+    required String targetDisplayName,
+  }) async => throw UnsupportedError('real_local 暂不支持对手方合并；请用 local_server');
 }
 
 class RealLocalPortfolioRepository implements PortfolioRepository {
