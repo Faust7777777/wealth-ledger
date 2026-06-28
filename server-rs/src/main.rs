@@ -659,6 +659,11 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/quotes", get(quotes))
         .route("/v1/fx-rates", get(fx_rates))
         .route("/v1/quotes/refresh", post(refresh_quotes))
+        .route("/v1/instruments", get(instruments).post(create_instrument))
+        .route(
+            "/v1/instruments/{instrument_id}",
+            get(instrument_detail).patch(update_instrument),
+        )
         .route(
             "/v1/instruments/{instrument_id}/historical-prices",
             get(empty_array),
@@ -1760,6 +1765,76 @@ async fn create_manual_snapshot(
     }
 }
 
+async fn instruments(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_instruments(path) {
+            Ok(instruments) => envelope(instruments).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(json!([])).into_response()
+}
+
+async fn create_instrument(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::create_instrument(path, input, &next_local_instrument_id()) {
+        Ok(instrument) => (StatusCode::CREATED, envelope(instrument)).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_instrument_input"),
+    }
+}
+
+async fn instrument_detail(
+    State(state): State<AppState>,
+    Path(instrument_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::get_instrument(path, &instrument_id) {
+            Ok(Some(instrument)) => envelope(instrument).into_response(),
+            Ok(None) => not_found(
+                "instrument_not_found",
+                "Instrument does not exist in local ledger.",
+            ),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    not_found(
+        "instrument_not_found",
+        "Instrument does not exist in this dev scenario.",
+    )
+}
+
+async fn update_instrument(
+    State(state): State<AppState>,
+    Path(instrument_id): Path<String>,
+    Json(patch): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    match local_ledger::update_instrument(path, &instrument_id, patch) {
+        Ok(instrument) => envelope(instrument).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_instrument_patch"),
+    }
+}
+
 async fn categories(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
@@ -2012,6 +2087,10 @@ fn next_local_category_id() -> String {
 
 fn next_local_counterparty_id() -> String {
     next_local_id("cp_local")
+}
+
+fn next_local_instrument_id() -> String {
+    next_local_id("inst_local")
 }
 
 fn next_local_ai_proposal_id() -> String {
@@ -3383,6 +3462,165 @@ mod tests {
 
         let persisted = local_ledger::read_document(&path).expect("ledger should be readable");
         assert_eq!(persisted["quotes"], json!([]));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_instrument_patch_supplies_quote_refresh_symbol() {
+        let path = unique_test_ledger_path("instrument_patch_symbol");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let cash_input = json!({
+            "displayName": "现金账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "1000.00"}
+            ]
+        });
+        let (_, cash_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", cash_input).await;
+        let cash_account_id = cash_body["data"]["id"].as_str().expect("cash id");
+
+        let brokerage_input = json!({
+            "displayName": "美股券商",
+            "accountType": "brokerage",
+            "defaultCurrency": "USD",
+            "supportedCurrencies": ["USD", "CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "holdings",
+            "openingBalances": [
+                {"currency": "USD", "amount": "0.00"}
+            ]
+        });
+        let (_, brokerage_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            brokerage_input,
+        )
+        .await;
+        let brokerage_account_id = brokerage_body["data"]["id"].as_str().expect("brokerage id");
+
+        let draft_input = json!({
+            "type": "buy",
+            "occurredAt": "2026-06-26T11:00:00+08:00",
+            "title": "记录自定义美股",
+            "entries": [
+                {
+                    "accountId": cash_account_id,
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": brokerage_account_id,
+                    "instrumentId": "inst_custom_stock",
+                    "amount": "10.00",
+                    "currency": "USD",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        let (_, draft_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            draft_input,
+        )
+        .await;
+        let atomic_group_id = draft_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("atomic group id");
+        let (confirm_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{atomic_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK);
+
+        let (detail_before_status, detail_before_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/instruments/inst_custom_stock",
+        )
+        .await;
+        assert_eq!(detail_before_status, StatusCode::OK);
+        assert_eq!(detail_before_body["data"]["id"], "inst_custom_stock");
+        assert!(detail_before_body["data"].get("symbol").is_none());
+
+        let patch = json!({
+            "type": "equity",
+            "symbol": "AAPL",
+            "displayName": "Apple Inc.",
+            "quoteCurrency": "USD",
+            "market": "US"
+        });
+        let (patch_status, patch_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            "/v1/instruments/inst_custom_stock",
+            patch,
+        )
+        .await;
+        assert_eq!(patch_status, StatusCode::OK);
+        assert_eq!(patch_body["data"]["symbol"], "AAPL");
+        assert_eq!(patch_body["data"]["quoteCurrency"], "USD");
+
+        let targets = local_ledger::quote_refresh_targets(
+            &path,
+            &json!({"instruments": ["inst_custom_stock"]}),
+        )
+        .expect("quote targets should be readable");
+        assert_eq!(targets[0]["instrumentId"], "inst_custom_stock");
+        assert_eq!(targets[0]["symbol"], "AAPL");
+        assert_eq!(targets[0]["quoteCurrency"], "USD");
+
+        let (holdings_status, holdings_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(holdings_status, StatusCode::OK);
+        assert_eq!(holdings_body["data"][0]["instrument"]["symbol"], "AAPL");
+        assert_eq!(
+            holdings_body["data"][0]["instrument"]["displayName"],
+            "Apple Inc."
+        );
+
+        let create_input = json!({
+            "id": "inst_manual_btc",
+            "type": "crypto",
+            "symbol": "BTC-USD",
+            "displayName": "Bitcoin",
+            "quoteCurrency": "USD",
+            "market": "CRYPTO"
+        });
+        let (create_status, create_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            create_input,
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::CREATED);
+        assert_eq!(create_body["data"]["id"], "inst_manual_btc");
+
+        let invalid_patch = json!({"id": "inst_should_not_change"});
+        let (invalid_status, invalid_body) = request_json_body_from(
+            router,
+            Method::PATCH,
+            "/v1/instruments/inst_custom_stock",
+            invalid_patch,
+        )
+        .await;
+        assert_eq!(invalid_status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid_body["error"]["code"], "invalid_instrument_patch");
 
         let _ = std::fs::remove_file(path);
     }

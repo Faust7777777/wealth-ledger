@@ -20,6 +20,7 @@ tags:
   - name: DCA
   - name: AI Proposals
   - name: Quotes
+  - name: Instruments
   - name: Snapshots
   - name: Taxonomy
   - name: Sync
@@ -699,6 +700,66 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/QuoteRefreshResultResponse"
+
+  /instruments:
+    get:
+      tags: [Instruments]
+      summary: List instruments.
+      responses:
+        "200":
+          description: Instruments.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstrumentListResponse"
+    post:
+      tags: [Instruments]
+      summary: Create an instrument.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateInstrumentRequest"
+      responses:
+        "201":
+          description: Created instrument.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstrumentResponse"
+
+  /instruments/{instrumentId}:
+    get:
+      tags: [Instruments]
+      summary: Get an instrument.
+      parameters:
+        - $ref: "#/components/parameters/instrumentId"
+      responses:
+        "200":
+          description: Instrument.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstrumentResponse"
+    patch:
+      tags: [Instruments]
+      summary: Update an instrument.
+      parameters:
+        - $ref: "#/components/parameters/instrumentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateInstrumentRequest"
+      responses:
+        "200":
+          description: Updated instrument.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InstrumentResponse"
 
   /instruments/{instrumentId}/historical-prices:
     get:
@@ -1386,6 +1447,60 @@ components:
           type: string
         sourceRef:
           type: string
+    InstrumentResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/Instrument"
+    InstrumentListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Instrument"
+    CreateInstrumentRequest:
+      type: object
+      required: [type, displayName, quoteCurrency]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        type:
+          enum: [cash, equity, fund, crypto, fx_cash, receivable, other]
+        symbol:
+          type: string
+        displayName:
+          type: string
+        quoteCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        market:
+          type: string
+        sourceRef:
+          type: string
+    UpdateInstrumentRequest:
+      type: object
+      properties:
+        type:
+          enum: [cash, equity, fund, crypto, fx_cash, receivable, other]
+        symbol:
+          type: string
+          nullable: true
+        displayName:
+          type: string
+        quoteCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        market:
+          type: string
+          nullable: true
+        sourceRef:
+          type: string
+          nullable: true
     ValuedMoney:
       type: object
       required: [amount, currency, asOf, quality]

@@ -9,6 +9,15 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const LEDGER_VERSION: i64 = 1;
 pub const DEFAULT_BASE_CURRENCY: &str = "CNY";
+const INSTRUMENT_TYPES: &[&str] = &[
+    "cash",
+    "equity",
+    "fund",
+    "crypto",
+    "fx_cash",
+    "receivable",
+    "other",
+];
 
 pub fn empty_document(base_currency: &str) -> Value {
     json!({
@@ -1158,6 +1167,76 @@ pub fn create_manual_snapshot(path: &Path, input: Value, now: &str) -> Result<Va
         .push(snapshot.clone());
     write_document(path, &document)?;
     Ok(snapshot)
+}
+
+pub fn list_instruments(path: &Path) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    Ok(json!(
+        document["instruments"]
+            .as_array()
+            .expect("validated local ledger instruments should be an array")
+            .clone()
+    ))
+}
+
+pub fn get_instrument(path: &Path, instrument_id: &str) -> io::Result<Option<Value>> {
+    let document = load_or_initialize(path)?;
+    Ok(document["instruments"]
+        .as_array()
+        .expect("validated local ledger instruments should be an array")
+        .iter()
+        .find(|instrument| instrument.get("id").and_then(Value::as_str) == Some(instrument_id))
+        .cloned())
+}
+
+pub fn create_instrument(
+    path: &Path,
+    input: Value,
+    fallback_instrument_id: &str,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let instrument = instrument_from_input(&input, fallback_instrument_id)?;
+    let instrument_id = instrument
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("validated instrument id should be string");
+    if document["instruments"]
+        .as_array()
+        .expect("validated local ledger instruments should be an array")
+        .iter()
+        .any(|existing| existing.get("id").and_then(Value::as_str) == Some(instrument_id))
+    {
+        return Err(LedgerError::Conflict(format!(
+            "instrument already exists: {instrument_id}"
+        )));
+    }
+
+    document["instruments"]
+        .as_array_mut()
+        .expect("validated local ledger instruments should be an array")
+        .push(instrument.clone());
+    write_document(path, &document)?;
+    Ok(instrument)
+}
+
+pub fn update_instrument(
+    path: &Path,
+    instrument_id: &str,
+    patch: Value,
+) -> Result<Value, LedgerError> {
+    let mut document = load_or_initialize(path)?;
+    let instrument = document["instruments"]
+        .as_array_mut()
+        .expect("validated local ledger instruments should be an array")
+        .iter_mut()
+        .find(|instrument| instrument.get("id").and_then(Value::as_str) == Some(instrument_id))
+        .ok_or_else(|| {
+            LedgerError::NotFound(format!("instrument does not exist: {instrument_id}"))
+        })?;
+    apply_instrument_patch(instrument, &patch)?;
+    let projected = instrument.clone();
+    write_document(path, &document)?;
+    Ok(projected)
 }
 
 pub fn list_categories(path: &Path) -> io::Result<Value> {
@@ -2523,6 +2602,105 @@ fn category_from_input(input: &Value, category_id: &str) -> Result<Value, Ledger
         category["aiDescription"] = json!(ai_description);
     }
     Ok(category)
+}
+
+fn instrument_from_input(
+    input: &Value,
+    fallback_instrument_id: &str,
+) -> Result<Value, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "instrument input must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut errors = Vec::new();
+    let instrument_id =
+        optional_string(object, "id", &mut errors).unwrap_or_else(|| fallback_instrument_id.into());
+    let instrument_type = required_enum(object, "type", INSTRUMENT_TYPES, &mut errors);
+    let display_name = required_string(object, "displayName", &mut errors);
+    let quote_currency = required_string(object, "quoteCurrency", &mut errors);
+    let symbol = optional_string(object, "symbol", &mut errors);
+    let market = optional_string(object, "market", &mut errors);
+    let source_ref = optional_string(object, "sourceRef", &mut errors);
+
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    let mut instrument = json!({
+        "id": instrument_id,
+        "type": instrument_type.expect("validated instrument type"),
+        "displayName": display_name.expect("validated instrument displayName"),
+        "quoteCurrency": quote_currency.expect("validated instrument quoteCurrency")
+    });
+    if let Some(symbol) = symbol {
+        instrument["symbol"] = json!(symbol);
+    }
+    if let Some(market) = market {
+        instrument["market"] = json!(market);
+    }
+    if let Some(source_ref) = source_ref {
+        instrument["sourceRef"] = json!(source_ref);
+    }
+    Ok(instrument)
+}
+
+fn apply_instrument_patch(instrument: &mut Value, patch: &Value) -> Result<(), LedgerError> {
+    let Some(object) = patch.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "instrument patch must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut errors = Vec::new();
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "type" | "symbol" | "displayName" | "quoteCurrency" | "market" | "sourceRef"
+        ) {
+            errors.push(format!("{key} is not an updatable instrument field"));
+        }
+    }
+    if let Some(instrument_type) = object.get("type") {
+        match instrument_type.as_str() {
+            Some(value) if INSTRUMENT_TYPES.contains(&value) => instrument["type"] = json!(value),
+            _ => errors.push("type must be a valid InstrumentType".to_string()),
+        }
+    }
+    if let Some(display_name) = object.get("displayName") {
+        match display_name
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(value) => instrument["displayName"] = json!(value),
+            None => errors.push("displayName must be a non-empty string".to_string()),
+        }
+    }
+    if let Some(quote_currency) = object.get("quoteCurrency") {
+        match quote_currency
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(value) => instrument["quoteCurrency"] = json!(value),
+            None => errors.push("quoteCurrency must be a non-empty string".to_string()),
+        }
+    }
+    if object.contains_key("symbol") {
+        patch_optional_string(instrument, object, "symbol", &mut errors);
+    }
+    if object.contains_key("market") {
+        patch_optional_string(instrument, object, "market", &mut errors);
+    }
+    if object.contains_key("sourceRef") {
+        patch_optional_string(instrument, object, "sourceRef", &mut errors);
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(LedgerError::InvalidInput(errors))
+    }
 }
 
 fn apply_category_patch(category: &mut Value, patch: &Value) -> Result<(), LedgerError> {
