@@ -113,6 +113,9 @@ QuoteRefreshError {
 - 启动刷新失败不阻塞 App 使用。
 - 定时刷新失败不弹强干扰错误，进入待处理/状态区。
 - 如果当前环境没有真实 provider，`quotes` / `fxRates` 可作为手动或外部 provider 已确认结果写入缓存；缺省时不得伪造价格，只能返回 `offline`/`failed` 并继续使用缓存。
+- Rust local server 可用 Yahoo provider 作为第一档实现：只对 `Instrument.symbol` 存在，或 `instrumentId` 本身可安全解释为 ticker 的标的自动刷新；内部 ID（如 `inst_*`）缺少 symbol 时必须返回错误并继续使用缓存。
+- FX provider 可按 `currencyPairs` 或账本中的非本位币现金自动推导 Yahoo pair（如 `USD/CNY` → `USDCNY=X`）。
+- 本地开发可用 `FINWEALTH_QUOTE_PROVIDER=none` 禁用联网 provider，只保留手动/外部 payload 写入与缓存读取。
 
 ## 5. TTL 初始建议
 

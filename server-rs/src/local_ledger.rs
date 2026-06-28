@@ -232,6 +232,135 @@ pub fn refresh_quotes(path: &Path, input: Value, now: &str) -> Result<Value, Led
     }))
 }
 
+pub fn quote_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value>> {
+    let document = load_or_initialize(path)?;
+    let requested_ids = input
+        .get("instruments")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            document["holdings"]
+                .as_array()
+                .expect("validated local ledger holdings should be an array")
+                .iter()
+                .filter(|holding| {
+                    parse_decimal(
+                        holding
+                            .get("quantity")
+                            .and_then(Value::as_str)
+                            .unwrap_or("0"),
+                    )
+                    .is_ok_and(|quantity| quantity > DecimalAmount::ZERO)
+                })
+                .filter_map(|holding| holding.get("instrumentId").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        });
+
+    let mut targets = Vec::new();
+    for instrument_id in requested_ids {
+        if targets.iter().any(|target: &Value| {
+            target.get("instrumentId").and_then(Value::as_str) == Some(instrument_id.as_str())
+        }) {
+            continue;
+        }
+        let instrument = document["instruments"]
+            .as_array()
+            .expect("validated local ledger instruments should be an array")
+            .iter()
+            .find(|instrument| {
+                instrument.get("id").and_then(Value::as_str) == Some(instrument_id.as_str())
+            });
+        let symbol = instrument
+            .and_then(|instrument| instrument.get("symbol").and_then(Value::as_str))
+            .filter(|symbol| !symbol.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| infer_yahoo_symbol_from_id(&instrument_id));
+        let quote_currency = instrument
+            .and_then(|instrument| instrument.get("quoteCurrency").and_then(Value::as_str))
+            .unwrap_or(DEFAULT_BASE_CURRENCY)
+            .to_string();
+        let display_name = instrument
+            .and_then(|instrument| instrument.get("displayName").and_then(Value::as_str))
+            .unwrap_or(instrument_id.as_str())
+            .to_string();
+        targets.push(json!({
+            "instrumentId": instrument_id,
+            "symbol": symbol,
+            "quoteCurrency": quote_currency,
+            "displayName": display_name
+        }));
+    }
+
+    Ok(targets)
+}
+
+pub fn fx_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value>> {
+    let document = load_or_initialize(path)?;
+    let base_currency = document
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_BASE_CURRENCY)
+        .to_string();
+    let requested_pairs = input
+        .get("currencyPairs")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let base = item.get("baseCurrency").and_then(Value::as_str)?;
+                    let quote = item.get("quoteCurrency").and_then(Value::as_str)?;
+                    Some((base.to_string(), quote.to_string()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            document["accounts"]
+                .as_array()
+                .expect("validated local ledger accounts should be an array")
+                .iter()
+                .filter(|account| account.get("status").and_then(Value::as_str) != Some("archived"))
+                .flat_map(|account| {
+                    account
+                        .get("cashBalances")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|balance| balance.get("currency").and_then(Value::as_str))
+                        .filter(|currency| *currency != base_currency)
+                        .map(|currency| (currency.to_string(), base_currency.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        });
+
+    let mut targets = Vec::new();
+    for (base, quote) in requested_pairs {
+        if base == quote
+            || targets.iter().any(|target: &Value| {
+                target.get("baseCurrency").and_then(Value::as_str) == Some(base.as_str())
+                    && target.get("quoteCurrency").and_then(Value::as_str) == Some(quote.as_str())
+            })
+        {
+            continue;
+        }
+        targets.push(json!({
+            "baseCurrency": base,
+            "quoteCurrency": quote,
+            "symbol": format!("{}{}=X", base, quote)
+        }));
+    }
+
+    Ok(targets)
+}
+
 pub fn create_account(
     path: &Path,
     input: Value,
@@ -3186,6 +3315,17 @@ fn stable_quote_id(prefix: &str, parts: &[&str]) -> String {
         id.push_str(&clean_identifier(part));
     }
     id
+}
+
+fn infer_yahoo_symbol_from_id(instrument_id: &str) -> Option<String> {
+    let value = instrument_id.trim();
+    if value.is_empty() || value.starts_with("inst_") || value.len() > 16 {
+        return None;
+    }
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '='))
+        .then(|| value.to_ascii_uppercase())
 }
 
 fn clean_identifier(value: &str) -> String {

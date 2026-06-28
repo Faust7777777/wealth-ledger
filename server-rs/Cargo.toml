@@ -9,6 +9,7 @@ axum = "0.8"
 serde_json = "1"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+yahoo_finance_api = "4.1"
 
 [dev-dependencies]
 http-body-util = "0.1"

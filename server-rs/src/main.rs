@@ -16,7 +16,8 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use yahoo_finance_api as yahoo;
 
 const EMPTY_BOOTSTRAP: &str =
     include_str!("../../docs/contracts/examples/ledger_bootstrap_empty.response.json");
@@ -1398,13 +1399,292 @@ async fn refresh_quotes(
             .local_ledger_path
             .as_ref()
             .expect("local ledger path should exist when local ledger is selected");
-        return match local_ledger::refresh_quotes(path, input, &current_timestamp()) {
-            Ok(result) => envelope(result).into_response(),
+        let now = current_timestamp();
+        let input = match enrich_quote_refresh_with_yahoo(path, input, &now).await {
+            Ok(input) => input,
+            Err(error_result) => return envelope(error_result).into_response(),
+        };
+        let provider_errors = quote_provider_errors(&input);
+        if input.get("quotes").is_none()
+            && input.get("fxRates").is_none()
+            && !provider_errors.is_empty()
+        {
+            return envelope(json!({
+                "status": "offline",
+                "quotes": [],
+                "fxRates": [],
+                "errors": provider_errors,
+                "completedAt": now
+            }))
+            .into_response();
+        }
+        return match local_ledger::refresh_quotes(path, input, &now) {
+            Ok(result) => {
+                envelope(merge_quote_provider_errors(result, provider_errors)).into_response()
+            }
             Err(error) => local_ledger_error(error, "invalid_quote_refresh_input"),
         };
     }
 
     example_json(QUOTE_STALE).into_response()
+}
+
+fn quote_provider_errors(input: &Value) -> Vec<Value> {
+    input
+        .get("_providerErrors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn merge_quote_provider_errors(mut result: Value, provider_errors: Vec<Value>) -> Value {
+    if provider_errors.is_empty() {
+        return result;
+    }
+    let had_errors = result
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| !errors.is_empty());
+    if let Some(errors) = result.get_mut("errors").and_then(Value::as_array_mut) {
+        errors.extend(provider_errors);
+    }
+    if !had_errors && result.get("status").and_then(Value::as_str) == Some("success") {
+        result["status"] = json!("partial_success");
+    }
+    result
+}
+
+async fn enrich_quote_refresh_with_yahoo(
+    path: &PathBuf,
+    mut input: Value,
+    now: &str,
+) -> Result<Value, Value> {
+    if input.get("quotes").is_some() || input.get("fxRates").is_some() {
+        return Ok(input);
+    }
+
+    let quote_targets = match local_ledger::quote_refresh_targets(path, &input) {
+        Ok(targets) => targets,
+        Err(error) => {
+            return Err(json!({
+                "status": "failed",
+                "quotes": [],
+                "fxRates": [],
+                "errors": [{
+                    "targetType": "request",
+                    "message": format!("failed to read quote refresh targets: {error}"),
+                    "retryable": true
+                }],
+                "completedAt": now
+            }));
+        }
+    };
+    let fx_targets = match local_ledger::fx_refresh_targets(path, &input) {
+        Ok(targets) => targets,
+        Err(error) => {
+            return Err(json!({
+                "status": "failed",
+                "quotes": [],
+                "fxRates": [],
+                "errors": [{
+                    "targetType": "request",
+                    "message": format!("failed to read FX refresh targets: {error}"),
+                    "retryable": true
+                }],
+                "completedAt": now
+            }));
+        }
+    };
+
+    if quote_targets.is_empty() && fx_targets.is_empty() {
+        return Ok(input);
+    }
+
+    if quote_provider_disabled() {
+        return Err(json!({
+            "status": "offline",
+            "quotes": [],
+            "fxRates": [],
+            "errors": [{
+                "targetType": "request",
+                "message": "quote provider disabled by FINWEALTH_QUOTE_PROVIDER=none; pass quotes/fxRates payload or keep using cache",
+                "retryable": false
+            }],
+            "completedAt": now
+        }));
+    }
+
+    let provider = match yahoo::YahooConnector::new() {
+        Ok(provider) => provider,
+        Err(error) => {
+            return Err(json!({
+                "status": "offline",
+                "quotes": [],
+                "fxRates": [],
+                "errors": [{
+                    "targetType": "request",
+                    "message": format!("Yahoo provider unavailable: {error}"),
+                    "retryable": true
+                }],
+                "completedAt": now
+            }));
+        }
+    };
+
+    let mut quotes = Vec::new();
+    let mut fx_rates = Vec::new();
+    let mut errors = Vec::new();
+    for target in quote_targets {
+        let instrument_id = target
+            .get("instrumentId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(symbol) = target.get("symbol").and_then(Value::as_str) else {
+            errors.push(json!({
+                "targetType": "instrument",
+                "targetId": instrument_id,
+                "message": "instrument has no Yahoo symbol; add symbol or pass manual quote payload",
+                "retryable": false
+            }));
+            continue;
+        };
+        match yahoo_latest_quote(&provider, instrument_id, symbol, &target, now).await {
+            Ok(quote) => quotes.push(quote),
+            Err(message) => errors.push(json!({
+                "targetType": "instrument",
+                "targetId": instrument_id,
+                "message": message,
+                "retryable": true
+            })),
+        }
+    }
+    for target in fx_targets {
+        let base_currency = target
+            .get("baseCurrency")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let quote_currency = target
+            .get("quoteCurrency")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(symbol) = target.get("symbol").and_then(Value::as_str) else {
+            errors.push(json!({
+                "targetType": "fx_pair",
+                "targetId": format!("{base_currency}/{quote_currency}"),
+                "message": "FX pair has no Yahoo symbol",
+                "retryable": false
+            }));
+            continue;
+        };
+        match yahoo_latest_fx_rate(&provider, base_currency, quote_currency, symbol).await {
+            Ok(rate) => fx_rates.push(rate),
+            Err(message) => errors.push(json!({
+                "targetType": "fx_pair",
+                "targetId": format!("{base_currency}/{quote_currency}"),
+                "message": message,
+                "retryable": true
+            })),
+        }
+    }
+
+    if let Some(object) = input.as_object_mut() {
+        if !quotes.is_empty() {
+            object.insert("quotes".to_string(), json!(quotes));
+        }
+        if !fx_rates.is_empty() {
+            object.insert("fxRates".to_string(), json!(fx_rates));
+        }
+        if !errors.is_empty() {
+            object.insert("_providerErrors".to_string(), json!(errors));
+        }
+    }
+    Ok(input)
+}
+
+fn quote_provider_disabled() -> bool {
+    env::var("FINWEALTH_QUOTE_PROVIDER")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "none" | "off" | "disabled"
+            )
+        })
+        .unwrap_or(false)
+}
+
+async fn yahoo_latest_quote(
+    provider: &yahoo::YahooConnector,
+    instrument_id: &str,
+    symbol: &str,
+    target: &Value,
+    _now: &str,
+) -> Result<Value, String> {
+    let response = provider
+        .get_latest_quotes(symbol, "1d")
+        .await
+        .map_err(|error| format!("Yahoo quote fetch failed for {symbol}: {error}"))?;
+    let quote = response
+        .last_quote()
+        .map_err(|error| format!("Yahoo returned no usable quote for {symbol}: {error}"))?;
+    let currency = response
+        .chart
+        .result
+        .as_ref()
+        .and_then(|items| items.first())
+        .and_then(|item| item.meta.currency.as_deref())
+        .or_else(|| target.get("quoteCurrency").and_then(Value::as_str))
+        .unwrap_or(local_ledger::DEFAULT_BASE_CURRENCY);
+    let as_of = OffsetDateTime::from_unix_timestamp(quote.timestamp)
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
+    let expires_at = (OffsetDateTime::now_utc() + Duration::minutes(15))
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
+
+    Ok(json!({
+        "instrumentId": instrument_id,
+        "price": quote.close.to_string(),
+        "currency": currency,
+        "asOf": as_of,
+        "source": "yahoo_finance_api",
+        "sourceUrl": format!("https://finance.yahoo.com/quote/{symbol}"),
+        "status": "fresh",
+        "expiresAt": expires_at
+    }))
+}
+
+async fn yahoo_latest_fx_rate(
+    provider: &yahoo::YahooConnector,
+    base_currency: &str,
+    quote_currency: &str,
+    symbol: &str,
+) -> Result<Value, String> {
+    let response = provider
+        .get_latest_quotes(symbol, "1d")
+        .await
+        .map_err(|error| format!("Yahoo FX fetch failed for {symbol}: {error}"))?;
+    let quote = response
+        .last_quote()
+        .map_err(|error| format!("Yahoo returned no usable FX quote for {symbol}: {error}"))?;
+    let as_of = OffsetDateTime::from_unix_timestamp(quote.timestamp)
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
+    let expires_at = (OffsetDateTime::now_utc() + Duration::hours(24))
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
+
+    Ok(json!({
+        "baseCurrency": base_currency,
+        "quoteCurrency": quote_currency,
+        "rate": quote.close.to_string(),
+        "asOf": as_of,
+        "source": "yahoo_finance_api",
+        "sourceUrl": format!("https://finance.yahoo.com/quote/{symbol}"),
+        "status": "fresh",
+        "expiresAt": expires_at
+    }))
 }
 
 async fn quote_summary(
@@ -3001,6 +3281,108 @@ mod tests {
         let persisted =
             local_ledger::read_document(&path).expect("ledger should persist refreshed quote");
         assert_eq!(persisted["quotes"][0]["instrumentId"], "inst_csi300_fund");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_quote_refresh_reports_missing_symbol_without_fabricating_price() {
+        let path = unique_test_ledger_path("quote_refresh_missing_symbol");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let cash_input = json!({
+            "displayName": "现金账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "1000.00"}
+            ]
+        });
+        let (_, cash_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", cash_input).await;
+        let cash_account_id = cash_body["data"]["id"].as_str().expect("cash id");
+
+        let brokerage_input = json!({
+            "displayName": "基金账户",
+            "accountType": "brokerage",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "holdings",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "0.00"}
+            ]
+        });
+        let (_, brokerage_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            brokerage_input,
+        )
+        .await;
+        let brokerage_account_id = brokerage_body["data"]["id"].as_str().expect("brokerage id");
+
+        let draft_input = json!({
+            "type": "buy",
+            "occurredAt": "2026-06-26T11:00:00+08:00",
+            "title": "记录自定义基金",
+            "entries": [
+                {
+                    "accountId": cash_account_id,
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": brokerage_account_id,
+                    "instrumentId": "inst_custom_fund",
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        let (_, draft_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            draft_input,
+        )
+        .await;
+        let atomic_group_id = draft_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("atomic group id");
+        let (confirm_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{atomic_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK);
+
+        let (refresh_status, refresh_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({"mode": "manual"}),
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::OK);
+        assert_eq!(refresh_body["data"]["status"], "offline");
+        assert_eq!(refresh_body["data"]["quotes"], json!([]));
+        assert_eq!(
+            refresh_body["data"]["errors"][0]["message"],
+            "instrument has no Yahoo symbol; add symbol or pass manual quote payload"
+        );
+
+        let persisted = local_ledger::read_document(&path).expect("ledger should be readable");
+        assert_eq!(persisted["quotes"], json!([]));
 
         let _ = std::fs::remove_file(path);
     }
