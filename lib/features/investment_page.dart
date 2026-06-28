@@ -211,7 +211,9 @@ class _ReminderTile extends ConsumerWidget {
   }
 }
 
-class _PlanTile extends StatelessWidget {
+enum _PlanAction { edit, pause, resume, complete }
+
+class _PlanTile extends ConsumerWidget {
   const _PlanTile({required this.p});
   final DcaPlanVm p;
 
@@ -229,7 +231,7 @@ class _PlanTile extends StatelessWidget {
   };
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return ListTile(
       contentPadding: EdgeInsets.zero,
       leading: const Icon(Icons.repeat),
@@ -237,7 +239,61 @@ class _PlanTile extends StatelessWidget {
       subtitle: Text(
         '$_freq ${formatMoney(p.plannedAmount)} · 下次 ${p.nextDueDate} · $_status',
       ),
+      trailing: PopupMenuButton<_PlanAction>(
+        tooltip: '定投计划操作',
+        onSelected: (action) => _handleAction(context, ref, action),
+        itemBuilder: (context) => [
+          const PopupMenuItem(value: _PlanAction.edit, child: Text('编辑')),
+          if (p.status == DcaPlanStatus.active ||
+              p.status == DcaPlanStatus.snoozed)
+            const PopupMenuItem(value: _PlanAction.pause, child: Text('暂停')),
+          if (p.status == DcaPlanStatus.paused)
+            const PopupMenuItem(value: _PlanAction.resume, child: Text('恢复')),
+          if (p.status != DcaPlanStatus.completed)
+            const PopupMenuItem(
+              value: _PlanAction.complete,
+              child: Text('标记完成'),
+            ),
+        ],
+      ),
     );
+  }
+
+  Future<void> _handleAction(
+    BuildContext context,
+    WidgetRef ref,
+    _PlanAction action,
+  ) async {
+    switch (action) {
+      case _PlanAction.edit:
+        await context.push('/investment/dca/${p.id}/edit', extra: p);
+      case _PlanAction.pause:
+        await _setStatus(context, ref, DcaPlanStatus.paused, '定投计划已暂停');
+      case _PlanAction.resume:
+        await _setStatus(context, ref, DcaPlanStatus.active, '定投计划已恢复');
+      case _PlanAction.complete:
+        await _setStatus(context, ref, DcaPlanStatus.completed, '定投计划已标记完成');
+    }
+  }
+
+  Future<void> _setStatus(
+    BuildContext context,
+    WidgetRef ref,
+    DcaPlanStatus status,
+    String message,
+  ) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await ref
+          .read(dcaRepositoryProvider)
+          .updatePlan(p.id, UpdateDcaPlanPatch(reminderStatus: status));
+      ref.invalidate(dcaPlansProvider);
+      ref.invalidate(dueRemindersProvider);
+      ref.invalidate(overviewProvider);
+      messenger.showSnackBar(SnackBar(content: Text(message)));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
   }
 }
 

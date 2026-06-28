@@ -1,4 +1,4 @@
-// Wealth Ledger — 新建定投计划。
+// Wealth Ledger — 新建 / 编辑定投计划。
 // 只记录“计划投什么、何时投、投多少”，不连接券商、不下单、不转账。
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -13,7 +13,9 @@ import '../theme/app_dimens.dart';
 const List<String> _currencies = ['CNY', 'USD', 'HKD', 'USDT'];
 
 class DcaPlanFormPage extends ConsumerStatefulWidget {
-  const DcaPlanFormPage({super.key});
+  const DcaPlanFormPage({super.key, this.existing});
+
+  final DcaPlanVm? existing;
 
   @override
   ConsumerState<DcaPlanFormPage> createState() => _DcaPlanFormPageState();
@@ -29,6 +31,23 @@ class _DcaPlanFormPageState extends ConsumerState<DcaPlanFormPage> {
   CurrencyCode _currency = 'CNY';
   DcaFrequency _frequency = DcaFrequency.monthly;
   bool _busy = false;
+
+  bool get _editing => widget.existing != null;
+
+  @override
+  void initState() {
+    super.initState();
+    final existing = widget.existing;
+    if (existing == null) return;
+    _name.text = existing.displayName;
+    _target.text = existing.targetInstrumentId;
+    _amount.text = existing.plannedAmount.amount;
+    _nextDueDate.text = existing.nextDueDate;
+    _note.text = existing.note ?? '';
+    _fundingAccountId = existing.fundingAccountId;
+    _currency = existing.plannedAmount.currency;
+    _frequency = existing.frequency;
+  }
 
   @override
   void dispose() {
@@ -64,24 +83,40 @@ class _DcaPlanFormPageState extends ConsumerState<DcaPlanFormPage> {
 
     setState(() => _busy = true);
     try {
-      await ref
-          .read(dcaRepositoryProvider)
-          .createPlan(
-            CreateDcaPlanInput(
-              displayName: name,
-              targetInstrumentId: target,
-              fundingAccountId: selectedAccount.id,
-              plannedAmount: Money(amount: amount, currency: _currency),
-              frequency: _frequency,
-              nextDueDate: dueDate,
-              note: note.isEmpty ? null : note,
-            ),
-          );
+      final repo = ref.read(dcaRepositoryProvider);
+      if (_editing) {
+        await repo.updatePlan(
+          widget.existing!.id,
+          UpdateDcaPlanPatch(
+            displayName: name,
+            targetInstrumentId: target,
+            fundingAccountId: selectedAccount.id,
+            plannedAmount: Money(amount: amount, currency: _currency),
+            frequency: _frequency,
+            nextDueDate: dueDate,
+            reminderStatus: widget.existing!.status,
+            note: note.isEmpty ? null : note,
+            clearNote: note.isEmpty,
+          ),
+        );
+      } else {
+        await repo.createPlan(
+          CreateDcaPlanInput(
+            displayName: name,
+            targetInstrumentId: target,
+            fundingAccountId: selectedAccount.id,
+            plannedAmount: Money(amount: amount, currency: _currency),
+            frequency: _frequency,
+            nextDueDate: dueDate,
+            note: note.isEmpty ? null : note,
+          ),
+        );
+      }
       ref.invalidate(dcaPlansProvider);
       ref.invalidate(dueRemindersProvider);
       ref.invalidate(overviewProvider);
       messenger.showSnackBar(
-        const SnackBar(content: Text('定投计划已创建；只提醒和记录，不下单。')),
+        SnackBar(content: Text(_editing ? '定投计划已更新。' : '定投计划已创建；只提醒和记录，不下单。')),
       );
       if (mounted) router.pop();
     } catch (e) {
@@ -106,7 +141,7 @@ class _DcaPlanFormPageState extends ConsumerState<DcaPlanFormPage> {
   Widget build(BuildContext context) {
     final accountsAsync = ref.watch(accountsProvider);
     return Scaffold(
-      appBar: AppBar(title: const Text('新建定投计划')),
+      appBar: AppBar(title: Text(_editing ? '编辑定投计划' : '新建定投计划')),
       body: accountsAsync.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => ErrorStateView(
@@ -258,7 +293,11 @@ class _DcaPlanFormPageState extends ConsumerState<DcaPlanFormPage> {
                 const SizedBox(height: AppSpacing.base),
                 FilledButton(
                   onPressed: _busy ? null : () => _save(accounts),
-                  child: Text(_busy ? '创建中…' : '创建定投计划'),
+                  child: Text(
+                    _busy
+                        ? (_editing ? '保存中…' : '创建中…')
+                        : (_editing ? '保存定投计划' : '创建定投计划'),
+                  ),
                 ),
               ],
             ),

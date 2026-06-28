@@ -146,6 +146,12 @@ String _dcaFrequencyWire(DcaFrequency f) => switch (f) {
   DcaFrequency.monthly => 'monthly',
   DcaFrequency.custom => 'custom',
 };
+String _dcaPlanStatusWire(DcaPlanStatus s) => switch (s) {
+  DcaPlanStatus.active => 'active',
+  DcaPlanStatus.snoozed => 'snoozed',
+  DcaPlanStatus.paused => 'paused',
+  DcaPlanStatus.completed => 'completed',
+};
 MovementType _movType(Object? s) => switch (s) {
   'income' => MovementType.income,
   'expense' => MovementType.expense,
@@ -398,12 +404,15 @@ DcaReminderVm _reminder(Map<String, dynamic> j) => DcaReminderVm(
 DcaPlanVm _plan(Map<String, dynamic> j) => DcaPlanVm(
   id: '${j['id']}',
   displayName: '${j['displayName']}',
+  targetInstrumentId: '${j['targetInstrumentId'] ?? ''}',
+  fundingAccountId: j['fundingAccountId']?.toString(),
   plannedAmount:
       _moneyOrNull(j['plannedAmount']) ??
       const Money(amount: '0', currency: 'CNY'),
   frequency: _freq(j['frequency']),
   nextDueDate: '${j['nextDueDate']}',
   status: _planStatus(j['reminderStatus'] ?? j['status']),
+  note: j['note']?.toString(),
 );
 
 AiFieldDiffVm _diff(Map<String, dynamic> j) {
@@ -879,6 +888,33 @@ class LocalServerDcaRepository implements DcaRepository {
         if (input.note != null && input.note!.isNotEmpty) 'note': input.note,
       },
     );
+    return _plan(_m(d));
+  }
+
+  @override
+  Future<DcaPlanVm> updatePlan(Id planId, UpdateDcaPlanPatch patch) async {
+    final body = <String, Object?>{
+      if (patch.displayName != null) 'displayName': patch.displayName,
+      if (patch.targetInstrumentId != null)
+        'targetInstrumentId': patch.targetInstrumentId,
+      if (patch.fundingAccountId != null)
+        'fundingAccountId': patch.fundingAccountId,
+      if (patch.plannedAmount != null)
+        'plannedAmount': {
+          'amount': patch.plannedAmount!.amount,
+          'currency': patch.plannedAmount!.currency,
+        },
+      if (patch.frequency != null)
+        'frequency': _dcaFrequencyWire(patch.frequency!),
+      if (patch.nextDueDate != null) 'nextDueDate': patch.nextDueDate,
+      if (patch.reminderStatus != null)
+        'reminderStatus': _dcaPlanStatusWire(patch.reminderStatus!),
+      if (patch.clearNote)
+        'note': null
+      else if (patch.note != null)
+        'note': patch.note,
+    };
+    final d = await _c.patchData('/v1/dca/plans/$planId', body: body);
     return _plan(_m(d));
   }
 

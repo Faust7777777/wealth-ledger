@@ -155,6 +155,30 @@ void main() {
     expect(find.widgetWithText(FilledButton, '创建定投计划'), findsOneWidget);
   });
 
+  testWidgets('DcaPlanFormPage renders existing plan for editing', (t) async {
+    const plan = DcaPlanVm(
+      id: 'plan_1',
+      displayName: '沪深300ETF',
+      targetInstrumentId: 'inst_csi300',
+      fundingAccountId: 'a1',
+      plannedAmount: Money(amount: '1000.00', currency: 'CNY'),
+      frequency: DcaFrequency.monthly,
+      nextDueDate: '2026-07-10',
+      status: DcaPlanStatus.active,
+      note: '只提醒，不下单',
+    );
+    await t.pumpWidget(
+      _host(const DcaPlanFormPage(existing: plan), [_acct('a1', '钱包')]),
+    );
+    await t.pumpAndSettle();
+    expect(find.text('编辑定投计划'), findsOneWidget);
+    expect(find.text('沪深300ETF'), findsOneWidget);
+    expect(find.text('inst_csi300'), findsOneWidget);
+    await t.drag(find.byType(ListView), const Offset(0, -700));
+    await t.pumpAndSettle();
+    expect(find.widgetWithText(FilledButton, '保存定投计划'), findsOneWidget);
+  });
+
   testWidgets('TaxonomyPage renders categories and counterparties', (t) async {
     await t.pumpWidget(_host(const TaxonomyPage(), const []));
     await t.pumpAndSettle();

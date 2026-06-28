@@ -97,6 +97,10 @@ final appRouter = GoRouter(
       builder: (c, s) => const DcaPlanFormPage(),
     ),
     GoRoute(
+      path: '/investment/dca/:id/edit',
+      builder: (c, s) => DcaPlanFormPage(existing: s.extra as DcaPlanVm?),
+    ),
+    GoRoute(
       path: '/ai-edit/:groupId',
       builder: (c, s) => AiEditPage(groupId: s.pathParameters['groupId']!),
     ),

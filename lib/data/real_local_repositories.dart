@@ -106,6 +106,9 @@ class RealLocalDcaRepository implements DcaRepository {
   Future<DcaPlanVm> createPlan(CreateDcaPlanInput input) async =>
       throw UnsupportedError('real_local 暂不支持创建定投计划；请用 local_server');
   @override
+  Future<DcaPlanVm> updatePlan(Id planId, UpdateDcaPlanPatch patch) async =>
+      throw UnsupportedError('real_local 暂不支持更新定投计划；请用 local_server');
+  @override
   Future<void> markExecutedAsProposal(Id reminderId) async =>
       throw UnsupportedError('real_local 暂不支持写入；请用 local_server 联调');
   @override

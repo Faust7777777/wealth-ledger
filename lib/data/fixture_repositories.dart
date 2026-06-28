@@ -204,6 +204,8 @@ const List<DcaPlanVm> _dcaPlans = [
   DcaPlanVm(
     id: 'plan_csi300',
     displayName: '沪深300ETF',
+    targetInstrumentId: 'inst_csi300_fund',
+    fundingAccountId: 'acct_cmb',
     plannedAmount: Money(amount: '1000.00', currency: 'CNY'),
     frequency: DcaFrequency.monthly,
     nextDueDate: '2026-07-10',
@@ -212,6 +214,8 @@ const List<DcaPlanVm> _dcaPlans = [
   DcaPlanVm(
     id: 'plan_nasdaq',
     displayName: '纳指ETF',
+    targetInstrumentId: 'inst_nasdaq_fund',
+    fundingAccountId: 'acct_cmb',
     plannedAmount: Money(amount: '800.00', currency: 'CNY'),
     frequency: DcaFrequency.monthly,
     nextDueDate: '2026-07-25',
@@ -442,6 +446,9 @@ class FixtureDcaRepository implements DcaRepository {
   @override
   Future<DcaPlanVm> createPlan(CreateDcaPlanInput input) async =>
       throw UnsupportedError('DEMO 演示只读，不支持创建定投计划；请用 local_server');
+  @override
+  Future<DcaPlanVm> updatePlan(Id planId, UpdateDcaPlanPatch patch) async =>
+      throw UnsupportedError('DEMO 演示只读，不支持更新定投计划；请用 local_server');
   @override
   Future<void> markExecutedAsProposal(Id reminderId) async {
     /* DEMO：模拟生成候选 */

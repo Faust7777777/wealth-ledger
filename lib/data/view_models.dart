@@ -394,21 +394,50 @@ class CreateDcaPlanInput {
   final String? note;
 }
 
+class UpdateDcaPlanPatch {
+  const UpdateDcaPlanPatch({
+    this.displayName,
+    this.targetInstrumentId,
+    this.fundingAccountId,
+    this.plannedAmount,
+    this.frequency,
+    this.nextDueDate,
+    this.reminderStatus,
+    this.note,
+    this.clearNote = false,
+  });
+  final String? displayName;
+  final String? targetInstrumentId;
+  final Id? fundingAccountId;
+  final Money? plannedAmount;
+  final DcaFrequency? frequency;
+  final IsoDate? nextDueDate;
+  final DcaPlanStatus? reminderStatus;
+  final String? note;
+  final bool clearNote;
+}
+
 class DcaPlanVm {
   const DcaPlanVm({
     required this.id,
     required this.displayName,
+    this.targetInstrumentId = '',
+    this.fundingAccountId,
     required this.plannedAmount,
     required this.frequency,
     required this.nextDueDate,
     required this.status,
+    this.note,
   });
   final Id id;
   final String displayName;
+  final String targetInstrumentId;
+  final Id? fundingAccountId;
   final Money plannedAmount;
   final DcaFrequency frequency;
   final IsoDate nextDueDate;
   final DcaPlanStatus status;
+  final String? note;
 }
 
 class AiFieldDiffVm {
