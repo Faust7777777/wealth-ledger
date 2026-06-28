@@ -34,12 +34,9 @@ class QuotesPage extends ConsumerWidget {
         title: const Text('行情 / 汇率'),
         actions: [
           IconButton(
-            tooltip: '重新拉取',
+            tooltip: '刷新行情',
             icon: const Icon(Icons.refresh),
-            onPressed: () {
-              ref.invalidate(quotesProvider);
-              ref.invalidate(fxRatesProvider);
-            },
+            onPressed: () => _refreshFromSource(context, ref),
           ),
         ],
       ),
@@ -122,6 +119,31 @@ class QuotesPage extends ConsumerWidget {
     ref.invalidate(accountsProvider);
     ref.invalidate(holdingsProvider);
     ref.invalidate(allocationProvider);
+  }
+
+  String _refreshMessage(QuoteRefreshResultVm r) {
+    final s = '${r.quoteCount} 行情 / ${r.fxRateCount} 汇率';
+    final err = r.errors.isEmpty ? '' : '：${r.errors.first}';
+    return switch (r.status) {
+      'success' => '已刷新：$s',
+      'partial_success' => '部分刷新失败，保留缓存$err',
+      'offline' => '离线或无行情源$err',
+      'failed' => '刷新失败$err',
+      _ => r.hasProblems ? '刷新完成但有问题$err' : '已刷新：$s',
+    };
+  }
+
+  // 触发后端刷新（local_server 会尝试 Yahoo provider 拉取有 symbol 的标的），再回拉列表。
+  Future<void> _refreshFromSource(BuildContext context, WidgetRef ref) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final r =
+          await ref.read(quoteRepositoryProvider).refreshQuotes(mode: 'manual');
+      _invalidateAll(ref);
+      messenger.showSnackBar(SnackBar(content: Text(_refreshMessage(r))));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('刷新失败：$e')));
+    }
   }
 
   Future<void> _addQuote(BuildContext context, WidgetRef ref) async {
