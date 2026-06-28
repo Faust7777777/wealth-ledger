@@ -1,4 +1,6 @@
 // Wealth Ledger — 应用根：MaterialApp.router + 深/浅主题 + DEMO 横幅。
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -16,7 +18,11 @@ class WealthLedgerApp extends ConsumerStatefulWidget {
 }
 
 class _WealthLedgerAppState extends ConsumerState<WealthLedgerApp> {
+  static const Duration _scheduledQuoteRefreshInterval = Duration(minutes: 15);
+
   bool _startupRefreshScheduled = false;
+  bool _scheduledRefreshRunning = false;
+  Timer? _scheduledQuoteRefreshTimer;
 
   void _invalidateQuoteDerivedData() {
     ref.invalidate(overviewProvider);
@@ -36,6 +42,39 @@ class _WealthLedgerAppState extends ConsumerState<WealthLedgerApp> {
     }
   }
 
+  Future<void> _scheduledRefreshQuotes() async {
+    if (_scheduledRefreshRunning) return;
+    _scheduledRefreshRunning = true;
+    try {
+      await ref.read(quoteRepositoryProvider).refreshQuotes(mode: 'scheduled');
+    } catch (_) {
+      // 定时刷新失败不弹强干扰错误；报价状态由状态区/待处理区表达。
+    } finally {
+      _scheduledRefreshRunning = false;
+      if (mounted) _invalidateQuoteDerivedData();
+    }
+  }
+
+  void _configureScheduledQuoteRefresh(AppEnvironment env) {
+    final shouldRun = env.isLocalServer;
+    if (!shouldRun) {
+      _scheduledQuoteRefreshTimer?.cancel();
+      _scheduledQuoteRefreshTimer = null;
+      return;
+    }
+    if (_scheduledQuoteRefreshTimer != null) return;
+    _scheduledQuoteRefreshTimer = Timer.periodic(
+      _scheduledQuoteRefreshInterval,
+      (_) => _scheduledRefreshQuotes(),
+    );
+  }
+
+  @override
+  void dispose() {
+    _scheduledQuoteRefreshTimer?.cancel();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!_startupRefreshScheduled) {
@@ -46,7 +85,9 @@ class _WealthLedgerAppState extends ConsumerState<WealthLedgerApp> {
     }
 
     final mode = ref.watch(themeModeProvider);
-    final banner = ref.watch(appEnvironmentProvider).devBannerLabel;
+    final env = ref.watch(appEnvironmentProvider);
+    _configureScheduledQuoteRefresh(env);
+    final banner = env.devBannerLabel;
 
     return MaterialApp.router(
       title: 'Wealth Ledger',
