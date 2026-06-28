@@ -8,11 +8,43 @@ import '../theme/app_colors.dart';
 import '../theme/app_theme.dart';
 import 'router.dart';
 
-class WealthLedgerApp extends ConsumerWidget {
+class WealthLedgerApp extends ConsumerStatefulWidget {
   const WealthLedgerApp({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<WealthLedgerApp> createState() => _WealthLedgerAppState();
+}
+
+class _WealthLedgerAppState extends ConsumerState<WealthLedgerApp> {
+  bool _startupRefreshScheduled = false;
+
+  void _invalidateQuoteDerivedData() {
+    ref.invalidate(overviewProvider);
+    ref.invalidate(accountsProvider);
+    ref.invalidate(holdingsProvider);
+    ref.invalidate(allocationProvider);
+    ref.invalidate(anomaliesProvider);
+  }
+
+  Future<void> _startupRefreshQuotes() async {
+    try {
+      await ref.read(quoteRepositoryProvider).refreshQuotes(mode: 'startup');
+    } catch (_) {
+      // 启动刷新失败不阻塞 App、不弹强干扰错误；待处理/报价状态由刷新后的读模型呈现。
+    } finally {
+      if (mounted) _invalidateQuoteDerivedData();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_startupRefreshScheduled) {
+      _startupRefreshScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _startupRefreshQuotes();
+      });
+    }
+
     final mode = ref.watch(themeModeProvider);
     final banner = ref.watch(appEnvironmentProvider).devBannerLabel;
 
