@@ -4,8 +4,9 @@ use argon2::{
 };
 use axum::{
     Json, Router,
-    extract::{Json as JsonExtractor, Path, Query, State},
+    extract::{Json as JsonExtractor, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get, patch, post},
 };
@@ -90,6 +91,7 @@ struct AuthConfig {
     username: Option<String>,
     password_hash: Option<String>,
     dev_plain_password: Option<String>,
+    require_auth: bool,
 }
 
 #[derive(Default)]
@@ -102,6 +104,7 @@ struct AuthDevice {
     id: String,
     name: String,
     refresh_token_hash: String,
+    access_token_hash: String,
     created_at: String,
     last_seen_at: String,
 }
@@ -127,18 +130,20 @@ impl AuthStore {
                 username: env::var("FINWEALTH_AUTH_USERNAME").ok(),
                 password_hash: env::var("FINWEALTH_AUTH_PASSWORD_HASH").ok(),
                 dev_plain_password: env::var("FINWEALTH_AUTH_PASSWORD").ok(),
+                require_auth: env_flag("FINWEALTH_REQUIRE_AUTH"),
             },
         }
     }
 
     #[cfg(test)]
-    fn configured(username: &str, password_hash: String) -> Self {
+    fn configured(username: &str, password_hash: String, require_auth: bool) -> Self {
         Self {
             inner: Arc::new(Mutex::new(AuthState::default())),
             config: AuthConfig {
                 username: Some(username.to_string()),
                 password_hash: Some(password_hash),
                 dev_plain_password: None,
+                require_auth,
             },
         }
     }
@@ -231,6 +236,24 @@ impl AuthStore {
             .retain(|_, device| device.refresh_token_hash != refresh_hash);
     }
 
+    fn should_require_auth(&self) -> bool {
+        self.config.require_auth
+    }
+
+    fn verify_access_token(&self, access_token: &str) -> bool {
+        let access_hash = token_hash(access_token);
+        let mut state = self.inner.lock().expect("auth store mutex should lock");
+        if let Some(device) = state
+            .devices
+            .values_mut()
+            .find(|device| device.access_token_hash == access_hash)
+        {
+            device.last_seen_at = current_timestamp();
+            return true;
+        }
+        false
+    }
+
     fn verify_password(&self, username: &str, password: &str) -> bool {
         let Some(configured_username) = self.config.username.as_deref() else {
             return true;
@@ -284,6 +307,7 @@ impl AuthStore {
                 id: device_id.clone(),
                 name: device_name.to_string(),
                 refresh_token_hash: token_hash(&refresh_token),
+                access_token_hash: token_hash(&access_token),
                 created_at,
                 last_seen_at: now.to_string(),
             },
@@ -861,6 +885,7 @@ fn app() -> Router {
 }
 
 fn app_with_state(state: AppState) -> Router {
+    let middleware_state = state.clone();
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/auth/login", post(auth_login))
@@ -975,7 +1000,35 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/ai/auto-approve", any(forbidden))
         .route("/v1/ai/write-ledger-directly", any(forbidden))
         .route("/v1/coupons/plan", any(forbidden))
+        .layer(middleware::from_fn_with_state(
+            middleware_state,
+            require_auth_middleware,
+        ))
         .with_state(state)
+}
+
+async fn require_auth_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !state.auth.should_require_auth() || is_public_auth_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+    let Some(token) = bearer_token(request.headers()) else {
+        return unauthorized("auth_required", "Bearer access token is required.");
+    };
+    if !state.auth.verify_access_token(&token) {
+        return unauthorized("auth_required", "Bearer access token is required.");
+    }
+    next.run(request).await
+}
+
+fn is_public_auth_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/health" | "/v1/auth/login" | "/v1/auth/refresh" | "/v1/auth/logout"
+    )
 }
 
 fn read_addr() -> SocketAddr {
@@ -2769,6 +2822,17 @@ fn random_token(prefix: &str) -> String {
     format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 fn token_hash(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     URL_SAFE_NO_PAD.encode(digest)
@@ -3386,9 +3450,38 @@ mod tests {
         (status, body)
     }
 
+    async fn request_json_with_bearer_from(
+        router: Router,
+        method: Method,
+        uri: &str,
+        token: &str,
+    ) -> (StatusCode, Value) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body should read");
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("response body should be JSON")
+        };
+        (status, body)
+    }
+
     #[tokio::test]
     async fn auth_login_refresh_devices_and_revoke_use_hashed_passwords() {
-        let auth = AuthStore::configured("wu", hash_password_for_test("correct horse"));
+        let auth = AuthStore::configured("wu", hash_password_for_test("correct horse"), false);
         let router = app_with_state(AppState::dev().with_auth(auth));
 
         let (wrong_status, wrong_body) = request_json_body_from(
@@ -3516,6 +3609,62 @@ mod tests {
         let (_, final_devices_body) =
             request_json_from(router, Method::GET, "/v1/auth/devices").await;
         assert_eq!(final_devices_body["data"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn require_auth_protects_non_public_routes_when_enabled() {
+        let auth = AuthStore::configured("wu", hash_password_for_test("correct horse"), true);
+        let router = app_with_state(AppState::dev().with_auth(auth));
+
+        let (health_status, _) = request_json_from(router.clone(), Method::GET, "/v1/health").await;
+        assert_eq!(health_status, StatusCode::OK);
+
+        let (blocked_status, blocked_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/accounts").await;
+        assert_eq!(blocked_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(blocked_body["error"]["code"], "auth_required");
+
+        let (login_status, login_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/auth/login",
+            json!({
+                "username": "wu",
+                "password": "correct horse",
+                "deviceName": "Windows"
+            }),
+        )
+        .await;
+        assert_eq!(login_status, StatusCode::OK);
+        let access_token = login_body["data"]["accessToken"]
+            .as_str()
+            .expect("access token should be string")
+            .to_string();
+
+        let (allowed_status, allowed_body) = request_json_with_bearer_from(
+            router.clone(),
+            Method::GET,
+            "/v1/accounts",
+            &access_token,
+        )
+        .await;
+        assert_eq!(allowed_status, StatusCode::OK);
+        assert_eq!(allowed_body["data"], json!([]));
+
+        let (devices_status, devices_body) = request_json_with_bearer_from(
+            router.clone(),
+            Method::GET,
+            "/v1/auth/devices",
+            &access_token,
+        )
+        .await;
+        assert_eq!(devices_status, StatusCode::OK);
+        assert_eq!(devices_body["data"][0]["name"], "Windows");
+
+        let (wrong_token_status, _) =
+            request_json_with_bearer_from(router, Method::GET, "/v1/accounts", "fw_access_wrong")
+                .await;
+        assert_eq!(wrong_token_status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

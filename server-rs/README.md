@@ -100,12 +100,17 @@ For self-hosted use, prefer an Argon2 password hash:
 "your-password" | cargo run --manifest-path server-rs/Cargo.toml -- --hash-password-stdin
 $env:FINWEALTH_AUTH_USERNAME="your-name"
 $env:FINWEALTH_AUTH_PASSWORD_HASH="<printed-argon2-hash>"
+$env:FINWEALTH_REQUIRE_AUTH="true"
 ```
 
 Temporary local development can use `FINWEALTH_AUTH_PASSWORD`, but do not use it
 for deployment. Tokens are random opaque strings; the server keeps only token
 hashes in memory. If auth env vars are absent, `/v1/auth/login` remains
 dev-compatible and returns `dev_*` tokens for existing smoke tests.
+
+`FINWEALTH_REQUIRE_AUTH=true` protects non-public routes with `Authorization:
+Bearer <accessToken>`. It is off by default so existing local Flutter integration
+continues to work until the client stores and sends tokens.
 
 ## Real-local ledger bootstrap
 
