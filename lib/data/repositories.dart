@@ -66,6 +66,7 @@ abstract interface class DcaRepository {
 
 abstract interface class QuoteRepository {
   Future<QuoteStatusSummaryVm> getQuoteSummary();
+  Future<QuoteRefreshResultVm> refreshQuotes({required String mode});
 }
 
 abstract interface class AiProposalRepository {

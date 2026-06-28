@@ -473,6 +473,18 @@ QuoteStatusSummaryVm _quoteSummary(Map<String, dynamic> j) =>
       errorCount: _int(j['errorCount']),
     );
 
+QuoteRefreshResultVm _quoteRefreshResult(Map<String, dynamic> j) =>
+    QuoteRefreshResultVm(
+      status: '${j['status'] ?? 'failed'}',
+      completedAt:
+          '${j['completedAt'] ?? DateTime.now().toUtc().toIso8601String()}',
+      quoteCount: _list(j['quotes']).length,
+      fxRateCount: _list(j['fxRates']).length,
+      errors: [
+        for (final e in _list(j['errors'])) e is Map ? '${e['message']}' : '$e',
+      ],
+    );
+
 PendingSummaryVm _pending(Map<String, dynamic> j) => PendingSummaryVm(
   aiPendingCount: _int(j['aiPendingCount']),
   accountAnomalyCount: _int(j['accountAnomalyCount']),
@@ -862,6 +874,12 @@ class LocalServerQuoteRepository implements QuoteRepository {
   @override
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       _quoteSummary(_m(await _c.getData('/v1/quotes/summary')));
+
+  @override
+  Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>
+      _quoteRefreshResult(
+        _m(await _c.postData('/v1/quotes/refresh', body: {'mode': mode})),
+      );
 }
 
 class LocalServerAiProposalRepository implements AiProposalRepository {

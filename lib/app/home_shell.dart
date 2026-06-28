@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../data/providers.dart';
+import '../data/view_models.dart';
 import '../features/record_sheet.dart';
 import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
@@ -18,15 +19,54 @@ class HomeShell extends ConsumerWidget {
 
   static const List<_Dest> _dests = [
     (icon: Icons.dashboard_outlined, selected: Icons.dashboard, label: '概览'),
-    (icon: Icons.account_balance_wallet_outlined, selected: Icons.account_balance_wallet, label: '账户'),
-    (icon: Icons.trending_up_outlined, selected: Icons.trending_up, label: '投资'),
-    (icon: Icons.account_balance_outlined, selected: Icons.account_balance, label: '负债'),
+    (
+      icon: Icons.account_balance_wallet_outlined,
+      selected: Icons.account_balance_wallet,
+      label: '账户',
+    ),
+    (
+      icon: Icons.trending_up_outlined,
+      selected: Icons.trending_up,
+      label: '投资',
+    ),
+    (
+      icon: Icons.account_balance_outlined,
+      selected: Icons.account_balance,
+      label: '负债',
+    ),
   ];
 
-  void _go(int index) =>
-      navigationShell.goBranch(index, initialLocation: index == navigationShell.currentIndex);
+  void _go(int index) => navigationShell.goBranch(
+    index,
+    initialLocation: index == navigationShell.currentIndex,
+  );
 
-  void _refresh(BuildContext context, WidgetRef ref) {
+  String _quoteRefreshMessage(QuoteRefreshResultVm result) {
+    final summary = '${result.quoteCount} 项行情 / ${result.fxRateCount} 项汇率';
+    final firstError = result.errors.isEmpty ? '' : '：${result.errors.first}';
+    return switch (result.status) {
+      'success' => '报价已刷新：$summary',
+      'partial_success' => '部分报价刷新失败，继续使用缓存$firstError',
+      'offline' => '离线或暂无行情接口$firstError',
+      'failed' => '报价刷新失败$firstError',
+      _ => result.hasProblems ? '报价刷新完成但有问题$firstError' : '报价已刷新：$summary',
+    };
+  }
+
+  Future<void> _refresh(BuildContext context, WidgetRef ref) async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final result = await ref
+          .read(quoteRepositoryProvider)
+          .refreshQuotes(mode: 'manual');
+      if (!context.mounted) return;
+      messenger.showSnackBar(
+        SnackBar(content: Text(_quoteRefreshMessage(result))),
+      );
+    } catch (e) {
+      if (!context.mounted) return;
+      messenger.showSnackBar(SnackBar(content: Text('报价刷新失败：$e')));
+    }
     ref.invalidate(overviewProvider);
     ref.invalidate(accountsProvider);
     ref.invalidate(holdingsProvider);
@@ -37,9 +77,6 @@ class HomeShell extends ConsumerWidget {
     ref.invalidate(dueRemindersProvider);
     ref.invalidate(dcaPlansProvider);
     ref.invalidate(aiPendingProvider);
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('已刷新')),
-    );
   }
 
   @override

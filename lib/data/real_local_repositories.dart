@@ -113,6 +113,13 @@ class RealLocalQuoteRepository implements QuoteRepository {
   @override
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       const QuoteStatusSummaryVm();
+  @override
+  Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>
+      QuoteRefreshResultVm(
+        status: 'offline',
+        completedAt: DateTime.now().toUtc().toIso8601String(),
+        errors: const ['real_local 暂无行情接口；请用 local_server 联调'],
+      );
 }
 
 class RealLocalAiProposalRepository implements AiProposalRepository {

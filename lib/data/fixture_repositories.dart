@@ -454,6 +454,15 @@ class FixtureQuoteRepository implements QuoteRepository {
   @override
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       const QuoteStatusSummaryVm(freshCount: 8, staleCount: 2);
+  @override
+  Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>
+      const QuoteRefreshResultVm(
+        status: 'partial_success',
+        completedAt: _asOf,
+        quoteCount: 2,
+        fxRateCount: 1,
+        errors: ['刷新失败，继续使用缓存报价。'],
+      );
 }
 
 class FixtureAiProposalRepository implements AiProposalRepository {

@@ -495,6 +495,27 @@ class QuoteStatusSummaryVm {
       errorCount == 0;
 }
 
+class QuoteRefreshResultVm {
+  const QuoteRefreshResultVm({
+    required this.status,
+    required this.completedAt,
+    this.quoteCount = 0,
+    this.fxRateCount = 0,
+    this.errors = const [],
+  });
+  final String status; // success | partial_success | failed | offline
+  final IsoDateTime completedAt;
+  final int quoteCount;
+  final int fxRateCount;
+  final List<String> errors;
+
+  bool get hasProblems =>
+      status == 'partial_success' ||
+      status == 'failed' ||
+      status == 'offline' ||
+      errors.isNotEmpty;
+}
+
 class PendingSummaryVm {
   const PendingSummaryVm({
     this.aiPendingCount = 0,
