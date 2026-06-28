@@ -5,8 +5,12 @@ edition = "2024"
 publish = false
 
 [dependencies]
+argon2 = { version = "0.5", features = ["std"] }
 axum = "0.8"
+base64 = "0.22"
+rand_core = { version = "0.6", features = ["getrandom"] }
 serde_json = "1"
+sha2 = "0.10"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 yahoo_finance_api = "4.1"

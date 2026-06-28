@@ -1,18 +1,27 @@
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+};
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Json as JsonExtractor, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get, patch, post},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 mod local_ledger;
 
+use rand_core::{OsRng, RngCore};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     env,
+    io::{self, Read},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
+    process,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -39,6 +48,7 @@ const QUOTE_STALE: &str =
 struct AppState {
     ledger: DevLedgerCore,
     local_ledger_path: Option<PathBuf>,
+    auth: AuthStore,
 }
 
 impl AppState {
@@ -46,6 +56,7 @@ impl AppState {
         Self {
             ledger: DevLedgerCore::new(),
             local_ledger_path: None,
+            auth: AuthStore::from_env_or_dev(),
         }
     }
 
@@ -53,11 +64,237 @@ impl AppState {
         Self {
             ledger: DevLedgerCore::new(),
             local_ledger_path: Some(path),
+            auth: AuthStore::from_env_or_dev(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_auth(mut self, auth: AuthStore) -> Self {
+        self.auth = auth;
+        self
     }
 
     fn should_use_local_ledger(&self, query: &HashMap<String, String>) -> bool {
         self.local_ledger_path.is_some() && !query.contains_key("scenario")
+    }
+}
+
+#[derive(Clone)]
+struct AuthStore {
+    inner: Arc<Mutex<AuthState>>,
+    config: AuthConfig,
+}
+
+#[derive(Clone)]
+struct AuthConfig {
+    username: Option<String>,
+    password_hash: Option<String>,
+    dev_plain_password: Option<String>,
+}
+
+#[derive(Default)]
+struct AuthState {
+    devices: BTreeMap<String, AuthDevice>,
+}
+
+#[derive(Clone)]
+struct AuthDevice {
+    id: String,
+    name: String,
+    refresh_token_hash: String,
+    created_at: String,
+    last_seen_at: String,
+}
+
+enum AuthError {
+    Request(Vec<String>),
+    Credentials,
+    RefreshToken,
+}
+
+struct AuthTokens {
+    access_token: String,
+    refresh_token: String,
+    expires_at: String,
+    device_id: String,
+}
+
+impl AuthStore {
+    fn from_env_or_dev() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(AuthState::default())),
+            config: AuthConfig {
+                username: env::var("FINWEALTH_AUTH_USERNAME").ok(),
+                password_hash: env::var("FINWEALTH_AUTH_PASSWORD_HASH").ok(),
+                dev_plain_password: env::var("FINWEALTH_AUTH_PASSWORD").ok(),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn configured(username: &str, password_hash: String) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(AuthState::default())),
+            config: AuthConfig {
+                username: Some(username.to_string()),
+                password_hash: Some(password_hash),
+                dev_plain_password: None,
+            },
+        }
+    }
+
+    fn login(&self, input: Value, now: &str) -> Result<AuthTokens, AuthError> {
+        let Some(object) = input.as_object() else {
+            return Err(AuthError::Request(vec![
+                "login request must be a JSON object".to_string(),
+            ]));
+        };
+        let mut errors = Vec::new();
+        let username = required_auth_string(object, "username", &mut errors);
+        let password = required_auth_string(object, "password", &mut errors);
+        let device_name = required_auth_string(object, "deviceName", &mut errors);
+        if !errors.is_empty() {
+            return Err(AuthError::Request(errors));
+        }
+
+        let username = username.expect("validated username");
+        let password = password.expect("validated password");
+        let device_name = device_name.expect("validated deviceName");
+        if !self.verify_password(&username, &password) {
+            return Err(AuthError::Credentials);
+        }
+
+        Ok(self.issue_tokens(&device_name, None, now))
+    }
+
+    fn refresh(&self, input: Value, now: &str) -> Result<AuthTokens, AuthError> {
+        let Some(object) = input.as_object() else {
+            return Err(AuthError::Request(vec![
+                "refresh request must be a JSON object".to_string(),
+            ]));
+        };
+        let mut errors = Vec::new();
+        let refresh_token = required_auth_string(object, "refreshToken", &mut errors);
+        if !errors.is_empty() {
+            return Err(AuthError::Request(errors));
+        }
+        let refresh_token = refresh_token.expect("validated refreshToken");
+        let refresh_hash = token_hash(&refresh_token);
+        let state = self.inner.lock().expect("auth store mutex should lock");
+        let Some(device_id) = state
+            .devices
+            .iter()
+            .find(|(_, device)| device.refresh_token_hash == refresh_hash)
+            .map(|(id, _)| id.clone())
+        else {
+            return Err(AuthError::RefreshToken);
+        };
+        let device_name = state
+            .devices
+            .get(&device_id)
+            .expect("device id came from auth store")
+            .name
+            .clone();
+        drop(state);
+
+        Ok(self.issue_tokens(&device_name, Some(device_id), now))
+    }
+
+    fn devices(&self) -> Value {
+        let state = self.inner.lock().expect("auth store mutex should lock");
+        json!(
+            state
+                .devices
+                .values()
+                .map(|device| {
+                    json!({
+                        "id": device.id,
+                        "name": device.name,
+                        "createdAt": device.created_at,
+                        "lastSeenAt": device.last_seen_at
+                    })
+                })
+                .collect::<Vec<_>>()
+        )
+    }
+
+    fn revoke_device(&self, device_id: &str) {
+        let mut state = self.inner.lock().expect("auth store mutex should lock");
+        state.devices.remove(device_id);
+    }
+
+    fn revoke_refresh_token(&self, refresh_token: &str) {
+        let refresh_hash = token_hash(refresh_token);
+        let mut state = self.inner.lock().expect("auth store mutex should lock");
+        state
+            .devices
+            .retain(|_, device| device.refresh_token_hash != refresh_hash);
+    }
+
+    fn verify_password(&self, username: &str, password: &str) -> bool {
+        let Some(configured_username) = self.config.username.as_deref() else {
+            return true;
+        };
+        if username != configured_username {
+            return false;
+        }
+        if let Some(hash) = self.config.password_hash.as_deref() {
+            return PasswordHash::new(hash).ok().is_some_and(|parsed| {
+                Argon2::default()
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok()
+            });
+        }
+        self.config
+            .dev_plain_password
+            .as_deref()
+            .is_some_and(|expected| password == expected)
+    }
+
+    fn issue_tokens(
+        &self,
+        device_name: &str,
+        existing_device_id: Option<String>,
+        now: &str,
+    ) -> AuthTokens {
+        let dev_mode = self.config.username.is_none();
+        let access_token = random_token(if dev_mode {
+            "dev_access_"
+        } else {
+            "fw_access_"
+        });
+        let refresh_token = random_token(if dev_mode {
+            "dev_refresh_"
+        } else {
+            "fw_refresh_"
+        });
+        let expires_at = (OffsetDateTime::now_utc() + Duration::hours(1))
+            .format(&Rfc3339)
+            .expect("RFC3339 formatting should succeed");
+        let mut state = self.inner.lock().expect("auth store mutex should lock");
+        let device_id = existing_device_id.unwrap_or_else(|| next_local_id("dev_auth_device"));
+        let created_at = state
+            .devices
+            .get(&device_id)
+            .map(|device| device.created_at.clone())
+            .unwrap_or_else(|| now.to_string());
+        state.devices.insert(
+            device_id.clone(),
+            AuthDevice {
+                id: device_id.clone(),
+                name: device_name.to_string(),
+                refresh_token_hash: token_hash(&refresh_token),
+                created_at,
+                last_seen_at: now.to_string(),
+            },
+        );
+
+        AuthTokens {
+            access_token,
+            refresh_token,
+            expires_at,
+            device_id,
+        }
     }
 }
 
@@ -440,6 +677,10 @@ impl DevLedgerCore {
 
 #[tokio::main]
 async fn main() {
+    if should_hash_password_from_stdin(env::args()) {
+        print_password_hash_from_stdin();
+        return;
+    }
     if let Some(command) = read_ledger_command_from(env::args()) {
         run_ledger_command(command).expect("ledger command failed");
         return;
@@ -483,6 +724,37 @@ enum LedgerCommand {
         real_path: PathBuf,
         fixture_path: PathBuf,
     },
+}
+
+fn should_hash_password_from_stdin<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    args.into_iter()
+        .map(Into::into)
+        .skip(1)
+        .any(|arg| arg == "--hash-password-stdin")
+}
+
+fn print_password_hash_from_stdin() {
+    let mut password = String::new();
+    if let Err(error) = io::stdin().read_to_string(&mut password) {
+        eprintln!("failed to read password from stdin: {error}");
+        process::exit(2);
+    }
+    let password = password.trim_end_matches(['\r', '\n']);
+    if password.is_empty() {
+        eprintln!("password must not be empty");
+        process::exit(2);
+    }
+    match hash_password(password) {
+        Ok(hash) => println!("{hash}"),
+        Err(error) => {
+            eprintln!("failed to hash password: {error}");
+            process::exit(2);
+        }
+    }
 }
 
 fn read_ledger_command_from<I, S>(args: I) -> Option<LedgerCommand>
@@ -593,9 +865,9 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/auth/login", post(auth_login))
         .route("/v1/auth/refresh", post(auth_refresh))
-        .route("/v1/auth/logout", post(no_content))
-        .route("/v1/auth/devices", get(empty_array))
-        .route("/v1/auth/devices/{device_id}/revoke", post(no_content))
+        .route("/v1/auth/logout", post(auth_logout))
+        .route("/v1/auth/devices", get(auth_devices))
+        .route("/v1/auth/devices/{device_id}/revoke", post(revoke_device))
         .route("/v1/ledger/bootstrap", get(example_empty_bootstrap))
         .route("/v1/accounts", get(accounts).post(create_account))
         .route("/v1/accounts/anomalies", get(account_anomalies))
@@ -756,17 +1028,43 @@ async fn health() -> Json<Value> {
     }))
 }
 
-async fn auth_login() -> Json<Value> {
-    envelope(json!({
-        "accessToken": "dev_access_token_not_for_production",
-        "refreshToken": "dev_refresh_token_not_for_production",
-        "expiresAt": "2026-06-25T13:00:00+08:00",
-        "deviceId": "dev_device_001"
-    }))
+async fn auth_login(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+    match state.auth.login(input, &current_timestamp()) {
+        Ok(tokens) => envelope(auth_tokens_json(tokens)).into_response(),
+        Err(error) => auth_error_response(error),
+    }
 }
 
-async fn auth_refresh() -> Json<Value> {
-    auth_login().await
+async fn auth_refresh(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+    match state.auth.refresh(input, &current_timestamp()) {
+        Ok(tokens) => envelope(auth_tokens_json(tokens)).into_response(),
+        Err(error) => auth_error_response(error),
+    }
+}
+
+async fn auth_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<JsonExtractor<Value>>,
+) -> StatusCode {
+    if let Some(refresh_token) = body
+        .as_ref()
+        .and_then(|JsonExtractor(value)| value.get("refreshToken").and_then(Value::as_str))
+    {
+        state.auth.revoke_refresh_token(refresh_token);
+    } else if let Some(token) = bearer_token(&headers) {
+        state.auth.revoke_refresh_token(&token);
+    }
+    StatusCode::NO_CONTENT
+}
+
+async fn auth_devices(State(state): State<AppState>) -> Json<Value> {
+    envelope(state.auth.devices())
+}
+
+async fn revoke_device(State(state): State<AppState>, Path(device_id): Path<String>) -> StatusCode {
+    state.auth.revoke_device(&device_id);
+    StatusCode::NO_CONTENT
 }
 
 async fn portfolio_overview(
@@ -1357,10 +1655,6 @@ async fn example_empty_bootstrap() -> Json<Value> {
     example_json(EMPTY_BOOTSTRAP)
 }
 
-async fn empty_array() -> Json<Value> {
-    envelope(json!([]))
-}
-
 async fn quotes(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
@@ -1463,7 +1757,7 @@ fn merge_quote_provider_errors(mut result: Value, provider_errors: Vec<Value>) -
 }
 
 async fn enrich_quote_refresh_with_yahoo(
-    path: &PathBuf,
+    path: &FsPath,
     mut input: Value,
     now: &str,
 ) -> Result<Value, Value> {
@@ -1695,34 +1989,26 @@ async fn yahoo_latest_fx_rate(
     }))
 }
 
-fn parse_historical_price_dates(query: &HashMap<String, String>) -> Result<(Date, Date), Response> {
+fn parse_historical_price_dates(
+    query: &HashMap<String, String>,
+) -> Result<(Date, Date), Vec<String>> {
     let mut errors = Vec::new();
     let from_date = parse_iso_date_query(query, "from", &mut errors);
     let to_date = parse_iso_date_query(query, "to", &mut errors);
     if !errors.is_empty() {
-        return Err(bad_request(
-            "invalid_historical_price_range",
-            "Historical price date range is invalid.",
-            json!({ "errors": errors }),
-        ));
+        return Err(errors);
     }
 
     let from_date = from_date.expect("validated from date");
     let to_date = to_date.expect("validated to date");
     if to_date < from_date {
-        return Err(bad_request(
-            "invalid_historical_price_range",
-            "Historical price date range is invalid.",
-            json!({ "errors": ["to must be on or after from"] }),
-        ));
+        return Err(vec!["to must be on or after from".to_string()]);
     }
     let span_days = (to_date - from_date).whole_days();
     if span_days > 366 {
-        return Err(bad_request(
-            "invalid_historical_price_range",
-            "Historical price date range is invalid.",
-            json!({ "errors": ["historical price range must not exceed one year"] }),
-        ));
+        return Err(vec![
+            "historical price range must not exceed one year".to_string(),
+        ]);
     }
 
     Ok((from_date, to_date))
@@ -1985,7 +2271,13 @@ async fn historical_prices(
 
     let (from_date, to_date) = match parse_historical_price_dates(&query) {
         Ok(range) => range,
-        Err(response) => return response,
+        Err(errors) => {
+            return bad_request(
+                "invalid_historical_price_range",
+                "Historical price date range is invalid.",
+                json!({ "errors": errors }),
+            );
+        }
     };
     let path = state
         .local_ledger_path
@@ -2322,6 +2614,73 @@ fn next_local_id(prefix: &str) -> String {
     format!("{prefix}_{nanos}")
 }
 
+fn auth_tokens_json(tokens: AuthTokens) -> Value {
+    json!({
+        "accessToken": tokens.access_token,
+        "refreshToken": tokens.refresh_token,
+        "expiresAt": tokens.expires_at,
+        "deviceId": tokens.device_id
+    })
+}
+
+fn auth_error_response(error: AuthError) -> Response {
+    match error {
+        AuthError::Request(errors) => bad_request(
+            "invalid_auth_request",
+            "Authentication request is invalid.",
+            json!({ "errors": errors }),
+        ),
+        AuthError::Credentials | AuthError::RefreshToken => unauthorized(
+            "invalid_credentials",
+            "Username, password, or refresh token is invalid.",
+        ),
+    }
+}
+
+fn required_auth_string(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    errors: &mut Vec<String>,
+) -> Option<String> {
+    match object.get(key).and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => Some(value.to_string()),
+        _ => {
+            errors.push(format!("{key} must be a non-empty string"));
+            None
+        }
+    }
+}
+
+fn random_token(prefix: &str) -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    format!("{prefix}{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn token_hash(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let header = headers.get("authorization")?.to_str().ok()?;
+    let token = header.strip_prefix("Bearer ")?;
+    (!token.trim().is_empty()).then(|| token.to_string())
+}
+
+fn hash_password(password: &str) -> Result<String, String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+fn hash_password_for_test(password: &str) -> String {
+    hash_password(password).expect("test password should hash")
+}
+
 fn example_json(raw: &str) -> Json<Value> {
     Json(serde_json::from_str(raw).expect("contract example JSON must parse"))
 }
@@ -2412,6 +2771,22 @@ fn bad_request(code: &str, message: &str, details: Value) -> Response {
                 "severity": "warning",
                 "retryable": false,
                 "details": details
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn unauthorized(code: &str, message: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "ok": false,
+            "error": {
+                "code": code,
+                "message": message,
+                "severity": "warning",
+                "retryable": false
             }
         })),
     )
@@ -2793,6 +3168,15 @@ mod tests {
     }
 
     #[test]
+    fn reads_hash_password_stdin_flag() {
+        assert!(should_hash_password_from_stdin([
+            "finwealth-server",
+            "--hash-password-stdin"
+        ]));
+        assert!(!should_hash_password_from_stdin(["finwealth-server"]));
+    }
+
+    #[test]
     fn reads_local_ledger_server_path() {
         assert_eq!(
             read_ledger_path(["finwealth-server", "--ledger-path", "ledger.json"]),
@@ -2888,6 +3272,138 @@ mod tests {
             serde_json::from_slice(&bytes).expect("response body should be JSON")
         };
         (status, body)
+    }
+
+    #[tokio::test]
+    async fn auth_login_refresh_devices_and_revoke_use_hashed_passwords() {
+        let auth = AuthStore::configured("wu", hash_password_for_test("correct horse"));
+        let router = app_with_state(AppState::dev().with_auth(auth));
+
+        let (wrong_status, wrong_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/auth/login",
+            json!({
+                "username": "wu",
+                "password": "wrong",
+                "deviceName": "Windows"
+            }),
+        )
+        .await;
+        assert_eq!(wrong_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(wrong_body["error"]["code"], "invalid_credentials");
+        assert!(
+            !wrong_body.to_string().contains("wrong"),
+            "auth errors must not echo password material"
+        );
+
+        let (login_status, login_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/auth/login",
+            json!({
+                "username": "wu",
+                "password": "correct horse",
+                "deviceName": "Windows"
+            }),
+        )
+        .await;
+        assert_eq!(login_status, StatusCode::OK);
+        assert!(
+            login_body["data"]["accessToken"]
+                .as_str()
+                .unwrap()
+                .starts_with("fw_access_")
+        );
+        assert!(
+            login_body["data"]["refreshToken"]
+                .as_str()
+                .unwrap()
+                .starts_with("fw_refresh_")
+        );
+        let refresh_token = login_body["data"]["refreshToken"]
+            .as_str()
+            .expect("refresh token should be string")
+            .to_string();
+        let device_id = login_body["data"]["deviceId"]
+            .as_str()
+            .expect("device id should be string")
+            .to_string();
+
+        let (devices_status, devices_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/auth/devices").await;
+        assert_eq!(devices_status, StatusCode::OK);
+        assert_eq!(devices_body["data"][0]["id"], device_id);
+        assert_eq!(devices_body["data"][0]["name"], "Windows");
+        assert!(!devices_body.to_string().contains("refreshToken"));
+        assert!(!devices_body.to_string().contains("accessToken"));
+
+        let (refresh_status, refresh_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/auth/refresh",
+            json!({ "refreshToken": refresh_token }),
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::OK);
+        let rotated_refresh_token = refresh_body["data"]["refreshToken"]
+            .as_str()
+            .expect("rotated refresh token should be string")
+            .to_string();
+        assert_ne!(rotated_refresh_token, refresh_token);
+
+        let (old_refresh_status, _) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/auth/refresh",
+            json!({ "refreshToken": refresh_token }),
+        )
+        .await;
+        assert_eq!(old_refresh_status, StatusCode::UNAUTHORIZED);
+
+        let (logout_status, logout_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/auth/logout",
+            json!({ "refreshToken": rotated_refresh_token }),
+        )
+        .await;
+        assert_eq!(logout_status, StatusCode::NO_CONTENT);
+        assert_eq!(logout_body, Value::Null);
+
+        let (devices_after_logout_status, devices_after_logout_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/auth/devices").await;
+        assert_eq!(devices_after_logout_status, StatusCode::OK);
+        assert_eq!(devices_after_logout_body["data"], json!([]));
+
+        let (login_again_status, login_again_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/auth/login",
+            json!({
+                "username": "wu",
+                "password": "correct horse",
+                "deviceName": "Android"
+            }),
+        )
+        .await;
+        assert_eq!(login_again_status, StatusCode::OK);
+        let second_device_id = login_again_body["data"]["deviceId"]
+            .as_str()
+            .expect("device id should be string")
+            .to_string();
+        let (revoke_status, revoke_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/auth/devices/{second_device_id}/revoke"),
+        )
+        .await;
+        assert_eq!(revoke_status, StatusCode::NO_CONTENT);
+        assert_eq!(revoke_body, Value::Null);
+
+        let (_, final_devices_body) =
+            request_json_from(router, Method::GET, "/v1/auth/devices").await;
+        assert_eq!(final_devices_body["data"], json!([]));
     }
 
     #[tokio::test]

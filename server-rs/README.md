@@ -44,9 +44,10 @@ cargo run --manifest-path server-rs/Cargo.toml -- --port 8791 --ledger-path .\tm
 - `--ledger-path` enables real-local JSON persistence for accounts, movements,
   DCA plans/reminders, AI proposals, snapshots, categories, counterparties, and
   derived portfolio read models
-- no real auth
+- configurable local auth for login/refresh/devices; dev-compatible tokens are
+  used only when auth env vars are absent
 - no real AI
-- no real quotes
+- Yahoo-backed quote/FX/historical-price fetches when symbols are configured
 - no real sync
 - no transfer execution
 - no broker order endpoints
@@ -90,6 +91,21 @@ GET /v1/quotes/summary?scenario=degraded
 
 This data is virtual dev data only. It is not a fixture seed and must not be
 synced or persisted.
+
+## Local auth
+
+For self-hosted use, prefer an Argon2 password hash:
+
+```powershell
+"your-password" | cargo run --manifest-path server-rs/Cargo.toml -- --hash-password-stdin
+$env:FINWEALTH_AUTH_USERNAME="your-name"
+$env:FINWEALTH_AUTH_PASSWORD_HASH="<printed-argon2-hash>"
+```
+
+Temporary local development can use `FINWEALTH_AUTH_PASSWORD`, but do not use it
+for deployment. Tokens are random opaque strings; the server keeps only token
+hashes in memory. If auth env vars are absent, `/v1/auth/login` remains
+dev-compatible and returns `dev_*` tokens for existing smoke tests.
 
 ## Real-local ledger bootstrap
 
