@@ -125,7 +125,15 @@ class RealLocalQuoteRepository implements QuoteRepository {
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       const QuoteStatusSummaryVm();
   @override
-  Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>
+  Future<List<QuoteVm>> listQuotes() async => const [];
+  @override
+  Future<List<FxRateVm>> listFxRates() async => const [];
+  @override
+  Future<QuoteRefreshResultVm> refreshQuotes({
+    required String mode,
+    List<ManualQuoteInput> quotes = const [],
+    List<ManualFxRateInput> fxRates = const [],
+  }) async =>
       QuoteRefreshResultVm(
         status: 'offline',
         completedAt: DateTime.now().toUtc().toIso8601String(),

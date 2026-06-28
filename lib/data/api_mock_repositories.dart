@@ -494,6 +494,26 @@ QuoteRefreshResultVm _quoteRefreshResult(Map<String, dynamic> j) =>
       ],
     );
 
+QuoteVm _quoteVm(Map<String, dynamic> j) => QuoteVm(
+      id: '${j['id']}',
+      instrumentId: '${j['instrumentId']}',
+      price: '${j['price']}',
+      currency: '${j['currency']}',
+      asOf: '${j['asOf']}',
+      status: _quote(j['status']),
+      source: j['source'] as String?,
+    );
+
+FxRateVm _fxRateVm(Map<String, dynamic> j) => FxRateVm(
+      id: '${j['id']}',
+      baseCurrency: '${j['baseCurrency']}',
+      quoteCurrency: '${j['quoteCurrency']}',
+      rate: '${j['rate']}',
+      asOf: '${j['asOf']}',
+      status: _quote(j['status']),
+      source: j['source'] as String?,
+    );
+
 PendingSummaryVm _pending(Map<String, dynamic> j) => PendingSummaryVm(
   aiPendingCount: _int(j['aiPendingCount']),
   accountAnomalyCount: _int(j['accountAnomalyCount']),
@@ -947,9 +967,43 @@ class LocalServerQuoteRepository implements QuoteRepository {
       _quoteSummary(_m(await _c.getData('/v1/quotes/summary')));
 
   @override
-  Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>
+  Future<List<QuoteVm>> listQuotes() async =>
+      [for (final q in _list(await _c.getData('/v1/quotes'))) _quoteVm(_m(q))];
+
+  @override
+  Future<List<FxRateVm>> listFxRates() async =>
+      [for (final r in _list(await _c.getData('/v1/fx-rates'))) _fxRateVm(_m(r))];
+
+  @override
+  Future<QuoteRefreshResultVm> refreshQuotes({
+    required String mode,
+    List<ManualQuoteInput> quotes = const [],
+    List<ManualFxRateInput> fxRates = const [],
+  }) async =>
       _quoteRefreshResult(
-        _m(await _c.postData('/v1/quotes/refresh', body: {'mode': mode})),
+        _m(await _c.postData('/v1/quotes/refresh', body: {
+          'mode': mode,
+          if (quotes.isNotEmpty)
+            'quotes': [
+              for (final q in quotes)
+                {
+                  'instrumentId': q.instrumentId,
+                  'price': q.price,
+                  'currency': q.currency,
+                  'source': 'manual',
+                },
+            ],
+          if (fxRates.isNotEmpty)
+            'fxRates': [
+              for (final r in fxRates)
+                {
+                  'baseCurrency': r.baseCurrency,
+                  'quoteCurrency': r.quoteCurrency,
+                  'rate': r.rate,
+                  'source': 'manual',
+                },
+            ],
+        })),
       );
 }
 

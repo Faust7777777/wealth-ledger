@@ -131,6 +131,12 @@ final recentMovementsProvider = FutureProvider<List<MovementVm>>(
 final snapshotsProvider = FutureProvider<List<NetWorthSnapshotVm>>(
   (ref) => ref.watch(snapshotRepositoryProvider).listSnapshots(),
 );
+final quotesProvider = FutureProvider<List<QuoteVm>>(
+  (ref) => ref.watch(quoteRepositoryProvider).listQuotes(),
+);
+final fxRatesProvider = FutureProvider<List<FxRateVm>>(
+  (ref) => ref.watch(quoteRepositoryProvider).listFxRates(),
+);
 final categoriesProvider = FutureProvider<List<CategoryVm>>(
   (ref) => ref.watch(taxonomyRepositoryProvider).listCategories(),
 );

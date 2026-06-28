@@ -72,7 +72,15 @@ abstract interface class DcaRepository {
 
 abstract interface class QuoteRepository {
   Future<QuoteStatusSummaryVm> getQuoteSummary();
-  Future<QuoteRefreshResultVm> refreshQuotes({required String mode});
+  Future<List<QuoteVm>> listQuotes();
+  Future<List<FxRateVm>> listFxRates();
+  /// 刷新行情/汇率。mode: manual/startup/scheduled。
+  /// 手动录入时把 quotes/fxRates 一并写入（仅 local_server 真实账本）。
+  Future<QuoteRefreshResultVm> refreshQuotes({
+    required String mode,
+    List<ManualQuoteInput> quotes = const [],
+    List<ManualFxRateInput> fxRates = const [],
+  });
 }
 
 abstract interface class AiProposalRepository {

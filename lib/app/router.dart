@@ -22,6 +22,7 @@ import '../features/liabilities_page.dart';
 import '../features/manual_record_page.dart';
 import '../features/movement_detail_page.dart';
 import '../features/overview_page.dart';
+import '../features/quotes_page.dart';
 import '../features/reconcile_page.dart';
 import '../features/settings_page.dart';
 import '../features/snapshots_page.dart';
@@ -107,6 +108,7 @@ final appRouter = GoRouter(
     GoRoute(path: '/anomalies', builder: (c, s) => const AnomaliesPage()),
     GoRoute(path: '/snapshots', builder: (c, s) => const SnapshotsPage()),
     GoRoute(path: '/settings', builder: (c, s) => const SettingsPage()),
+    GoRoute(path: '/quotes', builder: (c, s) => const QuotesPage()),
     GoRoute(path: '/taxonomy', builder: (c, s) => const TaxonomyPage()),
     GoRoute(
       path: '/movement/:id/correction',

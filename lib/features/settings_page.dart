@@ -53,6 +53,15 @@ class SettingsPage extends ConsumerWidget {
           const Divider(),
           ListTile(
             contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.show_chart),
+            title: const Text('行情 / 汇率'),
+            subtitle: const Text('查看与手动录入行情、汇率；写入后刷新持仓/净值估值'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => context.push('/quotes'),
+          ),
+          const Divider(),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
             leading: const Icon(Icons.label_outline),
             title: const Text('分类与对手方'),
             subtitle: const Text('维护 AI 可读取的分类词表、商户/平台/发薪方等对手方'),
