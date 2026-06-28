@@ -2029,6 +2029,16 @@ components:
                 $ref: "#/components/schemas/CurrencyCode"
               quoteCurrency:
                 $ref: "#/components/schemas/CurrencyCode"
+        quotes:
+          type: array
+          description: Confirmed provider/manual quote payload to cache; omitted when provider is unavailable.
+          items:
+            $ref: "#/components/schemas/Quote"
+        fxRates:
+          type: array
+          description: Confirmed provider/manual FX payload to cache; omitted when provider is unavailable.
+          items:
+            $ref: "#/components/schemas/FXRate"
     QuoteRefreshResult:
       type: object
       required: [status, quotes, fxRates, errors, completedAt]

@@ -655,9 +655,9 @@ fn app_with_state(state: AppState) -> Router {
             post(edit_atomic_group),
         )
         .route("/v1/quotes/summary", get(quote_summary))
-        .route("/v1/quotes", get(empty_array))
-        .route("/v1/fx-rates", get(empty_array))
-        .route("/v1/quotes/refresh", post(example_quote_stale))
+        .route("/v1/quotes", get(quotes))
+        .route("/v1/fx-rates", get(fx_rates))
+        .route("/v1/quotes/refresh", post(refresh_quotes))
         .route(
             "/v1/instruments/{instrument_id}/historical-prices",
             get(empty_array),
@@ -1348,12 +1348,63 @@ async fn example_empty_bootstrap() -> Json<Value> {
     example_json(EMPTY_BOOTSTRAP)
 }
 
-async fn example_quote_stale() -> Json<Value> {
-    example_json(QUOTE_STALE)
-}
-
 async fn empty_array() -> Json<Value> {
     envelope(json!([]))
+}
+
+async fn quotes(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_quotes(path, &current_timestamp()) {
+            Ok(quotes) => envelope(quotes).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(json!([])).into_response()
+}
+
+async fn fx_rates(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_fx_rates(path, &current_timestamp()) {
+            Ok(rates) => envelope(rates).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(json!([])).into_response()
+}
+
+async fn refresh_quotes(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    Json(input): Json<Value>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::refresh_quotes(path, input, &current_timestamp()) {
+            Ok(result) => envelope(result).into_response(),
+            Err(error) => local_ledger_error(error, "invalid_quote_refresh_input"),
+        };
+    }
+
+    example_json(QUOTE_STALE).into_response()
 }
 
 async fn quote_summary(
@@ -2811,6 +2862,225 @@ mod tests {
             request_json_body_from(router, Method::POST, "/v1/movements/drafts", draft_input).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_movement_draft_input");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_quote_refresh_revalues_holdings_from_cache() {
+        let path = unique_test_ledger_path("quote_refresh_holding");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let cash_input = json!({
+            "displayName": "现金账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "1000.00"}
+            ]
+        });
+        let (cash_status, cash_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", cash_input).await;
+        assert_eq!(cash_status, StatusCode::CREATED);
+        let cash_account_id = cash_body["data"]["id"].as_str().expect("cash id");
+
+        let brokerage_input = json!({
+            "displayName": "基金账户",
+            "accountType": "brokerage",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "holdings",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "0.00"}
+            ]
+        });
+        let (brokerage_status, brokerage_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            brokerage_input,
+        )
+        .await;
+        assert_eq!(brokerage_status, StatusCode::CREATED);
+        let brokerage_account_id = brokerage_body["data"]["id"].as_str().expect("brokerage id");
+
+        let draft_input = json!({
+            "type": "buy",
+            "occurredAt": "2026-06-26T11:00:00+08:00",
+            "title": "记录沪深300定投",
+            "entries": [
+                {
+                    "accountId": cash_account_id,
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": brokerage_account_id,
+                    "instrumentId": "inst_csi300_fund",
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        let (_, draft_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            draft_input,
+        )
+        .await;
+        let atomic_group_id = draft_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("atomic group id");
+        let (confirm_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{atomic_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK);
+
+        let (refresh_status, refresh_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "quotes": [{
+                    "instrumentId": "inst_csi300_fund",
+                    "price": "2.00",
+                    "currency": "CNY",
+                    "asOf": "2026-06-28T09:30:00Z",
+                    "expiresAt": "2099-01-01T00:00:00Z",
+                    "source": "test"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::OK);
+        assert_eq!(refresh_body["data"]["status"], "success");
+        assert_eq!(
+            refresh_body["data"]["quotes"]
+                .as_array()
+                .expect("quotes")
+                .len(),
+            1
+        );
+
+        let (holdings_status, holdings_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(holdings_status, StatusCode::OK);
+        assert_eq!(holdings_body["data"][0]["marketValue"]["amount"], "200.00");
+        assert_eq!(holdings_body["data"][0]["quoteStatus"], "fresh");
+
+        let (overview_status, overview_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_status, StatusCode::OK);
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "1100.00"
+        );
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["quoteStatusSummary"]["freshCount"],
+            1
+        );
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["quoteStatusSummary"]["staleCount"],
+            0
+        );
+
+        let persisted =
+            local_ledger::read_document(&path).expect("ledger should persist refreshed quote");
+        assert_eq!(persisted["quotes"][0]["instrumentId"], "inst_csi300_fund");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_fx_refresh_values_non_base_cash() {
+        let path = unique_test_ledger_path("fx_refresh_cash");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let usd_account = json!({
+            "displayName": "美元虚拟卡",
+            "accountType": "virtual_card",
+            "defaultCurrency": "USD",
+            "supportedCurrencies": ["USD"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "USD", "amount": "10.00"}
+            ]
+        });
+        let (account_status, account_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", usd_account).await;
+        assert_eq!(account_status, StatusCode::CREATED);
+        let account_id = account_body["data"]["id"].as_str().expect("account id");
+
+        let (refresh_status, refresh_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "fxRates": [{
+                    "baseCurrency": "USD",
+                    "quoteCurrency": "CNY",
+                    "rate": "7.00",
+                    "asOf": "2026-06-28T09:30:00Z",
+                    "expiresAt": "2099-01-01T00:00:00Z",
+                    "source": "test"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::OK);
+        assert_eq!(refresh_body["data"]["status"], "success");
+        assert_eq!(
+            refresh_body["data"]["fxRates"]
+                .as_array()
+                .expect("rates")
+                .len(),
+            1
+        );
+
+        let (account_after_status, account_after_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(account_after_status, StatusCode::OK);
+        assert_eq!(account_after_body["data"]["value"]["amount"], "70.00");
+        assert_eq!(account_after_body["data"]["value"]["currency"], "CNY");
+
+        let (overview_status, overview_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_status, StatusCode::OK);
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "70.00"
+        );
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["quoteStatusSummary"]["freshCount"],
+            1
+        );
+
+        let (rates_status, rates_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/fx-rates").await;
+        assert_eq!(rates_status, StatusCode::OK);
+        assert_eq!(rates_body["data"][0]["baseCurrency"], "USD");
+        assert_eq!(rates_body["data"][0]["quoteCurrency"], "CNY");
 
         let _ = std::fs::remove_file(path);
     }

@@ -107,6 +107,131 @@ pub fn get_account(path: &Path, account_id: &str) -> io::Result<Option<Value>> {
         .cloned())
 }
 
+pub fn list_quotes(path: &Path, now: &str) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    Ok(json!(project_quote_items(
+        document["quotes"]
+            .as_array()
+            .expect("validated local ledger quotes should be an array"),
+        now
+    )))
+}
+
+pub fn list_fx_rates(path: &Path, now: &str) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    Ok(json!(project_quote_items(
+        document["fxRates"]
+            .as_array()
+            .expect("validated local ledger fxRates should be an array"),
+        now
+    )))
+}
+
+pub fn refresh_quotes(path: &Path, input: Value, now: &str) -> Result<Value, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "quote refresh input must be a JSON object".to_string(),
+        ]));
+    };
+
+    let mut document = load_or_initialize(path)?;
+    let mut errors = Vec::new();
+    let mut refreshed_quotes = Vec::new();
+    let mut refreshed_fx_rates = Vec::new();
+
+    if let Some(mode) = object.get("mode") {
+        match mode.as_str() {
+            Some("manual" | "startup" | "scheduled") => {}
+            _ => errors.push(quote_refresh_error(
+                "request",
+                None,
+                "mode must be manual, startup, or scheduled",
+                false,
+            )),
+        }
+    }
+
+    match object.get("quotes") {
+        Some(Value::Array(items)) => {
+            for item in items {
+                match quote_from_refresh_input(item, now) {
+                    Ok(quote) => {
+                        upsert_quote(&mut document, quote.clone());
+                        refreshed_quotes.push(project_quote_item(&quote, now));
+                    }
+                    Err(error) => errors.push(quote_refresh_error(
+                        "instrument",
+                        item.get("instrumentId").and_then(Value::as_str),
+                        &error,
+                        false,
+                    )),
+                }
+            }
+        }
+        Some(_) => errors.push(quote_refresh_error(
+            "request",
+            None,
+            "quotes must be an array when present",
+            false,
+        )),
+        None => {}
+    }
+
+    match object.get("fxRates") {
+        Some(Value::Array(items)) => {
+            for item in items {
+                match fx_rate_from_refresh_input(item, now) {
+                    Ok(rate) => {
+                        upsert_fx_rate(&mut document, rate.clone());
+                        refreshed_fx_rates.push(project_quote_item(&rate, now));
+                    }
+                    Err(error) => errors.push(quote_refresh_error(
+                        "fx_pair",
+                        fx_pair_target_id(item).as_deref(),
+                        &error,
+                        false,
+                    )),
+                }
+            }
+        }
+        Some(_) => errors.push(quote_refresh_error(
+            "request",
+            None,
+            "fxRates must be an array when present",
+            false,
+        )),
+        None => {}
+    }
+
+    let wrote_any = !refreshed_quotes.is_empty() || !refreshed_fx_rates.is_empty();
+    if wrote_any {
+        write_document(path, &document)?;
+    } else if errors.is_empty() {
+        errors.push(quote_refresh_error(
+            "request",
+            None,
+            "no quote provider is configured; pass quotes/fxRates payload or keep using cache",
+            true,
+        ));
+    }
+
+    let status = if wrote_any && errors.is_empty() {
+        "success"
+    } else if wrote_any {
+        "partial_success"
+    } else {
+        "offline"
+    };
+
+    Ok(json!({
+        "status": status,
+        "quotes": refreshed_quotes,
+        "fxRates": refreshed_fx_rates,
+        "errors": errors,
+        "completedAt": now
+    }))
+}
+
 pub fn create_account(
     path: &Path,
     input: Value,
@@ -1559,24 +1684,45 @@ fn summarize_accounts(document: &Value, now: &str) -> io::Result<AccountSummary>
             .into_iter()
             .flatten()
         {
-            if balance.get("currency").and_then(Value::as_str) != Some(base_currency.as_str()) {
+            let Some(balance_currency) = balance.get("currency").and_then(Value::as_str) else {
                 unpriceable_count += 1;
                 quality = combine_quality(quality, "incomplete");
                 continue;
-            }
-
+            };
             let amount = parse_decimal(
                 balance
                     .get("amount")
                     .and_then(Value::as_str)
                     .expect("validated cash balance amount should be a string"),
             )?;
+            let (amount, balance_quality) = if balance_currency == base_currency.as_str() {
+                (
+                    amount,
+                    balance
+                        .get("quality")
+                        .and_then(Value::as_str)
+                        .unwrap_or("exact"),
+                )
+            } else if let Some((converted, status)) =
+                convert_amount(document, amount, balance_currency, &base_currency, now)
+            {
+                count_quote_status(
+                    status,
+                    &mut fresh_count,
+                    &mut stale_count,
+                    &mut offline_cached_count,
+                    &mut unpriceable_count,
+                    &mut error_count,
+                );
+                (converted, quality_from_quote_status(status))
+            } else {
+                unpriceable_count += 1;
+                quality = combine_quality(quality, "incomplete");
+                account_quality = combine_quality(account_quality, "incomplete");
+                continue;
+            };
             has_base_value = true;
             account_total += amount;
-            let balance_quality = balance
-                .get("quality")
-                .and_then(Value::as_str)
-                .unwrap_or("exact");
             account_quality = combine_quality(account_quality, balance_quality);
             quality = combine_quality(quality, balance_quality);
         }
@@ -2647,6 +2793,17 @@ fn project_holding_for_api(document: &Value, holding: &Value) -> Value {
     {
         projected["instrument"] = instrument_for_api(document, instrument_id);
     }
+    if let Some((market_value, status)) = quoted_holding_market_value(document, holding) {
+        projected["marketValue"] = market_value;
+        projected["quoteStatus"] = json!(status);
+        if let Some(as_of) = projected["marketValue"].get("asOf").cloned() {
+            projected["asOf"] = as_of;
+        }
+        if let Some(object) = projected.as_object_mut() {
+            object.remove("unrealizedPnl");
+            object.remove("unrealizedPnlRate");
+        }
+    }
     if projected.get("unrealizedPnl").is_none()
         && let (Some(market_value), Some(cost_basis)) = (
             projected
@@ -2669,6 +2826,385 @@ fn project_holding_for_api(document: &Value, holding: &Value) -> Value {
         projected["unrealizedPnl"] = money(market_value - cost_basis, currency);
     }
     projected
+}
+
+fn project_quote_items(items: &[Value], now: &str) -> Vec<Value> {
+    items
+        .iter()
+        .map(|item| project_quote_item(item, now))
+        .collect()
+}
+
+fn project_quote_item(item: &Value, now: &str) -> Value {
+    let mut projected = item.clone();
+    projected["status"] = json!(effective_quote_status(item, now));
+    projected
+}
+
+fn quote_from_refresh_input(input: &Value, now: &str) -> Result<Value, String> {
+    let object = input
+        .as_object()
+        .ok_or_else(|| "quote must be a JSON object".to_string())?;
+    let instrument_id = required_non_empty_field(object, "instrumentId")?;
+    let price = required_positive_decimal_field(object, "price")?;
+    let currency = required_non_empty_field(object, "currency")?;
+    let as_of = optional_non_empty_field(object, "asOf")?.unwrap_or_else(|| now.to_string());
+    let source =
+        optional_non_empty_field(object, "source")?.unwrap_or_else(|| "manual_refresh".to_string());
+    let status = optional_status_field(object, "status")?.unwrap_or("fresh");
+    let id = optional_non_empty_field(object, "id")?
+        .unwrap_or_else(|| stable_quote_id("quote", &[&instrument_id, &as_of]));
+
+    let mut quote = json!({
+        "id": id,
+        "instrumentId": instrument_id,
+        "price": price,
+        "currency": currency,
+        "asOf": as_of,
+        "source": source,
+        "status": status
+    });
+    if let Some(source_url) = optional_non_empty_field(object, "sourceUrl")? {
+        quote["sourceUrl"] = json!(source_url);
+    }
+    if let Some(expires_at) = optional_non_empty_field(object, "expiresAt")? {
+        quote["expiresAt"] = json!(expires_at);
+    }
+    Ok(quote)
+}
+
+fn fx_rate_from_refresh_input(input: &Value, now: &str) -> Result<Value, String> {
+    let object = input
+        .as_object()
+        .ok_or_else(|| "FX rate must be a JSON object".to_string())?;
+    let base_currency = required_non_empty_field(object, "baseCurrency")?;
+    let quote_currency = required_non_empty_field(object, "quoteCurrency")?;
+    let rate = required_positive_decimal_field(object, "rate")?;
+    let as_of = optional_non_empty_field(object, "asOf")?.unwrap_or_else(|| now.to_string());
+    let source =
+        optional_non_empty_field(object, "source")?.unwrap_or_else(|| "manual_refresh".to_string());
+    let status = optional_status_field(object, "status")?.unwrap_or("fresh");
+    let id = optional_non_empty_field(object, "id")?
+        .unwrap_or_else(|| stable_quote_id("fx", &[&base_currency, &quote_currency, &as_of]));
+
+    let mut rate_item = json!({
+        "id": id,
+        "baseCurrency": base_currency,
+        "quoteCurrency": quote_currency,
+        "rate": rate,
+        "asOf": as_of,
+        "source": source,
+        "status": status
+    });
+    if let Some(source_url) = optional_non_empty_field(object, "sourceUrl")? {
+        rate_item["sourceUrl"] = json!(source_url);
+    }
+    if let Some(expires_at) = optional_non_empty_field(object, "expiresAt")? {
+        rate_item["expiresAt"] = json!(expires_at);
+    }
+    Ok(rate_item)
+}
+
+fn upsert_quote(document: &mut Value, quote: Value) {
+    let instrument_id = quote
+        .get("instrumentId")
+        .and_then(Value::as_str)
+        .expect("validated quote instrumentId should be a string")
+        .to_string();
+    let quotes = document["quotes"]
+        .as_array_mut()
+        .expect("validated local ledger quotes should be an array");
+    if let Some(existing) = quotes.iter_mut().find(|item| {
+        item.get("instrumentId").and_then(Value::as_str) == Some(instrument_id.as_str())
+    }) {
+        *existing = quote;
+    } else {
+        quotes.push(quote);
+    }
+}
+
+fn upsert_fx_rate(document: &mut Value, rate: Value) {
+    let base_currency = rate
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .expect("validated FX baseCurrency should be a string")
+        .to_string();
+    let quote_currency = rate
+        .get("quoteCurrency")
+        .and_then(Value::as_str)
+        .expect("validated FX quoteCurrency should be a string")
+        .to_string();
+    let rates = document["fxRates"]
+        .as_array_mut()
+        .expect("validated local ledger fxRates should be an array");
+    if let Some(existing) = rates.iter_mut().find(|item| {
+        item.get("baseCurrency").and_then(Value::as_str) == Some(base_currency.as_str())
+            && item.get("quoteCurrency").and_then(Value::as_str) == Some(quote_currency.as_str())
+    }) {
+        *existing = rate;
+    } else {
+        rates.push(rate);
+    }
+}
+
+fn quoted_holding_market_value(document: &Value, holding: &Value) -> Option<(Value, &'static str)> {
+    let now = current_timestamp_for_projection();
+    let instrument_id = holding.get("instrumentId").and_then(Value::as_str)?;
+    let quantity = parse_decimal(holding.get("quantity")?.as_str()?).ok()?;
+    let quote = latest_quote_for_instrument(document, instrument_id)?;
+    let price = parse_decimal(quote.get("price")?.as_str()?).ok()?;
+    let quote_currency = quote.get("currency")?.as_str()?;
+    let quote_status = effective_quote_status(quote, &now);
+    let base_currency = document
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_BASE_CURRENCY);
+    let quote_value = multiply_decimal(quantity, price);
+    let as_of = quote
+        .get("asOf")
+        .and_then(Value::as_str)
+        .unwrap_or(now.as_str());
+
+    let (base_value, fx_status) =
+        convert_amount(document, quote_value, quote_currency, base_currency, &now)?;
+    let status = combine_quote_status(quote_status, fx_status);
+    Some((
+        json!({
+            "amount": money_amount(base_value),
+            "currency": base_currency,
+            "asOf": as_of,
+            "quality": quality_from_quote_status(status)
+        }),
+        status,
+    ))
+}
+
+fn latest_quote_for_instrument<'a>(document: &'a Value, instrument_id: &str) -> Option<&'a Value> {
+    document["quotes"]
+        .as_array()
+        .expect("validated local ledger quotes should be an array")
+        .iter()
+        .rev()
+        .find(|quote| quote.get("instrumentId").and_then(Value::as_str) == Some(instrument_id))
+}
+
+fn convert_amount(
+    document: &Value,
+    amount: DecimalAmount,
+    from_currency: &str,
+    to_currency: &str,
+    now: &str,
+) -> Option<(DecimalAmount, &'static str)> {
+    if from_currency == to_currency {
+        return Some((amount, "fresh"));
+    }
+    let (rate, status) = fx_rate_between(document, from_currency, to_currency, now)?;
+    Some((multiply_decimal(amount, rate), status))
+}
+
+fn fx_rate_between(
+    document: &Value,
+    from_currency: &str,
+    to_currency: &str,
+    now: &str,
+) -> Option<(DecimalAmount, &'static str)> {
+    for rate in document["fxRates"]
+        .as_array()
+        .expect("validated local ledger fxRates should be an array")
+        .iter()
+        .rev()
+    {
+        let base = rate.get("baseCurrency").and_then(Value::as_str)?;
+        let quote = rate.get("quoteCurrency").and_then(Value::as_str)?;
+        let parsed = parse_decimal(rate.get("rate")?.as_str()?).ok()?;
+        let status = effective_quote_status(rate, now);
+        if base == from_currency && quote == to_currency {
+            return Some((parsed, status));
+        }
+        if base == to_currency && quote == from_currency {
+            return divide_decimal(DecimalAmount::ONE, parsed).map(|inverse| (inverse, status));
+        }
+    }
+    None
+}
+
+fn effective_quote_status(item: &Value, now: &str) -> &'static str {
+    let status = match item.get("status").and_then(Value::as_str) {
+        Some("fresh") | None => "fresh",
+        Some("stale") => "stale",
+        Some("offline_cached") => "offline_cached",
+        Some("incomplete") => "incomplete",
+        Some("unpriceable") => "unpriceable",
+        Some("error") => "error",
+        Some(_) => "error",
+    };
+
+    if status == "fresh" && is_expired(item.get("expiresAt").and_then(Value::as_str), now) {
+        "stale"
+    } else {
+        status
+    }
+}
+
+fn is_expired(expires_at: Option<&str>, now: &str) -> bool {
+    let Some(expires_at) = expires_at else {
+        return false;
+    };
+    let Ok(expires_at) = OffsetDateTime::parse(expires_at, &Rfc3339) else {
+        return false;
+    };
+    let Ok(now) = OffsetDateTime::parse(now, &Rfc3339) else {
+        return false;
+    };
+    expires_at < now
+}
+
+fn combine_quote_status(left: &'static str, right: &'static str) -> &'static str {
+    fn rank(status: &str) -> u8 {
+        match status {
+            "fresh" => 0,
+            "stale" => 1,
+            "offline_cached" => 2,
+            "incomplete" | "unpriceable" => 3,
+            "error" => 4,
+            _ => 4,
+        }
+    }
+    if rank(right) > rank(left) {
+        right
+    } else {
+        left
+    }
+}
+
+fn quality_from_quote_status(status: &str) -> &'static str {
+    match status {
+        "fresh" => "exact",
+        "stale" | "offline_cached" => "estimated",
+        _ => "incomplete",
+    }
+}
+
+fn count_quote_status(
+    status: &str,
+    fresh: &mut u64,
+    stale: &mut u64,
+    offline: &mut u64,
+    unpriceable: &mut u64,
+    error: &mut u64,
+) {
+    match status {
+        "fresh" => *fresh += 1,
+        "stale" => *stale += 1,
+        "offline_cached" => *offline += 1,
+        "error" => *error += 1,
+        _ => *unpriceable += 1,
+    }
+}
+
+fn required_non_empty_field(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<String, String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("{key} must be a non-empty string"))
+}
+
+fn optional_non_empty_field(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.to_string())),
+        _ => Err(format!("{key} must be a non-empty string when present")),
+    }
+}
+
+fn required_positive_decimal_field(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<String, String> {
+    let value = required_non_empty_field(object, key)?;
+    if is_positive_decimal_string(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{key} must be a positive decimal string"))
+    }
+}
+
+fn optional_status_field(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'static str>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => match value.as_str() {
+            "fresh" => Ok(Some("fresh")),
+            "stale" => Ok(Some("stale")),
+            "offline_cached" => Ok(Some("offline_cached")),
+            "incomplete" => Ok(Some("incomplete")),
+            "unpriceable" => Ok(Some("unpriceable")),
+            "error" => Ok(Some("error")),
+            _ => Err(format!("{key} must be a valid QuoteStatus")),
+        },
+        _ => Err(format!("{key} must be a valid QuoteStatus")),
+    }
+}
+
+fn quote_refresh_error(
+    target_type: &str,
+    target_id: Option<&str>,
+    message: &str,
+    retryable: bool,
+) -> Value {
+    let mut error = json!({
+        "targetType": target_type,
+        "message": message,
+        "retryable": retryable
+    });
+    if let Some(target_id) = target_id {
+        error["targetId"] = json!(target_id);
+    }
+    error
+}
+
+fn fx_pair_target_id(input: &Value) -> Option<String> {
+    let base = input.get("baseCurrency").and_then(Value::as_str)?;
+    let quote = input.get("quoteCurrency").and_then(Value::as_str)?;
+    Some(format!("{base}/{quote}"))
+}
+
+fn stable_quote_id(prefix: &str, parts: &[&str]) -> String {
+    let mut id = prefix.to_string();
+    for part in parts {
+        id.push('_');
+        id.push_str(&clean_identifier(part));
+    }
+    id
+}
+
+fn clean_identifier(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn current_timestamp_for_projection() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed")
 }
 
 fn instrument_for_api(document: &Value, instrument_id: &str) -> Value {
@@ -2734,6 +3270,7 @@ fn projected_account_value_with_holdings(document: &Value, account: &Value) -> O
         .get("baseCurrency")
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_BASE_CURRENCY);
+    let now = current_timestamp_for_projection();
     let account_id = account.get("id").and_then(Value::as_str)?;
     let mut total = DecimalAmount::ZERO;
     let mut has_value = false;
@@ -2744,18 +3281,25 @@ fn projected_account_value_with_holdings(document: &Value, account: &Value) -> O
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|balance| balance.get("currency").and_then(Value::as_str) == Some(currency))
     {
+        let balance_currency = balance.get("currency").and_then(Value::as_str)?;
         let amount = parse_decimal(balance.get("amount")?.as_str()?).ok()?;
+        let (amount, balance_quality) = if balance_currency == currency {
+            (
+                amount,
+                balance
+                    .get("quality")
+                    .and_then(Value::as_str)
+                    .unwrap_or("exact"),
+            )
+        } else {
+            let (converted, status) =
+                convert_amount(document, amount, balance_currency, currency, &now)?;
+            (converted, quality_from_quote_status(status))
+        };
         total += amount;
         has_value = true;
-        quality = combine_quality(
-            quality,
-            balance
-                .get("quality")
-                .and_then(Value::as_str)
-                .unwrap_or("exact"),
-        );
+        quality = combine_quality(quality, balance_quality);
     }
 
     for holding in project_holdings_for_api(document)
@@ -2786,9 +3330,7 @@ fn projected_account_value_with_holdings(document: &Value, account: &Value) -> O
         json!({
             "amount": money_amount(total),
             "currency": currency,
-            "asOf": OffsetDateTime::now_utc()
-                .format(&Rfc3339)
-                .expect("RFC3339 formatting should succeed"),
+            "asOf": now,
             "quality": quality
         })
     })
@@ -2898,6 +3440,7 @@ struct DecimalAmount(i128);
 impl DecimalAmount {
     const SCALE: i128 = 100_000_000;
     const ZERO: Self = Self(0);
+    const ONE: Self = Self(Self::SCALE);
 
     fn parse(value: &str) -> io::Result<Self> {
         let (negative, value) = match value.strip_prefix('-') {
@@ -2983,6 +3526,14 @@ impl Neg for DecimalAmount {
 
 fn parse_decimal(value: &str) -> io::Result<DecimalAmount> {
     DecimalAmount::parse(value)
+}
+
+fn multiply_decimal(left: DecimalAmount, right: DecimalAmount) -> DecimalAmount {
+    DecimalAmount(round_div(left.0 * right.0, DecimalAmount::SCALE))
+}
+
+fn divide_decimal(left: DecimalAmount, right: DecimalAmount) -> Option<DecimalAmount> {
+    (right.0 != 0).then(|| DecimalAmount(round_div(left.0 * DecimalAmount::SCALE, right.0)))
 }
 
 fn absolute_decimal(value: DecimalAmount) -> DecimalAmount {

@@ -80,6 +80,8 @@ QuoteRefreshRequest {
   requestedAt: ISODateTime;
   instruments: ID[];
   currencyPairs: CurrencyPair[];
+  quotes?: Quote[];     // provider / 手动确认 / AI 候选确认后的写入载荷
+  fxRates?: FXRate[];   // provider / 手动确认 / AI 候选确认后的写入载荷
 }
 
 CurrencyPair {
@@ -110,6 +112,7 @@ QuoteRefreshError {
 - 手动刷新失败时必须给用户可见反馈。
 - 启动刷新失败不阻塞 App 使用。
 - 定时刷新失败不弹强干扰错误，进入待处理/状态区。
+- 如果当前环境没有真实 provider，`quotes` / `fxRates` 可作为手动或外部 provider 已确认结果写入缓存；缺省时不得伪造价格，只能返回 `offline`/`failed` 并继续使用缓存。
 
 ## 5. TTL 初始建议
 
@@ -186,4 +189,3 @@ HistoricalPricePoint {
 - 接口优先。
 - 接口不能覆盖时，AI 可以提出来源链接和候选数据，用户确认后才采用。
 - AI 搜索结果不得静默写入价格库。
-
