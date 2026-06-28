@@ -703,11 +703,11 @@ async fn main() {
     println!("finwealth rust server listening on http://{addr}");
     if local_ledger_enabled {
         println!(
-            "dev skeleton only: real_local JSON persistence for accounts; no real auth, real AI, real quotes, or sync effects"
+            "dev server: real_local JSON persistence enabled; configurable auth and Yahoo quotes available; no real AI or sync merge effects"
         );
     } else {
         println!(
-            "dev skeleton only: no persistence, real auth, real AI, real quotes, or sync effects"
+            "dev server: in-memory data; configurable auth available; no persistence, real AI, or sync merge effects"
         );
     }
 
@@ -868,7 +868,7 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/auth/logout", post(auth_logout))
         .route("/v1/auth/devices", get(auth_devices))
         .route("/v1/auth/devices/{device_id}/revoke", post(revoke_device))
-        .route("/v1/ledger/bootstrap", get(example_empty_bootstrap))
+        .route("/v1/ledger/bootstrap", get(ledger_bootstrap))
         .route("/v1/accounts", get(accounts).post(create_account))
         .route("/v1/accounts/anomalies", get(account_anomalies))
         .route(
@@ -1651,8 +1651,22 @@ async fn edit_atomic_group(
     }
 }
 
-async fn example_empty_bootstrap() -> Json<Value> {
-    example_json(EMPTY_BOOTSTRAP)
+async fn ledger_bootstrap(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger_bootstrap(path, &current_timestamp()) {
+            Ok(payload) => envelope(payload).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    example_json(EMPTY_BOOTSTRAP).into_response()
 }
 
 async fn quotes(
@@ -2117,6 +2131,66 @@ fn historical_price_points_from_yahoo_quotes(
         .collect()
 }
 
+fn local_ledger_bootstrap(path: &FsPath, now: &str) -> io::Result<Value> {
+    let document = local_ledger::read_document(path)?;
+    let mut payload = json!({
+        "ledgerVersion": document
+            .get("ledgerVersion")
+            .and_then(Value::as_i64)
+            .unwrap_or(local_ledger::LEDGER_VERSION),
+        "syncCursor": sync_cursor_from_document(&document),
+        "baseCurrency": document
+            .get("baseCurrency")
+            .and_then(Value::as_str)
+            .unwrap_or(local_ledger::DEFAULT_BASE_CURRENCY),
+        "accounts": local_ledger::list_accounts(path)?,
+        "categories": local_ledger::list_categories(path)?,
+        "counterparties": local_ledger::list_counterparties(path)?
+    });
+    let overview = local_ledger::portfolio_overview(path, now)?;
+    if let Some(snapshot) = overview
+        .get("latestSnapshot")
+        .filter(|value| !value.is_null())
+    {
+        payload["snapshot"] = snapshot.clone();
+    }
+    Ok(payload)
+}
+
+fn sync_cursor_from_document(document: &Value) -> String {
+    document
+        .get("syncState")
+        .and_then(|sync_state| sync_state.get("cursor"))
+        .and_then(Value::as_str)
+        .filter(|cursor| !cursor.trim().is_empty())
+        .unwrap_or("local_cursor_0000")
+        .to_string()
+}
+
+fn current_sync_cursor(state: &AppState, query: &HashMap<String, String>) -> String {
+    if state.should_use_local_ledger(query)
+        && let Some(path) = state.local_ledger_path.as_ref()
+        && let Ok(document) = local_ledger::read_document(path)
+    {
+        return sync_cursor_from_document(&document);
+    }
+    "rust_dev_cursor_0001".to_string()
+}
+
+fn contains_forbidden_sync_marker(value: &Value) -> bool {
+    match value {
+        Value::String(value) => {
+            let lower = value.to_ascii_lowercase();
+            lower == "debug_fixture" || lower == "fixture" || lower == "demo"
+        }
+        Value::Array(items) => items.iter().any(contains_forbidden_sync_marker),
+        Value::Object(object) => object
+            .iter()
+            .any(|(key, value)| key == "debugFixture" || contains_forbidden_sync_marker(value)),
+        _ => false,
+    }
+}
+
 async fn quote_summary(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
@@ -2502,23 +2576,61 @@ async fn create_counterparty_merge_proposal(
     }
 }
 
-async fn sync_bootstrap() -> Json<Value> {
-    envelope(json!({"cursor": "rust_dev_cursor_0001"}))
+async fn sync_bootstrap(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    envelope(json!({ "cursor": current_sync_cursor(&state, &query) })).into_response()
 }
 
-async fn sync_changes() -> Json<Value> {
+async fn sync_changes(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Json<Value> {
     envelope(json!({
-        "cursor": "rust_dev_cursor_0001",
+        "cursor": current_sync_cursor(&state, &query),
         "changes": [],
         "conflicts": []
     }))
 }
 
-async fn sync_push() -> Json<Value> {
+async fn sync_push(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(object) = input.as_object() else {
+        return bad_request(
+            "invalid_sync_push",
+            "Sync push request is invalid.",
+            json!({ "errors": ["sync push request must be a JSON object"] }),
+        );
+    };
+    let mut errors = Vec::new();
+    match object.get("deviceId").and_then(Value::as_str) {
+        Some(value) if !value.trim().is_empty() => {}
+        _ => errors.push("deviceId must be a non-empty string"),
+    }
+    match object.get("changes").and_then(Value::as_array) {
+        Some(_) => {}
+        None => errors.push("changes must be an array"),
+    }
+    if contains_forbidden_sync_marker(&input) {
+        errors.push("debug fixture, fixture, and demo payloads must not be synced");
+    }
+    if !errors.is_empty() {
+        return bad_request(
+            "invalid_sync_push",
+            "Sync push request is invalid.",
+            json!({ "errors": errors }),
+        );
+    }
+
     envelope(json!({
-        "cursor": "rust_dev_cursor_0001",
+        "cursor": current_sync_cursor(&state, &query),
         "conflicts": []
     }))
+    .into_response()
 }
 
 async fn no_content() -> StatusCode {
@@ -3404,6 +3516,78 @@ mod tests {
         let (_, final_devices_body) =
             request_json_from(router, Method::GET, "/v1/auth/devices").await;
         assert_eq!(final_devices_body["data"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn local_ledger_bootstrap_and_sync_cursor_use_real_local_state() {
+        let path = unique_test_ledger_path("bootstrap_sync_cursor");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let account_input = json!({
+            "displayName": "同步账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "88.00"}
+            ]
+        });
+        let (account_status, _) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", account_input)
+                .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+
+        let mut document = local_ledger::read_document(&path).expect("ledger should be readable");
+        document["syncState"]["cursor"] = json!("cursor_test_001");
+        local_ledger::write_document(&path, &document).expect("ledger cursor should persist");
+
+        let (bootstrap_status, bootstrap_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/ledger/bootstrap").await;
+        assert_eq!(bootstrap_status, StatusCode::OK);
+        assert_eq!(bootstrap_body["data"]["ledgerVersion"], 1);
+        assert_eq!(bootstrap_body["data"]["syncCursor"], "cursor_test_001");
+        assert_eq!(
+            bootstrap_body["data"]["accounts"][0]["displayName"],
+            "同步账户"
+        );
+        assert_eq!(
+            bootstrap_body["data"]["snapshot"]["netWorth"]["amount"],
+            "88.00"
+        );
+
+        let (sync_status, sync_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/sync/changes").await;
+        assert_eq!(sync_status, StatusCode::OK);
+        assert_eq!(sync_body["data"]["cursor"], "cursor_test_001");
+        assert_eq!(sync_body["data"]["changes"], json!([]));
+
+        let (push_status, push_body) = request_json_body_from(
+            router,
+            Method::POST,
+            "/v1/sync/push",
+            json!({
+                "deviceId": "device_test",
+                "changes": [
+                    {
+                        "id": "change_demo",
+                        "deviceId": "device_test",
+                        "entityType": "account",
+                        "entityId": "acct_demo",
+                        "operation": "create",
+                        "payload": {"source": "demo"},
+                        "createdAt": "2026-06-28T00:00:00Z"
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(push_status, StatusCode::BAD_REQUEST);
+        assert_eq!(push_body["error"]["code"], "invalid_sync_push");
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
