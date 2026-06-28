@@ -90,6 +90,9 @@ class TaxonomyPage extends ConsumerWidget {
                       ].join(' · '),
                     ),
                     trailing: c.isSystem ? const Chip(label: Text('系统')) : null,
+                    onTap: c.isSystem
+                        ? null
+                        : () => _showEditCategoryDialog(context, ref, c),
                   ),
                 ),
             SectionHeader(title: '对手方'),
@@ -121,6 +124,12 @@ class TaxonomyPage extends ConsumerWidget {
                     trailing: p.isUserMerged
                         ? const Chip(label: Text('已合并'))
                         : null,
+                    onTap: () => _showEditCounterpartyDialog(
+                      context,
+                      ref,
+                      p,
+                      categories,
+                    ),
                   ),
                 ),
           ],
@@ -128,6 +137,212 @@ class TaxonomyPage extends ConsumerWidget {
       ),
     );
   }
+}
+
+Future<void> _showEditCategoryDialog(
+  BuildContext context,
+  WidgetRef ref,
+  CategoryVm category,
+) async {
+  final name = TextEditingController(text: category.displayName);
+  final desc = TextEditingController(text: category.aiDescription ?? '');
+  var kind = category.kind;
+  var busy = false;
+  await showDialog<void>(
+    context: context,
+    builder: (dialogContext) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        title: const Text('编辑分类'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: name,
+                decoration: const InputDecoration(
+                  labelText: '分类名称',
+                  border: OutlineInputBorder(),
+                ),
+                onChanged: (_) => setState(() {}),
+              ),
+              const SizedBox(height: AppSpacing.sm),
+              DropdownButtonFormField<CategoryKind>(
+                initialValue: kind,
+                decoration: const InputDecoration(
+                  labelText: '分类类型',
+                  border: OutlineInputBorder(),
+                ),
+                items: [
+                  for (final k in CategoryKind.values)
+                    DropdownMenuItem(
+                      value: k,
+                      child: Text(categoryKindLabel(k)),
+                    ),
+                ],
+                onChanged: busy
+                    ? null
+                    : (v) => setState(() => kind = v ?? kind),
+              ),
+              const SizedBox(height: AppSpacing.sm),
+              TextField(
+                controller: desc,
+                decoration: const InputDecoration(
+                  labelText: 'AI 识别说明（可选）',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: busy ? null : () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: name.text.trim().isEmpty || busy
+                ? null
+                : () async {
+                    setState(() => busy = true);
+                    final messenger = ScaffoldMessenger.of(context);
+                    try {
+                      await ref
+                          .read(taxonomyRepositoryProvider)
+                          .updateCategory(
+                            category.id,
+                            CreateCategoryInput(
+                              displayName: name.text.trim(),
+                              kind: kind,
+                              parentId: category.parentId,
+                              aiDescription: desc.text.trim().isEmpty
+                                  ? null
+                                  : desc.text.trim(),
+                            ),
+                          );
+                      ref.invalidate(categoriesProvider);
+                      messenger.showSnackBar(
+                        const SnackBar(content: Text('已更新分类')),
+                      );
+                      if (dialogContext.mounted) Navigator.pop(dialogContext);
+                    } catch (e) {
+                      messenger.showSnackBar(SnackBar(content: Text('$e')));
+                    } finally {
+                      if (context.mounted) setState(() => busy = false);
+                    }
+                  },
+            child: Text(busy ? '保存中…' : '保存'),
+          ),
+        ],
+      ),
+    ),
+  );
+  name.dispose();
+  desc.dispose();
+}
+
+Future<void> _showEditCounterpartyDialog(
+  BuildContext context,
+  WidgetRef ref,
+  CounterpartyVm counterparty,
+  List<CategoryVm> categories,
+) async {
+  final name = TextEditingController(text: counterparty.displayName);
+  final aliases = TextEditingController(text: counterparty.aliases.join('，'));
+  var categoryHintId = counterparty.categoryHintId ?? '';
+  var busy = false;
+  await showDialog<void>(
+    context: context,
+    builder: (dialogContext) => StatefulBuilder(
+      builder: (context, setState) => AlertDialog(
+        title: const Text('编辑对手方'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: name,
+                decoration: const InputDecoration(
+                  labelText: '对手方名称',
+                  border: OutlineInputBorder(),
+                ),
+                onChanged: (_) => setState(() {}),
+              ),
+              const SizedBox(height: AppSpacing.sm),
+              TextField(
+                controller: aliases,
+                decoration: const InputDecoration(
+                  labelText: '别名（可选，用逗号/分号分隔）',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: AppSpacing.sm),
+              DropdownButtonFormField<String>(
+                initialValue: categoryHintId,
+                decoration: const InputDecoration(
+                  labelText: '默认分类提示（可选）',
+                  border: OutlineInputBorder(),
+                ),
+                items: [
+                  const DropdownMenuItem(value: '', child: Text('不设默认分类')),
+                  for (final c in categories)
+                    DropdownMenuItem(
+                      value: c.id,
+                      child: Text(
+                        '${c.displayName} · ${categoryKindLabel(c.kind)}',
+                      ),
+                    ),
+                ],
+                onChanged: busy
+                    ? null
+                    : (v) => setState(() => categoryHintId = v ?? ''),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: busy ? null : () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: name.text.trim().isEmpty || busy
+                ? null
+                : () async {
+                    setState(() => busy = true);
+                    final messenger = ScaffoldMessenger.of(context);
+                    try {
+                      await ref
+                          .read(taxonomyRepositoryProvider)
+                          .updateCounterparty(
+                            counterparty.id,
+                            CreateCounterpartyInput(
+                              displayName: name.text.trim(),
+                              aliases: _splitAliases(aliases.text),
+                              normalizedName: counterparty.normalizedName,
+                              categoryHintId: categoryHintId.isEmpty
+                                  ? null
+                                  : categoryHintId,
+                            ),
+                          );
+                      ref.invalidate(counterpartiesProvider);
+                      messenger.showSnackBar(
+                        const SnackBar(content: Text('已更新对手方')),
+                      );
+                      if (dialogContext.mounted) Navigator.pop(dialogContext);
+                    } catch (e) {
+                      messenger.showSnackBar(SnackBar(content: Text('$e')));
+                    } finally {
+                      if (context.mounted) setState(() => busy = false);
+                    }
+                  },
+            child: Text(busy ? '保存中…' : '保存'),
+          ),
+        ],
+      ),
+    ),
+  );
+  name.dispose();
+  aliases.dispose();
 }
 
 String _categoryName(List<CategoryVm> categories, String id) =>

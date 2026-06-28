@@ -630,6 +630,22 @@ class LocalServerTaxonomyRepository implements TaxonomyRepository {
   }
 
   @override
+  Future<CategoryVm> updateCategory(Id id, CreateCategoryInput input) async {
+    final d = await _c.patchData(
+      '/v1/categories/$id',
+      body: {
+        'displayName': input.displayName,
+        'kind': _categoryKindWire(input.kind),
+        if (input.parentId != null && input.parentId!.isNotEmpty)
+          'parentId': input.parentId,
+        if (input.aiDescription != null && input.aiDescription!.isNotEmpty)
+          'aiDescription': input.aiDescription,
+      },
+    );
+    return _category(_m(d));
+  }
+
+  @override
   Future<List<CounterpartyVm>> listCounterparties() async => [
     for (final c in _list(await _c.getData('/v1/counterparties')))
       _counterparty(_m(c)),
@@ -641,6 +657,25 @@ class LocalServerTaxonomyRepository implements TaxonomyRepository {
   ) async {
     final d = await _c.postData(
       '/v1/counterparties',
+      body: {
+        'displayName': input.displayName,
+        'aliases': input.aliases,
+        if (input.normalizedName != null && input.normalizedName!.isNotEmpty)
+          'normalizedName': input.normalizedName,
+        if (input.categoryHintId != null && input.categoryHintId!.isNotEmpty)
+          'categoryHintId': input.categoryHintId,
+      },
+    );
+    return _counterparty(_m(d));
+  }
+
+  @override
+  Future<CounterpartyVm> updateCounterparty(
+    Id id,
+    CreateCounterpartyInput input,
+  ) async {
+    final d = await _c.patchData(
+      '/v1/counterparties/$id',
       body: {
         'displayName': input.displayName,
         'aliases': input.aliases,

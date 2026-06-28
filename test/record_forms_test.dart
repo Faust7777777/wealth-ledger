@@ -172,6 +172,35 @@ void main() {
     expect(find.text('瑞幸咖啡'), findsWidgets);
   });
 
+  testWidgets('TaxonomyPage opens category edit dialog', (t) async {
+    await t.pumpWidget(_host(const TaxonomyPage(), const []));
+    await t.pumpAndSettle();
+    await t.tap(find.text('咖啡饮品').first);
+    await t.pumpAndSettle();
+    expect(find.text('编辑分类'), findsOneWidget);
+    expect(find.text('分类名称'), findsOneWidget);
+    expect(find.text('保存'), findsOneWidget);
+  });
+
+  testWidgets('TaxonomyPage opens counterparty edit dialog', (t) async {
+    await t.pumpWidget(_host(const TaxonomyPage(), const []));
+    await t.pumpAndSettle();
+    await t.drag(find.byType(ListView), const Offset(0, -1200));
+    await t.pumpAndSettle();
+    await t.tap(
+      find
+          .ancestor(
+            of: find.textContaining('默认分类：咖啡饮品'),
+            matching: find.byType(ListTile),
+          )
+          .last,
+    );
+    await t.pumpAndSettle();
+    expect(find.text('编辑对手方'), findsOneWidget);
+    expect(find.text('对手方名称'), findsOneWidget);
+    expect(find.text('保存'), findsOneWidget);
+  });
+
   testWidgets('CorrectionPage renders single-entry amount correction form', (
     t,
   ) async {

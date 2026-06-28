@@ -18,8 +18,13 @@ abstract interface class AccountRepository {
 abstract interface class TaxonomyRepository {
   Future<List<CategoryVm>> listCategories();
   Future<CategoryVm> createCategory(CreateCategoryInput input);
+  Future<CategoryVm> updateCategory(Id id, CreateCategoryInput input);
   Future<List<CounterpartyVm>> listCounterparties();
   Future<CounterpartyVm> createCounterparty(CreateCounterpartyInput input);
+  Future<CounterpartyVm> updateCounterparty(
+    Id id,
+    CreateCounterpartyInput input,
+  );
 
   /// 对手方合并：只生成 AI/atomic group 候选；确认前不改对手方、不改历史记录。
   Future<void> createCounterpartyMergeProposal({

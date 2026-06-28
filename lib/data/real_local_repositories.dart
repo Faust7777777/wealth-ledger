@@ -32,11 +32,19 @@ class RealLocalTaxonomyRepository implements TaxonomyRepository {
   Future<CategoryVm> createCategory(CreateCategoryInput input) async =>
       throw UnsupportedError('real_local 暂不支持创建分类；请用 local_server');
   @override
+  Future<CategoryVm> updateCategory(Id id, CreateCategoryInput input) async =>
+      throw UnsupportedError('real_local 暂不支持编辑分类；请用 local_server');
+  @override
   Future<List<CounterpartyVm>> listCounterparties() async => const [];
   @override
   Future<CounterpartyVm> createCounterparty(
     CreateCounterpartyInput input,
   ) async => throw UnsupportedError('real_local 暂不支持创建对手方；请用 local_server');
+  @override
+  Future<CounterpartyVm> updateCounterparty(
+    Id id,
+    CreateCounterpartyInput input,
+  ) async => throw UnsupportedError('real_local 暂不支持编辑对手方；请用 local_server');
   @override
   Future<void> createCounterpartyMergeProposal({
     required List<Id> sourceCounterpartyIds,
