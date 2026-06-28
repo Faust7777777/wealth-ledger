@@ -15,6 +15,7 @@ import '../features/ai_import_image_page.dart';
 import '../features/ai_import_text_page.dart';
 import '../features/ai_review_page.dart';
 import '../features/anomalies_page.dart';
+import '../features/correction_page.dart';
 import '../features/dca_plan_form_page.dart';
 import '../features/investment_page.dart';
 import '../features/liabilities_page.dart';
@@ -103,6 +104,10 @@ final appRouter = GoRouter(
     GoRoute(path: '/snapshots', builder: (c, s) => const SnapshotsPage()),
     GoRoute(path: '/settings', builder: (c, s) => const SettingsPage()),
     GoRoute(path: '/taxonomy', builder: (c, s) => const TaxonomyPage()),
+    GoRoute(
+      path: '/movement/:id/correction',
+      builder: (c, s) => CorrectionPage(movementId: s.pathParameters['id']!),
+    ),
     GoRoute(
       path: '/movement/:id',
       builder: (c, s) =>

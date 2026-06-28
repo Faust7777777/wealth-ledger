@@ -251,6 +251,20 @@ class ReconcileInput {
   final String? note;
 }
 
+/// 已确认记录更正输入：MVP 只支持单分录金额更正，确认后新增 correction movement，不改原记录。
+class CreateCorrectionInput {
+  const CreateCorrectionInput({
+    required this.targetMovementId,
+    required this.oldAmount,
+    required this.newAmount,
+    required this.reason,
+  });
+  final Id targetMovementId;
+  final DecimalString oldAmount;
+  final DecimalString newAmount;
+  final String reason;
+}
+
 class HoldingVm {
   const HoldingVm({
     required this.id,

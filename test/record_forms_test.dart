@@ -3,10 +3,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:finwealth/core/types.dart';
 import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/view_models.dart';
 import 'package:finwealth/features/ai_import_csv_page.dart';
 import 'package:finwealth/features/ai_import_image_page.dart';
+import 'package:finwealth/features/correction_page.dart';
 import 'package:finwealth/features/dca_plan_form_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/reconcile_page.dart';
@@ -61,6 +63,25 @@ Widget _host(Widget page, List<AccountVm> accounts) => ProviderScope(
     ),
   ],
   child: MaterialApp(home: page),
+);
+
+MovementVm _movement() => const MovementVm(
+  id: 'mov_1',
+  atomicGroupId: 'ag_1',
+  type: MovementType.expense,
+  status: MovementStatus.confirmed,
+  title: '瑞幸咖啡',
+  occurredAt: '2026-06-28T09:00:00+08:00',
+  displayAmount: Money(amount: '18.00', currency: 'CNY'),
+  entries: [
+    MovementEntryVm(
+      accountId: 'a1',
+      amount: '18.00',
+      currency: 'CNY',
+      direction: 'out',
+      role: 'source',
+    ),
+  ],
 );
 
 void main() {
@@ -149,5 +170,24 @@ void main() {
     expect(find.text('新增对手方'), findsOneWidget);
     expect(find.text('合并对手方'), findsOneWidget);
     expect(find.text('瑞幸咖啡'), findsWidgets);
+  });
+
+  testWidgets('CorrectionPage renders single-entry amount correction form', (
+    t,
+  ) async {
+    await t.pumpWidget(
+      ProviderScope(
+        overrides: [
+          movementByIdProvider.overrideWith((ref, id) async => _movement()),
+        ],
+        child: const MaterialApp(home: CorrectionPage(movementId: 'mov_1')),
+      ),
+    );
+    await t.pumpAndSettle();
+    expect(find.text('瑞幸咖啡'), findsOneWidget);
+    expect(find.text('当前金额'), findsOneWidget);
+    expect(find.text('更正后金额'), findsOneWidget);
+    expect(find.text('更正原因'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, '生成更正候选'), findsOneWidget);
   });
 }

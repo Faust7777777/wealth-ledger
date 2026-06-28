@@ -772,6 +772,25 @@ class LocalServerMovementRepository implements MovementRepository {
     });
   }
 
+  @override
+  Future<void> createCorrectionProposal(CreateCorrectionInput input) async {
+    await _c.postData(
+      '/v1/movements/corrections',
+      body: {
+        'targetMovementId': input.targetMovementId,
+        'reason': input.reason,
+        'proposedDiffs': [
+          {
+            'fieldPath': 'entries[0].amount',
+            'oldValue': input.oldAmount,
+            'newValue': input.newAmount,
+            'severity': 'danger',
+          },
+        ],
+      },
+    );
+  }
+
   // 候选 → 确认：草稿 → 提交复核 → 确认入账（均为用户主动发起的合法写路径）。
   Future<MovementVm> _recordViaPipeline(Map<String, Object?> body) async {
     final draft = _m(await _c.postData('/v1/movements/drafts', body: body));

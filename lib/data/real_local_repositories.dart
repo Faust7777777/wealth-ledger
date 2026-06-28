@@ -83,6 +83,9 @@ class RealLocalMovementRepository implements MovementRepository {
   @override
   Future<MovementVm> reconcileBalance(ReconcileInput input) async =>
       throw UnsupportedError('real_local 暂不支持余额校准；请用 local_server');
+  @override
+  Future<void> createCorrectionProposal(CreateCorrectionInput input) async =>
+      throw UnsupportedError('real_local 暂不支持发起更正；请用 local_server');
 }
 
 class RealLocalDcaRepository implements DcaRepository {

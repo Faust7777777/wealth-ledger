@@ -48,6 +48,9 @@ abstract interface class MovementRepository {
 
   /// 余额观察/校准：对差额生成 adjustment 候选并确认入账。仅 local_server。
   Future<MovementVm> reconcileBalance(ReconcileInput input);
+
+  /// 已确认记录更正：只生成 correction 候选；确认前不改原记录、不影响余额。
+  Future<void> createCorrectionProposal(CreateCorrectionInput input);
 }
 
 abstract interface class DcaRepository {

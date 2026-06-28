@@ -397,6 +397,10 @@ class FixtureMovementRepository implements MovementRepository {
   @override
   Future<MovementVm> reconcileBalance(ReconcileInput input) async =>
       throw UnsupportedError('DEMO 演示只读，不支持余额校准；请用 local_server');
+  @override
+  Future<void> createCorrectionProposal(CreateCorrectionInput input) async {
+    /* DEMO：模拟生成更正候选，演示数据不变 */
+  }
 }
 
 class FixtureTaxonomyRepository implements TaxonomyRepository {
