@@ -16,7 +16,10 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{
+    Date, Duration, OffsetDateTime,
+    format_description::well_known::{Iso8601, Rfc3339},
+};
 use yahoo_finance_api as yahoo;
 
 const EMPTY_BOOTSTRAP: &str =
@@ -666,7 +669,7 @@ fn app_with_state(state: AppState) -> Router {
         )
         .route(
             "/v1/instruments/{instrument_id}/historical-prices",
-            get(empty_array),
+            get(historical_prices),
         )
         .route("/v1/snapshots/latest", get(snapshot_latest))
         .route("/v1/snapshots", get(snapshots))
@@ -1692,6 +1695,142 @@ async fn yahoo_latest_fx_rate(
     }))
 }
 
+fn parse_historical_price_dates(query: &HashMap<String, String>) -> Result<(Date, Date), Response> {
+    let mut errors = Vec::new();
+    let from_date = parse_iso_date_query(query, "from", &mut errors);
+    let to_date = parse_iso_date_query(query, "to", &mut errors);
+    if !errors.is_empty() {
+        return Err(bad_request(
+            "invalid_historical_price_range",
+            "Historical price date range is invalid.",
+            json!({ "errors": errors }),
+        ));
+    }
+
+    let from_date = from_date.expect("validated from date");
+    let to_date = to_date.expect("validated to date");
+    if to_date < from_date {
+        return Err(bad_request(
+            "invalid_historical_price_range",
+            "Historical price date range is invalid.",
+            json!({ "errors": ["to must be on or after from"] }),
+        ));
+    }
+    let span_days = (to_date - from_date).whole_days();
+    if span_days > 366 {
+        return Err(bad_request(
+            "invalid_historical_price_range",
+            "Historical price date range is invalid.",
+            json!({ "errors": ["historical price range must not exceed one year"] }),
+        ));
+    }
+
+    Ok((from_date, to_date))
+}
+
+fn parse_iso_date_query(
+    query: &HashMap<String, String>,
+    key: &str,
+    errors: &mut Vec<String>,
+) -> Option<Date> {
+    match query.get(key) {
+        Some(value) => match Date::parse(value, &Iso8601::DATE) {
+            Ok(date) => Some(date),
+            Err(_) => {
+                errors.push(format!("{key} must be an ISO date in YYYY-MM-DD format"));
+                None
+            }
+        },
+        None => {
+            errors.push(format!("{key} is required"));
+            None
+        }
+    }
+}
+
+fn yahoo_symbol_for_instrument(instrument_id: &str, instrument: &Value) -> Option<String> {
+    instrument
+        .get("symbol")
+        .and_then(Value::as_str)
+        .filter(|symbol| !symbol.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| infer_yahoo_symbol_from_instrument_id(instrument_id))
+}
+
+fn infer_yahoo_symbol_from_instrument_id(instrument_id: &str) -> Option<String> {
+    let value = instrument_id.trim();
+    if value.is_empty() || value.starts_with("inst_") || value.len() > 16 {
+        return None;
+    }
+    value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '='))
+        .then(|| value.to_ascii_uppercase())
+}
+
+async fn yahoo_historical_prices(
+    provider: &yahoo::YahooConnector,
+    instrument_id: &str,
+    symbol: &str,
+    fallback_currency: &str,
+    from_date: Date,
+    to_date: Date,
+) -> Result<Vec<Value>, String> {
+    let start = from_date.midnight().assume_utc();
+    let end = to_date
+        .next_day()
+        .unwrap_or(to_date)
+        .midnight()
+        .assume_utc();
+    let response = provider
+        .get_quote_history(symbol, start, end)
+        .await
+        .map_err(|error| format!("Yahoo historical fetch failed for {symbol}: {error}"))?;
+    let currency = response
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.currency)
+        .filter(|currency| !currency.trim().is_empty())
+        .unwrap_or_else(|| fallback_currency.to_string());
+    let quotes = response
+        .quotes()
+        .map_err(|error| format!("Yahoo returned no usable history for {symbol}: {error}"))?;
+
+    Ok(historical_price_points_from_yahoo_quotes(
+        instrument_id,
+        symbol,
+        &currency,
+        &quotes,
+    ))
+}
+
+fn historical_price_points_from_yahoo_quotes(
+    instrument_id: &str,
+    symbol: &str,
+    currency: &str,
+    quotes: &[yahoo::Quote],
+) -> Vec<Value> {
+    quotes
+        .iter()
+        .filter(|quote| quote.close.is_finite())
+        .filter_map(|quote| {
+            let date = OffsetDateTime::from_unix_timestamp(quote.timestamp)
+                .ok()?
+                .date()
+                .format(&Iso8601::DATE)
+                .ok()?;
+            Some(json!({
+                "instrumentId": instrument_id,
+                "price": quote.close.to_string(),
+                "currency": currency,
+                "date": date,
+                "source": "yahoo_finance_api",
+                "sourceUrl": format!("https://finance.yahoo.com/quote/{symbol}/history")
+            }))
+        })
+        .collect()
+}
+
 async fn quote_summary(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
@@ -1832,6 +1971,84 @@ async fn update_instrument(
     match local_ledger::update_instrument(path, &instrument_id, patch) {
         Ok(instrument) => envelope(instrument).into_response(),
         Err(error) => local_ledger_error(error, "invalid_instrument_patch"),
+    }
+}
+
+async fn historical_prices(
+    State(state): State<AppState>,
+    Path(instrument_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if !state.should_use_local_ledger(&query) {
+        return envelope(json!([])).into_response();
+    }
+
+    let (from_date, to_date) = match parse_historical_price_dates(&query) {
+        Ok(range) => range,
+        Err(response) => return response,
+    };
+    let path = state
+        .local_ledger_path
+        .as_ref()
+        .expect("local ledger path should exist when local ledger is selected");
+    let instrument = match local_ledger::get_instrument(path, &instrument_id) {
+        Ok(Some(instrument)) => instrument,
+        Ok(None) => {
+            return not_found(
+                "instrument_not_found",
+                "Instrument does not exist in local ledger.",
+            );
+        }
+        Err(error) => return ledger_io_error(error),
+    };
+    let Some(symbol) = yahoo_symbol_for_instrument(&instrument_id, &instrument) else {
+        return bad_request(
+            "missing_instrument_symbol",
+            "Instrument has no Yahoo symbol; add symbol before requesting historical prices.",
+            json!({ "instrumentId": instrument_id }),
+        );
+    };
+    if quote_provider_disabled() {
+        return service_unavailable(
+            "quote_provider_disabled",
+            "Quote provider is disabled; historical prices require a configured provider.",
+            json!({ "instrumentId": instrument_id, "symbol": symbol }),
+            false,
+        );
+    }
+    let fallback_currency = instrument
+        .get("quoteCurrency")
+        .and_then(Value::as_str)
+        .unwrap_or(local_ledger::DEFAULT_BASE_CURRENCY);
+    let provider = match yahoo::YahooConnector::new() {
+        Ok(provider) => provider,
+        Err(error) => {
+            return service_unavailable(
+                "quote_provider_unavailable",
+                "Quote provider could not be initialized.",
+                json!({ "error": error.to_string() }),
+                true,
+            );
+        }
+    };
+
+    match yahoo_historical_prices(
+        &provider,
+        &instrument_id,
+        &symbol,
+        fallback_currency,
+        from_date,
+        to_date,
+    )
+    .await
+    {
+        Ok(points) => envelope(json!(points)).into_response(),
+        Err(message) => service_unavailable(
+            "historical_price_fetch_failed",
+            "Historical prices could not be fetched from the configured provider.",
+            json!({ "instrumentId": instrument_id, "symbol": symbol, "error": message }),
+            true,
+        ),
     }
 }
 
@@ -2194,6 +2411,23 @@ fn bad_request(code: &str, message: &str, details: Value) -> Response {
                 "message": message,
                 "severity": "warning",
                 "retryable": false,
+                "details": details
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn service_unavailable(code: &str, message: &str, details: Value, retryable: bool) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "ok": false,
+            "error": {
+                "code": code,
+                "message": message,
+                "severity": "warning",
+                "retryable": retryable,
                 "details": details
             }
         })),
@@ -3621,6 +3855,82 @@ mod tests {
         .await;
         assert_eq!(invalid_status, StatusCode::BAD_REQUEST);
         assert_eq!(invalid_body["error"]["code"], "invalid_instrument_patch");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn historical_price_mapping_formats_yahoo_quotes() {
+        let timestamp = OffsetDateTime::parse("2026-06-28T00:00:00Z", &Rfc3339)
+            .expect("test timestamp should parse")
+            .unix_timestamp();
+        let points = historical_price_points_from_yahoo_quotes(
+            "inst_aapl",
+            "AAPL",
+            "USD",
+            &[yahoo::Quote {
+                timestamp,
+                open: 122.0,
+                high: 124.0,
+                low: 121.0,
+                volume: 100,
+                close: 123.45,
+                adjclose: 123.45,
+            }],
+        );
+
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]["instrumentId"], "inst_aapl");
+        assert_eq!(points[0]["price"], "123.45");
+        assert_eq!(points[0]["currency"], "USD");
+        assert_eq!(points[0]["date"], "2026-06-28");
+        assert_eq!(
+            points[0]["sourceUrl"],
+            "https://finance.yahoo.com/quote/AAPL/history"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_ledger_historical_prices_validate_range_and_symbol() {
+        let path = unique_test_ledger_path("historical_price_validation");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let create_input = json!({
+            "id": "inst_no_symbol",
+            "type": "fund",
+            "displayName": "无代码基金",
+            "quoteCurrency": "CNY"
+        });
+        let (create_status, _) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            create_input,
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::CREATED);
+
+        let (range_status, range_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/instruments/inst_no_symbol/historical-prices?from=2026-06-28&to=2026-06-27",
+        )
+        .await;
+        assert_eq!(range_status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            range_body["error"]["code"],
+            "invalid_historical_price_range"
+        );
+
+        let (symbol_status, symbol_body) = request_json_from(
+            router,
+            Method::GET,
+            "/v1/instruments/inst_no_symbol/historical-prices?from=2026-06-27&to=2026-06-28",
+        )
+        .await;
+        assert_eq!(symbol_status, StatusCode::BAD_REQUEST);
+        assert_eq!(symbol_body["error"]["code"], "missing_instrument_symbol");
 
         let _ = std::fs::remove_file(path);
     }
