@@ -32,7 +32,8 @@ class AnomaliesPage extends ConsumerWidget {
     final async = ref.watch(anomaliesProvider);
     return Scaffold(
       appBar: AppBar(title: const Text('账户异常')),
-      body: async.when(
+      body: ContentMaxWidth(
+        child: async.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => ErrorStateView(
           message: '$e',
@@ -61,6 +62,7 @@ class AnomaliesPage extends ConsumerWidget {
           );
         },
       ),
+    ),
     );
   }
 }

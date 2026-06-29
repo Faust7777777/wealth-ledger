@@ -50,7 +50,8 @@ class SnapshotsPage extends ConsumerWidget {
           ),
         ],
       ),
-      body: async.when(
+      body: ContentMaxWidth(
+        child: async.when(
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, _) => ErrorStateView(
           message: '$e',
@@ -89,6 +90,7 @@ class SnapshotsPage extends ConsumerWidget {
           );
         },
       ),
+    ),
     );
   }
 }
