@@ -5,6 +5,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/env.dart';
 import 'api_mock_repositories.dart';
+import 'auth_repositories.dart';
+import 'auth_store.dart';
+import 'auth_token_store_io.dart';
 import 'fixture_repositories.dart';
 import 'real_local_repositories.dart';
 import 'repositories.dart';
@@ -15,7 +18,111 @@ DataSourceMode _mode(Ref ref) =>
 
 final devApiClientProvider = Provider<DevApiClient>((ref) {
   final env = ref.watch(appEnvironmentProvider);
-  return DevApiClient(env.apiBaseUrl, scenario: env.apiScenario);
+  return DevApiClient(
+    env.apiBaseUrl,
+    scenario: env.apiScenario,
+    tokenStore: ref.watch(authTokenStoreProvider),
+  );
+});
+
+final authTokenStoreProvider = Provider<AuthTokenStore>(
+  (ref) => PlatformAuthTokenStore(),
+);
+
+final authRepositoryProvider = Provider<AuthRepository>((ref) {
+  if (_mode(ref) != DataSourceMode.localServer) {
+    return const UnsupportedAuthRepository();
+  }
+  return LocalServerAuthRepository(ref.watch(devApiClientProvider));
+});
+
+class AuthController extends AsyncNotifier<AuthSessionVm?> {
+  @override
+  Future<AuthSessionVm?> build() async => ref
+      .watch(authTokenStoreProvider)
+      .read()
+      .then(
+        (stored) => stored == null
+            ? null
+            : AuthSessionVm(
+                accessToken: stored.accessToken,
+                refreshToken: stored.refreshToken,
+                expiresAt: stored.expiresAt,
+                deviceId: stored.deviceId,
+              ),
+      );
+
+  Future<void> login({
+    required String username,
+    required String password,
+    required String deviceName,
+  }) async {
+    state = const AsyncLoading<AuthSessionVm?>();
+    try {
+      final session = await ref
+          .read(authRepositoryProvider)
+          .login(
+            username: username,
+            password: password,
+            deviceName: deviceName,
+          );
+      await ref.read(authTokenStoreProvider).write(session);
+      state = AsyncData(session);
+      ref.invalidate(authDevicesProvider);
+    } catch (error, stackTrace) {
+      state = AsyncError<AuthSessionVm?>(error, stackTrace);
+      rethrow;
+    }
+  }
+
+  Future<void> refresh() async {
+    final current =
+        state.asData?.value ?? await ref.read(authTokenStoreProvider).read();
+    if (current == null) {
+      throw StateError('尚未登录');
+    }
+    state = const AsyncLoading<AuthSessionVm?>();
+    try {
+      final session = await ref
+          .read(authRepositoryProvider)
+          .refresh(current.refreshToken);
+      await ref.read(authTokenStoreProvider).write(session);
+      state = AsyncData(session);
+      ref.invalidate(authDevicesProvider);
+    } catch (error, stackTrace) {
+      state = AsyncError<AuthSessionVm?>(error, stackTrace);
+      rethrow;
+    }
+  }
+
+  Future<void> logout() async {
+    final current =
+        state.asData?.value ?? await ref.read(authTokenStoreProvider).read();
+    if (current != null) {
+      try {
+        await ref.read(authRepositoryProvider).logout(current.refreshToken);
+      } catch (_) {
+        // Local logout must still clear tokens even if the dev server is down.
+      }
+    }
+    await ref.read(authTokenStoreProvider).clear();
+    state = const AsyncData(null);
+    ref.invalidate(authDevicesProvider);
+  }
+
+  Future<void> revokeDevice(String deviceId) async {
+    await ref.read(authRepositoryProvider).revokeDevice(deviceId);
+    ref.invalidate(authDevicesProvider);
+  }
+}
+
+final authControllerProvider =
+    AsyncNotifierProvider<AuthController, AuthSessionVm?>(AuthController.new);
+
+final authDevicesProvider = FutureProvider<List<AuthDeviceVm>>((ref) async {
+  final session = await ref.watch(authControllerProvider.future);
+  if (session == null) return const [];
+  return ref.watch(authRepositoryProvider).listDevices();
 });
 
 T _pick<T>(

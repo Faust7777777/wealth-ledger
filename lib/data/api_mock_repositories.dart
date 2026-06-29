@@ -8,6 +8,7 @@ import 'package:http/http.dart' as http;
 
 import '../core/format.dart';
 import '../core/types.dart';
+import 'auth_store.dart';
 import 'repositories.dart';
 import 'view_models.dart';
 
@@ -19,18 +20,44 @@ class ApiForbiddenException implements Exception {
   String toString() => '该能力被产品边界禁止（403）：$path';
 }
 
+class ApiUnauthorizedException implements Exception {
+  ApiUnauthorizedException(this.path);
+  final String path;
+  @override
+  String toString() => '登录已失效或未登录（401）：$path';
+}
+
 class DevApiClient {
-  DevApiClient(this.baseUrl, {this.scenario = '', http.Client? client})
-    : _client = client ?? http.Client();
+  DevApiClient(
+    this.baseUrl, {
+    this.scenario = '',
+    this.tokenStore,
+    http.Client? client,
+  }) : _client = client ?? http.Client();
+
   final String baseUrl;
   final String scenario;
+  final AuthTokenStore? tokenStore;
   final http.Client _client;
+
+  Future<Map<String, String>> _headers({bool json = false}) async {
+    final headers = <String, String>{};
+    if (json) headers['content-type'] = 'application/json';
+    final token = await tokenStore?.readAccessToken();
+    if (token != null && token.isNotEmpty) {
+      headers['authorization'] = 'Bearer $token';
+    }
+    return headers;
+  }
 
   String _url(String path) => scenario.isEmpty
       ? '$baseUrl$path'
       : '$baseUrl$path${path.contains('?') ? '&' : '?'}scenario=$scenario';
 
   Object? _handle(http.Response res, String path) {
+    if (res.statusCode == 401) {
+      throw ApiUnauthorizedException(path);
+    }
     if (res.statusCode == 403) {
       throw ApiForbiddenException(path);
     }
@@ -48,13 +75,15 @@ class DevApiClient {
     return body;
   }
 
-  Future<Object?> getData(String path) async =>
-      _handle(await _client.get(Uri.parse(_url(path))), path);
+  Future<Object?> getData(String path) async => _handle(
+    await _client.get(Uri.parse(_url(path)), headers: await _headers()),
+    path,
+  );
 
   Future<Object?> postData(String path, {Object? body}) async => _handle(
     await _client.post(
       Uri.parse(_url(path)),
-      headers: const {'content-type': 'application/json'},
+      headers: await _headers(json: true),
       body: body == null ? null : jsonEncode(body),
     ),
     path,
@@ -63,7 +92,7 @@ class DevApiClient {
   Future<Object?> patchData(String path, {Object? body}) async => _handle(
     await _client.patch(
       Uri.parse(_url(path)),
-      headers: const {'content-type': 'application/json'},
+      headers: await _headers(json: true),
       body: body == null ? null : jsonEncode(body),
     ),
     path,
