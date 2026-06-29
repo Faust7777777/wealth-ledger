@@ -2,13 +2,14 @@
 //
 // Windows uses DPAPI (current user) through pure Dart FFI, avoiding Flutter
 // secure-storage plugins that require extra Visual Studio ATL components.
-// Non-Windows platforms currently use in-memory tokens: no plaintext persistence,
-// but also no cross-restart "instant login" until Android secure storage is wired.
+// Android uses Android Keystore via a small MethodChannel in MainActivity.
+// Other platforms currently use in-memory tokens: no plaintext persistence, but
+// also no cross-restart "instant login".
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
-import 'dart:typed_data';
 
+import 'package:flutter/services.dart';
 import 'package:ffi/ffi.dart';
 import 'package:win32/win32.dart';
 
@@ -17,11 +18,17 @@ import 'auth_store.dart';
 class PlatformAuthTokenStore implements AuthTokenStore {
   PlatformAuthTokenStore({File? file}) : _file = file ?? _defaultTokenFile();
 
+  static const _androidChannel = MethodChannel('finwealth.secure_token_store');
+
   final File _file;
   final AuthTokenStore _memoryFallback = MemoryAuthTokenStore();
 
   @override
   Future<StoredAuthSession?> read() async {
+    if (Platform.isAndroid) {
+      final raw = await _androidChannel.invokeMethod<String>('read');
+      return raw == null || raw.isEmpty ? null : _sessionFromJson(raw);
+    }
     if (!Platform.isWindows) {
       return _memoryFallback.read();
     }
@@ -29,14 +36,7 @@ class PlatformAuthTokenStore implements AuthTokenStore {
     final encrypted = await _file.readAsBytes();
     if (encrypted.isEmpty) return null;
     final raw = utf8.decode(_dpapiUnprotect(encrypted));
-    final json = jsonDecode(raw) as Map<String, dynamic>;
-    final session = StoredAuthSession(
-      accessToken: (json['accessToken'] ?? '').toString(),
-      refreshToken: (json['refreshToken'] ?? '').toString(),
-      expiresAt: (json['expiresAt'] ?? '').toString(),
-      deviceId: (json['deviceId'] ?? '').toString(),
-    );
-    return session.isComplete ? session : null;
+    return _sessionFromJson(raw);
   }
 
   @override
@@ -44,27 +44,28 @@ class PlatformAuthTokenStore implements AuthTokenStore {
 
   @override
   Future<void> write(StoredAuthSession session) async {
+    final raw = _sessionToJson(session);
+    if (Platform.isAndroid) {
+      await _androidChannel.invokeMethod<void>('write', {'value': raw});
+      return;
+    }
     if (!Platform.isWindows) {
       await _memoryFallback.write(session);
       return;
     }
     await _file.parent.create(recursive: true);
-    final raw = utf8.encode(
-      jsonEncode({
-        'accessToken': session.accessToken,
-        'refreshToken': session.refreshToken,
-        'expiresAt': session.expiresAt,
-        'deviceId': session.deviceId,
-      }),
-    );
     await _file.writeAsBytes(
-      _dpapiProtect(Uint8List.fromList(raw)),
+      _dpapiProtect(Uint8List.fromList(utf8.encode(raw))),
       flush: true,
     );
   }
 
   @override
   Future<void> clear() async {
+    if (Platform.isAndroid) {
+      await _androidChannel.invokeMethod<void>('clear');
+      return;
+    }
     if (!Platform.isWindows) {
       await _memoryFallback.clear();
       return;
@@ -74,6 +75,24 @@ class PlatformAuthTokenStore implements AuthTokenStore {
     }
   }
 }
+
+StoredAuthSession? _sessionFromJson(String raw) {
+  final json = jsonDecode(raw) as Map<String, dynamic>;
+  final session = StoredAuthSession(
+    accessToken: (json['accessToken'] ?? '').toString(),
+    refreshToken: (json['refreshToken'] ?? '').toString(),
+    expiresAt: (json['expiresAt'] ?? '').toString(),
+    deviceId: (json['deviceId'] ?? '').toString(),
+  );
+  return session.isComplete ? session : null;
+}
+
+String _sessionToJson(StoredAuthSession session) => jsonEncode({
+  'accessToken': session.accessToken,
+  'refreshToken': session.refreshToken,
+  'expiresAt': session.expiresAt,
+  'deviceId': session.deviceId,
+});
 
 File _defaultTokenFile() {
   final appData = Platform.environment['APPDATA'];

@@ -156,7 +156,7 @@ class _LocalServerAuthSectionState
         ),
         const SizedBox(height: AppSpacing.xs),
         Text(
-          '不保存密码。Windows 会用 DPAPI 持久保存 token；其他平台本轮仅会话内保存。',
+          '不保存密码。Windows 使用 DPAPI、Android 使用 Keystore 持久保存 token。',
           style: Theme.of(context).textTheme.bodySmall,
         ),
       ],
