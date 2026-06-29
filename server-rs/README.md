@@ -104,9 +104,12 @@ $env:FINWEALTH_REQUIRE_AUTH="true"
 ```
 
 Temporary local development can use `FINWEALTH_AUTH_PASSWORD`, but do not use it
-for deployment. Tokens are random opaque strings; the server keeps only token
-hashes in memory. If auth env vars are absent, `/v1/auth/login` remains
-dev-compatible and returns `dev_*` tokens for existing smoke tests.
+for deployment. Tokens are random opaque strings; the server stores only token
+hashes. With `--ledger-path .\tmp\ledger.json`, auth device state defaults to
+`.\tmp\ledger.auth.json`, so refresh-token "instant login" survives server
+restart. Set `FINWEALTH_AUTH_STATE_PATH` to override this location. If auth env
+vars are absent, `/v1/auth/login` remains dev-compatible and returns `dev_*`
+tokens for existing smoke tests.
 
 `FINWEALTH_REQUIRE_AUTH=true` protects non-public routes with `Authorization:
 Bearer <accessToken>`. It is off by default so existing local Flutter integration
