@@ -1,6 +1,7 @@
 param(
   [int]$Port = 8791,
   [string]$LedgerPath = "tmp\ledger.json",
+  [string]$LogDir = "tmp\logs",
   [string]$Device = "windows",
   [string]$Username = $env:FINWEALTH_AUTH_USERNAME,
   [string]$PasswordHash = $env:FINWEALTH_AUTH_PASSWORD_HASH,
@@ -67,11 +68,19 @@ function New-PasswordHash {
 }
 
 function Wait-Health {
-  param([string]$BaseUrl, [System.Diagnostics.Process]$Process)
+  param(
+    [string]$BaseUrl,
+    [System.Diagnostics.Process]$Process,
+    [string]$ErrorLog
+  )
   $lastError = $null
   for ($i = 0; $i -lt 80; $i++) {
     if ($Process.HasExited) {
-      throw "server exited early with code $($Process.ExitCode)"
+      $tail = ""
+      if (Test-Path $ErrorLog) {
+        $tail = (Get-Content -LiteralPath $ErrorLog -Tail 20) -join [Environment]::NewLine
+      }
+      throw "server exited early with code $($Process.ExitCode). Last stderr lines:$([Environment]::NewLine)$tail"
     }
     try {
       Invoke-RestMethod -Uri "$BaseUrl/v1/health" -Method Get | Out-Null
@@ -81,7 +90,11 @@ function Wait-Health {
       Start-Sleep -Milliseconds 250
     }
   }
-  throw "server did not become ready: $lastError"
+  $tail = ""
+  if (Test-Path $ErrorLog) {
+    $tail = (Get-Content -LiteralPath $ErrorLog -Tail 20) -join [Environment]::NewLine
+  }
+  throw "server did not become ready: $lastError$([Environment]::NewLine)$tail"
 }
 
 function Set-ProcessEnv {
@@ -107,6 +120,12 @@ $LedgerDir = Split-Path -Parent $LedgerFullPath
 if ($LedgerDir) {
   New-Item -ItemType Directory -Force -Path $LedgerDir | Out-Null
 }
+if ([System.IO.Path]::IsPathRooted($LogDir)) {
+  $LogFullDir = $LogDir
+} else {
+  $LogFullDir = Join-Path $Root $LogDir
+}
+New-Item -ItemType Directory -Force -Path $LogFullDir | Out-Null
 
 $CargoExe = Resolve-Executable `
   -Name "cargo" `
@@ -121,6 +140,8 @@ $FlutterExe = Resolve-Executable `
 $ManifestPath = Join-Path $Root "server-rs\Cargo.toml"
 $ServerExe = Join-Path $Root "server-rs\target\debug\finwealth-server.exe"
 $ApiBase = "http://127.0.0.1:$Port"
+$ServerOutLog = Join-Path $LogFullDir "finwealth-server.out.log"
+$ServerErrLog = Join-Path $LogFullDir "finwealth-server.err.log"
 
 if (!$NoAuth) {
   if ([string]::IsNullOrWhiteSpace($Username)) {
@@ -142,6 +163,7 @@ if (!$NoAuth) {
 Write-Host "Finwealth self-use local run"
 Write-Host "  API:        $ApiBase"
 Write-Host "  Ledger:     $LedgerFullPath"
+Write-Host "  Logs:       $LogFullDir"
 Write-Host "  Device:     $Device"
 Write-Host "  Auth:       $(if ($NoAuth) { 'disabled' } else { 'required' })"
 Write-Host "  Username:   $(if ($NoAuth) { '-' } else { $Username })"
@@ -176,13 +198,15 @@ try {
     -ArgumentList @("--port", $Port, "--ledger-path", $LedgerFullPath) `
     -WorkingDirectory $Root `
     -PassThru `
-    -WindowStyle Hidden
+    -WindowStyle Hidden `
+    -RedirectStandardOutput $ServerOutLog `
+    -RedirectStandardError $ServerErrLog
 } finally {
   Restore-ProcessEnv $oldEnv
 }
 
 try {
-  Wait-Health -BaseUrl $ApiBase -Process $server
+  Wait-Health -BaseUrl $ApiBase -Process $server -ErrorLog $ServerErrLog
   if ($SmokeOnly) {
     Write-Host "SmokeOnly: server health check passed."
     return
