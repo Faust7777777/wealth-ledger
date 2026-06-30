@@ -71,6 +71,23 @@ deploy/finwealth-server.env.example
 tools/install_vps_systemd.sh
 ```
 
+## Packaging
+
+Create local Windows zip and Android debug APK copies under `dist/`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\package_release.ps1
+```
+
+If the builds already exist, package without rebuilding:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\package_release.ps1 -SkipBuild
+```
+
+GitHub Actions also has a manual `Package` workflow that uploads Windows and
+Android artifacts for the current branch.
+
 ## Rust server skeleton
 
 ```bash

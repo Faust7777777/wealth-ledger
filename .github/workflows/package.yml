@@ -1,0 +1,63 @@
+name: Package
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-windows:
+    name: Package Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build Windows
+        run: flutter build windows
+
+      - name: Create zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath dist/finwealth-windows-x64.zip
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finwealth-windows-x64
+          path: dist/finwealth-windows-x64.zip
+
+  package-android:
+    name: Package Android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build Android debug APK
+        run: flutter build apk --debug
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finwealth-android-debug
+          path: build/app/outputs/flutter-apk/app-debug.apk
