@@ -96,6 +96,17 @@ sudo bash tools/backup_vps_ledger.sh
 Default output goes to `/var/backups/finwealth/<UTC timestamp>/` with a SHA-256
 manifest. Copy that directory off the VPS periodically.
 
+Restore from a backup directory:
+
+```bash
+sudo bash tools/restore_vps_ledger.sh /var/backups/finwealth/<timestamp>
+sudo systemctl restart finwealth-server.service
+```
+
+The restore script validates the backup ledger when `/opt/finwealth/finwealth-server`
+exists and creates a pre-restore backup of the current ledger before overwriting.
+Use `--force` only for non-interactive restore automation.
+
 ## 4. Run Flutter against the VPS
 
 Windows:

@@ -134,6 +134,12 @@ Back up the local JSON ledger and auth device state:
 powershell -ExecutionPolicy Bypass -File tools\backup_local_ledger.ps1
 ```
 
+Restore from a backup directory:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\restore_local_ledger.ps1 -BackupPath backups\<timestamp>
+```
+
 Manual two-terminal flow:
 
 Start the Rust server with a persistent local JSON ledger:
