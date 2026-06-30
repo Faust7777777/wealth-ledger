@@ -31,7 +31,7 @@ jobs:
         run: python -m py_compile tools/contract_check.py tools/mock_api_server.py tools/server_smoke.py tools/local_ledger_smoke.py server/dev_server.py
 
       - name: Check shell scripts
-        run: bash -n tools/install_vps_systemd.sh tools/backup_vps_ledger.sh
+        run: bash -n tools/install_vps_systemd.sh tools/backup_vps_ledger.sh tools/restore_vps_ledger.sh
 
       - name: Check Rust formatting
         run: cargo fmt --manifest-path server-rs/Cargo.toml --check
@@ -63,6 +63,22 @@ jobs:
       - name: Get Flutter dependencies
         run: flutter pub get
 
+      - name: Check PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem tools -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              Write-Error "PowerShell parse errors in $($_.FullName):"
+              $errors | Format-List | Out-String | Write-Error
+            }
+          }
+          if ($failed) { exit 1 }
+
       - name: Analyze Flutter
         run: flutter analyze
 
@@ -71,6 +87,10 @@ jobs:
 
       - name: Build Windows app
         run: flutter build windows
+
+      - name: Check Windows package script
+        shell: pwsh
+        run: ./tools/package_release.ps1 -SkipBuild -WindowsOnly -OutputDir tmp/package-ci
 
   flutter-android:
     name: Flutter Android
