@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-and-tools:
+    name: Rust server and tooling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server-rs
+
+      - name: Check Python syntax
+        run: python -m py_compile tools/contract_check.py tools/mock_api_server.py tools/server_smoke.py tools/local_ledger_smoke.py server/dev_server.py
+
+      - name: Check shell scripts
+        run: bash -n tools/install_vps_systemd.sh tools/backup_vps_ledger.sh
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path server-rs/Cargo.toml --check
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path server-rs/Cargo.toml
+
+      - name: Run Rust clippy
+        run: cargo clippy --manifest-path server-rs/Cargo.toml -- -D warnings
+
+      - name: Run API smoke checks
+        run: python tools/server_smoke.py
+
+      - name: Run local ledger smoke
+        run: python tools/local_ledger_smoke.py
+
+  flutter-windows:
+    name: Flutter Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Analyze Flutter
+        run: flutter analyze
+
+      - name: Run Flutter tests
+        run: flutter test
+
+      - name: Build Windows app
+        run: flutter build windows
+
+  flutter-android:
+    name: Flutter Android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Build Android debug APK
+        run: flutter build apk --debug
