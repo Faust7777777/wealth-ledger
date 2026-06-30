@@ -106,6 +106,18 @@ Fast path for Windows self-use development. This builds and starts the Rust
 server with a persistent local ledger, waits for `/v1/health`, starts the
 Flutter Windows app against it, and stops the server when Flutter exits:
 
+Check local readiness first:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\doctor.ps1
+```
+
+Run deeper local checks when needed:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\doctor.ps1 -Deep
+```
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\run_self_use_windows.ps1
 ```
