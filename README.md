@@ -60,6 +60,17 @@ Runs a write-capable smoke against a temporary real-local JSON ledger:
 python tools/local_ledger_smoke.py
 ```
 
+## VPS deployment draft
+
+Private self-use VPS deployment notes and systemd assets:
+
+```text
+docs/deploy/VPS_DEPLOYMENT.md
+deploy/systemd/finwealth-server.service
+deploy/finwealth-server.env.example
+tools/install_vps_systemd.sh
+```
+
 ## Rust server skeleton
 
 ```bash
