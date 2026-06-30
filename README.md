@@ -74,6 +74,34 @@ http://127.0.0.1:8790
 
 ## Self-use local run
 
+Fast path for Windows self-use development. This builds and starts the Rust
+server with a persistent local ledger, waits for `/v1/health`, starts the
+Flutter Windows app against it, and stops the server when Flutter exits:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\run_self_use_windows.ps1
+```
+
+By default the script enables local auth. It prompts for a username/password if
+`FINWEALTH_AUTH_USERNAME` / `FINWEALTH_AUTH_PASSWORD_HASH` are not already set.
+The password is used only to derive an Argon2 hash for the server process; the
+script does not write the password to disk. The app stores login tokens with
+Windows DPAPI / Android Keystore.
+
+Smoke-check the script without opening Flutter:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\run_self_use_windows.ps1 -SmokeOnly
+```
+
+Run without auth only for quick local debugging:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\run_self_use_windows.ps1 -NoAuth
+```
+
+Manual two-terminal flow:
+
 Start the Rust server with a persistent local JSON ledger:
 
 ```powershell
