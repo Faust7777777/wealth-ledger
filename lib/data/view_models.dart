@@ -545,6 +545,70 @@ class QuoteRefreshResultVm {
       errors.isNotEmpty;
 }
 
+/// 单条行情（GET /v1/quotes 项）。status 为后端计算的有效新鲜度（六态）。
+class QuoteVm {
+  const QuoteVm({
+    required this.id,
+    required this.instrumentId,
+    required this.price,
+    required this.currency,
+    required this.asOf,
+    required this.status,
+    this.source,
+  });
+  final Id id;
+  final String instrumentId;
+  final DecimalString price;
+  final CurrencyCode currency;
+  final IsoDateTime asOf;
+  final QuoteStatus status;
+  final String? source;
+}
+
+/// 单条汇率（GET /v1/fx-rates 项）。
+class FxRateVm {
+  const FxRateVm({
+    required this.id,
+    required this.baseCurrency,
+    required this.quoteCurrency,
+    required this.rate,
+    required this.asOf,
+    required this.status,
+    this.source,
+  });
+  final Id id;
+  final CurrencyCode baseCurrency;
+  final CurrencyCode quoteCurrency;
+  final DecimalString rate;
+  final IsoDateTime asOf;
+  final QuoteStatus status;
+  final String? source;
+}
+
+/// 手动录入行情输入（source 由仓库置 manual）。
+class ManualQuoteInput {
+  const ManualQuoteInput({
+    required this.instrumentId,
+    required this.price,
+    required this.currency,
+  });
+  final String instrumentId;
+  final DecimalString price; // 正数 decimal 字符串
+  final CurrencyCode currency;
+}
+
+/// 手动录入汇率输入。
+class ManualFxRateInput {
+  const ManualFxRateInput({
+    required this.baseCurrency,
+    required this.quoteCurrency,
+    required this.rate,
+  });
+  final CurrencyCode baseCurrency;
+  final CurrencyCode quoteCurrency;
+  final DecimalString rate; // 正数 decimal 字符串
+}
+
 class PendingSummaryVm {
   const PendingSummaryVm({
     this.aiPendingCount = 0,

@@ -470,7 +470,20 @@ class FixtureQuoteRepository implements QuoteRepository {
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       const QuoteStatusSummaryVm(freshCount: 8, staleCount: 2);
   @override
-  Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>
+  Future<List<QuoteVm>> listQuotes() async => const [
+    QuoteVm(id: 'q_nvda', instrumentId: 'NVDA', price: '142.50', currency: 'USD', asOf: _asOf, status: QuoteStatus.stale, source: 'demo'),
+    QuoteVm(id: 'q_btc', instrumentId: 'BTC', price: '64000.00', currency: 'USD', asOf: _asOf, status: QuoteStatus.fresh, source: 'demo'),
+  ];
+  @override
+  Future<List<FxRateVm>> listFxRates() async => const [
+    FxRateVm(id: 'fx_usdcny', baseCurrency: 'USD', quoteCurrency: 'CNY', rate: '7.12', asOf: _asOf, status: QuoteStatus.fresh, source: 'demo'),
+  ];
+  @override
+  Future<QuoteRefreshResultVm> refreshQuotes({
+    required String mode,
+    List<ManualQuoteInput> quotes = const [],
+    List<ManualFxRateInput> fxRates = const [],
+  }) async =>
       const QuoteRefreshResultVm(
         status: 'partial_success',
         completedAt: _asOf,
