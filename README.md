@@ -111,6 +111,12 @@ Run without auth only for quick local debugging:
 powershell -ExecutionPolicy Bypass -File tools\run_self_use_windows.ps1 -NoAuth
 ```
 
+Back up the local JSON ledger and auth device state:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\backup_local_ledger.ps1
+```
+
 Manual two-terminal flow:
 
 Start the Rust server with a persistent local JSON ledger:

@@ -87,6 +87,15 @@ Server-side firewall/security-list requirements:
 - keep `/etc/finwealth/server.env` mode `0600`;
 - back up `/var/lib/finwealth/ledger.json` and `/var/lib/finwealth/ledger.auth.json`.
 
+Manual backup:
+
+```bash
+sudo bash tools/backup_vps_ledger.sh
+```
+
+Default output goes to `/var/backups/finwealth/<UTC timestamp>/` with a SHA-256
+manifest. Copy that directory off the VPS periodically.
+
 ## 4. Run Flutter against the VPS
 
 Windows:
