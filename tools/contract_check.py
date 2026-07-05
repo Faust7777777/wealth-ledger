@@ -147,6 +147,11 @@ def check_examples() -> None:
     accounts = require_path(empty_bootstrap, "data.accounts")
     if accounts != []:
         fail("Empty bootstrap must not contain accounts")
+    capabilities = require_path(empty_bootstrap, "data.capabilities")
+    if capabilities.get("canWriteConfirmedLedger") is not False:
+        fail("Empty bootstrap capabilities must not claim confirmed-ledger writes")
+    if capabilities.get("proposalPersistence") != "memory":
+        fail("Empty bootstrap capabilities must declare memory proposal persistence")
 
     ai_diff = examples.get("ai_modify_movement_diff.response.json")
     if ai_diff is None:

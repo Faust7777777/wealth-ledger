@@ -2314,7 +2314,13 @@ fn local_ledger_bootstrap(path: &FsPath, now: &str) -> io::Result<Value> {
             .unwrap_or(local_ledger::DEFAULT_BASE_CURRENCY),
         "accounts": local_ledger::list_accounts(path)?,
         "categories": local_ledger::list_categories(path)?,
-        "counterparties": local_ledger::list_counterparties(path)?
+        "counterparties": local_ledger::list_counterparties(path)?,
+        "capabilities": ledger_capabilities(
+            "real_local",
+            true,
+            "file",
+            !quote_provider_disabled()
+        )
     });
     let overview = local_ledger::portfolio_overview(path, now)?;
     if let Some(snapshot) = overview
@@ -2324,6 +2330,27 @@ fn local_ledger_bootstrap(path: &FsPath, now: &str) -> io::Result<Value> {
         payload["snapshot"] = snapshot.clone();
     }
     Ok(payload)
+}
+
+fn ledger_capabilities(
+    data_source_mode: &str,
+    can_write_confirmed_ledger: bool,
+    proposal_persistence: &str,
+    can_use_outbound_quote_provider: bool,
+) -> Value {
+    json!({
+        "dataSourceMode": data_source_mode,
+        "canWriteConfirmedLedger": can_write_confirmed_ledger,
+        "canCreateAccount": can_write_confirmed_ledger,
+        "canRecordMovement": can_write_confirmed_ledger,
+        "canConfirmProposal": true,
+        "canPersistPendingProposal": proposal_persistence != "none",
+        "proposalPersistence": proposal_persistence,
+        "canRefreshQuotes": can_write_confirmed_ledger,
+        "canUseOutboundQuoteProvider": can_use_outbound_quote_provider,
+        "canSync": false,
+        "canUseRealAiProvider": false
+    })
 }
 
 fn sync_cursor_from_document(document: &Value) -> String {
@@ -4186,6 +4213,22 @@ mod tests {
         assert_eq!(
             bootstrap_body["data"]["snapshot"]["netWorth"]["amount"],
             "88.00"
+        );
+        assert_eq!(
+            bootstrap_body["data"]["capabilities"]["dataSourceMode"],
+            "real_local"
+        );
+        assert_eq!(
+            bootstrap_body["data"]["capabilities"]["canWriteConfirmedLedger"],
+            true
+        );
+        assert_eq!(
+            bootstrap_body["data"]["capabilities"]["proposalPersistence"],
+            "file"
+        );
+        assert_eq!(
+            bootstrap_body["data"]["capabilities"]["canUseOutboundQuoteProvider"],
+            false
         );
 
         let (sync_status, sync_body) =

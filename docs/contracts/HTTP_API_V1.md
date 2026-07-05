@@ -117,7 +117,20 @@ GET /v1/ledger/bootstrap
   "snapshot": {},
   "accounts": [],
   "categories": [],
-  "counterparties": []
+  "counterparties": [],
+  "capabilities": {
+    "dataSourceMode": "real_local",
+    "canWriteConfirmedLedger": true,
+    "canCreateAccount": true,
+    "canRecordMovement": true,
+    "canConfirmProposal": true,
+    "canPersistPendingProposal": true,
+    "proposalPersistence": "file",
+    "canRefreshQuotes": true,
+    "canUseOutboundQuoteProvider": false,
+    "canSync": false,
+    "canUseRealAiProvider": false
+  }
 }
 ```
 

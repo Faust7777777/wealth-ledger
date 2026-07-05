@@ -93,6 +93,8 @@ GET  /v1/snapshots
 GET  /v1/quotes/summary
 ```
 
+`/v1/ledger/bootstrap.data.capabilities` 是写入口 gating 的服务端口径。前端不得只凭 data source 名称猜测能力；至少应读取 `canWriteConfirmedLedger`、`canCreateAccount`、`canRecordMovement`、`canConfirmProposal`、`canPersistPendingProposal` 和 `proposalPersistence`。
+
 用于按钮行为的 proposal 端点：
 
 ```text

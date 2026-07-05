@@ -7,7 +7,19 @@
     "snapshot": null,
     "accounts": [],
     "categories": [],
-    "counterparties": []
+    "counterparties": [],
+    "capabilities": {
+      "dataSourceMode": "dev_empty",
+      "canWriteConfirmedLedger": false,
+      "canCreateAccount": false,
+      "canRecordMovement": false,
+      "canConfirmProposal": true,
+      "canPersistPendingProposal": true,
+      "proposalPersistence": "memory",
+      "canRefreshQuotes": false,
+      "canUseOutboundQuoteProvider": false,
+      "canSync": false,
+      "canUseRealAiProvider": false
+    }
   }
 }
-

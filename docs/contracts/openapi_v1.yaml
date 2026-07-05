@@ -2447,7 +2447,7 @@ components:
           const: true
         data:
           type: object
-          required: [ledgerVersion, syncCursor, baseCurrency, accounts, categories, counterparties]
+          required: [ledgerVersion, syncCursor, baseCurrency, accounts, categories, counterparties, capabilities]
           properties:
             ledgerVersion:
               type: integer
@@ -2469,6 +2469,48 @@ components:
               type: array
               items:
                 $ref: "#/components/schemas/Counterparty"
+            capabilities:
+              $ref: "#/components/schemas/LedgerCapabilities"
+
+    LedgerCapabilities:
+      type: object
+      required:
+        - dataSourceMode
+        - canWriteConfirmedLedger
+        - canCreateAccount
+        - canRecordMovement
+        - canConfirmProposal
+        - canPersistPendingProposal
+        - proposalPersistence
+        - canRefreshQuotes
+        - canUseOutboundQuoteProvider
+        - canSync
+        - canUseRealAiProvider
+      properties:
+        dataSourceMode:
+          enum: [real_local, dev_empty, dev_scenario, debug_fixture, local_server]
+        canWriteConfirmedLedger:
+          type: boolean
+          description: True only when confirmed/effective ledger writes are available.
+        canCreateAccount:
+          type: boolean
+        canRecordMovement:
+          type: boolean
+        canConfirmProposal:
+          type: boolean
+        canPersistPendingProposal:
+          type: boolean
+        proposalPersistence:
+          enum: [none, memory, file]
+        canRefreshQuotes:
+          type: boolean
+        canUseOutboundQuoteProvider:
+          type: boolean
+          description: True only after explicit quote-provider opt-in.
+        canSync:
+          type: boolean
+        canUseRealAiProvider:
+          type: boolean
 
     SyncStatus:
       enum: [synced, syncing, offline, degraded, conflict, error]
