@@ -50,6 +50,7 @@ struct AppState {
     ledger: DevLedgerCore,
     local_ledger_path: Option<PathBuf>,
     auth: AuthStore,
+    allow_ledger_scenario: bool,
 }
 
 impl AppState {
@@ -58,6 +59,7 @@ impl AppState {
             ledger: DevLedgerCore::new(),
             local_ledger_path: None,
             auth: AuthStore::from_env_or_dev_with_default_state_path(None),
+            allow_ledger_scenario: env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
         }
     }
 
@@ -67,6 +69,7 @@ impl AppState {
             ledger: DevLedgerCore::new(),
             local_ledger_path: Some(path),
             auth: AuthStore::from_env_or_dev_with_default_state_path(Some(auth_state_path)),
+            allow_ledger_scenario: env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
         }
     }
 
@@ -76,8 +79,20 @@ impl AppState {
         self
     }
 
-    fn should_use_local_ledger(&self, query: &HashMap<String, String>) -> bool {
-        self.local_ledger_path.is_some() && !query.contains_key("scenario")
+    #[cfg(test)]
+    fn with_allow_ledger_scenario(mut self, allow: bool) -> Self {
+        self.allow_ledger_scenario = allow;
+        self
+    }
+
+    fn should_use_local_ledger(&self, _query: &HashMap<String, String>) -> bool {
+        self.local_ledger_path.is_some()
+    }
+
+    fn rejects_ledger_scenario(&self, query: Option<&str>) -> bool {
+        self.local_ledger_path.is_some()
+            && !self.allow_ledger_scenario
+            && query_has_non_empty_scenario(query)
     }
 }
 
@@ -1063,6 +1078,16 @@ async fn require_auth_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    if state.rejects_ledger_scenario(request.uri().query()) {
+        return bad_request(
+            "ledger_scenario_forbidden",
+            "Scenario query parameters are disabled when a real local ledger is mounted.",
+            json!({
+                "reason": "scenario data must not be mixed with --ledger-path real ledger data",
+                "override": "set FINWEALTH_ALLOW_LEDGER_SCENARIO=true only for explicit dev-only diagnostics"
+            }),
+        );
+    }
     if !state.auth.should_require_auth() || is_public_auth_path(request.uri().path()) {
         return next.run(request).await;
     }
@@ -1080,6 +1105,16 @@ fn is_public_auth_path(path: &str) -> bool {
         path,
         "/v1/health" | "/v1/auth/login" | "/v1/auth/refresh" | "/v1/auth/logout"
     )
+}
+
+fn query_has_non_empty_scenario(query: Option<&str>) -> bool {
+    query.is_some_and(|query| {
+        query.split('&').any(|part| match part.split_once('=') {
+            Some(("scenario", value)) => !value.trim().is_empty(),
+            Some(_) => false,
+            None => part == "scenario",
+        })
+    })
 }
 
 fn read_addr() -> SocketAddr {
@@ -3994,6 +4029,45 @@ mod tests {
         .await;
         assert_eq!(push_status, StatusCode::BAD_REQUEST);
         assert_eq!(push_body["error"]["code"], "invalid_sync_push");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_rejects_scenario_query_to_prevent_demo_real_mixing() {
+        let path = unique_test_ledger_path("reject_scenario");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router =
+            app_with_state(AppState::local(path.clone()).with_allow_ledger_scenario(false));
+
+        let (read_status, read_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/accounts?scenario=degraded",
+        )
+        .await;
+        assert_eq!(read_status, StatusCode::BAD_REQUEST);
+        assert_eq!(read_body["error"]["code"], "ledger_scenario_forbidden");
+
+        let (write_status, write_body) = request_json_body_from(
+            router,
+            Method::POST,
+            "/v1/accounts?scenario=degraded",
+            json!({
+                "displayName": "不应写入",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance"
+            }),
+        )
+        .await;
+        assert_eq!(write_status, StatusCode::BAD_REQUEST);
+        assert_eq!(write_body["error"]["code"], "ledger_scenario_forbidden");
+
+        let document = local_ledger::read_document(&path).expect("ledger should stay readable");
+        assert_eq!(document["accounts"], json!([]));
 
         let _ = std::fs::remove_file(path);
     }

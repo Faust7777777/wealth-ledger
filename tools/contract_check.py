@@ -247,14 +247,24 @@ def check_rust_server() -> None:
     manifest = RUST_MANIFEST.read_text(encoding="utf-8")
     required_snippets = [
         "refusing to bind Rust server to a non-localhost address",
-        "dev_access_token_not_for_production",
         "forbidden_product_boundary",
         "include_str!",
         "/v1/dca/reminders/{reminder_id}/mark-executed-as-proposal",
+        "random_token(if dev_mode",
+        '"dev_access_"',
+        '"dev_refresh_"',
+        "refreshTokenHash",
+        "accessTokenHash",
+        "token_hash(&refresh_token)",
+        "token_hash(&access_token)",
+        "ledger_scenario_forbidden",
     ]
     missing = [snippet for snippet in required_snippets if snippet not in text]
     if missing:
         fail("Rust server missing required safety snippets: " + ", ".join(missing))
+
+    if "dev_access_token_not_for_production" in text:
+        fail("Rust server must not use the old fixed dev access token")
 
     if 'axum = "0.8"' not in manifest:
         fail("Rust server must use the expected Axum dependency line")
