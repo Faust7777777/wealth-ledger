@@ -289,7 +289,7 @@ POST /v1/sync/ack
 - confirmed movement create / correction 会追加 `SyncChange`；draft、pending proposal、未确认图片/CSV 不进入 outbox。
 - `GET /v1/sync/changes?since=<cursor>` 返回该 cursor 之后的本地 change。
 - `POST /v1/sync/ack` 接收 `cursor` 或 `changeIds`，成功后清理本地 `pendingChangeIds`，但保留 `syncChanges` 日志。
-- `POST /v1/sync/push` 仍只校验请求和禁止 debug/demo payload，不应用远端变更。
+- `POST /v1/sync/push` 会把远端 `SyncChange` 作为同步日志中继保存，并返回 `acceptedChangeIds` / `skippedChangeIds`；不会直接应用到账本实体。
 - 不做远端 merge、不做冲突解决、不做 E2EE 同步。
 
 ## 13. 明确禁止的 HTTP 端点

@@ -2623,6 +2623,14 @@ components:
           properties:
             cursor:
               type: string
+            acceptedChangeIds:
+              type: array
+              items:
+                type: string
+            skippedChangeIds:
+              type: array
+              items:
+                type: string
             conflicts:
               type: array
               items:

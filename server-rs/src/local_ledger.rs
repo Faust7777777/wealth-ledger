@@ -223,6 +223,39 @@ pub fn ack_sync_changes(path: &Path, input: Value) -> Result<Value, LedgerError>
     })
 }
 
+pub fn ingest_sync_push(path: &Path, input: Value, now: &str) -> Result<Value, LedgerError> {
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let (device_id, incoming_changes) = sync_push_changes_for_input(&input, now)?;
+        let mut accepted_change_ids = Vec::new();
+        let mut skipped_change_ids = Vec::new();
+
+        for mut incoming_change in incoming_changes {
+            let source_change_id = incoming_change
+                .get("sourceChangeId")
+                .and_then(Value::as_str)
+                .expect("validated sourceChangeId should be a string")
+                .to_string();
+            if sync_source_change_exists(&document, &device_id, &source_change_id) {
+                skipped_change_ids.push(source_change_id);
+                continue;
+            }
+
+            incoming_change["id"] = json!(next_sync_change_id(&mut document));
+            append_sync_log_change(&mut document, incoming_change);
+            accepted_change_ids.push(source_change_id);
+        }
+
+        write_document(path, &document)?;
+        Ok(json!({
+            "cursor": document["syncState"]["cursor"],
+            "acceptedChangeIds": accepted_change_ids,
+            "skippedChangeIds": skipped_change_ids,
+            "conflicts": []
+        }))
+    })
+}
+
 pub fn list_account_anomalies(path: &Path, now: &str) -> io::Result<Value> {
     let document = load_or_initialize(path)?;
     Ok(json!(account_anomalies_for_document(&document, now)?))
@@ -2479,6 +2512,184 @@ fn sync_ack_change_ids_for_input(
     }
 }
 
+fn sync_push_changes_for_input(
+    input: &Value,
+    now: &str,
+) -> Result<(String, Vec<Value>), LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "sync push request must be a JSON object".to_string(),
+        ]));
+    };
+    if contains_fixture_marker(input) {
+        return Err(LedgerError::InvalidInput(vec![
+            "debug fixture, fixture, and demo payloads must not be synced".to_string(),
+        ]));
+    }
+
+    let mut errors = Vec::new();
+    let device_id = match object
+        .get("deviceId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(value) => value.to_string(),
+        None => {
+            errors.push("deviceId must be a non-empty string".to_string());
+            String::new()
+        }
+    };
+    let changes: &[Value] = match object.get("changes").and_then(Value::as_array) {
+        Some(changes) => changes,
+        None => {
+            errors.push("changes must be an array".to_string());
+            &[]
+        }
+    };
+
+    let mut normalized_changes = Vec::new();
+    for (index, change) in changes.iter().enumerate() {
+        match sync_change_from_push_input(change, &device_id, now) {
+            Ok(change) => normalized_changes.push(change),
+            Err(mut change_errors) => {
+                errors.extend(
+                    change_errors
+                        .drain(..)
+                        .map(|error| format!("changes[{index}].{error}")),
+                );
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok((device_id, normalized_changes))
+    } else {
+        Err(LedgerError::InvalidInput(errors))
+    }
+}
+
+fn sync_change_from_push_input(
+    input: &Value,
+    request_device_id: &str,
+    now: &str,
+) -> Result<Value, Vec<String>> {
+    let Some(object) = input.as_object() else {
+        return Err(vec!["must be a JSON object".to_string()]);
+    };
+
+    let mut errors = Vec::new();
+    let source_change_id = required_sync_string(object, "id", &mut errors);
+    let change_device_id = required_sync_string(object, "deviceId", &mut errors);
+    let entity_type = required_sync_enum(
+        object,
+        "entityType",
+        &[
+            "account",
+            "instrument",
+            "holding",
+            "movement",
+            "dca_plan",
+            "category",
+            "counterparty",
+            "quote",
+            "fx_rate",
+            "snapshot",
+            "ai_proposal",
+        ],
+        &mut errors,
+    );
+    let entity_id = required_sync_string(object, "entityId", &mut errors);
+    let operation = required_sync_enum(
+        object,
+        "operation",
+        &["create", "update", "delete", "correction"],
+        &mut errors,
+    );
+    let created_at = required_sync_string(object, "createdAt", &mut errors);
+    let payload = match object.get("payload") {
+        Some(payload) => payload.clone(),
+        None => {
+            errors.push("payload is required".to_string());
+            Value::Null
+        }
+    };
+
+    if let Some(change_device_id) = change_device_id.as_deref()
+        && change_device_id != request_device_id
+    {
+        errors.push("deviceId must match the request deviceId".to_string());
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    let source_change_id = source_change_id.expect("validated source change id");
+    Ok(json!({
+        "id": Value::Null,
+        "deviceId": request_device_id,
+        "sourceDeviceId": request_device_id,
+        "sourceChangeId": source_change_id,
+        "entityType": entity_type.expect("validated entityType"),
+        "entityId": entity_id.expect("validated entityId"),
+        "operation": operation.expect("validated operation"),
+        "payload": payload,
+        "createdAt": created_at.expect("validated createdAt"),
+        "receivedAt": now
+    }))
+}
+
+fn required_sync_string(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    errors: &mut Vec<String>,
+) -> Option<String> {
+    match object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(value) => Some(value.to_string()),
+        None => {
+            errors.push(format!("{key} must be a non-empty string"));
+            None
+        }
+    }
+}
+
+fn required_sync_enum(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    allowed: &[&str],
+    errors: &mut Vec<String>,
+) -> Option<String> {
+    match object.get(key).and_then(Value::as_str) {
+        Some(value) if allowed.contains(&value) => Some(value.to_string()),
+        _ => {
+            errors.push(format!("{key} must be one of {}", allowed.join(", ")));
+            None
+        }
+    }
+}
+
+fn sync_source_change_exists(document: &Value, device_id: &str, source_change_id: &str) -> bool {
+    document["syncChanges"]
+        .as_array()
+        .expect("validated local ledger syncChanges should be an array")
+        .iter()
+        .any(|change| {
+            let change_device_id = change
+                .get("sourceDeviceId")
+                .or_else(|| change.get("deviceId"))
+                .and_then(Value::as_str);
+            let change_source_id = change
+                .get("sourceChangeId")
+                .or_else(|| change.get("id"))
+                .and_then(Value::as_str);
+            change_device_id == Some(device_id) && change_source_id == Some(source_change_id)
+        })
+}
+
 fn append_sync_change(
     document: &mut Value,
     entity_type: &str,
@@ -2498,6 +2709,24 @@ fn append_sync_change(
         "createdAt": now
     });
 
+    append_sync_log_change(document, change);
+    let sync_state = document["syncState"]
+        .as_object_mut()
+        .expect("validated local ledger syncState should be an object");
+    sync_state
+        .entry("pendingChangeIds".to_string())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .expect("validated local ledger pendingChangeIds should be an array")
+        .push(json!(change_id));
+}
+
+fn append_sync_log_change(document: &mut Value, change: Value) {
+    let change_id = change
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("validated sync change id should be a string")
+        .to_string();
     document["syncChanges"]
         .as_array_mut()
         .expect("validated local ledger syncChanges should be an array")
@@ -2506,12 +2735,6 @@ fn append_sync_change(
         .as_object_mut()
         .expect("validated local ledger syncState should be an object");
     sync_state.insert("cursor".to_string(), json!(change_id));
-    sync_state
-        .entry("pendingChangeIds".to_string())
-        .or_insert_with(|| json!([]))
-        .as_array_mut()
-        .expect("validated local ledger pendingChangeIds should be an array")
-        .push(json!(change_id));
 }
 
 fn next_sync_change_id(document: &mut Value) -> String {

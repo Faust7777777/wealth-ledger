@@ -363,9 +363,38 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     assert expense["id"] in confirmed_ids
     assert len(confirmed_ids) >= 3
 
+    remote_push = unwrap_data(
+        request_json(
+            base,
+            "/v1/sync/push",
+            method="POST",
+            body={
+                "deviceId": "smoke_remote_device",
+                "changes": [
+                    {
+                        "id": "smoke_remote_change_000001",
+                        "deviceId": "smoke_remote_device",
+                        "entityType": "account",
+                        "entityId": "acct_smoke_remote",
+                        "operation": "create",
+                        "payload": {"displayName": "Smoke Remote Account"},
+                        "createdAt": "2026-06-28T00:00:00Z",
+                    }
+                ],
+            },
+        )
+    )
+    assert remote_push["acceptedChangeIds"] == ["smoke_remote_change_000001"]
+    assert remote_push["skippedChangeIds"] == []
+    assert len(unwrap_data(request_json(base, "/v1/accounts"))) == 2
+
     final_sync = unwrap_data(request_json(base, "/v1/sync/changes"))
     assert final_sync["cursor"].startswith("local_change_")
     assert any(item["entityType"] == "movement" for item in final_sync["changes"])
+    assert any(
+        item.get("sourceChangeId") == "smoke_remote_change_000001"
+        for item in final_sync["changes"]
+    )
     ack_response = request_json(
         base,
         "/v1/sync/ack",

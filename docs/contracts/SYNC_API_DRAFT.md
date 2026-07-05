@@ -96,6 +96,13 @@ SyncPushRequest {
   changes: SyncChange[];
 }
 
+SyncPushResult {
+  cursor: string;
+  acceptedChangeIds: ID[];
+  skippedChangeIds: ID[]; // idempotent duplicate push
+  conflicts: SyncConflict[];
+}
+
 SyncPullResponse {
   cursor: string;
   changes: SyncChange[];
@@ -115,7 +122,7 @@ SyncAckRequest {
 - confirmed movement create / correction 会追加 `SyncChange`；draft、pending proposal、未确认图片/CSV 不进入 outbox。
 - `GET /v1/sync/changes?since=<cursor>` 可按本地 cursor 拉取之后的 change。
 - `POST /v1/sync/ack` 可清理本地 `pendingChangeIds`，但不删除 `syncChanges` 日志。
-- `POST /v1/sync/push` 目前只做请求校验和禁止 debug/demo payload，不应用远端 change。
+- `POST /v1/sync/push` 会把远端 `SyncChange` 作为同步日志中继保存，给它分配本地 server cursor；不会直接应用到账本实体。
 - 暂不做远端 merge、冲突解决、设备密钥和 E2EE。
 
 ## 5. 冲突处理

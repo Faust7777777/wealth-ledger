@@ -292,6 +292,7 @@ def check_rust_server() -> None:
         "syncChanges",
         "list_sync_changes",
         "ack_sync_changes",
+        "ingest_sync_push",
         "append_sync_change",
         "sync_operation_for_movement",
     ]

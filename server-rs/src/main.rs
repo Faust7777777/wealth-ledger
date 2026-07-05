@@ -2840,6 +2840,17 @@ async fn sync_push(
         );
     }
 
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::ingest_sync_push(path, input, &current_timestamp()) {
+            Ok(result) => envelope(result).into_response(),
+            Err(error) => local_ledger_error(error, "invalid_sync_push"),
+        };
+    }
+
     envelope(json!({
         "cursor": current_sync_cursor(&state, &query),
         "conflicts": []
@@ -4323,6 +4334,81 @@ mod tests {
         .await;
         assert_eq!(ack_invalid_status, StatusCode::BAD_REQUEST);
         assert_eq!(ack_invalid_body["error"]["code"], "invalid_sync_ack");
+
+        let remote_push = json!({
+            "deviceId": "device_remote",
+            "changes": [
+                {
+                    "id": "remote_change_000001",
+                    "deviceId": "device_remote",
+                    "entityType": "account",
+                    "entityId": "acct_remote",
+                    "operation": "create",
+                    "payload": {"displayName": "远端账户"},
+                    "createdAt": "2026-06-28T00:00:00Z"
+                }
+            ]
+        });
+        let (remote_push_status, remote_push_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/sync/push",
+            remote_push.clone(),
+        )
+        .await;
+        assert_eq!(remote_push_status, StatusCode::OK);
+        assert_eq!(
+            remote_push_body["data"]["acceptedChangeIds"],
+            json!(["remote_change_000001"])
+        );
+        assert_eq!(remote_push_body["data"]["skippedChangeIds"], json!([]));
+        assert_eq!(remote_push_body["data"]["cursor"], "local_change_000002");
+
+        let pushed_document =
+            local_ledger::read_document(&path).expect("ledger should persist remote sync push");
+        assert_eq!(
+            pushed_document["accounts"]
+                .as_array()
+                .expect("remote sync push must not apply account payload")
+                .len(),
+            1
+        );
+        assert_eq!(pushed_document["syncState"]["pendingChangeIds"], json!([]));
+        assert_eq!(
+            pushed_document["syncChanges"][1]["sourceChangeId"],
+            "remote_change_000001"
+        );
+        assert_eq!(
+            pushed_document["syncChanges"][1]["deviceId"],
+            "device_remote"
+        );
+        assert_eq!(
+            pushed_document["syncChanges"][1]["payload"]["displayName"],
+            "远端账户"
+        );
+
+        let (remote_retry_status, remote_retry_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/sync/push", remote_push)
+                .await;
+        assert_eq!(remote_retry_status, StatusCode::OK);
+        assert_eq!(remote_retry_body["data"]["acceptedChangeIds"], json!([]));
+        assert_eq!(
+            remote_retry_body["data"]["skippedChangeIds"],
+            json!(["remote_change_000001"])
+        );
+        let retried_document =
+            local_ledger::read_document(&path).expect("ledger should keep idempotent push stable");
+        assert_eq!(
+            retried_document["syncChanges"]
+                .as_array()
+                .expect("duplicate push should not append")
+                .len(),
+            2
+        );
+        assert_eq!(
+            retried_document["syncState"]["cursor"],
+            "local_change_000002"
+        );
 
         let (push_status, push_body) = request_json_body_from(
             router,
