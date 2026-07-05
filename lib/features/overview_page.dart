@@ -8,6 +8,7 @@ import '../core/format.dart';
 import '../core/types.dart';
 import '../data/providers.dart';
 import '../data/view_models.dart';
+import '../shared/money_text.dart';
 import '../shared/widgets.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_dimens.dart';
@@ -344,25 +345,52 @@ class _HoldingRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final dark = Theme.of(context).brightness == Brightness.dark;
+    final brand = dark ? AppColors.brandHover : AppColorsLight.brand;
     final mv = h.marketValue;
-    final value = mv == null ? '—' : formatValued(mv);
-    String pnl = '';
-    Color? pnlColor;
+
+    String? pnl;
+    var pnlTone = MoneyTone.muted;
     final p = h.unrealizedPnl;
     if (p != null) {
       final down = p.amount.startsWith('-');
       final abs = p.amount.replaceFirst(RegExp(r'^[+-]'), '');
       pnl = '浮 ${down ? '−' : '+'}¥${formatDecimalThousands(abs)}';
-      pnlColor = down
-          ? (dark ? AppColors.negative : AppColorsLight.negative)
-          : (dark ? AppColors.positive : AppColorsLight.positive);
+      pnlTone = down ? MoneyTone.negative : MoneyTone.positive;
     }
+
+    final sym = h.symbol.trim();
+    final mono = sym.isEmpty
+        ? '—'
+        : (sym.length <= 2 ? sym : sym.substring(0, 2)).toUpperCase();
+
     return ListTile(
       contentPadding: EdgeInsets.zero,
       dense: true,
-      title: Text('${h.symbol} · ${h.quantity}', style: AppType.bodyStrong),
-      subtitle: pnl.isEmpty ? null : Text(pnl, style: AppType.caption.copyWith(color: pnlColor)),
-      trailing: Text(value, style: AppType.moneyRow),
+      leading: Container(
+        width: 38,
+        height: 38,
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: brand.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+        ),
+        child: Text(mono,
+            style: AppType.caption
+                .copyWith(color: brand, fontWeight: FontWeight.w700)),
+      ),
+      title: Text(sym.isEmpty ? '—' : sym, style: AppType.bodyStrong),
+      subtitle: Text('持仓 ${h.quantity}', style: AppType.caption),
+      trailing: Column(
+        mainAxisSize: MainAxisSize.min,
+        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          MoneyText.optional(mv == null ? null : formatValued(mv),
+              emphasis: true),
+          if (pnl != null)
+            MoneyText(pnl, tone: pnlTone, style: AppType.caption),
+        ],
+      ),
     );
   }
 }
@@ -381,7 +409,7 @@ class _MovementRow extends StatelessWidget {
       subtitle: m.inTransit
           ? Text('在途 · 非支出', style: AppType.caption)
           : null,
-      trailing: amt == null ? null : Text(formatMoney(amt), style: AppType.moneyRow),
+      trailing: amt == null ? null : MoneyText(formatMoney(amt)),
       onTap: () => context.push('/movement/${m.id}'),
     );
   }
@@ -398,7 +426,7 @@ class _AccountRow extends StatelessWidget {
       contentPadding: EdgeInsets.zero,
       dense: true,
       title: Text(a.displayName, style: AppType.body),
-      trailing: Text(v == null ? '—' : formatValued(v), style: AppType.moneyRow),
+      trailing: MoneyText.optional(v == null ? null : formatValued(v)),
       onTap: () => context.push('/account/${a.id}'),
     );
   }
