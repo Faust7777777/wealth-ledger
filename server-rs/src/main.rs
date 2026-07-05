@@ -298,6 +298,15 @@ impl AuthStore {
         self.persist_state(&state);
     }
 
+    fn revoke_access_token(&self, access_token: &str) {
+        let access_hash = token_hash(access_token);
+        let mut state = self.inner.lock().expect("auth store mutex should lock");
+        state
+            .devices
+            .retain(|_, device| device.access_token_hash != access_hash);
+        self.persist_state(&state);
+    }
+
     fn should_require_auth(&self) -> bool {
         self.config.require_auth
     }
@@ -1203,7 +1212,7 @@ async fn auth_logout(
     {
         state.auth.revoke_refresh_token(refresh_token);
     } else if let Some(token) = bearer_token(&headers) {
-        state.auth.revoke_refresh_token(&token);
+        state.auth.revoke_access_token(&token);
     }
     StatusCode::NO_CONTENT
 }
@@ -3932,6 +3941,58 @@ mod tests {
         let (_, final_devices_body) =
             request_json_from(router, Method::GET, "/v1/auth/devices").await;
         assert_eq!(final_devices_body["data"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn auth_logout_with_bearer_revokes_matching_access_token_device() {
+        let auth = AuthStore::configured("wu", hash_password_for_test("correct horse"), false);
+        let router = app_with_state(AppState::dev().with_auth(auth));
+
+        let (login_status, login_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/auth/login",
+            json!({
+                "username": "wu",
+                "password": "correct horse",
+                "deviceName": "Windows"
+            }),
+        )
+        .await;
+        assert_eq!(login_status, StatusCode::OK);
+        let access_token = login_body["data"]["accessToken"]
+            .as_str()
+            .expect("access token should be string")
+            .to_string();
+        let refresh_token = login_body["data"]["refreshToken"]
+            .as_str()
+            .expect("refresh token should be string")
+            .to_string();
+
+        let (logout_status, logout_body) = request_json_with_bearer_from(
+            router.clone(),
+            Method::POST,
+            "/v1/auth/logout",
+            &access_token,
+        )
+        .await;
+        assert_eq!(logout_status, StatusCode::NO_CONTENT);
+        assert_eq!(logout_body, Value::Null);
+
+        let (devices_status, devices_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/auth/devices").await;
+        assert_eq!(devices_status, StatusCode::OK);
+        assert_eq!(devices_body["data"], json!([]));
+
+        let (refresh_status, refresh_body) = request_json_body_from(
+            router,
+            Method::POST,
+            "/v1/auth/refresh",
+            json!({ "refreshToken": refresh_token }),
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(refresh_body["error"]["code"], "invalid_credentials");
     }
 
     #[tokio::test]

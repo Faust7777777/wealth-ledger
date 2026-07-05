@@ -257,6 +257,7 @@ def check_rust_server() -> None:
         "accessTokenHash",
         "token_hash(&refresh_token)",
         "token_hash(&access_token)",
+        "revoke_access_token",
         "ledger_scenario_forbidden",
         "validate_auth_config",
         "FINWEALTH_REQUIRE_AUTH=true requires FINWEALTH_AUTH_USERNAME",
