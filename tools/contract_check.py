@@ -258,6 +258,10 @@ def check_rust_server() -> None:
         "token_hash(&refresh_token)",
         "token_hash(&access_token)",
         "ledger_scenario_forbidden",
+        "validate_auth_config",
+        "FINWEALTH_REQUIRE_AUTH=true requires FINWEALTH_AUTH_USERNAME",
+        "FINWEALTH_REQUIRE_AUTH=true requires FINWEALTH_AUTH_PASSWORD_HASH",
+        "plaintext fallback is not allowed when FINWEALTH_REQUIRE_AUTH=true",
     ]
     missing = [snippet for snippet in required_snippets if snippet not in text]
     if missing:

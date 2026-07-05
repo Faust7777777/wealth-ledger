@@ -157,15 +157,22 @@ impl AuthStore {
                 }
             })
             .unwrap_or_default();
+        let config = AuthConfig {
+            username: env::var("FINWEALTH_AUTH_USERNAME").ok(),
+            password_hash: env::var("FINWEALTH_AUTH_PASSWORD_HASH").ok(),
+            dev_plain_password: env::var("FINWEALTH_AUTH_PASSWORD").ok(),
+            require_auth: env_flag("FINWEALTH_REQUIRE_AUTH"),
+            state_path,
+        };
+        validate_auth_config(&config).unwrap_or_else(|errors| {
+            panic!(
+                "invalid Finwealth auth configuration: {}",
+                errors.join("; ")
+            )
+        });
         Self {
             inner: Arc::new(Mutex::new(state)),
-            config: AuthConfig {
-                username: env::var("FINWEALTH_AUTH_USERNAME").ok(),
-                password_hash: env::var("FINWEALTH_AUTH_PASSWORD_HASH").ok(),
-                dev_plain_password: env::var("FINWEALTH_AUTH_PASSWORD").ok(),
-                require_auth: env_flag("FINWEALTH_REQUIRE_AUTH"),
-                state_path,
-            },
+            config,
         }
     }
 
@@ -2902,6 +2909,48 @@ fn required_auth_string(
     }
 }
 
+fn validate_auth_config(config: &AuthConfig) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    if config.require_auth {
+        match config.username.as_deref() {
+            Some(value) if !value.trim().is_empty() => {}
+            _ => errors
+                .push("FINWEALTH_REQUIRE_AUTH=true requires FINWEALTH_AUTH_USERNAME".to_string()),
+        }
+        match config.password_hash.as_deref() {
+            Some(value) if PasswordHash::new(value).is_ok() => {}
+            Some(_) => errors.push(
+                "FINWEALTH_AUTH_PASSWORD_HASH must be a valid Argon2 password hash".to_string(),
+            ),
+            None => errors.push(
+                "FINWEALTH_REQUIRE_AUTH=true requires FINWEALTH_AUTH_PASSWORD_HASH".to_string(),
+            ),
+        }
+        if config
+            .dev_plain_password
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            errors.push(
+                "FINWEALTH_AUTH_PASSWORD plaintext fallback is not allowed when FINWEALTH_REQUIRE_AUTH=true".to_string(),
+            );
+        }
+    } else if config
+        .password_hash
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty() && PasswordHash::new(value).is_err())
+    {
+        errors
+            .push("FINWEALTH_AUTH_PASSWORD_HASH must be a valid Argon2 password hash".to_string());
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 fn random_token(prefix: &str) -> String {
     let mut bytes = [0_u8; 32];
     OsRng.fill_bytes(&mut bytes);
@@ -3672,6 +3721,68 @@ mod tests {
             serde_json::from_slice(&bytes).expect("response body should be JSON")
         };
         (status, body)
+    }
+
+    #[test]
+    fn auth_config_fails_closed_when_require_auth_is_incomplete() {
+        let missing_hash = AuthConfig {
+            username: Some("wu".to_string()),
+            password_hash: None,
+            dev_plain_password: None,
+            require_auth: true,
+            state_path: None,
+        };
+        let errors = validate_auth_config(&missing_hash).expect_err("hash should be required");
+        assert!(errors.iter().any(|error| error.contains("PASSWORD_HASH")));
+
+        let missing_username = AuthConfig {
+            username: None,
+            password_hash: Some(hash_password_for_test("correct horse")),
+            dev_plain_password: None,
+            require_auth: true,
+            state_path: None,
+        };
+        let errors =
+            validate_auth_config(&missing_username).expect_err("username should be required");
+        assert!(errors.iter().any(|error| error.contains("USERNAME")));
+    }
+
+    #[test]
+    fn auth_config_rejects_plaintext_fallback_when_require_auth_is_enabled() {
+        let config = AuthConfig {
+            username: Some("wu".to_string()),
+            password_hash: Some(hash_password_for_test("correct horse")),
+            dev_plain_password: Some("correct horse".to_string()),
+            require_auth: true,
+            state_path: None,
+        };
+        let errors = validate_auth_config(&config).expect_err("plaintext fallback is unsafe");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("plaintext fallback"))
+        );
+    }
+
+    #[test]
+    fn auth_config_accepts_hash_only_require_auth_and_open_dev_mode() {
+        let require_auth = AuthConfig {
+            username: Some("wu".to_string()),
+            password_hash: Some(hash_password_for_test("correct horse")),
+            dev_plain_password: None,
+            require_auth: true,
+            state_path: None,
+        };
+        validate_auth_config(&require_auth).expect("hash-only auth config should be valid");
+
+        let dev_mode = AuthConfig {
+            username: None,
+            password_hash: None,
+            dev_plain_password: None,
+            require_auth: false,
+            state_path: None,
+        };
+        validate_auth_config(&dev_mode).expect("open dev mode should remain available");
     }
 
     #[tokio::test]
