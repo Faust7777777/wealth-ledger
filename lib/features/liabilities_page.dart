@@ -5,6 +5,8 @@ import 'package:go_router/go_router.dart';
 
 import '../core/format.dart';
 import '../data/providers.dart';
+import '../shared/leading_avatar.dart';
+import '../shared/money_text.dart';
 import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
@@ -40,16 +42,17 @@ class LiabilitiesPage extends ConsumerWidget {
             final a = items[i];
             final v = a.value;
             return ListTile(
-              leading: Icon(accountTypeIcon(a.accountType)),
-              title: Text(a.displayName),
+              leading: LeadingAvatar.icon(accountTypeIcon(a.accountType)),
+              title: Text(a.displayName, style: AppType.bodyStrong),
               subtitle: Text(
                 a.note == null
                     ? accountTypeLabel(a.accountType)
                     : '${accountTypeLabel(a.accountType)} · ${a.note}',
+                style: AppType.caption,
               ),
-              trailing: Text(
-                v == null ? '—' : formatValued(v),
-                style: AppType.moneyRow,
+              trailing: MoneyText.optional(
+                v == null ? null : formatValued(v),
+                tone: MoneyTone.negative,
               ),
               onTap: () => context.push('/account/${a.id}'),
             );
