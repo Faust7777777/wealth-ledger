@@ -238,6 +238,22 @@ final recentMovementsProvider = FutureProvider<List<MovementVm>>(
 final snapshotsProvider = FutureProvider<List<NetWorthSnapshotVm>>(
   (ref) => ref.watch(snapshotRepositoryProvider).listSnapshots(),
 );
+
+/// 数据源能力：realLocal/DEMO 无服务 → 静态只读；local_server → GET /v1/ledger/bootstrap。
+/// 各写入口 watch 此 provider 做 gating（能力缺失时隐藏/禁用）。
+final capabilitiesProvider = FutureProvider<LedgerCapabilities>((ref) async {
+  final mode = _mode(ref);
+  if (mode != DataSourceMode.localServer) {
+    return LedgerCapabilities.readOnly(
+      mode == DataSourceMode.debugFixture ? 'debug_fixture' : 'real_local',
+    );
+  }
+  final data = await ref.watch(devApiClientProvider).getData('/v1/ledger/bootstrap');
+  final caps = data is Map ? data['capabilities'] : null;
+  return caps is Map
+      ? LedgerCapabilities.fromJson(caps.cast<String, dynamic>())
+      : const LedgerCapabilities.readOnly('local_server');
+});
 final categoriesProvider = FutureProvider<List<CategoryVm>>(
   (ref) => ref.watch(taxonomyRepositoryProvider).listCategories(),
 );

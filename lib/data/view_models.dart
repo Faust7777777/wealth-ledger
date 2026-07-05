@@ -545,6 +545,55 @@ class QuoteRefreshResultVm {
       errors.isNotEmpty;
 }
 
+/// 数据源能力（GET /v1/ledger/bootstrap 的 capabilities；realLocal/DEMO 无服务，静态只读）。
+/// 写入口按此 gate：能力为 false 时隐藏/禁用对应入口，避免用户点了报 UnsupportedError。
+class LedgerCapabilities {
+  const LedgerCapabilities({
+    required this.dataSourceMode,
+    required this.canWriteConfirmedLedger,
+    required this.canCreateAccount,
+    required this.canRecordMovement,
+    required this.canConfirmProposal,
+    required this.canPersistPendingProposal,
+    required this.canRefreshQuotes,
+    required this.canUseOutboundQuoteProvider,
+  });
+
+  /// 只读数据源（real_local 默认空账本 / debug_fixture DEMO）——所有写入口关闭。
+  const LedgerCapabilities.readOnly(this.dataSourceMode)
+      : canWriteConfirmedLedger = false,
+        canCreateAccount = false,
+        canRecordMovement = false,
+        canConfirmProposal = false,
+        canPersistPendingProposal = false,
+        canRefreshQuotes = false,
+        canUseOutboundQuoteProvider = false;
+
+  factory LedgerCapabilities.fromJson(Map<String, dynamic> j) =>
+      LedgerCapabilities(
+        dataSourceMode: '${j['dataSourceMode'] ?? 'local_server'}',
+        canWriteConfirmedLedger: j['canWriteConfirmedLedger'] == true,
+        canCreateAccount: j['canCreateAccount'] == true,
+        canRecordMovement: j['canRecordMovement'] == true,
+        canConfirmProposal: j['canConfirmProposal'] == true,
+        canPersistPendingProposal: j['canPersistPendingProposal'] == true,
+        canRefreshQuotes: j['canRefreshQuotes'] == true,
+        canUseOutboundQuoteProvider: j['canUseOutboundQuoteProvider'] == true,
+      );
+
+  final String dataSourceMode;
+  final bool canWriteConfirmedLedger;
+  final bool canCreateAccount;
+  final bool canRecordMovement;
+  final bool canConfirmProposal;
+  final bool canPersistPendingProposal;
+  final bool canRefreshQuotes;
+  final bool canUseOutboundQuoteProvider;
+
+  /// 是否有任一写入口可用（决定「记录」FAB 等是否显示）。
+  bool get anyWrite => canCreateAccount || canRecordMovement;
+}
+
 class PendingSummaryVm {
   const PendingSummaryVm({
     this.aiPendingCount = 0,

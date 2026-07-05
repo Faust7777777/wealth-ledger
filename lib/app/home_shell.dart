@@ -83,11 +83,16 @@ class HomeShell extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final useRail = MediaQuery.sizeOf(context).width >= AppLayout.bpRailIcon;
 
-    final fab = FloatingActionButton.extended(
-      onPressed: () => showRecordSheet(context),
-      icon: const Icon(Icons.add),
-      label: const Text('记录'),
-    );
+    // 写入口 gating：数据源无写入能力（默认 realLocal / DEMO / server 只读）时隐藏「记录」FAB。
+    final canRecord =
+        ref.watch(capabilitiesProvider).asData?.value.canRecordMovement ?? false;
+    final fab = canRecord
+        ? FloatingActionButton.extended(
+            onPressed: () => showRecordSheet(context),
+            icon: const Icon(Icons.add),
+            label: const Text('记录'),
+          )
+        : null;
 
     final appBar = AppBar(
       title: const Text('Wealth Ledger'),
@@ -124,10 +129,13 @@ class HomeShell extends ConsumerWidget {
               selectedIndex: navigationShell.currentIndex,
               onDestinationSelected: _go,
               labelType: NavigationRailLabelType.all,
-              leading: Padding(
-                padding: const EdgeInsets.symmetric(vertical: AppSpacing.md),
-                child: fab,
-              ),
+              leading: fab == null
+                  ? null
+                  : Padding(
+                      padding:
+                          const EdgeInsets.symmetric(vertical: AppSpacing.md),
+                      child: fab,
+                    ),
               destinations: [
                 for (final d in _dests)
                   NavigationRailDestination(
