@@ -1055,10 +1055,17 @@ paths:
           application/json:
             schema:
               type: object
-              required: [cursor]
               properties:
                 cursor:
                   type: string
+                changeIds:
+                  type: array
+                  items:
+                    type: string
+                ackedChangeIds:
+                  type: array
+                  items:
+                    type: string
       responses:
         "204":
           description: Acknowledged.

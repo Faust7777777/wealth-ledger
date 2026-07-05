@@ -1078,7 +1078,7 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/sync/bootstrap", get(sync_bootstrap))
         .route("/v1/sync/changes", get(sync_changes))
         .route("/v1/sync/push", post(sync_push))
-        .route("/v1/sync/ack", post(no_content))
+        .route("/v1/sync/ack", post(sync_ack))
         .route("/v1/transfers/execute", any(forbidden))
         .route("/v1/broker/orders", any(forbidden))
         .route("/v1/broker/buy", any(forbidden))
@@ -2847,6 +2847,25 @@ async fn sync_push(
     .into_response()
 }
 
+async fn sync_ack(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    Json(input): Json<Value>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::ack_sync_changes(path, input) {
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(error) => local_ledger_error(error, "invalid_sync_ack"),
+        };
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn no_content() -> StatusCode {
     StatusCode::NO_CONTENT
 }
@@ -4265,6 +4284,45 @@ mod tests {
         .await;
         assert_eq!(since_status, StatusCode::OK);
         assert_eq!(since_body["data"]["changes"], json!([]));
+
+        let (ack_status, ack_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/sync/ack",
+            json!({"cursor": "local_change_000001"}),
+        )
+        .await;
+        assert_eq!(ack_status, StatusCode::NO_CONTENT);
+        assert_eq!(ack_body, Value::Null);
+        let acked_document = local_ledger::read_document(&path).expect("ledger should persist ack");
+        assert_eq!(acked_document["syncState"]["pendingChangeIds"], json!([]));
+        assert_eq!(
+            acked_document["syncChanges"]
+                .as_array()
+                .expect("syncChanges should stay as immutable log")
+                .len(),
+            1
+        );
+
+        let (ack_retry_status, ack_retry_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/sync/ack",
+            json!({"changeIds": ["local_change_000001"]}),
+        )
+        .await;
+        assert_eq!(ack_retry_status, StatusCode::NO_CONTENT);
+        assert_eq!(ack_retry_body, Value::Null);
+
+        let (ack_invalid_status, ack_invalid_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/sync/ack",
+            json!({"cursor": "local_change_missing"}),
+        )
+        .await;
+        assert_eq!(ack_invalid_status, StatusCode::BAD_REQUEST);
+        assert_eq!(ack_invalid_body["error"]["code"], "invalid_sync_ack");
 
         let (push_status, push_body) = request_json_body_from(
             router,

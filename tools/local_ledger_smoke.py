@@ -363,6 +363,18 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     assert expense["id"] in confirmed_ids
     assert len(confirmed_ids) >= 3
 
+    final_sync = unwrap_data(request_json(base, "/v1/sync/changes"))
+    assert final_sync["cursor"].startswith("local_change_")
+    assert any(item["entityType"] == "movement" for item in final_sync["changes"])
+    ack_response = request_json(
+        base,
+        "/v1/sync/ack",
+        method="POST",
+        body={"cursor": final_sync["cursor"]},
+        expected_status=204,
+    )
+    assert ack_response == {}
+
     forbidden = request_json(
         base,
         "/v1/broker/orders",
@@ -376,6 +388,8 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     persisted = json.loads(ledger_path.read_text(encoding="utf-8"))
     assert len(persisted["accounts"]) == 2
     assert len(persisted["snapshots"]) == 1
+    assert persisted["syncState"]["pendingChangeIds"] == []
+    assert len(persisted["syncChanges"]) >= len(final_sync["changes"])
     assert any(item["source"]["kind"] == "ai_proposal" for item in persisted["movements"])
 
 

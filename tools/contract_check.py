@@ -291,6 +291,7 @@ def check_rust_server() -> None:
         "normalized_lock_path",
         "syncChanges",
         "list_sync_changes",
+        "ack_sync_changes",
         "append_sync_change",
         "sync_operation_for_movement",
     ]

@@ -184,6 +184,45 @@ pub fn list_sync_changes(path: &Path, since: Option<&str>) -> io::Result<Value> 
     Ok(sync_changes_for_document(&document, since))
 }
 
+pub fn ack_sync_changes(path: &Path, input: Value) -> Result<Value, LedgerError> {
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let ack_change_ids = sync_ack_change_ids_for_input(&document, &input)?;
+        let pending_change_ids = document["syncState"]["pendingChangeIds"]
+            .as_array_mut()
+            .expect("validated local ledger pendingChangeIds should be an array");
+        let pending_before = pending_change_ids
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let acked_change_ids = ack_change_ids
+            .iter()
+            .filter(|change_id| pending_before.contains(change_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let skipped_change_ids = ack_change_ids
+            .iter()
+            .filter(|change_id| !pending_before.contains(change_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        pending_change_ids.retain(|value| {
+            value
+                .as_str()
+                .is_none_or(|change_id| !ack_change_ids.iter().any(|id| id == change_id))
+        });
+        let pending_after = pending_change_ids.clone();
+        write_document(path, &document)?;
+        Ok(json!({
+            "cursor": document["syncState"]["cursor"],
+            "ackedChangeIds": acked_change_ids,
+            "skippedChangeIds": skipped_change_ids,
+            "pendingChangeIds": pending_after
+        }))
+    })
+}
+
 pub fn list_account_anomalies(path: &Path, now: &str) -> io::Result<Value> {
     let document = load_or_initialize(path)?;
     Ok(json!(account_anomalies_for_document(&document, now)?))
@@ -2360,6 +2399,84 @@ fn sync_changes_for_document(document: &Value, since: Option<&str>) -> Value {
         })
         .unwrap_or(0);
     json!(changes.iter().skip(start).cloned().collect::<Vec<_>>())
+}
+
+fn sync_ack_change_ids_for_input(
+    document: &Value,
+    input: &Value,
+) -> Result<Vec<String>, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "sync ack request must be a JSON object".to_string(),
+        ]));
+    };
+
+    let changes = document["syncChanges"]
+        .as_array()
+        .expect("validated local ledger syncChanges should be an array");
+    let known_change_ids = changes
+        .iter()
+        .filter_map(|change| change.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut ack_change_ids = Vec::new();
+    let mut errors = Vec::new();
+
+    if let Some(cursor_value) = object.get("cursor") {
+        match cursor_value
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(cursor) => match changes
+                .iter()
+                .position(|change| change.get("id").and_then(Value::as_str) == Some(cursor))
+            {
+                Some(index) => {
+                    for change in changes.iter().take(index + 1) {
+                        if let Some(change_id) = change.get("id").and_then(Value::as_str) {
+                            ack_change_ids.push(change_id.to_string());
+                        }
+                    }
+                }
+                None => errors.push(format!(
+                    "cursor must reference an existing sync change: {cursor}"
+                )),
+            },
+            None => errors.push("cursor must be a non-empty string when present".to_string()),
+        }
+    }
+
+    for key in ["changeIds", "ackedChangeIds"] {
+        if let Some(value) = object.get(key) {
+            match string_array(value) {
+                Some(change_ids) => ack_change_ids.extend(change_ids),
+                None => errors.push(format!("{key} must be an array of non-empty strings")),
+            }
+        }
+    }
+
+    ack_change_ids.sort();
+    ack_change_ids.dedup();
+
+    if ack_change_ids.is_empty() && errors.is_empty() {
+        errors.push("sync ack request must include cursor or changeIds".to_string());
+    }
+    for change_id in &ack_change_ids {
+        if !known_change_ids
+            .iter()
+            .any(|known_id| known_id == change_id)
+        {
+            errors.push(format!(
+                "changeIds contains unknown sync change id: {change_id}"
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(ack_change_ids)
+    } else {
+        Err(LedgerError::InvalidInput(errors))
+    }
 }
 
 fn append_sync_change(
