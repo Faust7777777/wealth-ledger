@@ -162,8 +162,12 @@ def check_examples() -> None:
     if dca is None:
         fail("Missing dca_mark_executed_proposal.response.json")
     dca_text = json.dumps(dca, ensure_ascii=False)
-    if "不下单" not in dca_text or "不转账" not in dca_text:
-        fail("DCA example must state no order and no transfer")
+    if (
+        "不下单" not in dca_text
+        or "不转账" not in dca_text
+        or "确认前不影响正式账本" not in dca_text
+    ):
+        fail("DCA example must state no order, no transfer, and no confirmed-ledger effect before confirmation")
     proposed = require_path(dca, "data.proposedMovements")
     if not isinstance(proposed, list) or not proposed:
         fail("DCA example must create a proposed movement")

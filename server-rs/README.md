@@ -147,6 +147,11 @@ demo integration.
 The validator rejects debug fixture markers and basic invalid money shapes so a
 real-local file cannot silently become demo data.
 
+DCA "record executed" in real-local mode may persist a pending proposal/draft so
+the review flow survives refresh/restart. It still does not place orders,
+execute transfers, or affect the confirmed/effective ledger until the user
+confirms the atomic group.
+
 The Rust dev server also accepts two temporary compatibility aliases for early
 frontend integration:
 

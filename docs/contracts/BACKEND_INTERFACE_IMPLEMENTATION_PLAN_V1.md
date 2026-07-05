@@ -186,7 +186,7 @@ Claude 前端可读取：
 
 1. AI 只产 proposal，不直接写账。
 2. atomic group 是最小确认单位。
-3. DCA 的“记录已执行”只生成候选记录，不下单、不转账。
+3. DCA 的“记录已执行”只生成 pending 候选记录 / draft，不下单、不转账；确认前不影响 confirmed/effective ledger。
 4. debug fixture 不同步、不写正式账本。
 5. confirmed movement 不静默覆盖，优先 correction。
 6. `unpriceable` 不按 0 计入净值。

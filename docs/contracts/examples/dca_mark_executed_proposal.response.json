@@ -14,7 +14,7 @@
         "recordedAt": "2026-07-10T09:05:00+08:00",
         "status": "pending_review",
         "title": "记录沪深300定投",
-        "description": "用户点击“记录已执行”后生成的候选记录；不下单、不转账。",
+        "description": "用户点击“记录已执行”后生成的候选记录；不下单、不转账；确认前不影响正式账本。",
         "entries": [
           {
             "id": "entry_dca_cash_out",
@@ -50,7 +50,7 @@
     "warnings": [
       {
         "code": "record_only_no_order",
-        "message": "该候选只记录用户已执行的定投，不连接券商、不下单、不转账。",
+        "message": "该候选只记录用户已执行的定投，不连接券商、不下单、不转账；确认前不影响正式账本。",
         "severity": "info"
       }
     ],
@@ -61,4 +61,3 @@
     }
   }
 }
-

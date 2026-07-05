@@ -385,7 +385,7 @@ DcaReminder {
 
 UI 动作：
 
-- `记录已执行`：只生成待确认 Movement proposal。
+- `记录已执行`：只生成待确认 Movement proposal / draft；可持久化等待复核，但确认前不影响 confirmed/effective ledger。
 - `跳过本期`：记录提醒状态，不生成交易。
 - `稍后提醒`：snooze。
 
@@ -518,4 +518,3 @@ SnapshotRepository
 ```
 
 旧 `API_CONTRACT_V1.md` 如存在，仅作为 legacy reference，不驱动 UI / Repository 命名。
-

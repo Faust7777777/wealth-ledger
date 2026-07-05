@@ -12,7 +12,7 @@ Claude 前端当前第一阶段默认应使用 `real_local` 空账本和隔离 `
 - 空账本。
 - 首页降级态。
 - AI old → new diff。
-- DCA “记录已执行”只生成 proposal。
+- DCA “记录已执行”只生成 pending proposal / draft；mock 不持久化，真实本地账本可持久化但确认前不影响 confirmed/effective ledger。
 - 报价 stale / offline_cached。
 
 这些状态应来自契约 examples，而不是临时乱造字段。
@@ -136,4 +136,3 @@ mock/stub 只有满足以下条件才可进入仓库：
 - mock server 不监听公网地址。
 - mock server 有清晰 `MOCK` 响应头或日志。
 - 前端默认仍为 `real_local`。
-

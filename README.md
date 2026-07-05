@@ -178,4 +178,6 @@ Defaults:
 - No broker order placement.
 - No AI direct ledger writes.
 - No coupon planning or consumption optimization module.
-- DCA "record executed" creates a proposal only; it never places an order.
+- DCA "record executed" creates a pending proposal/draft only; it never places
+  an order or transfer, and it affects the confirmed/effective ledger only after
+  user confirmation.

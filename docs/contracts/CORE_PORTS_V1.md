@@ -297,6 +297,8 @@ markDcaExecutedAsProposal(reminderId: ID): AiAtomicGroup
 - 不下单。
 - 不转账。
 - 不连接券商交易接口。
+- pending proposal / draft 可以持久化，但用户确认前不得写入 confirmed/effective ledger。
+- 确认 atomic group 后才影响余额、持仓、净值和快照。
 
 ## 7. Data source mode
 
@@ -320,4 +322,3 @@ DataSourceMode = "real_local" | "debug_fixture" | "api_remote";
 4. 最后接 VPS sync。
 
 不建议一开始直接写数据库表。先把 atomic group、proposal 隔离、snapshot invalidation、debug fixture 隔离跑通。
-

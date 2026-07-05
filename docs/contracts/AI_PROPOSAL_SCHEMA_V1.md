@@ -212,7 +212,7 @@ EditAtomicGroup {
 
 ## 8. DCA proposal
 
-定投提醒的“记录已执行”生成 proposal，而不是交易。
+定投提醒的“记录已执行”生成 pending proposal / draft，而不是外部交易执行。
 
 ```ts
 DcaExecutedProposal {
@@ -227,5 +227,6 @@ DcaExecutedProposal {
 - 不连接券商。
 - 不下单。
 - 不转账。
-- 用户确认后才生成正式 Movement。
-
+- pending proposal / draft 可以持久化，以便刷新或重启后继续复核。
+- 用户确认前不写 confirmed/effective ledger，不影响余额、持仓、净值或快照。
+- 用户确认 atomic group 后才生成正式 Movement。

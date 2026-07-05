@@ -19,8 +19,7 @@
   AI 修改已有记录的 old → new diff 示例。
 
 - `dca_mark_executed_proposal.response.json`  
-  DCA“记录已执行”只生成候选 atomic group，不下单、不转账。
+  DCA“记录已执行”只生成候选 atomic group，不下单、不转账；pending proposal / draft 可持久化，但确认前不影响正式账本。
 
 - `quote_refresh_stale.response.json`  
   报价/汇率刷新部分失败，使用 stale / offline cache 的示例。
-

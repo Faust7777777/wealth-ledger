@@ -64,7 +64,7 @@ python tools/contract_check.py
 - README 引用的当前契约文件都存在。
 - OpenAPI 不包含禁止端点。
 - `HTTP_API_V1.md` 中允许的 endpoint 都存在于 OpenAPI。
-- AI/DCA 的关键不变量存在：atomic group approval、old → new diff、DCA 只生成 proposal。
+- AI/DCA 的关键不变量存在：atomic group approval、old → new diff、DCA 只生成 pending proposal / draft 且确认前不影响 confirmed/effective ledger。
 - `examples/*.json` 可解析，并满足关键示例不变量：空账本不含账户、AI 修改有 diff、DCA 示例明确不下单/不转账且只生成 pending review、报价示例包含 stale/offline cached。
 
 ## 本地只读 mock API

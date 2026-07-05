@@ -185,10 +185,11 @@ POST  /v1/dca/reminders/{reminderId}/snooze
 
 规则：
 
-- `mark-executed-as-proposal` 只生成 AI / manual proposal。
+- `mark-executed-as-proposal` 只生成 pending AI / manual proposal 或 draft，可持久化用于复核。
 - 不下单。
 - 不转账。
 - 不连接券商交易接口。
+- 用户确认前不写 confirmed/effective ledger；确认 atomic group 后才影响余额、持仓、净值和快照。
 
 ## 8. AI Proposals
 
@@ -282,4 +283,3 @@ POST /v1/ai/auto-approve
 POST /v1/ai/write-ledger-directly
 POST /v1/coupons/plan
 ```
-

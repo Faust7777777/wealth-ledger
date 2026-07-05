@@ -206,7 +206,7 @@ POST /v1/coupons/plan
 2. `debug_fixture` 仍只在 debug/demo 下出现，并显示 DEMO。
 3. `api_mock/dev_server` 能渲染 `empty` 与 `degraded` 首页。
 4. AI 待确认页能渲染 old → new diff。
-5. DCA “记录已执行”按钮只生成/展示 pending review proposal，不出现下单/转账语义。
+5. DCA “记录已执行”按钮只生成/展示 pending review proposal / draft，不出现下单/转账语义；确认前不影响 confirmed/effective ledger。
 6. 禁止端点即使被误调，也以 403 呈现为产品边界错误。
 
 后端线验收命令：
