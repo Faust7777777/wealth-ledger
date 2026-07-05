@@ -75,54 +75,130 @@ class _Hero extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final dark = Theme.of(context).brightness == Brightness.dark;
+    final inset = dark ? AppColors.bgInset : AppColorsLight.bgInset;
+    final hair = dark ? AppColors.hairline : AppColorsLight.hairline;
+    final textSec = dark ? AppColors.textSecondary : AppColorsLight.textSecondary;
+    final textTer = dark ? AppColors.textTertiary : AppColorsLight.textTertiary;
+    final brand = dark ? AppColors.brand : AppColorsLight.brand;
+    final warn = dark ? AppColors.warningText : AppColorsLight.warning;
+
     final snap = o.latestSnapshot;
-    final muted = Theme.of(context).textTheme.bodySmall;
     final estimated = snap != null &&
         (snap.quality == ValueQuality.estimated ||
             snap.quality == ValueQuality.incomplete);
-    final amount = snap == null
-        ? '—'
-        : '${estimated ? '≈ ' : ''}${formatMoney(snap.netWorth)}';
+    final amount = snap == null ? '—' : formatMoney(snap.netWorth);
 
     final change = o.changeSinceLastSnapshot;
-    Widget? deltaLine;
+    Widget? deltaPill;
     if (change != null) {
       final down = change.amount.startsWith('-');
       final abs = change.amount.replaceFirst(RegExp(r'^[+-]'), '');
       final label = o.quoteStatusSummary.allFresh ? '今日' : '较上次快照';
-      final color =
-          down ? (dark ? AppColors.negative : AppColorsLight.negative) : (dark ? AppColors.positive : AppColorsLight.positive);
-      deltaLine = Padding(
-        padding: const EdgeInsets.only(top: AppSpacing.xs),
-        child: Text('${down ? '▼' : '▲'} ¥${formatDecimalThousands(abs)}  $label',
-            style: AppType.body.copyWith(color: color)),
+      final c = down
+          ? (dark ? AppColors.negative : AppColorsLight.negative)
+          : (dark ? AppColors.positive : AppColorsLight.positive);
+      deltaPill = Container(
+        padding: const EdgeInsets.symmetric(horizontal: AppSpacing.sm, vertical: 3),
+        decoration: BoxDecoration(
+          color: c.withValues(alpha: 0.14),
+          borderRadius: BorderRadius.circular(AppRadius.pill),
+        ),
+        child: Text(
+          '${down ? '▼' : '▲'} ¥${formatDecimalThousands(abs)} · $label',
+          style: AppType.caption.copyWith(color: c, fontWeight: FontWeight.w600),
+        ),
       );
     }
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text('净资产 · CNY', style: muted),
-        const SizedBox(height: AppSpacing.sm),
-        Text(amount, style: Theme.of(context).textTheme.displayLarge),
-        ?deltaLine,
-        if (!o.quoteStatusSummary.allFresh)
-          Padding(
-            padding: const EdgeInsets.only(top: AppSpacing.sm),
-            child: Text(
-              '◐ ${o.quoteStatusSummary.staleCount} 项报价过期 · 本地缓存',
-              style: AppType.caption.copyWith(
-                  color: dark ? AppColors.warningText : AppColorsLight.warning),
+    return Container(
+      padding: const EdgeInsets.all(AppSpacing.xl),
+      decoration: BoxDecoration(
+        color: inset,
+        borderRadius: BorderRadius.circular(AppRadius.lg),
+        border: Border.all(color: hair, width: AppStroke.hairline),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 3,
+                height: 13,
+                decoration: BoxDecoration(
+                  color: brand,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(width: AppSpacing.sm),
+              Text('净资产',
+                  style: AppType.caption.copyWith(color: textSec, letterSpacing: 0.5)),
+              const Spacer(),
+              Text('CNY', style: AppType.micro.copyWith(color: textTer)),
+            ],
+          ),
+          const SizedBox(height: AppSpacing.md),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              if (estimated)
+                Padding(
+                  padding: const EdgeInsets.only(right: 6, bottom: 8),
+                  child: Text('≈',
+                      style: AppType.h1.copyWith(color: textTer)),
+                ),
+              Flexible(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(amount,
+                      style: Theme.of(context).textTheme.displayLarge),
+                ),
+              ),
+            ],
+          ),
+          if (deltaPill != null)
+            Padding(
+              padding: const EdgeInsets.only(top: AppSpacing.md),
+              child: deltaPill,
+            ),
+          if (!o.quoteStatusSummary.allFresh)
+            Padding(
+              padding: const EdgeInsets.only(top: AppSpacing.sm),
+              child: Row(
+                children: [
+                  Icon(Icons.brightness_medium_outlined, size: 14, color: warn),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '${o.quoteStatusSummary.staleCount} 项报价过期 · 使用本地缓存',
+                      style: AppType.caption.copyWith(color: warn),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          const SizedBox(height: AppSpacing.sm),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton(
+              onPressed: () => context.push('/snapshots'),
+              style: TextButton.styleFrom(
+                padding: EdgeInsets.zero,
+                minimumSize: Size.zero,
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text('净值历史'),
+                  Icon(Icons.chevron_right, size: 16),
+                ],
+              ),
             ),
           ),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: TextButton(
-            onPressed: () => context.push('/snapshots'),
-            child: const Text('查看历史'),
-          ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 }

@@ -25,6 +25,9 @@ void main() {
     ));
     await tester.pumpAndSettle();
 
-    expect(find.text('≈ ¥245,678.90'), findsOneWidget);
+    // Hero 重设计：净值数字与「≈」估算标记分开渲染。
+    expect(find.text('¥245,678.90'), findsWidgets);
+    expect(find.text('≈'), findsOneWidget);
+    expect(find.text('净资产'), findsOneWidget);
   });
 }
