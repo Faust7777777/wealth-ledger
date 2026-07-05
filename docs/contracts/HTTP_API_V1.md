@@ -286,6 +286,7 @@ POST /v1/sync/ack
 当前 real-local 阶段只实现本地 outbox：
 
 - account create / update / archive 会追加 `SyncChange`。
+- confirmed movement create / correction 会追加 `SyncChange`；draft、pending proposal、未确认图片/CSV 不进入 outbox。
 - `GET /v1/sync/changes?since=<cursor>` 返回该 cursor 之后的本地 change。
 - `POST /v1/sync/push` 仍只校验请求和禁止 debug/demo payload，不应用远端变更。
 - 不做远端 merge、不做冲突解决、不做 E2EE 同步。

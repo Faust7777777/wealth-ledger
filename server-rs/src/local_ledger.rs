@@ -828,6 +828,7 @@ pub fn confirm_atomic_group(
         }
 
         if !confirmed_movement_ids.is_empty() {
+            let mut movement_sync_changes = Vec::new();
             let movements = document["movements"]
                 .as_array_mut()
                 .expect("validated local ledger movements should be an array");
@@ -840,7 +841,27 @@ pub fn confirm_atomic_group(
                 ) {
                     movement["status"] = json!(confirmed_status_for_movement(movement));
                     movement["updatedAt"] = json!(now);
+                    let movement_id = movement
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .expect("validated movement id should be a string")
+                        .to_string();
+                    movement_sync_changes.push((
+                        movement_id,
+                        sync_operation_for_movement(movement),
+                        project_movement_for_api(movement),
+                    ));
                 }
+            }
+            for (movement_id, operation, payload) in movement_sync_changes {
+                append_sync_change(
+                    &mut document,
+                    "movement",
+                    &movement_id,
+                    operation,
+                    &payload,
+                    now,
+                );
             }
             mark_dca_reminders_recorded_for_movements(&mut document, &candidate_movements, now);
         }
@@ -4034,6 +4055,14 @@ fn confirmed_status_for_movement(movement: &Value) -> &'static str {
     }
 }
 
+fn sync_operation_for_movement(movement: &Value) -> &'static str {
+    if movement.get("type").and_then(Value::as_str) == Some("correction") {
+        "correction"
+    } else {
+        "create"
+    }
+}
+
 fn is_liability_account(account: &Value) -> bool {
     matches!(
         account.get("balanceMode").and_then(Value::as_str),
@@ -5658,6 +5687,19 @@ fn confirm_ai_movement_atomic_group(
 
     for movement in &movements_to_append {
         append_movement_with_entries(document, movement)?;
+        let movement_id = movement
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("validated AI movement id should be a string");
+        let payload = project_movement_for_api(movement);
+        append_sync_change(
+            document,
+            "movement",
+            movement_id,
+            sync_operation_for_movement(movement),
+            &payload,
+            now,
+        );
     }
     set_ai_atomic_group_status(document, atomic_group_id, "approved")?;
 

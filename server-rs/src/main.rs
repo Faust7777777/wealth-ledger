@@ -4832,6 +4832,18 @@ mod tests {
             persisted["accounts"][0]["cashBalances"][0]["amount"],
             "82.00"
         );
+        let sync_changes = persisted["syncChanges"]
+            .as_array()
+            .expect("syncChanges should be an array");
+        let movement_changes = sync_changes
+            .iter()
+            .filter(|change| change["entityType"] == "movement")
+            .collect::<Vec<_>>();
+        assert_eq!(movement_changes.len(), 1);
+        assert_eq!(movement_changes[0]["operation"], "create");
+        assert_eq!(movement_changes[0]["entityId"], movement_id);
+        assert_eq!(movement_changes[0]["payload"]["status"], "confirmed");
+        assert_eq!(movement_changes[0]["payload"]["title"], "瑞幸咖啡");
 
         let _ = std::fs::remove_file(path);
     }
@@ -6333,6 +6345,10 @@ mod tests {
         .await;
         assert_eq!(confirm_correction_status, StatusCode::OK);
         assert_eq!(confirm_correction_body["data"]["ledgerWrite"], true);
+        let correction_movement_id = confirm_correction_body["data"]["confirmedMovementIds"][0]
+            .as_str()
+            .expect("correction movement id should be string")
+            .to_string();
 
         let (account_after_status, account_after_body) = request_json_from(
             router.clone(),
@@ -6361,6 +6377,18 @@ mod tests {
         );
         assert_eq!(persisted["movements"][1]["type"], "correction");
         assert_eq!(persisted["movements"][1]["status"], "confirmed");
+        let movement_changes = persisted["syncChanges"]
+            .as_array()
+            .expect("syncChanges should be an array")
+            .iter()
+            .filter(|change| change["entityType"] == "movement")
+            .collect::<Vec<_>>();
+        assert_eq!(movement_changes.len(), 2);
+        assert_eq!(movement_changes[0]["operation"], "create");
+        assert_eq!(movement_changes[0]["entityId"], original_movement_id);
+        assert_eq!(movement_changes[1]["operation"], "correction");
+        assert_eq!(movement_changes[1]["entityId"], correction_movement_id);
+        assert_eq!(movement_changes[1]["payload"]["type"], "correction");
 
         let _ = std::fs::remove_file(path);
     }
@@ -6753,6 +6781,10 @@ mod tests {
         .await;
         assert_eq!(confirm_status, StatusCode::OK);
         assert_eq!(confirm_body["data"]["ledgerWrite"], true);
+        let confirmed_movement_id = confirm_body["data"]["confirmedMovementIds"][0]
+            .as_str()
+            .expect("confirmed movement id should be string")
+            .to_string();
         assert_eq!(
             confirm_body["data"]["confirmedMovementIds"]
                 .as_array()
@@ -6781,6 +6813,20 @@ mod tests {
         let persisted = local_ledger::read_document(&path).expect("ledger should persist AI write");
         assert_eq!(persisted["movements"][0]["source"]["kind"], "ai_proposal");
         assert_eq!(persisted["aiProposals"][0]["status"], "approved");
+        let movement_changes = persisted["syncChanges"]
+            .as_array()
+            .expect("syncChanges should be an array")
+            .iter()
+            .filter(|change| change["entityType"] == "movement")
+            .collect::<Vec<_>>();
+        assert_eq!(movement_changes.len(), 1);
+        assert_eq!(movement_changes[0]["operation"], "create");
+        assert_eq!(movement_changes[0]["entityId"], confirmed_movement_id);
+        assert_eq!(
+            movement_changes[0]["payload"]["source"]["kind"],
+            "ai_proposal"
+        );
+        assert_eq!(movement_changes[0]["payload"]["title"], "AI 整理：午餐");
 
         let _ = std::fs::remove_file(path);
     }

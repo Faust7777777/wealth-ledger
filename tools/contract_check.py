@@ -292,6 +292,7 @@ def check_rust_server() -> None:
         "syncChanges",
         "list_sync_changes",
         "append_sync_change",
+        "sync_operation_for_movement",
     ]
     missing_lock_snippets = [
         snippet for snippet in ledger_lock_snippets if snippet not in local_ledger_text

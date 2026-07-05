@@ -106,6 +106,7 @@ SyncPullResponse {
 当前 Rust real-local 实现状态：
 
 - 已实现本地 outbox 的第一步：account create / update / archive 会追加 `SyncChange`。
+- confirmed movement create / correction 会追加 `SyncChange`；draft、pending proposal、未确认图片/CSV 不进入 outbox。
 - `GET /v1/sync/changes?since=<cursor>` 可按本地 cursor 拉取之后的 change。
 - `POST /v1/sync/push` 目前只做请求校验和禁止 debug/demo payload，不应用远端 change。
 - 暂不做远端 merge、冲突解决、设备密钥和 E2EE。

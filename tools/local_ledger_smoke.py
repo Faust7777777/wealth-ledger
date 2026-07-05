@@ -324,6 +324,18 @@ def run_smoke(base: str, ledger_path: Path) -> None:
 
     expense = create_and_confirm_manual_expense(base, cash["id"])
     assert expense["title"] == "local smoke coffee"
+    sync_after_expense = unwrap_data(
+        request_json(base, f"/v1/sync/changes?since={sync['cursor']}")
+    )
+    expense_changes = [
+        item
+        for item in sync_after_expense["changes"]
+        if item["entityType"] == "movement" and item["entityId"] == expense["id"]
+    ]
+    assert len(expense_changes) == 1
+    assert expense_changes[0]["operation"] == "create"
+    assert expense_changes[0]["payload"]["status"] == "confirmed"
+    assert expense_changes[0]["payload"]["title"] == "local smoke coffee"
 
     create_dca_and_mark_executed(base, cash["id"])
     create_and_confirm_ai_csv(base, cash["id"])
