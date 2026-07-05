@@ -1994,7 +1994,7 @@ async fn enrich_quote_refresh_with_yahoo(
             "fxRates": [],
             "errors": [{
                 "targetType": "request",
-                "message": "quote provider disabled by FINWEALTH_QUOTE_PROVIDER=none; pass quotes/fxRates payload or keep using cache",
+                "message": "quote provider is disabled; set FINWEALTH_QUOTE_PROVIDER=yahoo to opt in, or pass quotes/fxRates payload",
                 "retryable": false
             }],
             "completedAt": now
@@ -2089,14 +2089,12 @@ async fn enrich_quote_refresh_with_yahoo(
 }
 
 fn quote_provider_disabled() -> bool {
-    env::var("FINWEALTH_QUOTE_PROVIDER")
-        .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "none" | "off" | "disabled"
-            )
-        })
-        .unwrap_or(false)
+    let value = env::var("FINWEALTH_QUOTE_PROVIDER").ok();
+    quote_provider_disabled_value(value.as_deref())
+}
+
+fn quote_provider_disabled_value(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| value.trim().eq_ignore_ascii_case("yahoo"))
 }
 
 async fn yahoo_latest_quote(
@@ -5083,7 +5081,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_ledger_quote_refresh_reports_missing_symbol_without_fabricating_price() {
+    async fn local_ledger_quote_refresh_is_disabled_by_default_without_fabricating_price() {
         let path = unique_test_ledger_path("quote_refresh_missing_symbol");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
         let router = app_with_state(AppState::local(path.clone()));
@@ -5175,7 +5173,7 @@ mod tests {
         assert_eq!(refresh_body["data"]["quotes"], json!([]));
         assert_eq!(
             refresh_body["data"]["errors"][0]["message"],
-            "instrument has no Yahoo symbol; add symbol or pass manual quote payload"
+            "quote provider is disabled; set FINWEALTH_QUOTE_PROVIDER=yahoo to opt in, or pass quotes/fxRates payload"
         );
 
         let persisted = local_ledger::read_document(&path).expect("ledger should be readable");
@@ -5372,6 +5370,18 @@ mod tests {
             points[0]["sourceUrl"],
             "https://finance.yahoo.com/quote/AAPL/history"
         );
+    }
+
+    #[test]
+    fn quote_provider_is_private_by_default_and_requires_explicit_opt_in() {
+        assert!(quote_provider_disabled_value(None));
+        assert!(quote_provider_disabled_value(Some("")));
+        assert!(quote_provider_disabled_value(Some("none")));
+        assert!(quote_provider_disabled_value(Some("off")));
+        assert!(quote_provider_disabled_value(Some("disabled")));
+        assert!(quote_provider_disabled_value(Some("unknown")));
+        assert!(!quote_provider_disabled_value(Some("yahoo")));
+        assert!(!quote_provider_disabled_value(Some(" Yahoo ")));
     }
 
     #[tokio::test]

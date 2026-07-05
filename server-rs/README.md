@@ -47,7 +47,8 @@ cargo run --manifest-path server-rs/Cargo.toml -- --port 8791 --ledger-path .\tm
 - configurable local auth for login/refresh/devices; dev-compatible tokens are
   used only when auth env vars are absent
 - no real AI
-- Yahoo-backed quote/FX/historical-price fetches when symbols are configured
+- outbound quote/FX/historical-price fetches are disabled by default; set
+  `FINWEALTH_QUOTE_PROVIDER=yahoo` to opt in when symbols are configured
 - no real sync
 - no transfer execution
 - no broker order endpoints

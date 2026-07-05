@@ -52,10 +52,12 @@ FINWEALTH_REQUIRE_AUTH=true
 FINWEALTH_AUTH_USERNAME=your-name
 FINWEALTH_AUTH_PASSWORD_HASH=$argon2id$...
 FINWEALTH_RS_ADDR=127.0.0.1:8790
-FINWEALTH_QUOTE_PROVIDER=yahoo
+FINWEALTH_QUOTE_PROVIDER=none
 ```
 
-Do not put plaintext passwords in this file.
+Do not put plaintext passwords in this file. Keep `FINWEALTH_QUOTE_PROVIDER=none`
+unless you explicitly accept outbound ticker/FX lookup requests from the VPS; set
+it to `yahoo` only after that opt-in.
 
 Then start:
 

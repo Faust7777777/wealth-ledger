@@ -11,14 +11,25 @@ EnvironmentFile=/etc/finwealth/server.env
 ExecStart=/opt/finwealth/finwealth-server --ledger-path /var/lib/finwealth/ledger.json
 Restart=on-failure
 RestartSec=3
+UMask=0077
+StateDirectory=finwealth
+StateDirectoryMode=0700
 
 NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateDevices=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/finwealth
 LockPersonality=true
 MemoryDenyWriteExecute=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

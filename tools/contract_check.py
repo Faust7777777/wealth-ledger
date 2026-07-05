@@ -25,6 +25,8 @@ DEV_SERVER = ROOT / "server" / "dev_server.py"
 RUST_SERVER = ROOT / "server-rs" / "src" / "main.rs"
 RUST_MANIFEST = ROOT / "server-rs" / "Cargo.toml"
 SERVER_SMOKE = ROOT / "tools" / "server_smoke.py"
+DEPLOY_ENV_EXAMPLE = ROOT / "deploy" / "finwealth-server.env.example"
+SYSTEMD_SERVICE = ROOT / "deploy" / "systemd" / "finwealth-server.service"
 
 FORBIDDEN_ENDPOINTS = {
     "/transfers/execute",
@@ -320,6 +322,34 @@ def check_server_smoke() -> None:
     ok("Server smoke script checks passed")
 
 
+def check_deploy_security_defaults() -> None:
+    if not DEPLOY_ENV_EXAMPLE.exists():
+        fail(f"Missing deploy env example: {DEPLOY_ENV_EXAMPLE}")
+    if not SYSTEMD_SERVICE.exists():
+        fail(f"Missing systemd service: {SYSTEMD_SERVICE}")
+
+    env_text = DEPLOY_ENV_EXAMPLE.read_text(encoding="utf-8")
+    if "FINWEALTH_QUOTE_PROVIDER=none" not in env_text:
+        fail("Deploy env example must default FINWEALTH_QUOTE_PROVIDER to none")
+
+    service_text = SYSTEMD_SERVICE.read_text(encoding="utf-8")
+    required_snippets = [
+        "UMask=0077",
+        "StateDirectory=finwealth",
+        "StateDirectoryMode=0700",
+        "NoNewPrivileges=true",
+        "CapabilityBoundingSet=",
+        "PrivateDevices=true",
+        "ProtectSystem=strict",
+        "RestrictSUIDSGID=true",
+    ]
+    missing = [snippet for snippet in required_snippets if snippet not in service_text]
+    if missing:
+        fail("Systemd service missing hardening snippets: " + ", ".join(missing))
+
+    ok("Deploy security defaults passed")
+
+
 def missing_items(items: Iterable[Path]) -> list[Path]:
     return [item for item in items if not item.exists()]
 
@@ -372,6 +402,7 @@ def main() -> None:
     check_dev_server()
     check_rust_server()
     check_server_smoke()
+    check_deploy_security_defaults()
 
     if not forbidden_present and not missing_from_openapi:
         ok("Contract check passed")
