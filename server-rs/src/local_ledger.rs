@@ -152,6 +152,11 @@ pub fn get_account(path: &Path, account_id: &str) -> io::Result<Option<Value>> {
         .cloned())
 }
 
+pub fn list_account_anomalies(path: &Path, now: &str) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    Ok(json!(account_anomalies_for_document(&document, now)?))
+}
+
 pub fn list_quotes(path: &Path, now: &str) -> io::Result<Value> {
     let document = load_or_initialize(path)?;
     Ok(json!(project_quote_items(
@@ -2168,6 +2173,86 @@ fn summarize_accounts(document: &Value, now: &str) -> io::Result<AccountSummary>
         allocation_slices,
         primary_holdings: projected_holdings.into_iter().take(5).collect(),
     })
+}
+
+fn account_anomalies_for_document(document: &Value, now: &str) -> io::Result<Vec<Value>> {
+    let accounts = document["accounts"]
+        .as_array()
+        .expect("validated local ledger accounts should be an array");
+    let holdings = project_holdings_for_api(document);
+    let mut anomalies = Vec::new();
+
+    for account in accounts {
+        if account.get("status").and_then(Value::as_str) == Some("archived") {
+            continue;
+        }
+        let account_id = account
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("validated account id should be a string");
+        let account_name = account
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or(account_id);
+
+        if !is_liability_account(account)
+            && let Some(value) = projected_account_value_with_holdings(document, account)
+            && let Some(amount) = value.get("amount").and_then(Value::as_str)
+            && parse_decimal(amount)?.is_negative()
+        {
+            anomalies.push(json!({
+                "id": format!("anom_{account_id}_negative_balance"),
+                "accountId": account_id,
+                "accountName": account_name,
+                "kind": "negative_balance",
+                "severity": "critical",
+                "detail": format!("{account_name} 是资产账户，但余额为负数，请确认是否应改为负债或录入更正。"),
+                "affectedValue": value,
+                "action": "reconcile",
+                "createdAt": now
+            }));
+        }
+
+        let mut has_stale_quote = false;
+        let mut has_unpriceable = false;
+        for holding in holdings
+            .iter()
+            .filter(|holding| holding.get("accountId").and_then(Value::as_str) == Some(account_id))
+        {
+            match holding.get("quoteStatus").and_then(Value::as_str) {
+                Some("stale" | "offline_cached") => has_stale_quote = true,
+                Some("unpriceable" | "incomplete" | "error") | None => has_unpriceable = true,
+                _ => {}
+            }
+        }
+
+        if has_stale_quote {
+            anomalies.push(json!({
+                "id": format!("anom_{account_id}_quote_stale"),
+                "accountId": account_id,
+                "accountName": account_name,
+                "kind": "quote_stale",
+                "severity": "warning",
+                "detail": format!("{account_name} 存在过期报价，当前估值使用缓存或旧价格。"),
+                "action": "refresh",
+                "createdAt": now
+            }));
+        }
+        if has_unpriceable {
+            anomalies.push(json!({
+                "id": format!("anom_{account_id}_unpriceable"),
+                "accountId": account_id,
+                "accountName": account_name,
+                "kind": "unpriceable",
+                "severity": "warning",
+                "detail": format!("{account_name} 存在无法估值的持仓或现金折算，净资产可能不完整。"),
+                "action": "refresh",
+                "createdAt": now
+            }));
+        }
+    }
+
+    Ok(anomalies)
 }
 
 fn account_from_create_input(

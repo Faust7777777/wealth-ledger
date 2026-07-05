@@ -1336,12 +1336,24 @@ async fn account_detail(
 async fn account_anomalies(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_account_anomalies(path, &current_timestamp()) {
+            Ok(anomalies) => envelope(anomalies).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
     envelope(
         state
             .ledger
             .account_anomalies(DevScenario::from_query(&query)),
     )
+    .into_response()
 }
 
 async fn holdings(
@@ -4475,6 +4487,72 @@ mod tests {
             request_json_from(router, Method::GET, "/v1/quotes/summary").await;
         assert_eq!(quote_status, StatusCode::OK);
         assert_eq!(quote_body["data"]["unpriceableCount"], 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_account_anomalies_use_real_ledger_data() {
+        let path = unique_test_ledger_path("account_anomalies");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let asset_input = json!({
+            "displayName": "透支钱包",
+            "accountType": "wallet",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "-12.34"}
+            ]
+        });
+        let liability_input = json!({
+            "displayName": "助学贷款",
+            "accountType": "loan",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "liability",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "-1000.00"}
+            ]
+        });
+        let (asset_status, asset_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", asset_input).await;
+        assert_eq!(asset_status, StatusCode::CREATED);
+        let asset_account_id = asset_body["data"]["id"]
+            .as_str()
+            .expect("asset account id should be string")
+            .to_string();
+        let (liability_status, _) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            liability_input,
+        )
+        .await;
+        assert_eq!(liability_status, StatusCode::CREATED);
+
+        let (anomaly_status, anomaly_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/accounts/anomalies").await;
+        assert_eq!(anomaly_status, StatusCode::OK);
+        let anomalies = anomaly_body["data"]
+            .as_array()
+            .expect("anomalies should be an array");
+        assert_eq!(anomalies.len(), 1);
+        assert_eq!(anomalies[0]["accountId"], asset_account_id);
+        assert_eq!(anomalies[0]["kind"], "negative_balance");
+        assert_eq!(anomalies[0]["severity"], "critical");
+
+        let (overview_status, overview_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_status, StatusCode::OK);
+        assert_eq!(
+            overview_body["data"]["pendingSummary"]["accountAnomalyCount"],
+            1
+        );
 
         let _ = std::fs::remove_file(path);
     }
