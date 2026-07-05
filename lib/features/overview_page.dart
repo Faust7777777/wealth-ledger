@@ -209,43 +209,129 @@ class _Pending extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final items = <(String, int, String?)>[
-      ('AI 待确认', s.aiPendingCount, '/ai-review'),
-      ('账户异常', s.accountAnomalyCount, '/anomalies'),
-      ('定投到期', s.dcaDueCount, '/investment'),
-      ('在途交易', s.inTransitCount, null),
-      ('报价问题', s.quoteProblemCount, null),
-      ('同步降级', s.syncProblemCount, null),
-    ].where((e) => e.$2 > 0).toList();
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    Color col(Color d, Color l) => dark ? d : l;
+    final subtle = Theme.of(context).textTheme.bodySmall?.color;
+
+    // 每类待办给一个语义色 + 图标，让「行动中心」一眼可扫、异常态明确。
+    final items =
+        <({String label, int count, String? route, IconData icon, Color color})>[
+      (
+        label: 'AI 待确认',
+        count: s.aiPendingCount,
+        route: '/ai-review',
+        icon: Icons.auto_awesome_outlined,
+        color: col(AppColors.brandHover, AppColorsLight.brand),
+      ),
+      (
+        label: '账户异常',
+        count: s.accountAnomalyCount,
+        route: '/anomalies',
+        icon: Icons.warning_amber_rounded,
+        color: col(AppColors.warningText, AppColorsLight.warning),
+      ),
+      (
+        label: '定投到期',
+        count: s.dcaDueCount,
+        route: '/investment',
+        icon: Icons.event_repeat_outlined,
+        color: col(AppColors.infoText, AppColorsLight.info),
+      ),
+      (
+        label: '在途交易',
+        count: s.inTransitCount,
+        route: null,
+        icon: Icons.swap_horiz,
+        color: col(AppColors.inTransitText, AppColorsLight.inTransit),
+      ),
+      (
+        label: '报价问题',
+        count: s.quoteProblemCount,
+        route: null,
+        icon: Icons.show_chart,
+        color: col(AppColors.warningText, AppColorsLight.warning),
+      ),
+      (
+        label: '同步降级',
+        count: s.syncProblemCount,
+        route: null,
+        icon: Icons.sync_problem,
+        color: col(AppColors.errorText, AppColorsLight.error),
+      ),
+    ].where((e) => e.count > 0).toList();
 
     return Card(
       margin: const EdgeInsets.only(top: AppSpacing.xl),
       child: Padding(
-        padding: const EdgeInsets.all(AppSpacing.base),
+        padding: const EdgeInsets.symmetric(
+          horizontal: AppSpacing.base,
+          vertical: AppSpacing.xs,
+        ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('待处理 (${s.total})', style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: AppSpacing.sm),
-            for (final e in items)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
+              child: Row(
+                children: [
+                  Text('待处理',
+                      style: Theme.of(context).textTheme.titleMedium),
+                  const SizedBox(width: AppSpacing.sm),
+                  _CountBadge(count: s.total),
+                ],
+              ),
+            ),
+            for (final e in items) ...[
+              const Divider(height: 1),
               InkWell(
-                onTap: e.$3 == null
+                onTap: e.route == null
                     ? null
-                    : () => e.$3 == '/investment' ? context.go(e.$3!) : context.push(e.$3!),
+                    : () => e.route == '/investment'
+                        ? context.go(e.route!)
+                        : context.push(e.route!),
                 child: Padding(
-                  padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
+                  padding: const EdgeInsets.symmetric(vertical: AppSpacing.md),
                   child: Row(
                     children: [
-                      Expanded(child: Text(e.$1, style: AppType.body)),
-                      Text('${e.$2}', style: AppType.bodyStrong),
+                      Icon(e.icon, size: 18, color: e.color),
+                      const SizedBox(width: AppSpacing.md),
+                      Expanded(child: Text(e.label, style: AppType.body)),
+                      Text('${e.count}',
+                          style: AppType.bodyStrong.copyWith(color: e.color)),
+                      const SizedBox(width: AppSpacing.xs),
                       Icon(Icons.chevron_right,
-                          size: 18, color: e.$3 == null ? Colors.transparent : null),
+                          size: 18,
+                          color: e.route == null ? Colors.transparent : subtle),
                     ],
                   ),
                 ),
               ),
+            ],
           ],
         ),
+      ),
+    );
+  }
+}
+
+// 小圆角计数徽章：品牌金淡底，用于「待处理」总数。
+class _CountBadge extends StatelessWidget {
+  const _CountBadge({required this.count});
+  final int count;
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final c = dark ? AppColors.brandHover : AppColorsLight.brand;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+      decoration: BoxDecoration(
+        color: c.withValues(alpha: 0.16),
+        borderRadius: BorderRadius.circular(AppRadius.pill),
+      ),
+      child: Text(
+        '$count',
+        style: AppType.micro.copyWith(color: c, fontWeight: FontWeight.w700),
       ),
     );
   }
