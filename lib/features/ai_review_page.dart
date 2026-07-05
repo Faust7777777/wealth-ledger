@@ -6,6 +6,7 @@ import 'package:go_router/go_router.dart';
 
 import '../data/providers.dart';
 import '../data/view_models.dart';
+import '../shared/status_pill.dart';
 import '../shared/widgets.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_dimens.dart';
@@ -70,12 +71,18 @@ class _GroupBlock extends ConsumerWidget {
   const _GroupBlock({required this.g});
   final AiAtomicGroupVm g;
 
-  String get _opLabel => switch (g.operation) {
-        AiOperation.create => '新增',
-        AiOperation.modify => '修改',
-        AiOperation.correction => '更正',
-        AiOperation.merge => '归并',
-        AiOperation.classify => '分类',
+  ({String label, StatusTone tone, IconData icon}) get _op =>
+      switch (g.operation) {
+        AiOperation.create =>
+          (label: '新增', tone: StatusTone.positive, icon: Icons.add),
+        AiOperation.modify =>
+          (label: '修改', tone: StatusTone.info, icon: Icons.edit_outlined),
+        AiOperation.correction =>
+          (label: '更正', tone: StatusTone.warning, icon: Icons.build_outlined),
+        AiOperation.merge =>
+          (label: '归并', tone: StatusTone.inTransit, icon: Icons.merge_type),
+        AiOperation.classify =>
+          (label: '分类', tone: StatusTone.brand, icon: Icons.sell_outlined),
       };
 
   @override
@@ -87,11 +94,7 @@ class _GroupBlock extends ConsumerWidget {
         children: [
           Row(
             children: [
-              Chip(
-                label: Text(_opLabel),
-                visualDensity: VisualDensity.compact,
-                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              ),
+              StatusPill(_op.label, tone: _op.tone, icon: _op.icon),
               const SizedBox(width: AppSpacing.sm),
               Expanded(child: Text(g.title, style: AppType.bodyStrong)),
             ],

@@ -10,6 +10,7 @@ import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../shared/leading_avatar.dart';
 import '../shared/money_text.dart';
+import '../shared/status_pill.dart';
 import '../shared/widgets.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_dimens.dart';
@@ -395,7 +396,10 @@ class _MovementRow extends StatelessWidget {
       dense: true,
       title: Text(m.title, style: AppType.body),
       subtitle: m.inTransit
-          ? Text('在途 · 非支出', style: AppType.caption)
+          ? const Align(
+              alignment: Alignment.centerLeft,
+              child: StatusPill('在途 · 非支出', tone: StatusTone.inTransit),
+            )
           : null,
       trailing: amt == null ? null : MoneyText(formatMoney(amt)),
       onTap: () => context.push('/movement/${m.id}'),
