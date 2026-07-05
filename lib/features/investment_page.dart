@@ -7,8 +7,9 @@ import 'package:go_router/go_router.dart';
 import '../core/format.dart';
 import '../data/providers.dart';
 import '../data/view_models.dart';
+import '../shared/leading_avatar.dart';
+import '../shared/money_text.dart';
 import '../shared/widgets.dart';
-import '../theme/app_colors.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
 
@@ -85,38 +86,45 @@ class _HoldingTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final dark = Theme.of(context).brightness == Brightness.dark;
     final cost = h.costBasisTotal == null
         ? '成本未记录'
         : '成本 ${formatMoney(h.costBasisTotal!)}';
     final mv = h.marketValue;
-    String pnl = '';
-    Color? color;
+
+    String? pnl;
+    var pnlTone = MoneyTone.muted;
     final p = h.unrealizedPnl;
     if (p != null) {
       final down = p.amount.startsWith('-');
       final abs = p.amount.replaceFirst(RegExp(r'^[+-]'), '');
       final rate = h.unrealizedPnlRate;
-      pnl =
-          '浮 ${down ? '−' : '+'}¥${formatDecimalThousands(abs)}'
+      pnl = '浮 ${down ? '−' : '+'}¥${formatDecimalThousands(abs)}'
           '${rate == null ? '' : '  ${_pct(rate)}'}';
-      color = down
-          ? (dark ? AppColors.negative : AppColorsLight.negative)
-          : (dark ? AppColors.positive : AppColorsLight.positive);
+      pnlTone = down ? MoneyTone.negative : MoneyTone.positive;
     }
+
+    final sym = h.symbol.trim();
+    final mono = sym.isEmpty
+        ? '—'
+        : (sym.length <= 2 ? sym : sym.substring(0, 2)).toUpperCase();
+
     return ListTile(
       contentPadding: EdgeInsets.zero,
-      title: Text(
-        '${h.displayName} · ${h.symbol} · ${h.quantity}',
-        style: AppType.bodyStrong,
-      ),
-      subtitle: Text(
-        pnl.isEmpty ? cost : '$cost   $pnl',
-        style: AppType.caption.copyWith(color: color),
-      ),
-      trailing: Text(
-        mv == null ? '—' : formatValued(mv),
-        style: AppType.moneyRow,
+      leading: LeadingAvatar.mono(mono),
+      title:
+          Text('${h.displayName} · ${h.quantity}', style: AppType.bodyStrong),
+      subtitle:
+          Text(sym.isEmpty ? cost : '$sym · $cost', style: AppType.caption),
+      trailing: Column(
+        mainAxisSize: MainAxisSize.min,
+        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          MoneyText.optional(mv == null ? null : formatValued(mv),
+              emphasis: true),
+          if (pnl != null)
+            MoneyText(pnl, tone: pnlTone, style: AppType.caption),
+        ],
       ),
     );
   }

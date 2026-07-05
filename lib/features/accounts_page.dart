@@ -5,6 +5,8 @@ import 'package:go_router/go_router.dart';
 
 import '../core/format.dart';
 import '../data/providers.dart';
+import '../shared/leading_avatar.dart';
+import '../shared/money_text.dart';
 import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
@@ -36,23 +38,23 @@ class AccountsPage extends ConsumerWidget {
           padding: const EdgeInsets.all(AppSpacing.base),
           children: [
             ListTile(
-              leading: const Icon(Icons.add),
+              leading: const LeadingAvatar.icon(Icons.add),
               title: const Text('添加账户'),
               onTap: () => context.push('/accounts/new'),
             ),
             const Divider(height: 1),
             for (final a in accounts) ...[
               ListTile(
-                leading: Icon(accountTypeIcon(a.accountType)),
-                title: Text(a.displayName),
+                leading: LeadingAvatar.icon(accountTypeIcon(a.accountType)),
+                title: Text(a.displayName, style: AppType.bodyStrong),
                 subtitle: Text(
                   a.note == null
                       ? accountTypeLabel(a.accountType)
                       : '${accountTypeLabel(a.accountType)} · ${a.note}',
+                  style: AppType.caption,
                 ),
-                trailing: Text(
-                  a.value == null ? '—' : formatValued(a.value!),
-                  style: AppType.moneyRow,
+                trailing: MoneyText.optional(
+                  a.value == null ? null : formatValued(a.value!),
                 ),
                 onTap: () => context.push('/account/${a.id}'),
               ),

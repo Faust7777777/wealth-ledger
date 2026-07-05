@@ -8,6 +8,7 @@ import '../core/format.dart';
 import '../core/types.dart';
 import '../data/providers.dart';
 import '../data/view_models.dart';
+import '../shared/leading_avatar.dart';
 import '../shared/money_text.dart';
 import '../shared/widgets.dart';
 import '../theme/app_colors.dart';
@@ -344,8 +345,6 @@ class _HoldingRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final dark = Theme.of(context).brightness == Brightness.dark;
-    final brand = dark ? AppColors.brandHover : AppColorsLight.brand;
     final mv = h.marketValue;
 
     String? pnl;
@@ -366,18 +365,7 @@ class _HoldingRow extends StatelessWidget {
     return ListTile(
       contentPadding: EdgeInsets.zero,
       dense: true,
-      leading: Container(
-        width: 38,
-        height: 38,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: brand.withValues(alpha: 0.12),
-          borderRadius: BorderRadius.circular(AppRadius.sm),
-        ),
-        child: Text(mono,
-            style: AppType.caption
-                .copyWith(color: brand, fontWeight: FontWeight.w700)),
-      ),
+      leading: LeadingAvatar.mono(mono),
       title: Text(sym.isEmpty ? '—' : sym, style: AppType.bodyStrong),
       subtitle: Text('持仓 ${h.quantity}', style: AppType.caption),
       trailing: Column(
