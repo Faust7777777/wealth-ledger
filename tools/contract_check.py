@@ -270,6 +270,23 @@ def check_rust_server() -> None:
     if "dev_access_token_not_for_production" in text:
         fail("Rust server must not use the old fixed dev access token")
 
+    local_ledger_text = (ROOT / "server-rs" / "src" / "local_ledger.rs").read_text(
+        encoding="utf-8"
+    )
+    ledger_lock_snippets = [
+        "LEDGER_WRITE_LOCKS",
+        "with_ledger_write_lock",
+        "normalized_lock_path",
+    ]
+    missing_lock_snippets = [
+        snippet for snippet in ledger_lock_snippets if snippet not in local_ledger_text
+    ]
+    if missing_lock_snippets:
+        fail(
+            "Rust local ledger missing write-serialization snippets: "
+            + ", ".join(missing_lock_snippets)
+        )
+
     if 'axum = "0.8"' not in manifest:
         fail("Rust server must use the expected Axum dependency line")
 

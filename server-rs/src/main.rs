@@ -23,7 +23,10 @@ use std::{
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     process,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use time::{
@@ -44,6 +47,7 @@ const DCA_PROPOSAL: &str =
     include_str!("../../docs/contracts/examples/dca_mark_executed_proposal.response.json");
 const QUOTE_STALE: &str =
     include_str!("../../docs/contracts/examples/quote_refresh_stale.response.json");
+static LOCAL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 struct AppState {
@@ -2869,7 +2873,8 @@ fn next_local_id(prefix: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
-    format!("{prefix}_{nanos}")
+    let sequence = LOCAL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}_{nanos}_{sequence}")
 }
 
 fn auth_tokens_json(tokens: AuthTokens) -> Value {
@@ -4245,6 +4250,53 @@ mod tests {
             persisted["accounts"][0].get("value").is_none(),
             "derived account value must not be persisted into the ledger file"
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn local_ledger_serializes_concurrent_account_creates() {
+        let path = unique_test_ledger_path("concurrent_accounts");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let mut handles = Vec::new();
+        for index in 0..20 {
+            let router = router.clone();
+            handles.push(tokio::spawn(async move {
+                request_json_body_from(
+                    router,
+                    Method::POST,
+                    "/v1/accounts",
+                    json!({
+                        "displayName": format!("并发账户 {index}"),
+                        "accountType": "bank",
+                        "defaultCurrency": "CNY",
+                        "supportedCurrencies": ["CNY"],
+                        "includeInNetWorth": true,
+                        "balanceMode": "cash_balance",
+                        "openingBalances": [
+                            {
+                                "currency": "CNY",
+                                "amount": index.to_string()
+                            }
+                        ]
+                    }),
+                )
+                .await
+            }));
+        }
+
+        for handle in handles {
+            let (status, body) = handle.await.expect("request task should join");
+            assert_eq!(status, StatusCode::CREATED, "body={body}");
+        }
+
+        let document = local_ledger::read_document(&path).expect("ledger should be readable");
+        let accounts = document["accounts"]
+            .as_array()
+            .expect("validated accounts should be an array");
+        assert_eq!(accounts.len(), 20);
 
         let _ = std::fs::remove_file(path);
     }

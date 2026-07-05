@@ -1,9 +1,10 @@
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
-    fs, io,
+    env, fs, io,
     ops::{Add, AddAssign, Neg, Sub},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -18,6 +19,41 @@ const INSTRUMENT_TYPES: &[&str] = &[
     "receivable",
     "other",
 ];
+
+static LEDGER_WRITE_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+
+macro_rules! with_ledger_write_lock {
+    ($path:expr, $body:block) => {{
+        let lock = ledger_write_lock($path);
+        let _guard = lock
+            .lock()
+            .expect("local ledger write lock should not be poisoned");
+        $body
+    }};
+}
+
+fn ledger_write_lock(path: &Path) -> Arc<Mutex<()>> {
+    let key = normalized_lock_path(path);
+    let mut locks = LEDGER_WRITE_LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("local ledger lock registry should not be poisoned");
+    locks
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn normalized_lock_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    absolute.canonicalize().unwrap_or(absolute)
+}
 
 pub fn empty_document(base_currency: &str) -> Value {
     json!({
@@ -137,108 +173,110 @@ pub fn list_fx_rates(path: &Path, now: &str) -> io::Result<Value> {
 }
 
 pub fn refresh_quotes(path: &Path, input: Value, now: &str) -> Result<Value, LedgerError> {
-    let Some(object) = input.as_object() else {
-        return Err(LedgerError::InvalidInput(vec![
-            "quote refresh input must be a JSON object".to_string(),
-        ]));
-    };
+    with_ledger_write_lock!(path, {
+        let Some(object) = input.as_object() else {
+            return Err(LedgerError::InvalidInput(vec![
+                "quote refresh input must be a JSON object".to_string(),
+            ]));
+        };
 
-    let mut document = load_or_initialize(path)?;
-    let mut errors = Vec::new();
-    let mut refreshed_quotes = Vec::new();
-    let mut refreshed_fx_rates = Vec::new();
+        let mut document = load_or_initialize(path)?;
+        let mut errors = Vec::new();
+        let mut refreshed_quotes = Vec::new();
+        let mut refreshed_fx_rates = Vec::new();
 
-    if let Some(mode) = object.get("mode") {
-        match mode.as_str() {
-            Some("manual" | "startup" | "scheduled") => {}
-            _ => errors.push(quote_refresh_error(
+        if let Some(mode) = object.get("mode") {
+            match mode.as_str() {
+                Some("manual" | "startup" | "scheduled") => {}
+                _ => errors.push(quote_refresh_error(
+                    "request",
+                    None,
+                    "mode must be manual, startup, or scheduled",
+                    false,
+                )),
+            }
+        }
+
+        match object.get("quotes") {
+            Some(Value::Array(items)) => {
+                for item in items {
+                    match quote_from_refresh_input(item, now) {
+                        Ok(quote) => {
+                            upsert_quote(&mut document, quote.clone());
+                            refreshed_quotes.push(project_quote_item(&quote, now));
+                        }
+                        Err(error) => errors.push(quote_refresh_error(
+                            "instrument",
+                            item.get("instrumentId").and_then(Value::as_str),
+                            &error,
+                            false,
+                        )),
+                    }
+                }
+            }
+            Some(_) => errors.push(quote_refresh_error(
                 "request",
                 None,
-                "mode must be manual, startup, or scheduled",
+                "quotes must be an array when present",
                 false,
             )),
+            None => {}
         }
-    }
 
-    match object.get("quotes") {
-        Some(Value::Array(items)) => {
-            for item in items {
-                match quote_from_refresh_input(item, now) {
-                    Ok(quote) => {
-                        upsert_quote(&mut document, quote.clone());
-                        refreshed_quotes.push(project_quote_item(&quote, now));
+        match object.get("fxRates") {
+            Some(Value::Array(items)) => {
+                for item in items {
+                    match fx_rate_from_refresh_input(item, now) {
+                        Ok(rate) => {
+                            upsert_fx_rate(&mut document, rate.clone());
+                            refreshed_fx_rates.push(project_quote_item(&rate, now));
+                        }
+                        Err(error) => errors.push(quote_refresh_error(
+                            "fx_pair",
+                            fx_pair_target_id(item).as_deref(),
+                            &error,
+                            false,
+                        )),
                     }
-                    Err(error) => errors.push(quote_refresh_error(
-                        "instrument",
-                        item.get("instrumentId").and_then(Value::as_str),
-                        &error,
-                        false,
-                    )),
                 }
             }
+            Some(_) => errors.push(quote_refresh_error(
+                "request",
+                None,
+                "fxRates must be an array when present",
+                false,
+            )),
+            None => {}
         }
-        Some(_) => errors.push(quote_refresh_error(
-            "request",
-            None,
-            "quotes must be an array when present",
-            false,
-        )),
-        None => {}
-    }
 
-    match object.get("fxRates") {
-        Some(Value::Array(items)) => {
-            for item in items {
-                match fx_rate_from_refresh_input(item, now) {
-                    Ok(rate) => {
-                        upsert_fx_rate(&mut document, rate.clone());
-                        refreshed_fx_rates.push(project_quote_item(&rate, now));
-                    }
-                    Err(error) => errors.push(quote_refresh_error(
-                        "fx_pair",
-                        fx_pair_target_id(item).as_deref(),
-                        &error,
-                        false,
-                    )),
-                }
-            }
+        let wrote_any = !refreshed_quotes.is_empty() || !refreshed_fx_rates.is_empty();
+        if wrote_any {
+            write_document(path, &document)?;
+        } else if errors.is_empty() {
+            errors.push(quote_refresh_error(
+                "request",
+                None,
+                "no quote provider is configured; pass quotes/fxRates payload or keep using cache",
+                true,
+            ));
         }
-        Some(_) => errors.push(quote_refresh_error(
-            "request",
-            None,
-            "fxRates must be an array when present",
-            false,
-        )),
-        None => {}
-    }
 
-    let wrote_any = !refreshed_quotes.is_empty() || !refreshed_fx_rates.is_empty();
-    if wrote_any {
-        write_document(path, &document)?;
-    } else if errors.is_empty() {
-        errors.push(quote_refresh_error(
-            "request",
-            None,
-            "no quote provider is configured; pass quotes/fxRates payload or keep using cache",
-            true,
-        ));
-    }
+        let status = if wrote_any && errors.is_empty() {
+            "success"
+        } else if wrote_any {
+            "partial_success"
+        } else {
+            "offline"
+        };
 
-    let status = if wrote_any && errors.is_empty() {
-        "success"
-    } else if wrote_any {
-        "partial_success"
-    } else {
-        "offline"
-    };
-
-    Ok(json!({
-        "status": status,
-        "quotes": refreshed_quotes,
-        "fxRates": refreshed_fx_rates,
-        "errors": errors,
-        "completedAt": now
-    }))
+        Ok(json!({
+            "status": status,
+            "quotes": refreshed_quotes,
+            "fxRates": refreshed_fx_rates,
+            "errors": errors,
+            "completedAt": now
+        }))
+    })
 }
 
 pub fn quote_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value>> {
@@ -376,28 +414,30 @@ pub fn create_account(
     account_id: &str,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let account = account_from_create_input(&input, account_id, now)?;
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let account = account_from_create_input(&input, account_id, now)?;
 
-    {
-        let accounts = document["accounts"]
-            .as_array_mut()
-            .expect("validated local ledger accounts should be an array");
-
-        if accounts
-            .iter()
-            .any(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
         {
-            return Err(LedgerError::Conflict(format!(
-                "account id already exists: {account_id}"
-            )));
+            let accounts = document["accounts"]
+                .as_array_mut()
+                .expect("validated local ledger accounts should be an array");
+
+            if accounts
+                .iter()
+                .any(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+            {
+                return Err(LedgerError::Conflict(format!(
+                    "account id already exists: {account_id}"
+                )));
+            }
+
+            accounts.push(account.clone());
         }
 
-        accounts.push(account.clone());
-    }
-
-    write_document(path, &document)?;
-    Ok(project_account_for_api(&account))
+        write_document(path, &document)?;
+        Ok(project_account_for_api(&account))
+    })
 }
 
 pub fn update_account(
@@ -406,25 +446,31 @@ pub fn update_account(
     patch: Value,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let account = find_account_mut(&mut document, account_id)
-        .ok_or_else(|| LedgerError::NotFound(format!("account does not exist: {account_id}")))?;
-    apply_account_patch(account, &patch, now)?;
-    let projected = project_account_for_api(account);
-    write_document(path, &document)?;
-    Ok(projected)
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let account = find_account_mut(&mut document, account_id).ok_or_else(|| {
+            LedgerError::NotFound(format!("account does not exist: {account_id}"))
+        })?;
+        apply_account_patch(account, &patch, now)?;
+        let projected = project_account_for_api(account);
+        write_document(path, &document)?;
+        Ok(projected)
+    })
 }
 
 pub fn archive_account(path: &Path, account_id: &str, now: &str) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let account = find_account_mut(&mut document, account_id)
-        .ok_or_else(|| LedgerError::NotFound(format!("account does not exist: {account_id}")))?;
-    account["status"] = json!("archived");
-    account["visibility"] = json!("archived");
-    account["updatedAt"] = json!(now);
-    let projected = project_account_for_api(account);
-    write_document(path, &document)?;
-    Ok(projected)
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let account = find_account_mut(&mut document, account_id).ok_or_else(|| {
+            LedgerError::NotFound(format!("account does not exist: {account_id}"))
+        })?;
+        account["status"] = json!("archived");
+        account["visibility"] = json!("archived");
+        account["updatedAt"] = json!(now);
+        let projected = project_account_for_api(account);
+        write_document(path, &document)?;
+        Ok(projected)
+    })
 }
 
 pub fn list_holdings(path: &Path) -> io::Result<Value> {
@@ -470,31 +516,33 @@ pub fn create_movement_draft(
     atomic_group_id: &str,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let movement =
-        movement_from_create_input(&document, &input, movement_id, atomic_group_id, now)?;
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let movement =
+            movement_from_create_input(&document, &input, movement_id, atomic_group_id, now)?;
 
-    {
-        let movements = document["movements"]
-            .as_array_mut()
-            .expect("validated local ledger movements should be an array");
-        movements.push(movement.clone());
-    }
-
-    if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
-        let movement_entries = document["movementEntries"]
-            .as_array_mut()
-            .expect("validated local ledger movementEntries should be an array");
-        for entry in entries {
-            let mut indexed_entry = entry.clone();
-            indexed_entry["movementId"] = json!(movement_id);
-            indexed_entry["atomicGroupId"] = json!(atomic_group_id);
-            movement_entries.push(indexed_entry);
+        {
+            let movements = document["movements"]
+                .as_array_mut()
+                .expect("validated local ledger movements should be an array");
+            movements.push(movement.clone());
         }
-    }
 
-    write_document(path, &document)?;
-    Ok(project_movement_for_api(&movement))
+        if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
+            let movement_entries = document["movementEntries"]
+                .as_array_mut()
+                .expect("validated local ledger movementEntries should be an array");
+            for entry in entries {
+                let mut indexed_entry = entry.clone();
+                indexed_entry["movementId"] = json!(movement_id);
+                indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+                movement_entries.push(indexed_entry);
+            }
+        }
+
+        write_document(path, &document)?;
+        Ok(project_movement_for_api(&movement))
+    })
 }
 
 pub fn create_correction_proposal(
@@ -504,105 +552,107 @@ pub fn create_correction_proposal(
     atomic_group_id: &str,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let Some(object) = input.as_object() else {
-        return Err(LedgerError::InvalidInput(vec![
-            "correction input must be a JSON object".to_string(),
-        ]));
-    };
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let Some(object) = input.as_object() else {
+            return Err(LedgerError::InvalidInput(vec![
+                "correction input must be a JSON object".to_string(),
+            ]));
+        };
 
-    let mut errors = Vec::new();
-    let target_movement_id = required_string(object, "targetMovementId", &mut errors);
-    let reason = required_string(object, "reason", &mut errors);
-    let proposed_diffs = object
-        .get("proposedDiffs")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        let mut errors = Vec::new();
+        let target_movement_id = required_string(object, "targetMovementId", &mut errors);
+        let reason = required_string(object, "reason", &mut errors);
+        let proposed_diffs = object
+            .get("proposedDiffs")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
 
-    if !errors.is_empty() {
-        return Err(LedgerError::InvalidInput(errors));
-    }
-
-    let target_movement_id = target_movement_id.expect("validated correction targetMovementId");
-    let reason = reason.expect("validated correction reason");
-    let target = document["movements"]
-        .as_array()
-        .expect("validated local ledger movements should be an array")
-        .iter()
-        .find(|movement| {
-            movement.get("id").and_then(Value::as_str) == Some(target_movement_id.as_str())
-        })
-        .cloned()
-        .ok_or_else(|| {
-            LedgerError::NotFound(format!(
-                "target movement does not exist: {target_movement_id}"
-            ))
-        })?;
-
-    if target.get("status").and_then(Value::as_str) != Some("confirmed")
-        && target.get("status").and_then(Value::as_str) != Some("in_transit")
-    {
-        return Err(LedgerError::Conflict(format!(
-            "target movement must be confirmed before correction: {target_movement_id}"
-        )));
-    }
-
-    let correction_entry = correction_entry_from_diffs(&target, &proposed_diffs, movement_id)?;
-    let target_title = target
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or(target_movement_id.as_str());
-    let movement = json!({
-        "id": movement_id,
-        "atomicGroupId": atomic_group_id,
-        "type": "correction",
-        "occurredAt": now,
-        "recordedAt": now,
-        "status": "pending_review",
-        "title": format!("更正：{target_title}"),
-        "description": reason,
-        "entries": [correction_entry],
-        "tags": ["correction"],
-        "source": {
-            "kind": "manual",
-            "sourceId": target_movement_id,
-            "createdBy": "user"
-        },
-        "createdAt": now,
-        "updatedAt": now
-    });
-
-    document["movements"]
-        .as_array_mut()
-        .expect("validated local ledger movements should be an array")
-        .push(movement.clone());
-    if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
-        let movement_entries = document["movementEntries"]
-            .as_array_mut()
-            .expect("validated local ledger movementEntries should be an array");
-        for entry in entries {
-            let mut indexed_entry = entry.clone();
-            indexed_entry["movementId"] = json!(movement_id);
-            indexed_entry["atomicGroupId"] = json!(atomic_group_id);
-            movement_entries.push(indexed_entry);
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
         }
-    }
 
-    let mut group = atomic_group_from_movement(&movement, "pending");
-    group["operation"] = json!("correction");
-    group["targetId"] = json!(target_movement_id);
-    group["diffs"] = json!(proposed_diffs);
-    group["warnings"] = json!([
+        let target_movement_id = target_movement_id.expect("validated correction targetMovementId");
+        let reason = reason.expect("validated correction reason");
+        let target = document["movements"]
+            .as_array()
+            .expect("validated local ledger movements should be an array")
+            .iter()
+            .find(|movement| {
+                movement.get("id").and_then(Value::as_str) == Some(target_movement_id.as_str())
+            })
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!(
+                    "target movement does not exist: {target_movement_id}"
+                ))
+            })?;
+
+        if target.get("status").and_then(Value::as_str) != Some("confirmed")
+            && target.get("status").and_then(Value::as_str) != Some("in_transit")
         {
-            "code": "confirmed_movement_not_modified",
-            "message": "该更正不会改写原 confirmed 记录，只会在确认后新增 correction movement。",
-            "severity": "info"
+            return Err(LedgerError::Conflict(format!(
+                "target movement must be confirmed before correction: {target_movement_id}"
+            )));
         }
-    ]);
 
-    write_document(path, &document)?;
-    Ok(group)
+        let correction_entry = correction_entry_from_diffs(&target, &proposed_diffs, movement_id)?;
+        let target_title = target
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(target_movement_id.as_str());
+        let movement = json!({
+            "id": movement_id,
+            "atomicGroupId": atomic_group_id,
+            "type": "correction",
+            "occurredAt": now,
+            "recordedAt": now,
+            "status": "pending_review",
+            "title": format!("更正：{target_title}"),
+            "description": reason,
+            "entries": [correction_entry],
+            "tags": ["correction"],
+            "source": {
+                "kind": "manual",
+                "sourceId": target_movement_id,
+                "createdBy": "user"
+            },
+            "createdAt": now,
+            "updatedAt": now
+        });
+
+        document["movements"]
+            .as_array_mut()
+            .expect("validated local ledger movements should be an array")
+            .push(movement.clone());
+        if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
+            let movement_entries = document["movementEntries"]
+                .as_array_mut()
+                .expect("validated local ledger movementEntries should be an array");
+            for entry in entries {
+                let mut indexed_entry = entry.clone();
+                indexed_entry["movementId"] = json!(movement_id);
+                indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+                movement_entries.push(indexed_entry);
+            }
+        }
+
+        let mut group = atomic_group_from_movement(&movement, "pending");
+        group["operation"] = json!("correction");
+        group["targetId"] = json!(target_movement_id);
+        group["diffs"] = json!(proposed_diffs);
+        group["warnings"] = json!([
+            {
+                "code": "confirmed_movement_not_modified",
+                "message": "该更正不会改写原 confirmed 记录，只会在确认后新增 correction movement。",
+                "severity": "info"
+            }
+        ]);
+
+        write_document(path, &document)?;
+        Ok(group)
+    })
 }
 
 pub fn submit_movement_review(
@@ -610,31 +660,34 @@ pub fn submit_movement_review(
     movement_id: &str,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let movement = find_movement_mut(&mut document, movement_id)
-        .ok_or_else(|| LedgerError::NotFound(format!("movement does not exist: {movement_id}")))?;
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let movement = find_movement_mut(&mut document, movement_id).ok_or_else(|| {
+            LedgerError::NotFound(format!("movement does not exist: {movement_id}"))
+        })?;
 
-    match movement.get("status").and_then(Value::as_str) {
-        Some("draft") => {
-            movement["status"] = json!("pending_review");
-            movement["updatedAt"] = json!(now);
+        match movement.get("status").and_then(Value::as_str) {
+            Some("draft") => {
+                movement["status"] = json!("pending_review");
+                movement["updatedAt"] = json!(now);
+            }
+            Some("pending_review") => {}
+            Some(status) => {
+                return Err(LedgerError::Conflict(format!(
+                    "movement cannot be submitted for review from status: {status}"
+                )));
+            }
+            None => {
+                return Err(LedgerError::InvalidInput(vec![
+                    "movement.status must be present".to_string(),
+                ]));
+            }
         }
-        Some("pending_review") => {}
-        Some(status) => {
-            return Err(LedgerError::Conflict(format!(
-                "movement cannot be submitted for review from status: {status}"
-            )));
-        }
-        None => {
-            return Err(LedgerError::InvalidInput(vec![
-                "movement.status must be present".to_string(),
-            ]));
-        }
-    }
 
-    let group = atomic_group_from_movement(movement, "pending");
-    write_document(path, &document)?;
-    Ok(group)
+        let group = atomic_group_from_movement(movement, "pending");
+        write_document(path, &document)?;
+        Ok(group)
+    })
 }
 
 pub fn confirm_atomic_group(
@@ -642,99 +695,104 @@ pub fn confirm_atomic_group(
     atomic_group_id: &str,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    if let Some(result) = confirm_counterparty_merge_atomic_group(&mut document, atomic_group_id)? {
-        write_document(path, &document)?;
-        return Ok(result);
-    }
-    if let Some(result) = confirm_ai_movement_atomic_group(&mut document, atomic_group_id, now)? {
-        write_document(path, &document)?;
-        return Ok(result);
-    }
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        if let Some(result) =
+            confirm_counterparty_merge_atomic_group(&mut document, atomic_group_id)?
+        {
+            write_document(path, &document)?;
+            return Ok(result);
+        }
+        if let Some(result) = confirm_ai_movement_atomic_group(&mut document, atomic_group_id, now)?
+        {
+            write_document(path, &document)?;
+            return Ok(result);
+        }
 
-    let candidate_movements = document["movements"]
-        .as_array()
-        .expect("validated local ledger movements should be an array")
-        .iter()
-        .filter(|movement| {
-            movement.get("atomicGroupId").and_then(Value::as_str) == Some(atomic_group_id)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+        let candidate_movements = document["movements"]
+            .as_array()
+            .expect("validated local ledger movements should be an array")
+            .iter()
+            .filter(|movement| {
+                movement.get("atomicGroupId").and_then(Value::as_str) == Some(atomic_group_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
 
-    if candidate_movements.is_empty() {
-        return Err(LedgerError::NotFound(format!(
-            "atomic group does not exist: {atomic_group_id}"
-        )));
-    }
+        if candidate_movements.is_empty() {
+            return Err(LedgerError::NotFound(format!(
+                "atomic group does not exist: {atomic_group_id}"
+            )));
+        }
 
-    let mut confirmed_movement_ids = Vec::new();
-    for movement in &candidate_movements {
-        match movement.get("status").and_then(Value::as_str) {
-            Some("draft" | "pending_review") => {
-                let entries = movement
-                    .get("entries")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                apply_movement_entries(&mut document, &entries, now)?;
-                confirmed_movement_ids.push(
-                    movement
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .expect("validated movement id should be a string")
-                        .to_string(),
-                );
-            }
-            Some("confirmed" | "in_transit") => {}
-            Some("cancelled" | "reversed") => {
-                return Err(LedgerError::Conflict(format!(
-                    "atomic group cannot be confirmed from movement status: {}",
-                    movement
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .expect("status should exist")
-                )));
-            }
-            Some(status) => {
-                return Err(LedgerError::Conflict(format!(
-                    "atomic group cannot be confirmed from movement status: {status}"
-                )));
-            }
-            None => {
-                return Err(LedgerError::InvalidInput(vec![
-                    "movement.status must be present".to_string(),
-                ]));
+        let mut confirmed_movement_ids = Vec::new();
+        for movement in &candidate_movements {
+            match movement.get("status").and_then(Value::as_str) {
+                Some("draft" | "pending_review") => {
+                    let entries = movement
+                        .get("entries")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    apply_movement_entries(&mut document, &entries, now)?;
+                    confirmed_movement_ids.push(
+                        movement
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .expect("validated movement id should be a string")
+                            .to_string(),
+                    );
+                }
+                Some("confirmed" | "in_transit") => {}
+                Some("cancelled" | "reversed") => {
+                    return Err(LedgerError::Conflict(format!(
+                        "atomic group cannot be confirmed from movement status: {}",
+                        movement
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .expect("status should exist")
+                    )));
+                }
+                Some(status) => {
+                    return Err(LedgerError::Conflict(format!(
+                        "atomic group cannot be confirmed from movement status: {status}"
+                    )));
+                }
+                None => {
+                    return Err(LedgerError::InvalidInput(vec![
+                        "movement.status must be present".to_string(),
+                    ]));
+                }
             }
         }
-    }
 
-    if !confirmed_movement_ids.is_empty() {
-        let movements = document["movements"]
-            .as_array_mut()
-            .expect("validated local ledger movements should be an array");
-        for movement in movements.iter_mut().filter(|movement| {
-            movement.get("atomicGroupId").and_then(Value::as_str) == Some(atomic_group_id)
-        }) {
-            if matches!(
-                movement.get("status").and_then(Value::as_str),
-                Some("draft" | "pending_review")
-            ) {
-                movement["status"] = json!(confirmed_status_for_movement(movement));
-                movement["updatedAt"] = json!(now);
+        if !confirmed_movement_ids.is_empty() {
+            let movements = document["movements"]
+                .as_array_mut()
+                .expect("validated local ledger movements should be an array");
+            for movement in movements.iter_mut().filter(|movement| {
+                movement.get("atomicGroupId").and_then(Value::as_str) == Some(atomic_group_id)
+            }) {
+                if matches!(
+                    movement.get("status").and_then(Value::as_str),
+                    Some("draft" | "pending_review")
+                ) {
+                    movement["status"] = json!(confirmed_status_for_movement(movement));
+                    movement["updatedAt"] = json!(now);
+                }
             }
+            mark_dca_reminders_recorded_for_movements(&mut document, &candidate_movements, now);
         }
-        mark_dca_reminders_recorded_for_movements(&mut document, &candidate_movements, now);
-    }
 
-    write_document(path, &document)?;
-    Ok(json!({
-        "atomicGroupId": atomic_group_id,
-        "confirmedMovementIds": confirmed_movement_ids,
-        "snapshotInvalidated": !confirmed_movement_ids.is_empty(),
-        "ledgerWrite": !confirmed_movement_ids.is_empty(),
-        "devOnly": false
-    }))
+        write_document(path, &document)?;
+        Ok(json!({
+            "atomicGroupId": atomic_group_id,
+            "confirmedMovementIds": confirmed_movement_ids,
+            "snapshotInvalidated": !confirmed_movement_ids.is_empty(),
+            "ledgerWrite": !confirmed_movement_ids.is_empty(),
+            "devOnly": false
+        }))
+    })
 }
 
 pub fn reject_atomic_group(
@@ -742,48 +800,50 @@ pub fn reject_atomic_group(
     atomic_group_id: &str,
     now: &str,
 ) -> Result<(), LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    if reject_ai_atomic_group(&mut document, atomic_group_id)? {
-        write_document(path, &document)?;
-        return Ok(());
-    }
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        if reject_ai_atomic_group(&mut document, atomic_group_id)? {
+            write_document(path, &document)?;
+            return Ok(());
+        }
 
-    let mut found = false;
-    let movements = document["movements"]
-        .as_array_mut()
-        .expect("validated local ledger movements should be an array");
+        let mut found = false;
+        let movements = document["movements"]
+            .as_array_mut()
+            .expect("validated local ledger movements should be an array");
 
-    for movement in movements.iter_mut().filter(|movement| {
-        movement.get("atomicGroupId").and_then(Value::as_str) == Some(atomic_group_id)
-    }) {
-        found = true;
-        match movement.get("status").and_then(Value::as_str) {
-            Some("draft" | "pending_review") => {
-                movement["status"] = json!("cancelled");
-                movement["updatedAt"] = json!(now);
-            }
-            Some("cancelled") => {}
-            Some(status) => {
-                return Err(LedgerError::Conflict(format!(
-                    "atomic group cannot be rejected from movement status: {status}"
-                )));
-            }
-            None => {
-                return Err(LedgerError::InvalidInput(vec![
-                    "movement.status must be present".to_string(),
-                ]));
+        for movement in movements.iter_mut().filter(|movement| {
+            movement.get("atomicGroupId").and_then(Value::as_str) == Some(atomic_group_id)
+        }) {
+            found = true;
+            match movement.get("status").and_then(Value::as_str) {
+                Some("draft" | "pending_review") => {
+                    movement["status"] = json!("cancelled");
+                    movement["updatedAt"] = json!(now);
+                }
+                Some("cancelled") => {}
+                Some(status) => {
+                    return Err(LedgerError::Conflict(format!(
+                        "atomic group cannot be rejected from movement status: {status}"
+                    )));
+                }
+                None => {
+                    return Err(LedgerError::InvalidInput(vec![
+                        "movement.status must be present".to_string(),
+                    ]));
+                }
             }
         }
-    }
 
-    if !found {
-        return Err(LedgerError::NotFound(format!(
-            "atomic group does not exist: {atomic_group_id}"
-        )));
-    }
+        if !found {
+            return Err(LedgerError::NotFound(format!(
+                "atomic group does not exist: {atomic_group_id}"
+            )));
+        }
 
-    write_document(path, &document)?;
-    Ok(())
+        write_document(path, &document)?;
+        Ok(())
+    })
 }
 
 pub fn list_dca_plans(path: &Path) -> io::Result<Value> {
@@ -803,21 +863,23 @@ pub fn create_dca_plan(
     reminder_id: &str,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let plan = dca_plan_from_create_input(&document, &input, plan_id, now)?;
-    let reminder = dca_reminder_from_plan(&plan, reminder_id);
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let plan = dca_plan_from_create_input(&document, &input, plan_id, now)?;
+        let reminder = dca_reminder_from_plan(&plan, reminder_id);
 
-    document["dcaPlans"]
-        .as_array_mut()
-        .expect("validated local ledger dcaPlans should be an array")
-        .push(plan.clone());
-    document["dcaReminders"]
-        .as_array_mut()
-        .expect("validated local ledger dcaReminders should be an array")
-        .push(reminder);
+        document["dcaPlans"]
+            .as_array_mut()
+            .expect("validated local ledger dcaPlans should be an array")
+            .push(plan.clone());
+        document["dcaReminders"]
+            .as_array_mut()
+            .expect("validated local ledger dcaReminders should be an array")
+            .push(reminder);
 
-    write_document(path, &document)?;
-    Ok(plan)
+        write_document(path, &document)?;
+        Ok(plan)
+    })
 }
 
 pub fn update_dca_plan(
@@ -826,32 +888,36 @@ pub fn update_dca_plan(
     patch: Value,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
 
-    if let Some(object) = patch.as_object()
-        && let Some(Value::String(funding_account_id)) = object.get("fundingAccountId")
-        && !active_account_exists(&document, funding_account_id)
-    {
-        return Err(LedgerError::InvalidInput(vec![
-            "fundingAccountId does not exist or is archived".to_string(),
-        ]));
-    }
+        if let Some(object) = patch.as_object()
+            && let Some(Value::String(funding_account_id)) = object.get("fundingAccountId")
+            && !active_account_exists(&document, funding_account_id)
+        {
+            return Err(LedgerError::InvalidInput(vec![
+                "fundingAccountId does not exist or is archived".to_string(),
+            ]));
+        }
 
-    let projected = {
-        let plan = document["dcaPlans"]
-            .as_array_mut()
-            .expect("validated local ledger dcaPlans should be an array")
-            .iter_mut()
-            .find(|plan| plan.get("id").and_then(Value::as_str) == Some(plan_id))
-            .ok_or_else(|| LedgerError::NotFound(format!("DCA plan does not exist: {plan_id}")))?;
+        let projected = {
+            let plan = document["dcaPlans"]
+                .as_array_mut()
+                .expect("validated local ledger dcaPlans should be an array")
+                .iter_mut()
+                .find(|plan| plan.get("id").and_then(Value::as_str) == Some(plan_id))
+                .ok_or_else(|| {
+                    LedgerError::NotFound(format!("DCA plan does not exist: {plan_id}"))
+                })?;
 
-        apply_dca_plan_patch(plan, &patch, now)?;
-        plan.clone()
-    };
+            apply_dca_plan_patch(plan, &patch, now)?;
+            plan.clone()
+        };
 
-    sync_open_dca_reminders_for_plan(&mut document, plan_id, &projected, now);
-    write_document(path, &document)?;
-    Ok(projected)
+        sync_open_dca_reminders_for_plan(&mut document, plan_id, &projected, now);
+        write_document(path, &document)?;
+        Ok(projected)
+    })
 }
 
 pub fn list_due_dca_reminders(path: &Path) -> io::Result<Value> {
@@ -875,7 +941,9 @@ pub fn list_due_dca_reminders(path: &Path) -> io::Result<Value> {
 }
 
 pub fn skip_dca_reminder(path: &Path, reminder_id: &str, now: &str) -> Result<Value, LedgerError> {
-    update_dca_reminder_status(path, reminder_id, "skipped", None, now)
+    with_ledger_write_lock!(path, {
+        update_dca_reminder_status(path, reminder_id, "skipped", None, now)
+    })
 }
 
 pub fn snooze_dca_reminder(
@@ -884,18 +952,20 @@ pub fn snooze_dca_reminder(
     input: Value,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let Some(object) = input.as_object() else {
-        return Err(LedgerError::InvalidInput(vec![
-            "snooze input must be a JSON object".to_string(),
-        ]));
-    };
-    let mut errors = Vec::new();
-    let until = required_string(object, "until", &mut errors);
-    if !errors.is_empty() {
-        return Err(LedgerError::InvalidInput(errors));
-    }
+    with_ledger_write_lock!(path, {
+        let Some(object) = input.as_object() else {
+            return Err(LedgerError::InvalidInput(vec![
+                "snooze input must be a JSON object".to_string(),
+            ]));
+        };
+        let mut errors = Vec::new();
+        let until = required_string(object, "until", &mut errors);
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
 
-    update_dca_reminder_status(path, reminder_id, "snoozed", until, now)
+        update_dca_reminder_status(path, reminder_id, "snoozed", until, now)
+    })
 }
 
 pub fn mark_dca_executed_as_proposal(
@@ -905,157 +975,161 @@ pub fn mark_dca_executed_as_proposal(
     atomic_group_id: &str,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let reminder = document["dcaReminders"]
-        .as_array()
-        .expect("validated local ledger dcaReminders should be an array")
-        .iter()
-        .find(|reminder| reminder.get("id").and_then(Value::as_str) == Some(reminder_id))
-        .cloned()
-        .ok_or_else(|| {
-            LedgerError::NotFound(format!("DCA reminder does not exist: {reminder_id}"))
-        })?;
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let reminder = document["dcaReminders"]
+            .as_array()
+            .expect("validated local ledger dcaReminders should be an array")
+            .iter()
+            .find(|reminder| reminder.get("id").and_then(Value::as_str) == Some(reminder_id))
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("DCA reminder does not exist: {reminder_id}"))
+            })?;
 
-    match reminder.get("status").and_then(Value::as_str) {
-        Some("due" | "overdue" | "snoozed") => {}
-        Some(status) => {
-            return Err(LedgerError::Conflict(format!(
-                "DCA reminder cannot be recorded from status: {status}"
+        match reminder.get("status").and_then(Value::as_str) {
+            Some("due" | "overdue" | "snoozed") => {}
+            Some(status) => {
+                return Err(LedgerError::Conflict(format!(
+                    "DCA reminder cannot be recorded from status: {status}"
+                )));
+            }
+            None => {
+                return Err(LedgerError::InvalidInput(vec![
+                    "DCA reminder.status must be present".to_string(),
+                ]));
+            }
+        }
+
+        let plan_id = reminder
+            .get("planId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["DCA reminder.planId is missing".to_string()])
+            })?;
+        let plan = document["dcaPlans"]
+            .as_array()
+            .expect("validated local ledger dcaPlans should be an array")
+            .iter()
+            .find(|plan| plan.get("id").and_then(Value::as_str) == Some(plan_id))
+            .cloned()
+            .ok_or_else(|| LedgerError::NotFound(format!("DCA plan does not exist: {plan_id}")))?;
+        let funding_account_id = plan
+            .get("fundingAccountId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![
+                    "DCA plan.fundingAccountId is required to record execution".to_string(),
+                ])
+            })?;
+        if !active_account_exists(&document, funding_account_id) {
+            return Err(LedgerError::NotFound(format!(
+                "DCA funding account does not exist or is archived: {funding_account_id}"
             )));
         }
-        None => {
+        let target_instrument_id = plan
+            .get("targetInstrumentId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![
+                    "DCA plan.targetInstrumentId is required".to_string(),
+                ])
+            })?;
+        let planned_amount = plan.get("plannedAmount").ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["DCA plan.plannedAmount is required".to_string()])
+        })?;
+        let amount = planned_amount
+            .get("amount")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![
+                    "DCA plan.plannedAmount.amount is required".to_string(),
+                ])
+            })?;
+        let currency = planned_amount
+            .get("currency")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![
+                    "DCA plan.plannedAmount.currency is required".to_string(),
+                ])
+            })?;
+        if !is_positive_decimal_string(amount) {
             return Err(LedgerError::InvalidInput(vec![
-                "DCA reminder.status must be present".to_string(),
+                "DCA plan.plannedAmount.amount must be a positive decimal string".to_string(),
             ]));
         }
-    }
 
-    let plan_id = reminder
-        .get("planId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            LedgerError::InvalidInput(vec!["DCA reminder.planId is missing".to_string()])
-        })?;
-    let plan = document["dcaPlans"]
-        .as_array()
-        .expect("validated local ledger dcaPlans should be an array")
-        .iter()
-        .find(|plan| plan.get("id").and_then(Value::as_str) == Some(plan_id))
-        .cloned()
-        .ok_or_else(|| LedgerError::NotFound(format!("DCA plan does not exist: {plan_id}")))?;
-    let funding_account_id = plan
-        .get("fundingAccountId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            LedgerError::InvalidInput(vec![
-                "DCA plan.fundingAccountId is required to record execution".to_string(),
-            ])
-        })?;
-    if !active_account_exists(&document, funding_account_id) {
-        return Err(LedgerError::NotFound(format!(
-            "DCA funding account does not exist or is archived: {funding_account_id}"
-        )));
-    }
-    let target_instrument_id = plan
-        .get("targetInstrumentId")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            LedgerError::InvalidInput(vec!["DCA plan.targetInstrumentId is required".to_string()])
-        })?;
-    let planned_amount = plan.get("plannedAmount").ok_or_else(|| {
-        LedgerError::InvalidInput(vec!["DCA plan.plannedAmount is required".to_string()])
-    })?;
-    let amount = planned_amount
-        .get("amount")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            LedgerError::InvalidInput(vec![
-                "DCA plan.plannedAmount.amount is required".to_string(),
-            ])
-        })?;
-    let currency = planned_amount
-        .get("currency")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            LedgerError::InvalidInput(vec![
-                "DCA plan.plannedAmount.currency is required".to_string(),
-            ])
-        })?;
-    if !is_positive_decimal_string(amount) {
-        return Err(LedgerError::InvalidInput(vec![
-            "DCA plan.plannedAmount.amount must be a positive decimal string".to_string(),
-        ]));
-    }
-
-    let display_name = plan
-        .get("displayName")
-        .and_then(Value::as_str)
-        .unwrap_or(target_instrument_id);
-    let movement = json!({
-        "id": movement_id,
-        "atomicGroupId": atomic_group_id,
-        "type": "buy",
-        "occurredAt": now,
-        "recordedAt": now,
-        "status": "pending_review",
-        "title": format!("记录{display_name}定投"),
-        "description": "用户点击“记录已执行”后生成的候选记录；不下单、不转账。",
-        "entries": [
-            {
-                "id": format!("entry_{movement_id}_cash_out"),
-                "accountId": funding_account_id,
-                "amount": amount,
-                "currency": currency,
-                "direction": "out",
-                "role": "source"
+        let display_name = plan
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or(target_instrument_id);
+        let movement = json!({
+            "id": movement_id,
+            "atomicGroupId": atomic_group_id,
+            "type": "buy",
+            "occurredAt": now,
+            "recordedAt": now,
+            "status": "pending_review",
+            "title": format!("记录{display_name}定投"),
+            "description": "用户点击“记录已执行”后生成的候选记录；不下单、不转账。",
+            "entries": [
+                {
+                    "id": format!("entry_{movement_id}_cash_out"),
+                    "accountId": funding_account_id,
+                    "amount": amount,
+                    "currency": currency,
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "id": format!("entry_{movement_id}_holding_in"),
+                    "accountId": funding_account_id,
+                    "instrumentId": target_instrument_id,
+                    "amount": amount,
+                    "currency": currency,
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ],
+            "categoryId": "cat_investment_dca",
+            "tags": ["dca"],
+            "source": {
+                "kind": "system",
+                "sourceId": reminder_id,
+                "createdBy": "system"
             },
-            {
-                "id": format!("entry_{movement_id}_holding_in"),
-                "accountId": funding_account_id,
-                "instrumentId": target_instrument_id,
-                "amount": amount,
-                "currency": currency,
-                "direction": "in",
-                "role": "destination"
-            }
-        ],
-        "categoryId": "cat_investment_dca",
-        "tags": ["dca"],
-        "source": {
-            "kind": "system",
-            "sourceId": reminder_id,
-            "createdBy": "system"
-        },
-        "createdAt": now,
-        "updatedAt": now
-    });
+            "createdAt": now,
+            "updatedAt": now
+        });
 
-    document["movements"]
-        .as_array_mut()
-        .expect("validated local ledger movements should be an array")
-        .push(movement.clone());
-    if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
-        let movement_entries = document["movementEntries"]
+        document["movements"]
             .as_array_mut()
-            .expect("validated local ledger movementEntries should be an array");
-        for entry in entries {
-            let mut indexed_entry = entry.clone();
-            indexed_entry["movementId"] = json!(movement_id);
-            indexed_entry["atomicGroupId"] = json!(atomic_group_id);
-            movement_entries.push(indexed_entry);
+            .expect("validated local ledger movements should be an array")
+            .push(movement.clone());
+        if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
+            let movement_entries = document["movementEntries"]
+                .as_array_mut()
+                .expect("validated local ledger movementEntries should be an array");
+            for entry in entries {
+                let mut indexed_entry = entry.clone();
+                indexed_entry["movementId"] = json!(movement_id);
+                indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+                movement_entries.push(indexed_entry);
+            }
         }
-    }
 
-    let mut group = atomic_group_from_movement(&movement, "pending");
-    group["warnings"] = json!([
-        {
-            "code": "record_only_no_order",
-            "message": "该候选只记录用户已执行的定投，不连接券商、不下单、不转账。",
-            "severity": "info"
-        }
-    ]);
-    write_document(path, &document)?;
-    Ok(group)
+        let mut group = atomic_group_from_movement(&movement, "pending");
+        group["warnings"] = json!([
+            {
+                "code": "record_only_no_order",
+                "message": "该候选只记录用户已执行的定投，不连接券商、不下单、不转账。",
+                "severity": "info"
+            }
+        ]);
+        write_document(path, &document)?;
+        Ok(group)
+    })
 }
 
 pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
@@ -1135,38 +1209,40 @@ pub fn list_snapshots(path: &Path) -> io::Result<Value> {
 }
 
 pub fn create_manual_snapshot(path: &Path, input: Value, now: &str) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let Some(object) = input.as_object() else {
-        return Err(LedgerError::InvalidInput(vec![
-            "manual snapshot input must be a JSON object".to_string(),
-        ]));
-    };
-    let mut errors = Vec::new();
-    let reason = required_enum(
-        object,
-        "reason",
-        &["baseline", "manual_refresh"],
-        &mut errors,
-    );
-    if !errors.is_empty() {
-        return Err(LedgerError::InvalidInput(errors));
-    }
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let Some(object) = input.as_object() else {
+            return Err(LedgerError::InvalidInput(vec![
+                "manual snapshot input must be a JSON object".to_string(),
+            ]));
+        };
+        let mut errors = Vec::new();
+        let reason = required_enum(
+            object,
+            "reason",
+            &["baseline", "manual_refresh"],
+            &mut errors,
+        );
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
 
-    let mut snapshot = summarize_accounts(&document, now)?.latest_snapshot;
-    if snapshot.is_null() {
-        return Err(LedgerError::Conflict(
-            "cannot create a manual snapshot before any included account exists".to_string(),
-        ));
-    }
-    snapshot["reason"] = json!(reason.expect("validated snapshot reason"));
-    snapshot["createdAt"] = json!(now);
+        let mut snapshot = summarize_accounts(&document, now)?.latest_snapshot;
+        if snapshot.is_null() {
+            return Err(LedgerError::Conflict(
+                "cannot create a manual snapshot before any included account exists".to_string(),
+            ));
+        }
+        snapshot["reason"] = json!(reason.expect("validated snapshot reason"));
+        snapshot["createdAt"] = json!(now);
 
-    document["snapshots"]
-        .as_array_mut()
-        .expect("validated local ledger snapshots should be an array")
-        .push(snapshot.clone());
-    write_document(path, &document)?;
-    Ok(snapshot)
+        document["snapshots"]
+            .as_array_mut()
+            .expect("validated local ledger snapshots should be an array")
+            .push(snapshot.clone());
+        write_document(path, &document)?;
+        Ok(snapshot)
+    })
 }
 
 pub fn list_instruments(path: &Path) -> io::Result<Value> {
@@ -1194,29 +1270,31 @@ pub fn create_instrument(
     input: Value,
     fallback_instrument_id: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let instrument = instrument_from_input(&input, fallback_instrument_id)?;
-    let instrument_id = instrument
-        .get("id")
-        .and_then(Value::as_str)
-        .expect("validated instrument id should be string");
-    if document["instruments"]
-        .as_array()
-        .expect("validated local ledger instruments should be an array")
-        .iter()
-        .any(|existing| existing.get("id").and_then(Value::as_str) == Some(instrument_id))
-    {
-        return Err(LedgerError::Conflict(format!(
-            "instrument already exists: {instrument_id}"
-        )));
-    }
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let instrument = instrument_from_input(&input, fallback_instrument_id)?;
+        let instrument_id = instrument
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("validated instrument id should be string");
+        if document["instruments"]
+            .as_array()
+            .expect("validated local ledger instruments should be an array")
+            .iter()
+            .any(|existing| existing.get("id").and_then(Value::as_str) == Some(instrument_id))
+        {
+            return Err(LedgerError::Conflict(format!(
+                "instrument already exists: {instrument_id}"
+            )));
+        }
 
-    document["instruments"]
-        .as_array_mut()
-        .expect("validated local ledger instruments should be an array")
-        .push(instrument.clone());
-    write_document(path, &document)?;
-    Ok(instrument)
+        document["instruments"]
+            .as_array_mut()
+            .expect("validated local ledger instruments should be an array")
+            .push(instrument.clone());
+        write_document(path, &document)?;
+        Ok(instrument)
+    })
 }
 
 pub fn update_instrument(
@@ -1224,19 +1302,21 @@ pub fn update_instrument(
     instrument_id: &str,
     patch: Value,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let instrument = document["instruments"]
-        .as_array_mut()
-        .expect("validated local ledger instruments should be an array")
-        .iter_mut()
-        .find(|instrument| instrument.get("id").and_then(Value::as_str) == Some(instrument_id))
-        .ok_or_else(|| {
-            LedgerError::NotFound(format!("instrument does not exist: {instrument_id}"))
-        })?;
-    apply_instrument_patch(instrument, &patch)?;
-    let projected = instrument.clone();
-    write_document(path, &document)?;
-    Ok(projected)
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let instrument = document["instruments"]
+            .as_array_mut()
+            .expect("validated local ledger instruments should be an array")
+            .iter_mut()
+            .find(|instrument| instrument.get("id").and_then(Value::as_str) == Some(instrument_id))
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("instrument does not exist: {instrument_id}"))
+            })?;
+        apply_instrument_patch(instrument, &patch)?;
+        let projected = instrument.clone();
+        write_document(path, &document)?;
+        Ok(projected)
+    })
 }
 
 pub fn list_categories(path: &Path) -> io::Result<Value> {
@@ -1250,28 +1330,34 @@ pub fn list_categories(path: &Path) -> io::Result<Value> {
 }
 
 pub fn create_category(path: &Path, input: Value, category_id: &str) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let category = category_from_input(&input, category_id)?;
-    document["categories"]
-        .as_array_mut()
-        .expect("validated local ledger categories should be an array")
-        .push(category.clone());
-    write_document(path, &document)?;
-    Ok(category)
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let category = category_from_input(&input, category_id)?;
+        document["categories"]
+            .as_array_mut()
+            .expect("validated local ledger categories should be an array")
+            .push(category.clone());
+        write_document(path, &document)?;
+        Ok(category)
+    })
 }
 
 pub fn update_category(path: &Path, category_id: &str, patch: Value) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let category = document["categories"]
-        .as_array_mut()
-        .expect("validated local ledger categories should be an array")
-        .iter_mut()
-        .find(|category| category.get("id").and_then(Value::as_str) == Some(category_id))
-        .ok_or_else(|| LedgerError::NotFound(format!("category does not exist: {category_id}")))?;
-    apply_category_patch(category, &patch)?;
-    let projected = category.clone();
-    write_document(path, &document)?;
-    Ok(projected)
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let category = document["categories"]
+            .as_array_mut()
+            .expect("validated local ledger categories should be an array")
+            .iter_mut()
+            .find(|category| category.get("id").and_then(Value::as_str) == Some(category_id))
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("category does not exist: {category_id}"))
+            })?;
+        apply_category_patch(category, &patch)?;
+        let projected = category.clone();
+        write_document(path, &document)?;
+        Ok(projected)
+    })
 }
 
 pub fn list_counterparties(path: &Path) -> io::Result<Value> {
@@ -1289,14 +1375,16 @@ pub fn create_counterparty(
     input: Value,
     counterparty_id: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let counterparty = counterparty_from_input(&input, counterparty_id)?;
-    document["counterparties"]
-        .as_array_mut()
-        .expect("validated local ledger counterparties should be an array")
-        .push(counterparty.clone());
-    write_document(path, &document)?;
-    Ok(counterparty)
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let counterparty = counterparty_from_input(&input, counterparty_id)?;
+        document["counterparties"]
+            .as_array_mut()
+            .expect("validated local ledger counterparties should be an array")
+            .push(counterparty.clone());
+        write_document(path, &document)?;
+        Ok(counterparty)
+    })
 }
 
 pub fn update_counterparty(
@@ -1304,21 +1392,23 @@ pub fn update_counterparty(
     counterparty_id: &str,
     patch: Value,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let counterparty = document["counterparties"]
-        .as_array_mut()
-        .expect("validated local ledger counterparties should be an array")
-        .iter_mut()
-        .find(|counterparty| {
-            counterparty.get("id").and_then(Value::as_str) == Some(counterparty_id)
-        })
-        .ok_or_else(|| {
-            LedgerError::NotFound(format!("counterparty does not exist: {counterparty_id}"))
-        })?;
-    apply_counterparty_patch(counterparty, &patch)?;
-    let projected = counterparty.clone();
-    write_document(path, &document)?;
-    Ok(projected)
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let counterparty = document["counterparties"]
+            .as_array_mut()
+            .expect("validated local ledger counterparties should be an array")
+            .iter_mut()
+            .find(|counterparty| {
+                counterparty.get("id").and_then(Value::as_str) == Some(counterparty_id)
+            })
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("counterparty does not exist: {counterparty_id}"))
+            })?;
+        apply_counterparty_patch(counterparty, &patch)?;
+        let projected = counterparty.clone();
+        write_document(path, &document)?;
+        Ok(projected)
+    })
 }
 
 pub fn create_counterparty_merge_proposal(
@@ -1328,30 +1418,32 @@ pub fn create_counterparty_merge_proposal(
     atomic_group_id: &str,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let group = counterparty_merge_group_from_input(&document, &input, atomic_group_id)?;
-    let proposal = json!({
-        "id": proposal_id,
-        "status": "pending",
-        "source": {
-            "kind": "manual_import",
-            "evidenceRefs": []
-        },
-        "atomicGroups": [group.clone()],
-        "summary": group
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("对手方合并候选"),
-        "warnings": [],
-        "createdAt": now
-    });
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let group = counterparty_merge_group_from_input(&document, &input, atomic_group_id)?;
+        let proposal = json!({
+            "id": proposal_id,
+            "status": "pending",
+            "source": {
+                "kind": "manual_import",
+                "evidenceRefs": []
+            },
+            "atomicGroups": [group.clone()],
+            "summary": group
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("对手方合并候选"),
+            "warnings": [],
+            "createdAt": now
+        });
 
-    document["aiProposals"]
-        .as_array_mut()
-        .expect("validated local ledger aiProposals should be an array")
-        .push(proposal);
-    write_document(path, &document)?;
-    Ok(group)
+        document["aiProposals"]
+            .as_array_mut()
+            .expect("validated local ledger aiProposals should be an array")
+            .push(proposal);
+        write_document(path, &document)?;
+        Ok(group)
+    })
 }
 
 pub fn create_ai_import_proposal(
@@ -1363,24 +1455,27 @@ pub fn create_ai_import_proposal(
     movement_id: &str,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let groups = ai_import_groups_from_input(
-        &document,
-        &input,
-        source_kind,
-        proposal_id,
-        atomic_group_id,
-        movement_id,
-        now,
-    )?;
-    let proposal = ai_import_proposal_from_groups(&input, source_kind, proposal_id, groups, now);
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let groups = ai_import_groups_from_input(
+            &document,
+            &input,
+            source_kind,
+            proposal_id,
+            atomic_group_id,
+            movement_id,
+            now,
+        )?;
+        let proposal =
+            ai_import_proposal_from_groups(&input, source_kind, proposal_id, groups, now);
 
-    document["aiProposals"]
-        .as_array_mut()
-        .expect("validated local ledger aiProposals should be an array")
-        .push(proposal.clone());
-    write_document(path, &document)?;
-    Ok(proposal)
+        document["aiProposals"]
+            .as_array_mut()
+            .expect("validated local ledger aiProposals should be an array")
+            .push(proposal.clone());
+        write_document(path, &document)?;
+        Ok(proposal)
+    })
 }
 
 pub fn edit_ai_atomic_group(
@@ -1390,33 +1485,42 @@ pub fn edit_ai_atomic_group(
     movement_id: &str,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
-    let source_id = find_ai_proposal_id_for_group(&document, atomic_group_id).ok_or_else(|| {
-        LedgerError::NotFound(format!("AI atomic group does not exist: {atomic_group_id}"))
-    })?;
-    let group = find_ai_atomic_group(&document, atomic_group_id).ok_or_else(|| {
-        LedgerError::NotFound(format!("AI atomic group does not exist: {atomic_group_id}"))
-    })?;
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        let source_id =
+            find_ai_proposal_id_for_group(&document, atomic_group_id).ok_or_else(|| {
+                LedgerError::NotFound(format!("AI atomic group does not exist: {atomic_group_id}"))
+            })?;
+        let group = find_ai_atomic_group(&document, atomic_group_id).ok_or_else(|| {
+            LedgerError::NotFound(format!("AI atomic group does not exist: {atomic_group_id}"))
+        })?;
 
-    match group.get("status").and_then(Value::as_str) {
-        Some("pending" | "edited") => {}
-        Some(status) => {
-            return Err(LedgerError::Conflict(format!(
-                "AI atomic group cannot be edited from status: {status}"
-            )));
+        match group.get("status").and_then(Value::as_str) {
+            Some("pending" | "edited") => {}
+            Some(status) => {
+                return Err(LedgerError::Conflict(format!(
+                    "AI atomic group cannot be edited from status: {status}"
+                )));
+            }
+            None => {
+                return Err(LedgerError::InvalidInput(vec![
+                    "atomic group status must be present".to_string(),
+                ]));
+            }
         }
-        None => {
-            return Err(LedgerError::InvalidInput(vec![
-                "atomic group status must be present".to_string(),
-            ]));
-        }
-    }
 
-    let edited_group =
-        edited_ai_atomic_group_from_patch(&document, &group, &patch, &source_id, movement_id, now)?;
-    replace_ai_atomic_group(&mut document, atomic_group_id, edited_group.clone())?;
-    write_document(path, &document)?;
-    Ok(edited_group)
+        let edited_group = edited_ai_atomic_group_from_patch(
+            &document,
+            &group,
+            &patch,
+            &source_id,
+            movement_id,
+            now,
+        )?;
+        replace_ai_atomic_group(&mut document, atomic_group_id, edited_group.clone())?;
+        write_document(path, &document)?;
+        Ok(edited_group)
+    })
 }
 
 pub fn list_pending_ai_proposals(path: &Path) -> io::Result<Value> {
