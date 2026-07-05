@@ -2782,12 +2782,30 @@ async fn sync_bootstrap(
 async fn sync_changes(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        let since = query.get("since").map(String::as_str);
+        return match local_ledger::list_sync_changes(path, since) {
+            Ok(changes) => envelope(json!({
+                "cursor": current_sync_cursor(&state, &query),
+                "changes": changes,
+                "conflicts": []
+            }))
+            .into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
     envelope(json!({
         "cursor": current_sync_cursor(&state, &query),
         "changes": [],
         "conflicts": []
     }))
+    .into_response()
 }
 
 async fn sync_push(
@@ -4197,15 +4215,11 @@ mod tests {
                 .await;
         assert_eq!(account_status, StatusCode::CREATED);
 
-        let mut document = local_ledger::read_document(&path).expect("ledger should be readable");
-        document["syncState"]["cursor"] = json!("cursor_test_001");
-        local_ledger::write_document(&path, &document).expect("ledger cursor should persist");
-
         let (bootstrap_status, bootstrap_body) =
             request_json_from(router.clone(), Method::GET, "/v1/ledger/bootstrap").await;
         assert_eq!(bootstrap_status, StatusCode::OK);
         assert_eq!(bootstrap_body["data"]["ledgerVersion"], 1);
-        assert_eq!(bootstrap_body["data"]["syncCursor"], "cursor_test_001");
+        assert_eq!(bootstrap_body["data"]["syncCursor"], "local_change_000001");
         assert_eq!(
             bootstrap_body["data"]["accounts"][0]["displayName"],
             "同步账户"
@@ -4234,8 +4248,23 @@ mod tests {
         let (sync_status, sync_body) =
             request_json_from(router.clone(), Method::GET, "/v1/sync/changes").await;
         assert_eq!(sync_status, StatusCode::OK);
-        assert_eq!(sync_body["data"]["cursor"], "cursor_test_001");
-        assert_eq!(sync_body["data"]["changes"], json!([]));
+        assert_eq!(sync_body["data"]["cursor"], "local_change_000001");
+        assert_eq!(sync_body["data"]["changes"][0]["id"], "local_change_000001");
+        assert_eq!(sync_body["data"]["changes"][0]["entityType"], "account");
+        assert_eq!(sync_body["data"]["changes"][0]["operation"], "create");
+        assert_eq!(
+            sync_body["data"]["changes"][0]["payload"]["displayName"],
+            "同步账户"
+        );
+
+        let (since_status, since_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/sync/changes?since=local_change_000001",
+        )
+        .await;
+        assert_eq!(since_status, StatusCode::OK);
+        assert_eq!(since_body["data"]["changes"], json!([]));
 
         let (push_status, push_body) = request_json_body_from(
             router,
@@ -4411,6 +4440,11 @@ mod tests {
             .as_array()
             .expect("validated accounts should be an array");
         assert_eq!(accounts.len(), 20);
+        let sync_changes = document["syncChanges"]
+            .as_array()
+            .expect("validated syncChanges should be an array");
+        assert_eq!(sync_changes.len(), 20);
+        assert_eq!(document["syncState"]["cursor"], "local_change_000020");
 
         let _ = std::fs::remove_file(path);
     }
@@ -4502,6 +4536,16 @@ mod tests {
             "200.50"
         );
         assert_eq!(persisted["accounts"][0]["status"], "archived");
+        let sync_changes = persisted["syncChanges"]
+            .as_array()
+            .expect("validated syncChanges should be an array");
+        assert_eq!(sync_changes.len(), 3);
+        assert_eq!(sync_changes[0]["operation"], "create");
+        assert_eq!(sync_changes[1]["operation"], "update");
+        assert_eq!(sync_changes[1]["payload"]["displayName"], "建行工资卡");
+        assert_eq!(sync_changes[2]["operation"], "update");
+        assert_eq!(sync_changes[2]["payload"]["status"], "archived");
+        assert_eq!(persisted["syncState"]["cursor"], "local_change_000003");
 
         let _ = std::fs::remove_file(path);
     }

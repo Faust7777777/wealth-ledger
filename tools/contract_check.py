@@ -289,6 +289,9 @@ def check_rust_server() -> None:
         "LEDGER_WRITE_LOCKS",
         "with_ledger_write_lock",
         "normalized_lock_path",
+        "syncChanges",
+        "list_sync_changes",
+        "append_sync_change",
     ]
     missing_lock_snippets = [
         snippet for snippet in ledger_lock_snippets if snippet not in local_ledger_text

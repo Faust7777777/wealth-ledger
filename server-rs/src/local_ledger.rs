@@ -10,6 +10,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const LEDGER_VERSION: i64 = 1;
 pub const DEFAULT_BASE_CURRENCY: &str = "CNY";
+const LOCAL_SYNC_DEVICE_ID: &str = "local_device";
 const INSTRUMENT_TYPES: &[&str] = &[
     "cash",
     "equity",
@@ -80,8 +81,10 @@ pub fn empty_document(base_currency: &str) -> Value {
         "anomalies": [],
         "syncState": {
             "cursor": null,
+            "nextChangeSequence": 1,
             "pendingChangeIds": []
         },
+        "syncChanges": [],
         "migrations": []
     })
 }
@@ -98,7 +101,8 @@ pub fn load_or_initialize(path: &Path) -> io::Result<Value> {
 
 pub fn read_document(path: &Path) -> io::Result<Value> {
     let raw = fs::read_to_string(path)?;
-    let document: Value = serde_json::from_str(&raw).map_err(invalid_data)?;
+    let mut document: Value = serde_json::from_str(&raw).map_err(invalid_data)?;
+    normalize_document_for_read(&mut document);
     validate_document(&document).map_err(validation_error)?;
     Ok(document)
 }
@@ -115,6 +119,29 @@ pub fn write_document(path: &Path, document: &Value) -> io::Result<()> {
     fs::write(&tmp_path, bytes)?;
     fs::rename(tmp_path, path)?;
     Ok(())
+}
+
+fn normalize_document_for_read(document: &mut Value) {
+    let Some(object) = document.as_object_mut() else {
+        return;
+    };
+    object
+        .entry("syncChanges".to_string())
+        .or_insert_with(|| json!([]));
+    let sync_state = object
+        .entry("syncState".to_string())
+        .or_insert_with(|| json!({}));
+    if let Some(sync_state) = sync_state.as_object_mut() {
+        sync_state
+            .entry("cursor".to_string())
+            .or_insert(Value::Null);
+        sync_state
+            .entry("nextChangeSequence".to_string())
+            .or_insert_with(|| json!(1));
+        sync_state
+            .entry("pendingChangeIds".to_string())
+            .or_insert_with(|| json!([]));
+    }
 }
 
 #[derive(Debug)]
@@ -150,6 +177,11 @@ pub fn get_account(path: &Path, account_id: &str) -> io::Result<Option<Value>> {
         .iter()
         .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
         .cloned())
+}
+
+pub fn list_sync_changes(path: &Path, since: Option<&str>) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    Ok(sync_changes_for_document(&document, since))
 }
 
 pub fn list_account_anomalies(path: &Path, now: &str) -> io::Result<Value> {
@@ -440,6 +472,14 @@ pub fn create_account(
             accounts.push(account.clone());
         }
 
+        append_sync_change(
+            &mut document,
+            "account",
+            account_id,
+            "create",
+            &account,
+            now,
+        );
         write_document(path, &document)?;
         Ok(project_account_for_api(&account))
     })
@@ -458,6 +498,14 @@ pub fn update_account(
         })?;
         apply_account_patch(account, &patch, now)?;
         let projected = project_account_for_api(account);
+        append_sync_change(
+            &mut document,
+            "account",
+            account_id,
+            "update",
+            &projected,
+            now,
+        );
         write_document(path, &document)?;
         Ok(projected)
     })
@@ -473,6 +521,14 @@ pub fn archive_account(path: &Path, account_id: &str, now: &str) -> Result<Value
         account["visibility"] = json!("archived");
         account["updatedAt"] = json!(now);
         let projected = project_account_for_api(account);
+        append_sync_change(
+            &mut document,
+            "account",
+            account_id,
+            "update",
+            &projected,
+            now,
+        );
         write_document(path, &document)?;
         Ok(projected)
     })
@@ -1621,9 +1677,23 @@ pub fn validate_document(document: &Value) -> Result<(), Vec<String>> {
         "aiProposals",
         "evidenceRefs",
         "anomalies",
+        "syncChanges",
         "migrations",
     ] {
         require_array(object, key, &mut errors);
+    }
+
+    match object.get("syncState").and_then(Value::as_object) {
+        Some(sync_state) => {
+            if sync_state
+                .get("pendingChangeIds")
+                .and_then(Value::as_array)
+                .is_none()
+            {
+                errors.push("syncState.pendingChangeIds must be an array".to_string());
+            }
+        }
+        None => errors.push("syncState must be an object".to_string()),
     }
 
     if contains_fixture_marker(document) {
@@ -2253,6 +2323,73 @@ fn account_anomalies_for_document(document: &Value, now: &str) -> io::Result<Vec
     }
 
     Ok(anomalies)
+}
+
+fn sync_changes_for_document(document: &Value, since: Option<&str>) -> Value {
+    let changes = document["syncChanges"]
+        .as_array()
+        .expect("validated local ledger syncChanges should be an array");
+    let since = since.map(str::trim).filter(|value| !value.is_empty());
+    let start = since
+        .and_then(|cursor| {
+            changes
+                .iter()
+                .position(|change| change.get("id").and_then(Value::as_str) == Some(cursor))
+                .map(|index| index + 1)
+        })
+        .unwrap_or(0);
+    json!(changes.iter().skip(start).cloned().collect::<Vec<_>>())
+}
+
+fn append_sync_change(
+    document: &mut Value,
+    entity_type: &str,
+    entity_id: &str,
+    operation: &str,
+    payload: &Value,
+    now: &str,
+) {
+    let change_id = next_sync_change_id(document);
+    let change = json!({
+        "id": change_id,
+        "deviceId": LOCAL_SYNC_DEVICE_ID,
+        "entityType": entity_type,
+        "entityId": entity_id,
+        "operation": operation,
+        "payload": payload,
+        "createdAt": now
+    });
+
+    document["syncChanges"]
+        .as_array_mut()
+        .expect("validated local ledger syncChanges should be an array")
+        .push(change);
+    let sync_state = document["syncState"]
+        .as_object_mut()
+        .expect("validated local ledger syncState should be an object");
+    sync_state.insert("cursor".to_string(), json!(change_id));
+    sync_state
+        .entry("pendingChangeIds".to_string())
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .expect("validated local ledger pendingChangeIds should be an array")
+        .push(json!(change_id));
+}
+
+fn next_sync_change_id(document: &mut Value) -> String {
+    let fallback_sequence = document["syncChanges"]
+        .as_array()
+        .map(|changes| changes.len() as u64 + 1)
+        .unwrap_or(1);
+    let sync_state = document["syncState"]
+        .as_object_mut()
+        .expect("validated local ledger syncState should be an object");
+    let sequence = sync_state
+        .get("nextChangeSequence")
+        .and_then(Value::as_u64)
+        .unwrap_or(fallback_sequence);
+    sync_state.insert("nextChangeSequence".to_string(), json!(sequence + 1));
+    format!("local_change_{sequence:06}")
 }
 
 fn account_from_create_input(

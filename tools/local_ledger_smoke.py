@@ -313,6 +313,15 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     )
     assert updated["displayName"] == "Smoke Reserve Updated"
 
+    sync = unwrap_data(request_json(base, "/v1/sync/changes"))
+    account_changes = [item for item in sync["changes"] if item["entityType"] == "account"]
+    assert len(account_changes) >= 3
+    assert account_changes[0]["operation"] == "create"
+    assert account_changes[-1]["operation"] == "update"
+    assert account_changes[-1]["payload"]["displayName"] == "Smoke Reserve Updated"
+    sync_after_cursor = unwrap_data(request_json(base, f"/v1/sync/changes?since={sync['cursor']}"))
+    assert sync_after_cursor["changes"] == []
+
     expense = create_and_confirm_manual_expense(base, cash["id"])
     assert expense["title"] == "local smoke coffee"
 

@@ -61,6 +61,7 @@ ledger/
   evidence_refs
   anomalies
   sync_state
+  sync_changes
   migrations
 ```
 
@@ -172,4 +173,3 @@ snapshots.csv
 - transfer 双边账户存在。
 - AI proposal 通过 validation 后才可 approve。
 - debug fixture 与 real ledger 路径互斥。
-
