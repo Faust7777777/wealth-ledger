@@ -6575,7 +6575,9 @@ fn is_decimal_string(value: &str) -> bool {
     }
 
     match fraction {
-        Some(value) => !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()),
+        Some(value) => {
+            !value.is_empty() && value.len() <= 8 && value.chars().all(|c| c.is_ascii_digit())
+        }
         None => true,
     }
 }

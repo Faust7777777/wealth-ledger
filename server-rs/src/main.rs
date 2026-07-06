@@ -55,6 +55,7 @@ struct AppState {
     local_ledger_path: Option<PathBuf>,
     auth: AuthStore,
     allow_ledger_scenario: bool,
+    allowed_hosts: Vec<String>,
 }
 
 impl AppState {
@@ -64,6 +65,7 @@ impl AppState {
             local_ledger_path: None,
             auth: AuthStore::from_env_or_dev_with_default_state_path(None),
             allow_ledger_scenario: env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
+            allowed_hosts: allowed_hosts_from_env(),
         }
     }
 
@@ -74,6 +76,7 @@ impl AppState {
             local_ledger_path: Some(path),
             auth: AuthStore::from_env_or_dev_with_default_state_path(Some(auth_state_path)),
             allow_ledger_scenario: env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
+            allowed_hosts: allowed_hosts_from_env(),
         }
     }
 
@@ -97,6 +100,10 @@ impl AppState {
         self.local_ledger_path.is_some()
             && !self.allow_ledger_scenario
             && query_has_non_empty_scenario(query)
+    }
+
+    fn rejects_host_header(&self, headers: &HeaderMap) -> bool {
+        self.local_ledger_path.is_some() && !host_header_is_allowed(headers, &self.allowed_hosts)
     }
 }
 
@@ -1098,6 +1105,21 @@ async fn require_auth_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    if state.rejects_host_header(request.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "ok": false,
+                "error": {
+                    "code": "host_header_forbidden",
+                    "message": "Host header is not allowed for a mounted local ledger.",
+                    "severity": "critical",
+                    "retryable": false
+                }
+            })),
+        )
+            .into_response();
+    }
     if state.rejects_ledger_scenario(request.uri().query()) {
         return bad_request(
             "ledger_scenario_forbidden",
@@ -1135,6 +1157,53 @@ fn query_has_non_empty_scenario(query: Option<&str>) -> bool {
             None => part == "scenario",
         })
     })
+}
+
+fn allowed_hosts_from_env() -> Vec<String> {
+    let mut hosts = vec![
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+        "[::1]".to_string(),
+        "::1".to_string(),
+    ];
+    if let Ok(extra_hosts) = env::var("FINWEALTH_ALLOWED_HOSTS") {
+        hosts.extend(
+            extra_hosts
+                .split(',')
+                .filter_map(normalized_host_without_port),
+        );
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+fn host_header_is_allowed(headers: &HeaderMap, allowed_hosts: &[String]) -> bool {
+    let Some(host) = headers.get("host").and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    normalized_host_without_port(host).is_some_and(|host| allowed_hosts.contains(&host))
+}
+
+fn normalized_host_without_port(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Some(without_opening_bracket) = value.strip_prefix('[') {
+        let (host, suffix) = without_opening_bracket.split_once(']')?;
+        if suffix.is_empty() || suffix.starts_with(':') {
+            return Some(format!("[{host}]"));
+        }
+        return None;
+    }
+
+    if value.matches(':').count() == 1 {
+        return value.split_once(':').map(|(host, _)| host.to_string());
+    }
+
+    Some(value)
 }
 
 fn read_addr() -> SocketAddr {
@@ -3774,6 +3843,7 @@ mod tests {
                     .method(method)
                     .uri(uri)
                     .header("content-type", "application/json")
+                    .header("host", "127.0.0.1")
                     .body(Body::from(
                         serde_json::to_vec(&body).expect("request body should serialize"),
                     ))
@@ -3805,6 +3875,7 @@ mod tests {
                     .method(method)
                     .uri(uri)
                     .header("authorization", format!("Bearer {token}"))
+                    .header("host", "127.0.0.1")
                     .body(Body::empty())
                     .expect("request should build"),
             )
@@ -4471,6 +4542,35 @@ mod tests {
 
         let document = local_ledger::read_document(&path).expect("ledger should stay readable");
         assert_eq!(document["accounts"], json!([]));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_rejects_non_loopback_host_header() {
+        let path = unique_test_ledger_path("reject_host_header");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/v1/accounts")
+                    .header("host", "evil.example")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body should read");
+        let body: Value = serde_json::from_slice(&bytes).expect("response body should be JSON");
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "host_header_forbidden");
 
         let _ = std::fs::remove_file(path);
     }
@@ -6635,6 +6735,88 @@ mod tests {
                 .any(|error| error
                     .as_str()
                     .is_some_and(|text| text.contains("displayName")))
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_rejects_decimal_amounts_over_eight_places() {
+        let path = unique_test_ledger_path("decimal_scale");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let invalid_account = json!({
+            "displayName": "高精度账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "1.123456789"}
+            ]
+        });
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            invalid_account,
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::BAD_REQUEST);
+        assert_eq!(account_body["error"]["code"], "invalid_account_input");
+
+        let valid_account = json!({
+            "displayName": "有效账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "10.12345678"}
+            ]
+        });
+        let (create_status, create_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/accounts", valid_account)
+                .await;
+        assert_eq!(create_status, StatusCode::CREATED);
+        let account_id = create_body["data"]["id"]
+            .as_str()
+            .expect("created account id should be string")
+            .to_string();
+
+        let invalid_draft = json!({
+            "type": "expense",
+            "occurredAt": "2026-06-26T10:00:00+08:00",
+            "title": "高精度支出",
+            "entries": [
+                {
+                    "accountId": account_id,
+                    "amount": "1.123456789",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }
+            ]
+        });
+        let (draft_status, draft_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            invalid_draft,
+        )
+        .await;
+        assert_eq!(draft_status, StatusCode::BAD_REQUEST);
+        assert_eq!(draft_body["error"]["code"], "invalid_movement_draft_input");
+
+        let (overview_status, overview_body) =
+            request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_status, StatusCode::OK);
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "10.12"
         );
 
         let _ = std::fs::remove_file(path);
