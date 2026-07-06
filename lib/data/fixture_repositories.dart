@@ -490,9 +490,13 @@ class FixtureAiProposalRepository implements AiProposalRepository {
       .cast<AiProposalVm?>()
       .firstWhere((p) => true, orElse: () => null);
   @override
-  Future<void> approveAtomicGroup(Id groupId) async {
-    /* DEMO：模拟接受，演示数据不变 */
-  }
+  Future<ConfirmResultVm> approveAtomicGroup(Id groupId) async =>
+      ConfirmResultVm(
+        atomicGroupId: groupId,
+        confirmedMovementIds: const [],
+        snapshotInvalidated: false,
+        ledgerWrite: false,
+      );
   @override
   Future<void> rejectAtomicGroup(Id groupId, {String? reason}) async {
     /* DEMO：模拟拒绝 */

@@ -211,6 +211,9 @@ def check_mock_server() -> None:
         "FORBIDDEN_PATHS",
         "X-Finwealth-Mock",
         "read_example",
+        '"/v1/holdings"',
+        '"/v1/movements/recent"',
+        '"ledgerWrite": False',
     ]
     missing = [snippet for snippet in required_snippets if snippet not in text]
     if missing:
@@ -235,6 +238,9 @@ def check_dev_server() -> None:
         "FORBIDDEN_PATHS",
         "dev_access_token_not_for_production",
         "No persistence, no real auth, no real AI, no real quotes, no sync side effects.",
+        '"/v1/holdings"',
+        '"/v1/movements/recent"',
+        '"ledgerWrite": False',
     ]
     missing = [snippet for snippet in required_snippets if snippet not in text]
     if missing:
@@ -410,8 +416,22 @@ def main() -> None:
         fail("DCA executed flow must create a proposal endpoint")
     if "/ai/atomic-groups/{atomicGroupId}/approve" not in paths:
         fail("AI approval endpoint must remain atomic-group based")
+    if "/holdings" not in paths:
+        fail("OpenAPI must document the local-server holdings alias /holdings")
+    if "/movements/recent" not in paths:
+        fail("OpenAPI must document the local-server recent movements alias /movements/recent")
     if "AiFieldDiff" not in schemas:
         fail("OpenAPI must expose AiFieldDiff for old -> new review")
+    confirm_result = doc["components"]["schemas"].get("ConfirmResult", {})
+    confirm_required = set(confirm_result.get("required", []))
+    if "ledgerWrite" not in confirm_required:
+        fail("ConfirmResult must require ledgerWrite so clients do not guess write semantics")
+    categories_post_schema = doc["paths"]["/categories"]["post"]["requestBody"]["content"]["application/json"]["schema"].get("$ref")
+    if categories_post_schema != "#/components/schemas/CreateCategoryInput":
+        fail("POST /categories must use CreateCategoryInput, not the response Category schema")
+    counterparties_post_schema = doc["paths"]["/counterparties"]["post"]["requestBody"]["content"]["application/json"]["schema"].get("$ref")
+    if counterparties_post_schema != "#/components/schemas/CreateCounterpartyInput":
+        fail("POST /counterparties must use CreateCounterpartyInput, not the response Counterparty schema")
     ok("Critical AI/DCA invariants are represented")
 
     check_examples()

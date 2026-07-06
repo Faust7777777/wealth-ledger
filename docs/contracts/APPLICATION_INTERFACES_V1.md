@@ -139,6 +139,7 @@ CreateMovementDraftInput {
 ConfirmResult {
   atomicGroupId: ID;
   confirmedMovementIds: ID[];
+  ledgerWrite: boolean;
   snapshotInvalidated: boolean;
 }
 ```
@@ -146,6 +147,7 @@ ConfirmResult {
 约束：
 
 - `confirmAtomicGroup` 是最小写入事务边界。
+- `ledgerWrite` 是前端显示“已入账”和刷新账本派生视图的唯一依据。
 - draft / pending review 不影响正式余额。
 - 已确认记录的修改优先走 correction。
 
@@ -282,4 +284,3 @@ autoModifyConfirmedLedger()
 planCouponUsage()
 recommendMilkTea()
 ```
-

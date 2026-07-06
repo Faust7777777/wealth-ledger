@@ -131,6 +131,35 @@ class MockApiHandler(BaseHTTPRequestHandler):
             self._send_json(200, json_bytes({"ok": True, "data": []}))
             return
 
+        if path in {
+            "/v1/auth/devices",
+            "/v1/accounts",
+            "/v1/accounts/anomalies",
+            "/v1/portfolio/holdings",
+            "/v1/holdings",
+            "/v1/movements",
+            "/v1/movements/recent",
+            "/v1/dca/plans",
+            "/v1/dca/reminders/due",
+            "/v1/categories",
+            "/v1/counterparties",
+            "/v1/snapshots",
+        }:
+            self._send_json(200, json_bytes({"ok": True, "data": []}))
+            return
+
+        if path == "/v1/portfolio/allocation":
+            self._send_json(200, json_bytes({"ok": True, "data": {}}))
+            return
+
+        if path == "/v1/snapshots/latest":
+            self._send_json(200, json_bytes({"ok": True, "data": None}))
+            return
+
+        if path.startswith("/v1/accounts/") and path.endswith("/holdings"):
+            self._send_json(200, json_bytes({"ok": True, "data": []}))
+            return
+
         if path == "/v1/quotes/summary":
             self._send_json(
                 200,
@@ -170,6 +199,27 @@ class MockApiHandler(BaseHTTPRequestHandler):
 
         if path == "/v1/ai/proposals/from-csv":
             self._send_json(200, read_example("ai_modify_movement_diff.response.json"))
+            return
+
+        if path.startswith("/v1/ai/atomic-groups/") and path.endswith("/approve"):
+            self._send_json(
+                200,
+                json_bytes(
+                    {
+                        "ok": True,
+                        "data": {
+                            "atomicGroupId": path.split("/")[-2],
+                            "confirmedMovementIds": [],
+                            "ledgerWrite": False,
+                            "snapshotInvalidated": False,
+                        },
+                    }
+                ),
+            )
+            return
+
+        if path.startswith("/v1/ai/atomic-groups/") and path.endswith("/reject"):
+            self._send_json(204, b"")
             return
 
         if path.endswith("/mark-executed-as-proposal") and path.startswith("/v1/dca/reminders/"):

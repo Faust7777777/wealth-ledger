@@ -140,7 +140,7 @@ class RealLocalAiProposalRepository implements AiProposalRepository {
   @override
   Future<AiProposalVm?> getProposal(Id id) async => null;
   @override
-  Future<void> approveAtomicGroup(Id groupId) async =>
+  Future<ConfirmResultVm> approveAtomicGroup(Id groupId) async =>
       throw UnsupportedError('real_local 暂不支持写入；请用 local_server 联调');
   @override
   Future<void> rejectAtomicGroup(Id groupId, {String? reason}) async =>

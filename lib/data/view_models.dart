@@ -265,6 +265,20 @@ class CreateCorrectionInput {
   final String reason;
 }
 
+/// 确认 atomic group 的结果。UI 必须以 ledgerWrite 为准，不能自行猜测是否已入账。
+class ConfirmResultVm {
+  const ConfirmResultVm({
+    required this.atomicGroupId,
+    required this.confirmedMovementIds,
+    required this.snapshotInvalidated,
+    required this.ledgerWrite,
+  });
+  final Id atomicGroupId;
+  final List<Id> confirmedMovementIds;
+  final bool snapshotInvalidated;
+  final bool ledgerWrite;
+}
+
 class HoldingVm {
   const HoldingVm({
     required this.id,

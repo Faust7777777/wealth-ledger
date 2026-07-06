@@ -266,6 +266,8 @@ confirmAtomicGroup(groupId: ID): ConfirmResult
 6. 标记快照过期。
 7. 追加 sync outbox。
 
+返回值必须包含 `ledgerWrite`；调用方只能在 `ledgerWrite=true` 时展示“已入账”或按正式账本写入刷新派生视图。
+
 失败条件：
 
 - validation 失败。

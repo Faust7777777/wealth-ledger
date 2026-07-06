@@ -21,8 +21,10 @@ class AiReviewPage extends ConsumerWidget {
       appBar: AppBar(title: const Text('AI 待确认')),
       body: async.when(
         loading: () => const Center(child: CircularProgressIndicator()),
-        error: (e, _) =>
-            ErrorStateView(message: '$e', onRetry: () => ref.invalidate(aiPendingProvider)),
+        error: (e, _) => ErrorStateView(
+          message: '$e',
+          onRetry: () => ref.invalidate(aiPendingProvider),
+        ),
         data: (proposals) {
           if (proposals.isEmpty) {
             return const EmptyState(
@@ -54,7 +56,10 @@ class _ProposalCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(p.summary ?? 'AI 提案', style: Theme.of(context).textTheme.titleMedium),
+            Text(
+              p.summary ?? 'AI 提案',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
             const SizedBox(height: AppSpacing.xxs),
             Text('来源：${p.sourceLabel}', style: AppType.caption),
             const Divider(),
@@ -71,12 +76,12 @@ class _GroupBlock extends ConsumerWidget {
   final AiAtomicGroupVm g;
 
   String get _opLabel => switch (g.operation) {
-        AiOperation.create => '新增',
-        AiOperation.modify => '修改',
-        AiOperation.correction => '更正',
-        AiOperation.merge => '归并',
-        AiOperation.classify => '分类',
-      };
+    AiOperation.create => '新增',
+    AiOperation.modify => '修改',
+    AiOperation.correction => '更正',
+    AiOperation.merge => '归并',
+    AiOperation.classify => '分类',
+  };
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -104,13 +109,12 @@ class _GroupBlock extends ConsumerWidget {
           Row(
             children: [
               TextButton(
-                onPressed: () => _run(
-                  context,
-                  ref,
-                  () => ref.read(aiProposalRepositoryProvider).rejectAtomicGroup(g.id),
-                  '已拒绝该组',
-                  writesLedger: false,
-                ),
+                onPressed: () => _run(context, ref, () async {
+                  await ref
+                      .read(aiProposalRepositoryProvider)
+                      .rejectAtomicGroup(g.id);
+                  return null;
+                }, '已拒绝该组'),
                 child: const Text('拒绝整组'),
               ),
               const Spacer(),
@@ -123,9 +127,10 @@ class _GroupBlock extends ConsumerWidget {
                 onPressed: () => _run(
                   context,
                   ref,
-                  () => ref.read(aiProposalRepositoryProvider).approveAtomicGroup(g.id),
+                  () => ref
+                      .read(aiProposalRepositoryProvider)
+                      .approveAtomicGroup(g.id),
                   '已接受该组',
-                  writesLedger: true,
                 ),
                 child: const Text('接受整组'),
               ),
@@ -139,25 +144,32 @@ class _GroupBlock extends ConsumerWidget {
   Future<void> _run(
     BuildContext context,
     WidgetRef ref,
-    Future<void> Function() op,
-    String okMsg, {
-    required bool writesLedger,
-  }) async {
+    Future<ConfirmResultVm?> Function() op,
+    String okMsg,
+  ) async {
     final messenger = ScaffoldMessenger.of(context);
     try {
-      await op();
+      final result = await op();
       ref.invalidate(aiPendingProvider);
-      if (writesLedger) {
-        // 接受 = confirm：已写入正式账本，刷新所有账本派生视图。
+      final shouldRefreshLedgerViews =
+          result?.ledgerWrite == true || result?.snapshotInvalidated == true;
+      if (shouldRefreshLedgerViews) {
+        // 只消费服务端确认结果：ledgerWrite/snapshotInvalidated 为真才刷新账本派生视图。
         ref.invalidate(overviewProvider);
         ref.invalidate(accountsProvider);
+        ref.invalidate(liabilitiesProvider);
+        ref.invalidate(holdingsProvider);
         ref.invalidate(recentMovementsProvider);
         ref.invalidate(allocationProvider);
         ref.invalidate(snapshotsProvider);
+        ref.invalidate(anomaliesProvider);
       }
-      messenger.showSnackBar(
-        SnackBar(content: Text(writesLedger ? '$okMsg · 已入账' : '$okMsg（未写账本）')),
-      );
+      final suffix = result == null
+          ? '（未写账本）'
+          : result.ledgerWrite
+          ? ' · 已入账'
+          : '（未产生新入账）';
+      messenger.showSnackBar(SnackBar(content: Text('$okMsg$suffix')));
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
     }
@@ -175,7 +187,8 @@ class _DiffRow extends StatelessWidget {
     if (d.changed) {
       newColor = switch (d.severity) {
         AiDiffSeverity.danger => dark ? AppColors.error : AppColorsLight.error,
-        AiDiffSeverity.important => dark ? AppColors.warningText : AppColorsLight.warning,
+        AiDiffSeverity.important =>
+          dark ? AppColors.warningText : AppColorsLight.warning,
         AiDiffSeverity.normal => null,
       };
     }
@@ -186,9 +199,12 @@ class _DiffRow extends StatelessWidget {
         children: [
           SizedBox(width: 64, child: Text(d.fieldPath, style: AppType.caption)),
           Expanded(
-            child: Text(d.oldValue ?? '—',
-                style: AppType.caption.copyWith(
-                    decoration: d.changed ? TextDecoration.lineThrough : null)),
+            child: Text(
+              d.oldValue ?? '—',
+              style: AppType.caption.copyWith(
+                decoration: d.changed ? TextDecoration.lineThrough : null,
+              ),
+            ),
           ),
           const Padding(
             padding: EdgeInsets.symmetric(horizontal: AppSpacing.xs),

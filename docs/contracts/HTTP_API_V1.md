@@ -156,6 +156,7 @@ GET    /v1/accounts/anomalies
 ```http
 GET /v1/portfolio/overview
 GET /v1/portfolio/holdings
+GET /v1/holdings
 GET /v1/accounts/{accountId}/holdings
 GET /v1/portfolio/allocation
 ```
@@ -170,6 +171,7 @@ GET /v1/portfolio/allocation
 
 ```http
 GET   /v1/movements
+GET   /v1/movements/recent
 POST  /v1/movements/drafts
 GET   /v1/movements/{movementId}
 POST  /v1/movements/{movementId}/submit-review

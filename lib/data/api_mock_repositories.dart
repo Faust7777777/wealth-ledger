@@ -105,6 +105,7 @@ List<dynamic> _list(Object? d) => d is List
     ? d
     : (d is Map && d['items'] is List ? d['items'] as List : const []);
 int _int(Object? o) => (o as num?)?.toInt() ?? 0;
+bool _bool(Object? o, {bool fallback = false}) => o is bool ? o : fallback;
 
 // ———— enum 解析 ————
 ValueQuality _quality(Object? s) => switch (s) {
@@ -479,6 +480,21 @@ AiProposalVm _proposal(Map<String, dynamic> j) {
     sourceLabel: '${ev['label'] ?? src['kind'] ?? '输入'}',
     summary: j['summary'] as String?,
     groups: [for (final g in _list(j['atomicGroups'])) _group(_m(g))],
+  );
+}
+
+ConfirmResultVm _confirmResult(Map<String, dynamic> j) {
+  final confirmedMovementIds = [
+    for (final id in _list(j['confirmedMovementIds'])) '$id',
+  ];
+  return ConfirmResultVm(
+    atomicGroupId: '${j['atomicGroupId'] ?? ''}',
+    confirmedMovementIds: confirmedMovementIds,
+    snapshotInvalidated: _bool(j['snapshotInvalidated']),
+    ledgerWrite: _bool(
+      j['ledgerWrite'],
+      fallback: confirmedMovementIds.isNotEmpty,
+    ),
   );
 }
 
@@ -997,9 +1013,10 @@ class LocalServerAiProposalRepository implements AiProposalRepository {
   }
 
   @override
-  Future<void> approveAtomicGroup(Id groupId) async {
-    await _c.postData('/v1/ai/atomic-groups/$groupId/approve');
-  }
+  Future<ConfirmResultVm> approveAtomicGroup(Id groupId) async =>
+      _confirmResult(
+        _m(await _c.postData('/v1/ai/atomic-groups/$groupId/approve')),
+      );
 
   @override
   Future<void> rejectAtomicGroup(Id groupId, {String? reason}) async {

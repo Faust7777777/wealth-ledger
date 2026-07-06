@@ -1,118 +1,99 @@
 # LOCAL_LEDGER_FORMAT_V1
 
-状态：草案。  
-用途：定义真实本地账本、debug fixture、迁移、备份、校验的边界。  
-非用途：不要求前端第一阶段实现 SQLite / 加密 / Rust core。
+状态：当前实现契约。
+用途：定义 `--ledger-path` 真实本地账本的磁盘格式、备份边界、fixture 隔离和校验入口。
+非用途：不承诺 SQLite/多文件目录结构；不定义远端同步数据库格式。
 
-## 0. 第一阶段分工
+## 0. 当前物理格式
 
-Claude 前端第一阶段只实现：
+当前真实本地账本是一个 UTF-8 JSON 文件，由 Rust local ledger 读写：
 
-- Repository interface。
-- `real_local` 空账本实现。
-- `debug_fixture` 隔离实现。
-- 空数据 UI。
-- DEMO 标记。
+```text
+ledger.json
+ledger.json.tmp   // 写入中临时文件；成功 rename 后可被清理
+```
 
-不实现：
+规则：
 
-- 正式 SQLite 表结构。
-- 加密账本。
-- Rust core。
-- 同步协议。
-- 真实行情。
-- 真实 AI。
+- `ledger.json` 是唯一真实账本文件。
+- 不存在 `accounts.csv`、`movements.csv`、`ledger.db` 等正式磁盘文件。
+- 写入流程必须是：读取现有 JSON → 内存中修改 → schema/invariant 校验 → 写入同目录 `.tmp` → 原子 rename 覆盖 `ledger.json`。
+- 已存在但损坏/截断的 `ledger.json` 不得被静默重建；必须返回错误，让用户先备份或人工恢复。
+- 新建账本只允许发生在目标 `ledger.json` 不存在时。
 
 ## 1. 数据源模式
 
 ```ts
 DataSourceMode =
-  | "real_local"
-  | "debug_fixture"
-  | "api_remote";
+  | "real_local"      // Flutter 默认空实现，不直接读写 JSON
+  | "debug_fixture"   // DEMO/fixture，必须隔离
+  | "local_server";   // Flutter 通过 Rust localhost server 访问 --ledger-path
 ```
 
 规则：
 
-- 默认必须是 `real_local`。
-- `debug_fixture` 只能在 debug/demo 模式启用。
-- `api_remote` 预留给未来 VPS 同步。
+- Flutter 不直接读写 `ledger.json`。
+- `local_server` 才能通过 HTTP 调 Rust local ledger。
+- `debug_fixture` 只能在 debug/demo 模式启用，必须有可见 `DEMO` 标记。
+- fixture 数据不得同步、不得备份进真实账本、不得和 `ledger.json` 共用文件。
 
-## 2. 本地账本逻辑结构
+## 2. 顶层 JSON 结构
 
-未来正式本地账本至少包含：
+`ledger.json` 顶层对象至少包含这些字段，字段名以实际 JSON/camelCase 为准：
 
-```text
-ledger/
-  metadata
-  accounts
-  instruments
-  holdings
-  movements
-  movement_entries
-  dca_plans
-  dca_reminders
-  categories
-  counterparties
-  quotes
-  fx_rates
-  snapshots
-  ai_proposals
-  evidence_refs
-  anomalies
-  sync_state
-  sync_changes
-  migrations
+```json
+{
+  "metadata": {},
+  "accounts": [],
+  "instruments": [],
+  "holdings": [],
+  "movements": [],
+  "movementEntries": [],
+  "dcaPlans": [],
+  "dcaReminders": [],
+  "categories": [],
+  "counterparties": [],
+  "quotes": [],
+  "fxRates": [],
+  "snapshots": [],
+  "aiProposals": [],
+  "evidenceRefs": [],
+  "anomalies": [],
+  "syncState": {},
+  "syncChanges": [],
+  "migrations": []
+}
 ```
 
-实现可选择 Rust + SQLite + 加密；Flutter 不直接依赖物理表结构。
+说明：
+
+- API 响应可以是投影/聚合结果；磁盘格式不是 HTTP 响应格式。
+- `movements` 是业务事件；`movementEntries` 是分录明细。
+- `aiProposals` 只保存候选与复核状态；确认前不得影响正式余额、净值、持仓。
+- `syncChanges` 是本地/远端同步变更日志，不等于业务流水。
 
 ## 3. 空账本初始化
 
-`real_local` 第一次启动应有：
+第一次创建 `ledger.json` 时：
 
-- 空 accounts。
-- 空 holdings。
-- 空 movements。
-- 空 dca plans。
-- 空 proposals。
-- base currency 默认 `CNY`，但允许后续设置。
-- 首页显示空状态 CTA：建账户 / 记录基线。
+- `accounts`、`holdings`、`movements`、`movementEntries`、`dcaPlans`、`aiProposals` 必须为空。
+- base currency 默认 `CNY`。
+- 不得自动注入示例资产。
+- 不得默认加载 fixture。
+- 首页应显示空状态 CTA：建账户 / 记录基线。
 
-禁止：
-
-- 禁止自动注入示例资产。
-- 禁止默认加载 fixture。
-
-## 4. debug fixture 隔离
-
-fixture 规则：
-
-1. fixture 使用独立内存 store 或独立数据库文件。
-2. fixture 不写入正式账本。
-3. fixture 不参与同步。
-4. fixture UI 必须常驻 `DEMO` 标记。
-5. fixture 只允许在 `kDebugMode` 或显式 `DEMO=true` 时启用。
-6. 离开 fixture 模式后，真实账本仍保持原样。
-
-推荐命名：
-
-```text
-ledger.db          // 真实本地账本，未来正式
-ledger.fixture.db  // debug/demo only
-```
-
-## 5. 写入原则
+## 4. 写入原则
 
 正式账本写入必须满足：
 
-- 单次写入以 atomic group 为事务边界。
-- 写入前完成 schema validation。
-- 写入后刷新快照或标记快照过期。
-- 已确认记录优先通过 correction 修正，不静默覆盖。
-- 每次 AI 写入必须保留 proposal id / evidence refs。
+- 写操作以 atomic group 或单个明确命令为事务边界。
+- 写入前完成金额、币种、账户引用、分录方向、AI validation 等校验。
+- decimal string 必须使用统一校验口径；当前最多允许 8 位小数。
+- 已确认记录更正必须生成 correction movement，不静默覆盖原记录。
+- AI approve 必须消费服务端 `ledgerWrite` / `confirmedMovementIds`，前端不得自行猜测“已入账”。
+- 写入后如影响净值/持仓/快照，必须返回或标记 `snapshotInvalidated`。
 
-## 6. 迁移原则
+## 5. 迁移原则
 
 ```ts
 Migration {
@@ -126,50 +107,37 @@ Migration {
 
 规则：
 
-- 迁移必须可重复检测。
-- 迁移失败不得破坏原账本。
-- 迁移前应创建本地备份。
+- 迁移器必须先备份整个 `ledger.json`。
+- 迁移失败不得覆盖原账本。
+- 迁移必须可重复检测，不能重复应用同一 migration。
+- 迁移完成后必须执行完整账本校验。
 
-## 7. 备份与导出
+## 6. 备份与导出
 
-MVP 备份需求：
+MVP 备份口径：
 
-- CSV 导入导出后续做。
-- 本地账本应支持手动备份。
-- debug fixture 不应被正式备份包含。
+- 手动备份 = 复制整个 `ledger.json`。
+- 备份不包含 fixture。
+- 备份不包含运行时 token、设备密钥、服务端 env。
+- CSV 导入导出是应用层能力，不是当前本地账本的物理格式。
 
-未来导出格式：
+未来如提供 CSV 导出，应明确标注为“导出视图”，不是可直接替代 `ledger.json` 的完整备份。
 
-```text
-accounts.csv
-holdings.csv
-movements.csv
-movement_entries.csv
-dca_plans.csv
-quotes.csv
-fx_rates.csv
-snapshots.csv
-```
+## 7. 安全边界
 
-## 8. 安全边界
+- `ledger.json` 可能包含完整资产、账户名称、AI evidence 摘要，默认应按敏感文件处理。
+- 不在日志中输出完整余额、token、密钥、原始图片内容。
+- localhost server 必须保持 loopback bind，并通过 Host allow-list 防 DNS rebinding。
+- 真实账本模式建议开启 auth；开发脚本不得无提示地以无 auth 方式打开真实账本。
 
-未来正式本地账本应考虑：
-
-- 本地加密。
-- 系统安全存储保存登录 token。
-- 不在日志中输出完整账户余额、密钥、token、原始图片内容。
-- 不把 AI 输入原文无差别写入长期日志。
-
-第一阶段前端不得添加真实密钥、真实 API key、真实账号密码。
-
-## 9. 校验入口
+## 8. 校验入口
 
 本地账本至少需要这些校验：
 
-- decimal string 格式。
+- decimal string 格式与小数位数。
 - currency code 非空。
-- movement entries 账户存在。
+- movement entries 引用的账户存在。
 - holding 指向 account / instrument 存在。
-- transfer 双边账户存在。
+- transfer 双边账户存在且不直接执行外部转账。
 - AI proposal 通过 validation 后才可 approve。
 - debug fixture 与 real ledger 路径互斥。

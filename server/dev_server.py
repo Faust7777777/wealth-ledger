@@ -152,7 +152,9 @@ class DevServerHandler(BaseHTTPRequestHandler):
             "/v1/accounts",
             "/v1/accounts/anomalies",
             "/v1/portfolio/holdings",
+            "/v1/holdings",
             "/v1/movements",
+            "/v1/movements/recent",
             "/v1/dca/plans",
             "/v1/dca/reminders/due",
             "/v1/ai/proposals/pending",
@@ -225,6 +227,7 @@ class DevServerHandler(BaseHTTPRequestHandler):
                         "accessToken": "dev_access_token_not_for_production",
                         "refreshToken": "dev_refresh_token_not_for_production",
                         "expiresAt": "2026-06-25T13:00:00+08:00",
+                        "refreshExpiresAt": "2026-07-25T13:00:00+08:00",
                         "deviceId": "dev_device_001",
                     }
                 ),
@@ -239,6 +242,7 @@ class DevServerHandler(BaseHTTPRequestHandler):
                         "accessToken": "dev_access_token_not_for_production",
                         "refreshToken": "dev_refresh_token_not_for_production",
                         "expiresAt": "2026-06-25T13:00:00+08:00",
+                        "refreshExpiresAt": "2026-07-25T13:00:00+08:00",
                         "deviceId": "dev_device_001",
                     }
                 ),
@@ -275,6 +279,24 @@ class DevServerHandler(BaseHTTPRequestHandler):
 
         if path == "/v1/sync/push":
             self.send_json(200, envelope({"cursor": "dev_cursor_0001", "conflicts": []}))
+            return
+
+        if path.startswith("/v1/ai/atomic-groups/") and path.endswith("/approve"):
+            self.send_json(
+                200,
+                envelope(
+                    {
+                        "atomicGroupId": path.split("/")[-2],
+                        "confirmedMovementIds": [],
+                        "ledgerWrite": False,
+                        "snapshotInvalidated": False,
+                    }
+                ),
+            )
+            return
+
+        if path.startswith("/v1/ai/atomic-groups/") and path.endswith("/reject"):
+            self.send_no_content()
             return
 
         if path.startswith("/v1/atomic-groups/") or path.startswith("/v1/ai/atomic-groups/"):

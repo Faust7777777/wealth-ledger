@@ -37,6 +37,7 @@ use yahoo_finance_api as yahoo;
 
 const EMPTY_BOOTSTRAP: &str =
     include_str!("../../docs/contracts/examples/ledger_bootstrap_empty.response.json");
+const REFRESH_TOKEN_TTL_DAYS: i64 = 30;
 const OVERVIEW_EMPTY: &str =
     include_str!("../../docs/contracts/examples/portfolio_overview_empty.response.json");
 const OVERVIEW_DEGRADED: &str =
@@ -134,6 +135,7 @@ struct AuthDevice {
     refresh_token_hash: String,
     access_token_hash: String,
     access_expires_at: String,
+    refresh_expires_at: String,
     created_at: String,
     last_seen_at: String,
 }
@@ -148,6 +150,7 @@ struct AuthTokens {
     access_token: String,
     refresh_token: String,
     expires_at: String,
+    refresh_expires_at: String,
     device_id: String,
 }
 
@@ -252,21 +255,21 @@ impl AuthStore {
         }
         let refresh_token = refresh_token.expect("validated refreshToken");
         let refresh_hash = token_hash(&refresh_token);
-        let state = self.inner.lock().expect("auth store mutex should lock");
-        let Some(device_id) = state
+        let mut state = self.inner.lock().expect("auth store mutex should lock");
+        let Some((device_id, device)) = state
             .devices
             .iter()
             .find(|(_, device)| device.refresh_token_hash == refresh_hash)
-            .map(|(id, _)| id.clone())
+            .map(|(id, device)| (id.clone(), device.clone()))
         else {
             return Err(AuthError::RefreshToken);
         };
-        let device_name = state
-            .devices
-            .get(&device_id)
-            .expect("device id came from auth store")
-            .name
-            .clone();
+        if token_expired(&device.refresh_expires_at) {
+            state.devices.remove(&device_id);
+            self.persist_state(&state);
+            return Err(AuthError::RefreshToken);
+        }
+        let device_name = device.name;
         drop(state);
 
         Ok(self.issue_tokens(&device_name, Some(device_id), now))
@@ -376,6 +379,10 @@ impl AuthStore {
         let expires_at = (OffsetDateTime::now_utc() + Duration::hours(1))
             .format(&Rfc3339)
             .expect("RFC3339 formatting should succeed");
+        let refresh_expires_at = (OffsetDateTime::now_utc()
+            + Duration::days(REFRESH_TOKEN_TTL_DAYS))
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
         let mut state = self.inner.lock().expect("auth store mutex should lock");
         let device_id = existing_device_id.unwrap_or_else(|| next_local_id("dev_auth_device"));
         let created_at = state
@@ -391,6 +398,7 @@ impl AuthStore {
                 refresh_token_hash: token_hash(&refresh_token),
                 access_token_hash: token_hash(&access_token),
                 access_expires_at: expires_at.clone(),
+                refresh_expires_at: refresh_expires_at.clone(),
                 created_at,
                 last_seen_at: now.to_string(),
             },
@@ -401,6 +409,7 @@ impl AuthStore {
             access_token,
             refresh_token,
             expires_at,
+            refresh_expires_at,
             device_id,
         }
     }
@@ -3045,6 +3054,7 @@ fn auth_tokens_json(tokens: AuthTokens) -> Value {
         "accessToken": tokens.access_token,
         "refreshToken": tokens.refresh_token,
         "expiresAt": tokens.expires_at,
+        "refreshExpiresAt": tokens.refresh_expires_at,
         "deviceId": tokens.device_id
     })
 }
@@ -3190,6 +3200,7 @@ fn auth_state_to_json(state: &AuthState) -> Value {
                     "refreshTokenHash": device.refresh_token_hash,
                     "accessTokenHash": device.access_token_hash,
                     "accessExpiresAt": device.access_expires_at,
+                    "refreshExpiresAt": device.refresh_expires_at,
                     "createdAt": device.created_at,
                     "lastSeenAt": device.last_seen_at
                 })
@@ -3220,6 +3231,8 @@ fn auth_state_from_json(value: &Value) -> Result<AuthState, String> {
         let access_token_hash = required_auth_state_string(device, "accessTokenHash", index)?;
         let access_expires_at = required_auth_state_string(device, "accessExpiresAt", index)?;
         let created_at = required_auth_state_string(device, "createdAt", index)?;
+        let refresh_expires_at = optional_auth_state_string(device, "refreshExpiresAt")
+            .unwrap_or_else(|| default_refresh_expires_at(&created_at));
         let last_seen_at = required_auth_state_string(device, "lastSeenAt", index)?;
         state.devices.insert(
             id.clone(),
@@ -3229,6 +3242,7 @@ fn auth_state_from_json(value: &Value) -> Result<AuthState, String> {
                 refresh_token_hash,
                 access_token_hash,
                 access_expires_at,
+                refresh_expires_at,
                 created_at,
                 last_seen_at,
             },
@@ -3250,6 +3264,25 @@ fn required_auth_state_string(
         .ok_or_else(|| format!("devices[{index}].{key} must be a non-empty string"))
 }
 
+fn optional_auth_state_string(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn default_refresh_expires_at(created_at: &str) -> String {
+    let created_at =
+        OffsetDateTime::parse(created_at, &Rfc3339).unwrap_or_else(|_| OffsetDateTime::now_utc());
+    (created_at + Duration::days(REFRESH_TOKEN_TTL_DAYS))
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed")
+}
+
 fn invalid_auth_state_data(error: impl std::error::Error + Send + Sync + 'static) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
@@ -3259,6 +3292,10 @@ fn invalid_auth_state_message(message: String) -> io::Error {
 }
 
 fn access_token_expired(expires_at: &str) -> bool {
+    token_expired(expires_at)
+}
+
+fn token_expired(expires_at: &str) -> bool {
     OffsetDateTime::parse(expires_at, &Rfc3339)
         .map(|expires_at| expires_at <= OffsetDateTime::now_utc())
         .unwrap_or(true)
@@ -4006,6 +4043,10 @@ mod tests {
             .as_str()
             .expect("refresh token should be string")
             .to_string();
+        assert!(
+            login_body["data"]["refreshExpiresAt"].as_str().is_some(),
+            "login response should expose refresh token expiry"
+        );
         let device_id = login_body["data"]["deviceId"]
             .as_str()
             .expect("device id should be string")
@@ -4031,6 +4072,10 @@ mod tests {
             .as_str()
             .expect("rotated refresh token should be string")
             .to_string();
+        assert!(
+            refresh_body["data"]["refreshExpiresAt"].as_str().is_some(),
+            "refresh response should rotate refresh token expiry"
+        );
         assert_ne!(rotated_refresh_token, refresh_token);
 
         let (old_refresh_status, _) = request_json_body_from(
@@ -4290,6 +4335,68 @@ mod tests {
         .await;
         assert_eq!(revoked_status, StatusCode::UNAUTHORIZED);
         assert_eq!(revoked_body["error"]["code"], "invalid_credentials");
+
+        let _ = std::fs::remove_file(auth_path);
+    }
+
+    #[tokio::test]
+    async fn auth_refresh_rejects_expired_refresh_tokens() {
+        let auth_path = unique_test_ledger_path("auth_expired_refresh");
+        std::fs::create_dir_all(
+            auth_path
+                .parent()
+                .expect("test auth path should have a parent directory"),
+        )
+        .expect("test auth directory should be created");
+        let refresh_token = "fw_refresh_expired_for_test";
+        let access_token = "fw_access_for_expired_refresh_test";
+        let future_access_expires_at = (OffsetDateTime::now_utc() + Duration::hours(1))
+            .format(&Rfc3339)
+            .expect("RFC3339 formatting should succeed");
+        let expired_refresh_expires_at = (OffsetDateTime::now_utc() - Duration::days(1))
+            .format(&Rfc3339)
+            .expect("RFC3339 formatting should succeed");
+        let auth_state = json!({
+            "version": 1,
+            "devices": [{
+                "id": "dev_auth_device_expired",
+                "name": "Windows",
+                "refreshTokenHash": token_hash(refresh_token),
+                "accessTokenHash": token_hash(access_token),
+                "accessExpiresAt": future_access_expires_at,
+                "refreshExpiresAt": expired_refresh_expires_at,
+                "createdAt": "2026-06-01T00:00:00Z",
+                "lastSeenAt": "2026-06-01T00:00:00Z"
+            }]
+        });
+        std::fs::write(
+            &auth_path,
+            serde_json::to_string_pretty(&auth_state).expect("auth state JSON should encode"),
+        )
+        .expect("test auth state should be written");
+
+        let router = app_with_state(AppState::dev().with_auth(
+            AuthStore::configured_with_state_path(
+                "wu",
+                hash_password_for_test("correct horse"),
+                true,
+                Some(auth_path.clone()),
+            ),
+        ));
+        let (refresh_status, refresh_body) = request_json_body_from(
+            router,
+            Method::POST,
+            "/v1/auth/refresh",
+            json!({ "refreshToken": refresh_token }),
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(refresh_body["error"]["code"], "invalid_credentials");
+
+        let persisted = fs::read_to_string(&auth_path).expect("auth state should persist");
+        let persisted: Value =
+            serde_json::from_str(&persisted).expect("persisted auth state should parse");
+        assert_eq!(persisted["devices"], json!([]));
 
         let _ = std::fs::remove_file(auth_path);
     }
