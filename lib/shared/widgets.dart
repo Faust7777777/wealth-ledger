@@ -1,5 +1,6 @@
 // Wealth Ledger — shared presentation widgets (theme-aware).
 import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
 import '../theme/app_dimens.dart';
 
 /// 宽屏内容限宽居中（桌面可读性；窄屏宽度 < maxWidth 时无副作用）。
@@ -131,20 +132,46 @@ class WriteGate extends StatelessWidget {
 }
 
 /// 错误态（结构化错误展示；不静默吞错）。
+/// 对两类高频错误给出可行动引导：401 → 去登录；本地服务连不上 → 启动指引。
 class ErrorStateView extends StatelessWidget {
   const ErrorStateView({super.key, required this.message, this.onRetry});
   final String message;
   final VoidCallback? onRetry;
 
+  bool get _isAuth => message.contains('401');
+  bool get _isConnection =>
+      message.contains('SocketException') ||
+      message.contains('Connection refused') ||
+      message.contains('ClientException');
+
   @override
   Widget build(BuildContext context) {
+    final (icon, title, hint) = _isConnection
+        ? (
+            Icons.cloud_off_outlined,
+            '无法连接本地服务',
+            '请先启动本地服务（tools\\run_self_use_windows.ps1），或到设置检查 API 地址。',
+          )
+        : _isAuth
+        ? (Icons.lock_outline, '需要登录', null)
+        : (Icons.error_outline, '出错了', null);
     return EmptyState(
-      icon: Icons.error_outline,
-      title: '出错了',
-      message: message,
-      action: onRetry == null
-          ? null
-          : FilledButton.tonal(onPressed: onRetry, child: const Text('重试')),
+      icon: icon,
+      title: title,
+      message: hint == null ? message : '$hint\n\n$message',
+      action: Wrap(
+        spacing: AppSpacing.sm,
+        alignment: WrapAlignment.center,
+        children: [
+          if (_isAuth)
+            FilledButton(
+              onPressed: () => GoRouter.of(context).push('/settings'),
+              child: const Text('去登录'),
+            ),
+          if (onRetry != null)
+            FilledButton.tonal(onPressed: onRetry, child: const Text('重试')),
+        ],
+      ),
     );
   }
 }
