@@ -156,7 +156,8 @@ class _Header extends StatelessWidget {
         const SizedBox(height: AppSpacing.xs),
         Text(sub, style: AppType.caption),
         const SizedBox(height: AppSpacing.sm),
-        Text(
+        // 账户估值与净值 Hero 同一处理：真实值之间过渡，不伪造中间金额。
+        AnimatedMoneyText(
           v == null ? '—' : formatValued(v),
           style: Theme.of(context).textTheme.headlineMedium,
         ),
