@@ -1,7 +1,110 @@
 // Wealth Ledger — shared presentation widgets (theme-aware).
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import '../theme/app_dimens.dart';
+
+/// 入场动画：挂载时淡入 + 轻微上移。用于首屏关键块，克制而非炫技。
+/// 只动透明度/位移，不触碰金额数值；尊重系统「减弱动态效果」设置。
+class Reveal extends StatefulWidget {
+  const Reveal({
+    super.key,
+    required this.child,
+    this.delay = Duration.zero,
+    this.duration = const Duration(milliseconds: 380),
+  });
+
+  final Widget child;
+  final Duration delay;
+  final Duration duration;
+
+  @override
+  State<Reveal> createState() => _RevealState();
+}
+
+class _RevealState extends State<Reveal> with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: widget.duration,
+  );
+  late final Animation<double> _anim = CurvedAnimation(
+    parent: _controller,
+    curve: Curves.easeOutCubic,
+  );
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.delay == Duration.zero) {
+      _controller.forward();
+    } else {
+      _timer = Timer(widget.delay, () {
+        if (mounted) _controller.forward();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // 无障碍：减弱动态效果时直接呈现，不做位移/淡入。
+    if (MediaQuery.maybeOf(context)?.disableAnimations ?? false) {
+      return widget.child;
+    }
+    return AnimatedBuilder(
+      animation: _anim,
+      builder: (context, child) => Opacity(
+        opacity: _anim.value.clamp(0.0, 1.0),
+        child: Transform.translate(
+          offset: Offset(0, (1 - _anim.value) * 8),
+          child: child,
+        ),
+      ),
+      child: widget.child,
+    );
+  }
+}
+
+/// 金额切换动画：值变化时新值淡入上滑、旧值淡出。左对齐，等宽数字保持成列。
+/// 不伪造中间数字（遵守「金额不过 double」），只在真实值之间过渡。
+class AnimatedMoneyText extends StatelessWidget {
+  const AnimatedMoneyText(this.text, {super.key, this.style});
+
+  final String text;
+  final TextStyle? style;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 420),
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      layoutBuilder: (current, previous) => Stack(
+        alignment: Alignment.centerLeft,
+        children: [...previous, ?current],
+      ),
+      transitionBuilder: (child, animation) => FadeTransition(
+        opacity: animation,
+        child: SlideTransition(
+          position: Tween<Offset>(
+            begin: const Offset(0, 0.25),
+            end: Offset.zero,
+          ).animate(animation),
+          child: child,
+        ),
+      ),
+      child: Text(text, key: ValueKey<String>(text), style: style),
+    );
+  }
+}
 
 /// 宽屏内容限宽居中（桌面可读性；窄屏宽度 < maxWidth 时无副作用）。
 class ContentMaxWidth extends StatelessWidget {

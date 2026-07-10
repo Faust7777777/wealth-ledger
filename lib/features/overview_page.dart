@@ -46,10 +46,18 @@ class OverviewPage extends ConsumerWidget {
         return ListView(
           padding: const EdgeInsets.all(AppSpacing.xl),
           children: [
-            _Hero(o: o),
-            if (o.pendingSummary.total > 0) _Pending(s: o.pendingSummary),
+            // 首屏关键块轻微错峰入场；列表行不参与，避免滚动时反复触发。
+            Reveal(child: _Hero(o: o)),
+            if (o.pendingSummary.total > 0)
+              Reveal(
+                delay: const Duration(milliseconds: 70),
+                child: _Pending(s: o.pendingSummary),
+              ),
             if (allocation != null && !allocation.isEmpty)
-              _AllocationBar(a: allocation),
+              Reveal(
+                delay: const Duration(milliseconds: 130),
+                child: _AllocationBar(a: allocation),
+              ),
             if (o.primaryHoldings.isNotEmpty) ...[
               const SectionHeader(title: '主要持仓'),
               for (final h in o.primaryHoldings) _HoldingRow(h: h),
@@ -115,7 +123,11 @@ class _Hero extends StatelessWidget {
       children: [
         Text('净资产 · CNY', style: muted),
         const SizedBox(height: AppSpacing.sm),
-        Text(amount, style: Theme.of(context).textTheme.displayLarge),
+        // 值变化时在真实数字之间过渡（淡入上滑），不伪造中间金额。
+        AnimatedMoneyText(
+          amount,
+          style: Theme.of(context).textTheme.displayLarge,
+        ),
         ?deltaLine,
         if (!o.quoteStatusSummary.allFresh)
           Padding(
