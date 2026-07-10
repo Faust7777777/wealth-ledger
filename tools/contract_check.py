@@ -284,6 +284,8 @@ def check_rust_server() -> None:
         "FINWEALTH_REQUIRE_AUTH=true requires FINWEALTH_AUTH_USERNAME",
         "FINWEALTH_REQUIRE_AUTH=true requires FINWEALTH_AUTH_PASSWORD_HASH",
         "plaintext fallback is not allowed when FINWEALTH_REQUIRE_AUTH=true",
+        "ConstantTimeEq",
+        "token_hash_eq",
     ]
     missing = [snippet for snippet in required_snippets if snippet not in text]
     if missing:
@@ -436,6 +438,28 @@ def main() -> None:
     counterparties_post_schema = doc["paths"]["/counterparties"]["post"]["requestBody"]["content"]["application/json"]["schema"].get("$ref")
     if counterparties_post_schema != "#/components/schemas/CreateCounterpartyInput":
         fail("POST /counterparties must use CreateCounterpartyInput, not the response Counterparty schema")
+    bearer_format = doc["components"]["securitySchemes"]["bearerAuth"].get("bearerFormat")
+    if bearer_format != "opaque":
+        fail("Bearer auth must be documented as opaque tokens, not JWT")
+    logout = doc["paths"]["/auth/logout"]["post"]
+    if {} not in logout.get("security", []):
+        fail("POST /auth/logout must allow refresh-token logout without bearer auth")
+    logout_schema = logout.get("requestBody", {}).get("content", {}).get("application/json", {}).get("schema", {})
+    if "refreshToken" not in logout_schema.get("properties", {}):
+        fail("POST /auth/logout must document its optional refreshToken body")
+    created_operations = (
+        ("/accounts", "post"),
+        ("/movements/drafts", "post"),
+        ("/dca/plans", "post"),
+        ("/categories", "post"),
+        ("/counterparties", "post"),
+    )
+    for path, method in created_operations:
+        if "201" not in doc["paths"][path][method].get("responses", {}):
+            fail(f"{method.upper()} {path} must document the server's 201 response")
+    for path in ("/categories/{categoryId}", "/counterparties/{counterpartyId}"):
+        if "get" not in doc["paths"][path]:
+            fail(f"OpenAPI must document the implemented detail route GET {path}")
     for path, method in (("/sync/changes", "get"), ("/sync/ack", "post")):
         responses = doc["paths"][path][method].get("responses", {})
         if "400" not in responses:

@@ -86,10 +86,14 @@ POST /v1/auth/devices/{deviceId}/revoke
 
 ```json
 {
-  "accessToken": "string",
-  "refreshToken": "string",
-  "expiresAt": "2026-06-25T13:00:00+08:00",
-  "deviceId": "id"
+  "ok": true,
+  "data": {
+    "accessToken": "string",
+    "refreshToken": "string",
+    "expiresAt": "2026-06-25T13:00:00+08:00",
+    "refreshExpiresAt": "2026-07-25T13:00:00+08:00",
+    "deviceId": "id"
+  }
 }
 ```
 
@@ -97,6 +101,8 @@ POST /v1/auth/devices/{deviceId}/revoke
 
 - 暂不做 2FA。
 - 服务端只存密码哈希。
+- access/refresh token 是随机 opaque token，服务端仅保存 token hash，不使用 JWT。
+- logout 可通过可选 body 的 `refreshToken` 撤销 refresh token；未提供 body 时可通过 bearer token 撤销当前 access token。
 - token 不写日志。
 
 ## 3. Bootstrap
@@ -262,9 +268,11 @@ POST /v1/snapshots/invalidate
 ```http
 GET   /v1/categories
 POST  /v1/categories
+GET   /v1/categories/{categoryId}
 PATCH /v1/categories/{categoryId}
 GET   /v1/counterparties
 POST  /v1/counterparties
+GET   /v1/counterparties/{counterpartyId}
 PATCH /v1/counterparties/{counterpartyId}
 POST  /v1/counterparties/merge-proposal
 ```

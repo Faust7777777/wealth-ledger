@@ -29,6 +29,7 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
+use subtle::ConstantTimeEq;
 use time::{
     Date, Duration, OffsetDateTime,
     format_description::well_known::{Iso8601, Rfc3339},
@@ -259,7 +260,7 @@ impl AuthStore {
         let Some((device_id, device)) = state
             .devices
             .iter()
-            .find(|(_, device)| device.refresh_token_hash == refresh_hash)
+            .find(|(_, device)| token_hash_eq(&device.refresh_token_hash, &refresh_hash))
             .map(|(id, device)| (id.clone(), device.clone()))
         else {
             return Err(AuthError::RefreshToken);
@@ -304,7 +305,7 @@ impl AuthStore {
         let mut state = self.inner.lock().expect("auth store mutex should lock");
         state
             .devices
-            .retain(|_, device| device.refresh_token_hash != refresh_hash);
+            .retain(|_, device| !token_hash_eq(&device.refresh_token_hash, &refresh_hash));
         self.persist_state(&state);
     }
 
@@ -313,7 +314,7 @@ impl AuthStore {
         let mut state = self.inner.lock().expect("auth store mutex should lock");
         state
             .devices
-            .retain(|_, device| device.access_token_hash != access_hash);
+            .retain(|_, device| !token_hash_eq(&device.access_token_hash, &access_hash));
         self.persist_state(&state);
     }
 
@@ -327,7 +328,7 @@ impl AuthStore {
         if let Some(device) = state
             .devices
             .values_mut()
-            .find(|device| device.access_token_hash == access_hash)
+            .find(|device| token_hash_eq(&device.access_token_hash, &access_hash))
         {
             if access_token_expired(&device.access_expires_at) {
                 return false;
@@ -3141,6 +3142,10 @@ fn token_hash(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest)
 }
 
+fn token_hash_eq(stored_hash: &str, candidate_hash: &str) -> bool {
+    bool::from(stored_hash.as_bytes().ct_eq(candidate_hash.as_bytes()))
+}
+
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let header = headers.get("authorization")?.to_str().ok()?;
     let token = header.strip_prefix("Bearer ")?;
@@ -3740,6 +3745,17 @@ mod tests {
             assert_loopback("0.0.0.0:8790".parse().expect("valid socket addr"));
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn token_hash_comparison_accepts_only_identical_hashes() {
+        let first = token_hash("first-token");
+        let same = token_hash("first-token");
+        let different = token_hash("different-token");
+
+        assert!(token_hash_eq(&first, &same));
+        assert!(!token_hash_eq(&first, &different));
+        assert!(!token_hash_eq(&first, "invalid-length"));
     }
 
     #[test]
