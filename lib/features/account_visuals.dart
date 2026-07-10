@@ -4,29 +4,29 @@ import 'package:flutter/material.dart';
 import '../data/view_models.dart';
 
 String accountTypeLabel(AccountType t) => switch (t) {
-      AccountType.bank => '银行',
-      AccountType.brokerage => '券商',
-      AccountType.exchange => '交易所',
-      AccountType.wallet => '钱包',
-      AccountType.platformWallet => '平台余额',
-      AccountType.virtualCard => '虚拟卡',
-      AccountType.socialSecurity => '社保',
-      AccountType.creditCard => '信用卡',
-      AccountType.loan => '贷款',
-      AccountType.cash => '现金',
-      AccountType.other => '其他',
-    };
+  AccountType.bank => '银行',
+  AccountType.brokerage => '券商',
+  AccountType.exchange => '交易所',
+  AccountType.wallet => '钱包',
+  AccountType.platformWallet => '平台余额',
+  AccountType.virtualCard => '虚拟卡',
+  AccountType.socialSecurity => '社保',
+  AccountType.creditCard => '信用卡',
+  AccountType.loan => '贷款',
+  AccountType.cash => '现金',
+  AccountType.other => '其他',
+};
 
 IconData accountTypeIcon(AccountType t) => switch (t) {
-      AccountType.bank => Icons.account_balance,
-      AccountType.brokerage => Icons.trending_up,
-      AccountType.exchange => Icons.currency_bitcoin,
-      AccountType.wallet => Icons.account_balance_wallet,
-      AccountType.platformWallet => Icons.account_balance_wallet_outlined,
-      AccountType.virtualCard => Icons.credit_card,
-      AccountType.socialSecurity => Icons.health_and_safety_outlined,
-      AccountType.creditCard => Icons.credit_card,
-      AccountType.loan => Icons.request_quote_outlined,
-      AccountType.cash => Icons.payments_outlined,
-      AccountType.other => Icons.category_outlined,
-    };
+  AccountType.bank => Icons.account_balance,
+  AccountType.brokerage => Icons.trending_up,
+  AccountType.exchange => Icons.currency_bitcoin,
+  AccountType.wallet => Icons.account_balance_wallet,
+  AccountType.platformWallet => Icons.account_balance_wallet_outlined,
+  AccountType.virtualCard => Icons.credit_card,
+  AccountType.socialSecurity => Icons.health_and_safety_outlined,
+  AccountType.creditCard => Icons.credit_card,
+  AccountType.loan => Icons.request_quote_outlined,
+  AccountType.cash => Icons.payments_outlined,
+  AccountType.other => Icons.category_outlined,
+};

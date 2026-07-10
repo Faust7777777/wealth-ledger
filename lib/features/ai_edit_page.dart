@@ -53,7 +53,9 @@ class _AiEditPageState extends ConsumerState<AiEditPage> {
     final messenger = ScaffoldMessenger.of(context);
     final router = GoRouter.of(context);
     try {
-      await ref.read(aiProposalRepositoryProvider).editAtomicGroup(
+      await ref
+          .read(aiProposalRepositoryProvider)
+          .editAtomicGroup(
             widget.groupId,
             ManualRecordInput(
               type: _type,
@@ -81,112 +83,118 @@ class _AiEditPageState extends ConsumerState<AiEditPage> {
     return Scaffold(
       appBar: AppBar(title: const Text('编辑 AI 候选')),
       body: ContentMaxWidth(
-          child: accountsAsync.when(
-        loading: () => const Center(child: CircularProgressIndicator()),
-        error: (e, _) => ErrorStateView(
-          message: '$e',
-          onRetry: () => ref.invalidate(accountsProvider),
-        ),
-        data: (accounts) {
-          if (accounts.isEmpty) {
-            return EmptyState(
-              icon: Icons.account_balance_wallet_outlined,
-              title: '还没有账户',
-              message: '先添加账户，才能把候选补成结构化记录。',
-              action: FilledButton(
-                onPressed: () => context.push('/accounts/new'),
-                child: const Text('添加账户'),
-              ),
+        child: accountsAsync.when(
+          loading: () => const Center(child: CircularProgressIndicator()),
+          error: (e, _) => ErrorStateView(
+            message: '$e',
+            onRetry: () => ref.invalidate(accountsProvider),
+          ),
+          data: (accounts) {
+            if (accounts.isEmpty) {
+              return EmptyState(
+                icon: Icons.account_balance_wallet_outlined,
+                title: '还没有账户',
+                message: '先添加账户，才能把候选补成结构化记录。',
+                action: WriteGate(
+                  enabled: ref.writeCapabilities.canCreateAccount,
+                  child: FilledButton(
+                    onPressed: () => context.push('/accounts/new'),
+                    child: const Text('添加账户'),
+                  ),
+                ),
+              );
+            }
+            _accountId ??= accounts.first.id;
+            final currencyItems = [
+              ..._currencies,
+              if (!_currencies.contains(_currency)) _currency,
+            ];
+            return ListView(
+              padding: const EdgeInsets.all(AppSpacing.base),
+              children: [
+                Text(
+                  'AI 文本候选不含金额；补全为结构化收支后，回 AI 复核点「接受整组」才写账本。',
+                  style: AppType.caption,
+                ),
+                const SizedBox(height: AppSpacing.base),
+                SegmentedButton<MovementType>(
+                  segments: const [
+                    ButtonSegment(
+                      value: MovementType.expense,
+                      label: Text('支出'),
+                      icon: Icon(Icons.south_east),
+                    ),
+                    ButtonSegment(
+                      value: MovementType.income,
+                      label: Text('收入'),
+                      icon: Icon(Icons.north_east),
+                    ),
+                  ],
+                  selected: {_type},
+                  onSelectionChanged: (s) => setState(() => _type = s.first),
+                ),
+                const SizedBox(height: AppSpacing.base),
+                TextField(
+                  controller: _amount,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  decoration: const InputDecoration(
+                    labelText: '金额',
+                    border: OutlineInputBorder(),
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+                const SizedBox(height: AppSpacing.base),
+                DropdownButtonFormField<String>(
+                  initialValue: _accountId,
+                  decoration: const InputDecoration(
+                    labelText: '账户',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: [
+                    for (final a in accounts)
+                      DropdownMenuItem(value: a.id, child: Text(a.displayName)),
+                  ],
+                  onChanged: (v) => setState(() {
+                    _accountId = v;
+                    _currency = accounts
+                        .firstWhere((x) => x.id == v)
+                        .defaultCurrency;
+                  }),
+                ),
+                const SizedBox(height: AppSpacing.base),
+                DropdownButtonFormField<String>(
+                  initialValue: _currency,
+                  decoration: const InputDecoration(
+                    labelText: '币种',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: [
+                    for (final c in currencyItems)
+                      DropdownMenuItem(value: c, child: Text(c)),
+                  ],
+                  onChanged: (v) => setState(() => _currency = v ?? _currency),
+                ),
+                const SizedBox(height: AppSpacing.base),
+                TextField(
+                  controller: _title,
+                  decoration: const InputDecoration(
+                    labelText: '摘要',
+                    border: OutlineInputBorder(),
+                  ),
+                  onChanged: (_) => setState(() {}),
+                ),
+                const SizedBox(height: AppSpacing.base),
+                FilledButton(
+                  onPressed: _canSave ? _save : null,
+                  child: Text(_busy ? '保存中…' : '保存候选'),
+                ),
+              ],
             );
-          }
-          _accountId ??= accounts.first.id;
-          final currencyItems = [
-            ..._currencies,
-            if (!_currencies.contains(_currency)) _currency,
-          ];
-          return ListView(
-            padding: const EdgeInsets.all(AppSpacing.base),
-            children: [
-              Text(
-                'AI 文本候选不含金额；补全为结构化收支后，回 AI 复核点「接受整组」才写账本。',
-                style: AppType.caption,
-              ),
-              const SizedBox(height: AppSpacing.base),
-              SegmentedButton<MovementType>(
-                segments: const [
-                  ButtonSegment(
-                    value: MovementType.expense,
-                    label: Text('支出'),
-                    icon: Icon(Icons.south_east),
-                  ),
-                  ButtonSegment(
-                    value: MovementType.income,
-                    label: Text('收入'),
-                    icon: Icon(Icons.north_east),
-                  ),
-                ],
-                selected: {_type},
-                onSelectionChanged: (s) => setState(() => _type = s.first),
-              ),
-              const SizedBox(height: AppSpacing.base),
-              TextField(
-                controller: _amount,
-                keyboardType:
-                    const TextInputType.numberWithOptions(decimal: true),
-                decoration: const InputDecoration(
-                  labelText: '金额',
-                  border: OutlineInputBorder(),
-                ),
-                onChanged: (_) => setState(() {}),
-              ),
-              const SizedBox(height: AppSpacing.base),
-              DropdownButtonFormField<String>(
-                initialValue: _accountId,
-                decoration: const InputDecoration(
-                  labelText: '账户',
-                  border: OutlineInputBorder(),
-                ),
-                items: [
-                  for (final a in accounts)
-                    DropdownMenuItem(value: a.id, child: Text(a.displayName)),
-                ],
-                onChanged: (v) => setState(() {
-                  _accountId = v;
-                  _currency =
-                      accounts.firstWhere((x) => x.id == v).defaultCurrency;
-                }),
-              ),
-              const SizedBox(height: AppSpacing.base),
-              DropdownButtonFormField<String>(
-                initialValue: _currency,
-                decoration: const InputDecoration(
-                  labelText: '币种',
-                  border: OutlineInputBorder(),
-                ),
-                items: [
-                  for (final c in currencyItems)
-                    DropdownMenuItem(value: c, child: Text(c)),
-                ],
-                onChanged: (v) => setState(() => _currency = v ?? _currency),
-              ),
-              const SizedBox(height: AppSpacing.base),
-              TextField(
-                controller: _title,
-                decoration: const InputDecoration(
-                  labelText: '摘要',
-                  border: OutlineInputBorder(),
-                ),
-                onChanged: (_) => setState(() {}),
-              ),
-              const SizedBox(height: AppSpacing.base),
-              FilledButton(
-                onPressed: _canSave ? _save : null,
-                child: Text(_busy ? '保存中…' : '保存候选'),
-              ),
-            ],
-          );
-        },
-      )),
+          },
+        ),
+      ),
     );
   }
 }

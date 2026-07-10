@@ -58,9 +58,12 @@ class _ReconcilePageState extends ConsumerState<ReconcilePage> {
                 icon: Icons.fact_check_outlined,
                 title: '还没有账户',
                 message: '先添加账户，才能校准余额。',
-                action: FilledButton(
-                  onPressed: () => context.push('/accounts/new'),
-                  child: const Text('添加账户'),
+                action: WriteGate(
+                  enabled: ref.writeCapabilities.canCreateAccount,
+                  child: FilledButton(
+                    onPressed: () => context.push('/accounts/new'),
+                    child: const Text('添加账户'),
+                  ),
                 ),
               );
             }

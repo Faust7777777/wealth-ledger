@@ -73,9 +73,12 @@ class _AiImportCsvPageState extends ConsumerState<AiImportCsvPage> {
                 icon: Icons.account_balance_wallet_outlined,
                 title: '还没有账户',
                 message: '先添加账户，才能把 CSV 行归到默认账户。',
-                action: FilledButton(
-                  onPressed: () => context.push('/accounts/new'),
-                  child: const Text('添加账户'),
+                action: WriteGate(
+                  enabled: ref.writeCapabilities.canCreateAccount,
+                  child: FilledButton(
+                    onPressed: () => context.push('/accounts/new'),
+                    child: const Text('添加账户'),
+                  ),
                 ),
               );
             }

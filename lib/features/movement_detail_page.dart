@@ -118,8 +118,11 @@ class MovementDetailPage extends ConsumerWidget {
                   for (final e in m.entries) _entryRow(context, e, nameById),
                 ],
                 const SizedBox(height: AppSpacing.lg),
+                // 更正=生成候选：还需服务端 canPersistPendingProposal 能力。
                 OutlinedButton(
-                  onPressed: canCorrect
+                  onPressed:
+                      canCorrect &&
+                          ref.writeCapabilities.canPersistPendingProposal
                       ? () => context.push('/movement/${m.id}/correction')
                       : null,
                   child: const Text('发起更正'),
@@ -131,6 +134,11 @@ class MovementDetailPage extends ConsumerWidget {
                       'MVP 只支持单分录金额更正；多腿交易更正后续做。',
                       style: AppType.caption,
                     ),
+                  )
+                else if (!ref.writeCapabilities.canPersistPendingProposal)
+                  Padding(
+                    padding: const EdgeInsets.only(top: AppSpacing.xs),
+                    child: Text(kReadOnlyHint, style: AppType.caption),
                   ),
               ],
             );

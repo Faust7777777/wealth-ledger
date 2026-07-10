@@ -31,6 +31,18 @@ AccountVm _acct(
 
 Widget _host(Widget page, List<AccountVm> accounts) => ProviderScope(
   overrides: [
+    // 表单冒烟默认按"可写数据源"渲染；gating 行为由 capability_gating_test 单测。
+    capabilitiesProvider.overrideWith(
+      (ref) async => const LedgerCapabilitiesVm(
+        dataSourceMode: 'real_local',
+        canWriteConfirmedLedger: true,
+        canCreateAccount: true,
+        canRecordMovement: true,
+        canConfirmProposal: true,
+        canPersistPendingProposal: true,
+        proposalPersistence: 'file',
+      ),
+    ),
     accountsProvider.overrideWith((ref) async => accounts),
     categoriesProvider.overrideWith(
       (ref) async => const [

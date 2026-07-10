@@ -125,9 +125,12 @@ class _TransferPageState extends ConsumerState<TransferPage> {
                 icon: Icons.swap_horiz,
                 title: '至少需要两个账户',
                 message: '转账需要转出和转入两个账户。',
-                action: FilledButton(
-                  onPressed: () => context.push('/accounts/new'),
-                  child: const Text('添加账户'),
+                action: WriteGate(
+                  enabled: ref.writeCapabilities.canCreateAccount,
+                  child: FilledButton(
+                    onPressed: () => context.push('/accounts/new'),
+                    child: const Text('添加账户'),
+                  ),
                 ),
               );
             }

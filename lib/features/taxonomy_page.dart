@@ -66,7 +66,11 @@ class TaxonomyPage extends ConsumerWidget {
               ),
             ],
             SectionHeader(title: '分类'),
-            _CategoryCreateCard(categories: categories),
+            // 词表创建/编辑是账本写路径；合并只生成候选。均按服务端 capabilities gate。
+            WriteGate(
+              enabled: ref.writeCapabilities.canWriteConfirmedLedger,
+              child: _CategoryCreateCard(categories: categories),
+            ),
             const SizedBox(height: AppSpacing.sm),
             if (categories.isEmpty)
               const Card(
@@ -90,15 +94,23 @@ class TaxonomyPage extends ConsumerWidget {
                       ].join(' · '),
                     ),
                     trailing: c.isSystem ? const Chip(label: Text('系统')) : null,
-                    onTap: c.isSystem
+                    onTap:
+                        c.isSystem ||
+                            !ref.writeCapabilities.canWriteConfirmedLedger
                         ? null
                         : () => _showEditCategoryDialog(context, ref, c),
                   ),
                 ),
             SectionHeader(title: '对手方'),
-            _CounterpartyCreateCard(categories: categories),
+            WriteGate(
+              enabled: ref.writeCapabilities.canWriteConfirmedLedger,
+              child: _CounterpartyCreateCard(categories: categories),
+            ),
             const SizedBox(height: AppSpacing.sm),
-            _CounterpartyMergeCard(counterparties: counterparties),
+            WriteGate(
+              enabled: ref.writeCapabilities.canPersistPendingProposal,
+              child: _CounterpartyMergeCard(counterparties: counterparties),
+            ),
             const SizedBox(height: AppSpacing.sm),
             if (counterparties.isEmpty)
               const Card(
@@ -124,12 +136,14 @@ class TaxonomyPage extends ConsumerWidget {
                     trailing: p.isUserMerged
                         ? const Chip(label: Text('已合并'))
                         : null,
-                    onTap: () => _showEditCounterpartyDialog(
-                      context,
-                      ref,
-                      p,
-                      categories,
-                    ),
+                    onTap: ref.writeCapabilities.canWriteConfirmedLedger
+                        ? () => _showEditCounterpartyDialog(
+                            context,
+                            ref,
+                            p,
+                            categories,
+                          )
+                        : null,
                   ),
                 ),
           ],

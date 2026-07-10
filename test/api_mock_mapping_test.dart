@@ -7,14 +7,17 @@ import 'package:finwealth/core/format.dart';
 import 'package:finwealth/data/api_mock_repositories.dart';
 
 Map<String, dynamic> _data(String path) {
-  final body = jsonDecode(File(path).readAsStringSync()) as Map<String, dynamic>;
+  final body =
+      jsonDecode(File(path).readAsStringSync()) as Map<String, dynamic>;
   return (body['data'] as Map).cast<String, dynamic>();
 }
 
 void main() {
   test('parseOverviewData maps the degraded example payload', () {
     final vm = parseOverviewData(
-      _data('docs/contracts/examples/portfolio_overview_degraded.response.json'),
+      _data(
+        'docs/contracts/examples/portfolio_overview_degraded.response.json',
+      ),
     );
     expect(vm.latestSnapshot?.netWorth.amount, '245678.90');
     expect(vm.pendingSummary.aiPendingCount, 2);
@@ -23,7 +26,10 @@ void main() {
     expect(vm.primaryHoldings.first.symbol, 'NVDA');
     expect(vm.recentMovements.first.inTransit, isTrue);
     expect(vm.recentMovements.first.displayAmount?.amount, '500.00');
-    expect(vm.changeSinceLastSnapshot?.amount, '1245.67'); // 245678.90 - 244433.23
+    expect(
+      vm.changeSinceLastSnapshot?.amount,
+      '1245.67',
+    ); // 245678.90 - 244433.23
   });
 
   test('parseOverviewData maps the empty payload to an empty overview', () {
@@ -40,7 +46,7 @@ void main() {
           'category': '现金',
           'percent': '100.0',
           'value': {'amount': '123.45', 'currency': 'CNY'},
-        }
+        },
       ],
       'totalAssets': {'amount': '123.45', 'currency': 'CNY'},
       'totalLiabilities': {'amount': '20.00', 'currency': 'CNY'},

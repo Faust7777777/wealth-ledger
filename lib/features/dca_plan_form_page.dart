@@ -154,9 +154,12 @@ class _DcaPlanFormPageState extends ConsumerState<DcaPlanFormPage> {
               icon: Icons.account_balance_wallet_outlined,
               title: '先创建资金账户',
               message: '定投计划需要关联一个资金账户，用于之后生成“记录已执行”的待确认记录。',
-              action: FilledButton(
-                onPressed: () => context.push('/accounts/new'),
-                child: const Text('添加账户'),
+              action: WriteGate(
+                enabled: ref.writeCapabilities.canCreateAccount,
+                child: FilledButton(
+                  onPressed: () => context.push('/accounts/new'),
+                  child: const Text('添加账户'),
+                ),
               ),
             );
           }

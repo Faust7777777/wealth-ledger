@@ -13,16 +13,17 @@ Color _sevColor(BuildContext c, AnomalySeverity s) {
   final dark = Theme.of(c).brightness == Brightness.dark;
   return switch (s) {
     AnomalySeverity.critical => dark ? AppColors.error : AppColorsLight.error,
-    AnomalySeverity.warning => dark ? AppColors.warning : AppColorsLight.warning,
+    AnomalySeverity.warning =>
+      dark ? AppColors.warning : AppColorsLight.warning,
     AnomalySeverity.info => dark ? AppColors.info : AppColorsLight.info,
   };
 }
 
 IconData _sevIcon(AnomalySeverity s) => switch (s) {
-      AnomalySeverity.critical => Icons.error_outline,
-      AnomalySeverity.warning => Icons.warning_amber_outlined,
-      AnomalySeverity.info => Icons.info_outline,
-    };
+  AnomalySeverity.critical => Icons.error_outline,
+  AnomalySeverity.warning => Icons.warning_amber_outlined,
+  AnomalySeverity.info => Icons.info_outline,
+};
 
 class AnomaliesPage extends ConsumerWidget {
   const AnomaliesPage({super.key});
@@ -53,7 +54,10 @@ class AnomaliesPage extends ConsumerWidget {
             itemBuilder: (context, i) {
               final a = items[i];
               return ListTile(
-                leading: Icon(_sevIcon(a.severity), color: _sevColor(context, a.severity)),
+                leading: Icon(
+                  _sevIcon(a.severity),
+                  color: _sevColor(context, a.severity),
+                ),
                 title: Text(a.accountName),
                 subtitle: Text(a.detail),
               );

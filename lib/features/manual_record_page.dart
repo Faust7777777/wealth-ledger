@@ -164,9 +164,12 @@ class _ManualRecordPageState extends ConsumerState<ManualRecordPage> {
                 icon: Icons.account_balance_wallet_outlined,
                 title: '还没有账户',
                 message: '先添加一个账户，才能记账。',
-                action: FilledButton(
-                  onPressed: () => context.push('/accounts/new'),
-                  child: const Text('添加账户'),
+                action: WriteGate(
+                  enabled: ref.writeCapabilities.canCreateAccount,
+                  child: FilledButton(
+                    onPressed: () => context.push('/accounts/new'),
+                    child: const Text('添加账户'),
+                  ),
                 ),
               );
             }

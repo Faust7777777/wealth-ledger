@@ -19,12 +19,15 @@ class OverviewPage extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final async = ref.watch(overviewProvider);
-    final accounts = ref.watch(accountsProvider).asData?.value ?? const <AccountVm>[];
+    final accounts =
+        ref.watch(accountsProvider).asData?.value ?? const <AccountVm>[];
     final allocation = ref.watch(allocationProvider).asData?.value;
     return async.when(
       loading: () => const Center(child: CircularProgressIndicator()),
-      error: (e, _) =>
-          ErrorStateView(message: '$e', onRetry: () => ref.invalidate(overviewProvider)),
+      error: (e, _) => ErrorStateView(
+        message: '$e',
+        onRetry: () => ref.invalidate(overviewProvider),
+      ),
       data: (o) {
         if (o.isEmpty) {
           return EmptyState(
@@ -45,7 +48,8 @@ class OverviewPage extends ConsumerWidget {
           children: [
             _Hero(o: o),
             if (o.pendingSummary.total > 0) _Pending(s: o.pendingSummary),
-            if (allocation != null && !allocation.isEmpty) _AllocationBar(a: allocation),
+            if (allocation != null && !allocation.isEmpty)
+              _AllocationBar(a: allocation),
             if (o.primaryHoldings.isNotEmpty) ...[
               const SectionHeader(title: '主要持仓'),
               for (final h in o.primaryHoldings) _HoldingRow(h: h),
@@ -80,7 +84,8 @@ class _Hero extends StatelessWidget {
     final dark = Theme.of(context).brightness == Brightness.dark;
     final snap = o.latestSnapshot;
     final muted = Theme.of(context).textTheme.bodySmall;
-    final estimated = snap != null &&
+    final estimated =
+        snap != null &&
         (snap.quality == ValueQuality.estimated ||
             snap.quality == ValueQuality.incomplete);
     final amount = snap == null
@@ -93,12 +98,15 @@ class _Hero extends StatelessWidget {
       final down = change.amount.startsWith('-');
       final abs = change.amount.replaceFirst(RegExp(r'^[+-]'), '');
       final label = o.quoteStatusSummary.allFresh ? '今日' : '较上次快照';
-      final color =
-          down ? (dark ? AppColors.negative : AppColorsLight.negative) : (dark ? AppColors.positive : AppColorsLight.positive);
+      final color = down
+          ? (dark ? AppColors.negative : AppColorsLight.negative)
+          : (dark ? AppColors.positive : AppColorsLight.positive);
       deltaLine = Padding(
         padding: const EdgeInsets.only(top: AppSpacing.xs),
-        child: Text('${down ? '▼' : '▲'} ¥${formatDecimalThousands(abs)}  $label',
-            style: AppType.body.copyWith(color: color)),
+        child: Text(
+          '${down ? '▼' : '▲'} ¥${formatDecimalThousands(abs)}  $label',
+          style: AppType.body.copyWith(color: color),
+        ),
       );
     }
 
@@ -115,7 +123,8 @@ class _Hero extends StatelessWidget {
             child: Text(
               '◐ ${o.quoteStatusSummary.staleCount} 项报价过期 · 本地缓存',
               style: AppType.caption.copyWith(
-                  color: dark ? AppColors.warningText : AppColorsLight.warning),
+                color: dark ? AppColors.warningText : AppColorsLight.warning,
+              ),
             ),
           ),
         Align(
@@ -152,21 +161,29 @@ class _Pending extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('待处理 (${s.total})', style: Theme.of(context).textTheme.titleMedium),
+            Text(
+              '待处理 (${s.total})',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
             const SizedBox(height: AppSpacing.sm),
             for (final e in items)
               InkWell(
                 onTap: e.$3 == null
                     ? null
-                    : () => e.$3 == '/investment' ? context.go(e.$3!) : context.push(e.$3!),
+                    : () => e.$3 == '/investment'
+                          ? context.go(e.$3!)
+                          : context.push(e.$3!),
                 child: Padding(
                   padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
                   child: Row(
                     children: [
                       Expanded(child: Text(e.$1, style: AppType.body)),
                       Text('${e.$2}', style: AppType.bodyStrong),
-                      Icon(Icons.chevron_right,
-                          size: 18, color: e.$3 == null ? Colors.transparent : null),
+                      Icon(
+                        Icons.chevron_right,
+                        size: 18,
+                        color: e.$3 == null ? Colors.transparent : null,
+                      ),
                     ],
                   ),
                 ),
@@ -202,7 +219,9 @@ class _HoldingRow extends StatelessWidget {
       contentPadding: EdgeInsets.zero,
       dense: true,
       title: Text('${h.symbol} · ${h.quantity}', style: AppType.bodyStrong),
-      subtitle: pnl.isEmpty ? null : Text(pnl, style: AppType.caption.copyWith(color: pnlColor)),
+      subtitle: pnl.isEmpty
+          ? null
+          : Text(pnl, style: AppType.caption.copyWith(color: pnlColor)),
       trailing: Text(value, style: AppType.moneyRow),
     );
   }
@@ -219,10 +238,10 @@ class _MovementRow extends StatelessWidget {
       contentPadding: EdgeInsets.zero,
       dense: true,
       title: Text(m.title, style: AppType.body),
-      subtitle: m.inTransit
-          ? Text('在途 · 非支出', style: AppType.caption)
-          : null,
-      trailing: amt == null ? null : Text(formatMoney(amt), style: AppType.moneyRow),
+      subtitle: m.inTransit ? Text('在途 · 非支出', style: AppType.caption) : null,
+      trailing: amt == null
+          ? null
+          : Text(formatMoney(amt), style: AppType.moneyRow),
       onTap: () => context.push('/movement/${m.id}'),
     );
   }
@@ -239,7 +258,10 @@ class _AccountRow extends StatelessWidget {
       contentPadding: EdgeInsets.zero,
       dense: true,
       title: Text(a.displayName, style: AppType.body),
-      trailing: Text(v == null ? '—' : formatValued(v), style: AppType.moneyRow),
+      trailing: Text(
+        v == null ? '—' : formatValued(v),
+        style: AppType.moneyRow,
+      ),
       onTap: () => context.push('/account/${a.id}'),
     );
   }
@@ -304,7 +326,10 @@ class _AllocationBar extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(width: AppSpacing.xs),
-                  Text('${slices[i].category} ${slices[i].percent}%', style: AppType.caption),
+                  Text(
+                    '${slices[i].category} ${slices[i].percent}%',
+                    style: AppType.caption,
+                  ),
                 ],
               ),
           ],

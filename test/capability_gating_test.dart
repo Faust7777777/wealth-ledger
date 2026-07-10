@@ -12,6 +12,7 @@ import 'package:finwealth/data/view_models.dart';
 import 'package:finwealth/features/accounts_page.dart';
 import 'package:finwealth/features/ai_review_page.dart';
 import 'package:finwealth/features/record_sheet.dart';
+import 'package:finwealth/features/taxonomy_page.dart';
 
 const _writable = LedgerCapabilitiesVm(
   dataSourceMode: 'real_local',
@@ -215,6 +216,22 @@ void main() {
       for (final label in ['手动记账', '转账', '余额观察', 'AI 文本导入', 'CSV 导入', '图片导入']) {
         expect(tileOf(tester, label).enabled, isTrue, reason: label);
       }
+    });
+  });
+
+  group('TaxonomyPage 写入口 gating', () {
+    testWidgets('locked 时创建/合并卡禁用并给出原因、词表条目不可编辑', (tester) async {
+      // 拉高视口，让 ListView 渲染出全部三张卡。
+      tester.view.physicalSize = const Size(800, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        _app(const TaxonomyPage(), caps: LedgerCapabilitiesVm.locked),
+      );
+      await tester.pumpAndSettle();
+
+      // 分类创建卡 + 对手方创建卡 + 合并卡，共 3 处 WriteGate 原因文案。
+      expect(find.textContaining('当前数据源只读'), findsNWidgets(3));
     });
   });
 

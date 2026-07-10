@@ -18,8 +18,10 @@ class AccountsPage extends ConsumerWidget {
     final async = ref.watch(accountsProvider);
     return async.when(
       loading: () => const Center(child: CircularProgressIndicator()),
-      error: (e, _) =>
-          ErrorStateView(message: '$e', onRetry: () => ref.invalidate(accountsProvider)),
+      error: (e, _) => ErrorStateView(
+        message: '$e',
+        onRetry: () => ref.invalidate(accountsProvider),
+      ),
       data: (accounts) {
         final canCreate = ref.writeCapabilities.canCreateAccount;
         if (accounts.isEmpty) {

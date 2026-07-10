@@ -28,62 +28,70 @@ class AccountDetailPage extends ConsumerWidget {
       appBar: AppBar(
         title: Text(acct?.displayName ?? '账户详情'),
         actions: [
+          // 账户写能力由服务端 capabilities 决定；只读时禁用编辑/归档。
           if (acct != null)
             IconButton(
               tooltip: '编辑',
               icon: const Icon(Icons.edit_outlined),
-              onPressed: () => context.push('/account/${acct.id}/edit', extra: acct),
+              onPressed: ref.writeCapabilities.canCreateAccount
+                  ? () => context.push('/account/${acct.id}/edit', extra: acct)
+                  : null,
             ),
           IconButton(
             tooltip: '归档',
             icon: const Icon(Icons.archive_outlined),
-            onPressed: () => _archive(context, ref),
+            onPressed: ref.writeCapabilities.canCreateAccount
+                ? () => _archive(context, ref)
+                : null,
           ),
         ],
       ),
       body: ContentMaxWidth(
-          child: accountAsync.when(
-        loading: () => const Center(child: CircularProgressIndicator()),
-        error: (e, _) => ErrorStateView(
-          message: '$e',
-          onRetry: () => ref.invalidate(accountByIdProvider(accountId)),
-        ),
-        data: (a) {
-          if (a == null) {
-            return const EmptyState(icon: Icons.help_outline, title: '账户不存在');
-          }
-          final holdings = holdingsAsync.asData?.value ?? const <HoldingVm>[];
-          return ListView(
-            padding: const EdgeInsets.all(AppSpacing.base),
-            children: [
-              _Header(a: a),
-              if (a.cashBalances.isNotEmpty) ...[
-                const SectionHeader(title: '现金余额'),
-                for (final e in a.cashBalances.entries)
-                  ListTile(
-                    contentPadding: EdgeInsets.zero,
-                    title: Text(e.key),
-                    trailing: Text(
-                      formatMoney(Money(amount: e.value, currency: e.key)),
-                      style: AppType.moneyRow,
+        child: accountAsync.when(
+          loading: () => const Center(child: CircularProgressIndicator()),
+          error: (e, _) => ErrorStateView(
+            message: '$e',
+            onRetry: () => ref.invalidate(accountByIdProvider(accountId)),
+          ),
+          data: (a) {
+            if (a == null) {
+              return const EmptyState(icon: Icons.help_outline, title: '账户不存在');
+            }
+            final holdings = holdingsAsync.asData?.value ?? const <HoldingVm>[];
+            return ListView(
+              padding: const EdgeInsets.all(AppSpacing.base),
+              children: [
+                _Header(a: a),
+                if (a.cashBalances.isNotEmpty) ...[
+                  const SectionHeader(title: '现金余额'),
+                  for (final e in a.cashBalances.entries)
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: Text(e.key),
+                      trailing: Text(
+                        formatMoney(Money(amount: e.value, currency: e.key)),
+                        style: AppType.moneyRow,
+                      ),
+                    ),
+                ],
+                if (holdings.isNotEmpty) ...[
+                  const SectionHeader(title: '持仓'),
+                  for (final h in holdings) _HoldingTile(h: h),
+                ] else
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      vertical: AppSpacing.sm,
+                    ),
+                    child: Text(
+                      '该账户暂无持仓（现金 / 活期类账户）',
+                      style: Theme.of(context).textTheme.bodySmall,
                     ),
                   ),
               ],
-              if (holdings.isNotEmpty) ...[
-                const SectionHeader(title: '持仓'),
-                for (final h in holdings) _HoldingTile(h: h),
-              ] else
-                Padding(
-                  padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
-                  child: Text(
-                    '该账户暂无持仓（现金 / 活期类账户）',
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                ),
-            ],
-          );
-        },
-      )),
+            );
+          },
+        ),
+      ),
     );
   }
 
@@ -96,8 +104,14 @@ class AccountDetailPage extends ConsumerWidget {
         title: const Text('归档账户'),
         content: const Text('归档后不再计入新记录（后端可恢复）。确认归档？'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('归档')),
+          TextButton(
+            onPressed: () => Navigator.pop(c, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(c, true),
+            child: const Text('归档'),
+          ),
         ],
       ),
     );
@@ -132,7 +146,10 @@ class _Header extends StatelessWidget {
             Icon(accountTypeIcon(a.accountType)),
             const SizedBox(width: AppSpacing.sm),
             Expanded(
-              child: Text(a.displayName, style: Theme.of(context).textTheme.titleLarge),
+              child: Text(
+                a.displayName,
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
             ),
           ],
         ),
@@ -172,10 +189,18 @@ class _HoldingTile extends StatelessWidget {
     }
     return ListTile(
       contentPadding: EdgeInsets.zero,
-      title: Text('${h.displayName} · ${h.symbol} · ${h.quantity}', style: AppType.bodyStrong),
-      subtitle: Text(pnl.isEmpty ? cost : '$cost   $pnl',
-          style: AppType.caption.copyWith(color: color)),
-      trailing: Text(mv == null ? '—' : formatValued(mv), style: AppType.moneyRow),
+      title: Text(
+        '${h.displayName} · ${h.symbol} · ${h.quantity}',
+        style: AppType.bodyStrong,
+      ),
+      subtitle: Text(
+        pnl.isEmpty ? cost : '$cost   $pnl',
+        style: AppType.caption.copyWith(color: color),
+      ),
+      trailing: Text(
+        mv == null ? '—' : formatValued(mv),
+        style: AppType.moneyRow,
+      ),
     );
   }
 }

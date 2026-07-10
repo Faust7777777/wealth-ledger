@@ -72,8 +72,9 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
       defaultCurrency: _currency,
       balanceMode: _balanceMode,
       includeInNetWorth: _includeInNetWorth,
-      institutionName:
-          _institution.text.trim().isEmpty ? null : _institution.text.trim(),
+      institutionName: _institution.text.trim().isEmpty
+          ? null
+          : _institution.text.trim(),
     );
     try {
       if (_isEdit) {
@@ -106,81 +107,83 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
     return Scaffold(
       appBar: AppBar(title: Text(_isEdit ? '编辑账户' : '新建账户')),
       body: ContentMaxWidth(
-          child: ListView(
-        padding: const EdgeInsets.all(AppSpacing.base),
-        children: [
-          TextField(
-            controller: _name,
-            decoration: const InputDecoration(
-              labelText: '账户名称',
-              border: OutlineInputBorder(),
+        child: ListView(
+          padding: const EdgeInsets.all(AppSpacing.base),
+          children: [
+            TextField(
+              controller: _name,
+              decoration: const InputDecoration(
+                labelText: '账户名称',
+                border: OutlineInputBorder(),
+              ),
             ),
-          ),
-          const SizedBox(height: AppSpacing.base),
-          DropdownButtonFormField<AccountType>(
-            initialValue: _type,
-            decoration: const InputDecoration(
-              labelText: '账户类型',
-              border: OutlineInputBorder(),
+            const SizedBox(height: AppSpacing.base),
+            DropdownButtonFormField<AccountType>(
+              initialValue: _type,
+              decoration: const InputDecoration(
+                labelText: '账户类型',
+                border: OutlineInputBorder(),
+              ),
+              items: [
+                for (final t in AccountType.values)
+                  DropdownMenuItem(value: t, child: Text(accountTypeLabel(t))),
+              ],
+              onChanged: (v) => setState(() => _type = v ?? _type),
             ),
-            items: [
-              for (final t in AccountType.values)
-                DropdownMenuItem(value: t, child: Text(accountTypeLabel(t))),
-            ],
-            onChanged: (v) => setState(() => _type = v ?? _type),
-          ),
-          const SizedBox(height: AppSpacing.base),
-          DropdownButtonFormField<String>(
-            initialValue: _currency,
-            decoration: const InputDecoration(
-              labelText: '默认币种',
-              border: OutlineInputBorder(),
+            const SizedBox(height: AppSpacing.base),
+            DropdownButtonFormField<String>(
+              initialValue: _currency,
+              decoration: const InputDecoration(
+                labelText: '默认币种',
+                border: OutlineInputBorder(),
+              ),
+              items: [
+                for (final c in currencyItems)
+                  DropdownMenuItem(value: c, child: Text(c)),
+              ],
+              onChanged: (v) => setState(() => _currency = v ?? _currency),
             ),
-            items: [
-              for (final c in currencyItems)
-                DropdownMenuItem(value: c, child: Text(c)),
-            ],
-            onChanged: (v) => setState(() => _currency = v ?? _currency),
-          ),
-          const SizedBox(height: AppSpacing.base),
-          DropdownButtonFormField<String>(
-            initialValue: _balanceMode,
-            decoration: const InputDecoration(
-              labelText: '余额模式',
-              border: OutlineInputBorder(),
+            const SizedBox(height: AppSpacing.base),
+            DropdownButtonFormField<String>(
+              initialValue: _balanceMode,
+              decoration: const InputDecoration(
+                labelText: '余额模式',
+                border: OutlineInputBorder(),
+              ),
+              items: [
+                for (final e in _balanceModes.entries)
+                  DropdownMenuItem(value: e.key, child: Text(e.value)),
+              ],
+              onChanged: (v) =>
+                  setState(() => _balanceMode = v ?? _balanceMode),
             ),
-            items: [
-              for (final e in _balanceModes.entries)
-                DropdownMenuItem(value: e.key, child: Text(e.value)),
-            ],
-            onChanged: (v) => setState(() => _balanceMode = v ?? _balanceMode),
-          ),
-          const SizedBox(height: AppSpacing.base),
-          TextField(
-            controller: _institution,
-            decoration: const InputDecoration(
-              labelText: '机构名称（可选）',
-              border: OutlineInputBorder(),
+            const SizedBox(height: AppSpacing.base),
+            TextField(
+              controller: _institution,
+              decoration: const InputDecoration(
+                labelText: '机构名称（可选）',
+                border: OutlineInputBorder(),
+              ),
             ),
-          ),
-          const SizedBox(height: AppSpacing.sm),
-          SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('计入净资产'),
-            value: _includeInNetWorth,
-            onChanged: (v) => setState(() => _includeInNetWorth = v),
-          ),
-          const SizedBox(height: AppSpacing.base),
-          FilledButton(
-            onPressed: _busy ? null : _save,
-            child: Text(
-              _busy
-                  ? (_isEdit ? '保存中…' : '创建中…')
-                  : (_isEdit ? '保存修改' : '创建账户'),
+            const SizedBox(height: AppSpacing.sm),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('计入净资产'),
+              value: _includeInNetWorth,
+              onChanged: (v) => setState(() => _includeInNetWorth = v),
             ),
-          ),
-        ],
-      )),
+            const SizedBox(height: AppSpacing.base),
+            FilledButton(
+              onPressed: _busy ? null : _save,
+              child: Text(
+                _busy
+                    ? (_isEdit ? '保存中…' : '创建中…')
+                    : (_isEdit ? '保存修改' : '创建账户'),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

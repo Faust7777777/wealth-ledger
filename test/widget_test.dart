@@ -15,14 +15,16 @@ void main() {
   });
 
   testWidgets('DEMO fixture renders net worth on overview', (tester) async {
-    await tester.pumpWidget(ProviderScope(
-      overrides: [
-        appEnvironmentProvider.overrideWithValue(
-          const AppEnvironment(dataSourceMode: DataSourceMode.debugFixture),
-        ),
-      ],
-      child: const WealthLedgerApp(),
-    ));
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          appEnvironmentProvider.overrideWithValue(
+            const AppEnvironment(dataSourceMode: DataSourceMode.debugFixture),
+          ),
+        ],
+        child: const WealthLedgerApp(),
+      ),
+    );
     await tester.pumpAndSettle();
 
     expect(find.text('≈ ¥245,678.90'), findsOneWidget);
