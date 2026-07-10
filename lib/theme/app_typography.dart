@@ -2,7 +2,8 @@
 // 来源真相: project-context/DESIGN_V1.md §8。
 // 中文优先(MiSans) + Latin/数字(Inter)；货币统一开启 tabular figures 以对齐成列。
 // Hero 仅在 NetWorthHero 用 display（移动端降至 40）。
-// 状态: 暂存稿；字体 .ttf 待打包，未打包前回退系统字体（不影响 analyze）。
+// 字体: MiSans 已打包（pubspec fonts）；family='Inter' 未打包，回退链首选 MiSans，
+//       故全局以 MiSans 渲染，tabular figures 生效。Inter 官方 TTF 到位后可设为首选。
 import 'package:flutter/painting.dart';
 
 abstract final class AppType {

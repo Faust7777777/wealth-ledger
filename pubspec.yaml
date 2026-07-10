@@ -63,6 +63,15 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
+  # 打包 MiSans（小米开源、可商用）作为唯一实体字型：中文 + Latin + 等宽数字。
+  # AppType.family='Inter' 未打包，回退链首选 MiSans，故全局以 MiSans 渲染，
+  # 让 tabular figures 与字形身份真正生效（此前回退系统字体）。
+  # 来源为本机 WPS 字体缓存；如需可换成 MiSans 官方发行版重新打包。
+  fonts:
+    - family: MiSans
+      fonts:
+        - asset: assets/fonts/MiSans.ttf
+
   # To add assets to your application, add an assets section, like this:
   # assets:
   #   - images/a_dot_burr.jpeg
