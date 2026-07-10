@@ -299,6 +299,27 @@ def create_image_proposal_without_writing(base: str) -> None:
 def run_smoke(base: str, ledger_path: Path) -> None:
     assert unwrap_data(request_json(base, "/v1/accounts")) == []
 
+    bootstrap = unwrap_data(request_json(base, "/v1/ledger/bootstrap"))
+    assert bootstrap["syncCursor"] == "local_cursor_0000"
+    genesis_pull = unwrap_data(
+        request_json(base, "/v1/sync/changes?since=local_cursor_0000")
+    )
+    assert genesis_pull["cursor"] == "local_cursor_0000"
+    assert genesis_pull["changes"] == []
+    request_json(
+        base,
+        "/v1/sync/ack",
+        method="POST",
+        body={"cursor": "local_cursor_0000"},
+        expected_status=204,
+    )
+    unknown_cursor = request_json(
+        base,
+        "/v1/sync/changes?since=local_change_missing",
+        expected_status=400,
+    )
+    assert unknown_cursor["error"]["code"] == "invalid_sync_cursor"
+
     cash = create_account(base, "Smoke Cash", "1000.00")
     reserve = create_account(base, "Smoke Reserve", "250.00", account_type="wallet")
     assert cash["cashBalances"][0]["amount"] == "1000.00"

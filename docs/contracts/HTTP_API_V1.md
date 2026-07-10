@@ -290,7 +290,12 @@ POST /v1/sync/ack
 - account create / update / archive 会追加 `SyncChange`。
 - confirmed movement create / correction 会追加 `SyncChange`；draft、pending proposal、未确认图片/CSV 不进入 outbox。
 - `GET /v1/sync/changes?since=<cursor>` 返回该 cursor 之后的本地 change。
+- 空日志使用 genesis cursor `local_cursor_0000`；从该 cursor 拉取会返回完整保留日志，从该 cursor ack 是幂等 no-op。
+- 除 genesis 外，未知 `since` cursor 返回 `400 invalid_sync_cursor`，不得静默从头重放。
+- pull 响应中的 `cursor` 与 `changes` 来自同一次账本快照，cursor 不得超前于响应内 change。
 - `POST /v1/sync/ack` 接收 `cursor` 或 `changeIds`，成功后清理本地 `pendingChangeIds`，但保留 `syncChanges` 日志。
+- 当前 ack 是单一上游对本地 outbox 的高水位确认，不代表每台 Android/Windows 设备分别收妥。
+- 新 change ID 必须同时参考 `nextChangeSequence` 和已有最大 `local_change_N`，防止计数器回退后复用 ID。
 - `POST /v1/sync/push` 会把远端 `SyncChange` 作为同步日志中继保存，并返回 `acceptedChangeIds` / `skippedChangeIds`；不会直接应用到账本实体。
 - 不做远端 merge、不做冲突解决、不做 E2EE 同步。
 

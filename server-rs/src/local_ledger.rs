@@ -10,6 +10,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const LEDGER_VERSION: i64 = 1;
 pub const DEFAULT_BASE_CURRENCY: &str = "CNY";
+pub const LOCAL_SYNC_GENESIS_CURSOR: &str = "local_cursor_0000";
 const LOCAL_SYNC_DEVICE_ID: &str = "local_device";
 const INSTRUMENT_TYPES: &[&str] = &[
     "cash",
@@ -179,9 +180,21 @@ pub fn get_account(path: &Path, account_id: &str) -> io::Result<Option<Value>> {
         .cloned())
 }
 
-pub fn list_sync_changes(path: &Path, since: Option<&str>) -> io::Result<Value> {
+pub fn list_sync_changes(path: &Path, since: Option<&str>) -> Result<(String, Value), LedgerError> {
     let document = load_or_initialize(path)?;
-    Ok(sync_changes_for_document(&document, since))
+    let cursor = sync_cursor_from_document(&document);
+    let changes = sync_changes_for_document(&document, since)?;
+    Ok((cursor, changes))
+}
+
+pub fn sync_cursor_from_document(document: &Value) -> String {
+    document
+        .get("syncState")
+        .and_then(|sync_state| sync_state.get("cursor"))
+        .and_then(Value::as_str)
+        .filter(|cursor| !cursor.trim().is_empty())
+        .unwrap_or(LOCAL_SYNC_GENESIS_CURSOR)
+        .to_string()
 }
 
 pub fn ack_sync_changes(path: &Path, input: Value) -> Result<Value, LedgerError> {
@@ -2418,20 +2431,27 @@ fn account_anomalies_for_document(document: &Value, now: &str) -> io::Result<Vec
     Ok(anomalies)
 }
 
-fn sync_changes_for_document(document: &Value, since: Option<&str>) -> Value {
+fn sync_changes_for_document(document: &Value, since: Option<&str>) -> Result<Value, LedgerError> {
     let changes = document["syncChanges"]
         .as_array()
         .expect("validated local ledger syncChanges should be an array");
     let since = since.map(str::trim).filter(|value| !value.is_empty());
-    let start = since
-        .and_then(|cursor| {
-            changes
-                .iter()
-                .position(|change| change.get("id").and_then(Value::as_str) == Some(cursor))
-                .map(|index| index + 1)
-        })
-        .unwrap_or(0);
-    json!(changes.iter().skip(start).cloned().collect::<Vec<_>>())
+    let start = match since {
+        Some(LOCAL_SYNC_GENESIS_CURSOR) => 0,
+        Some(cursor) => changes
+            .iter()
+            .position(|change| change.get("id").and_then(Value::as_str) == Some(cursor))
+            .map(|index| index + 1)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![format!(
+                    "since cursor must reference an existing sync change: {cursor}"
+                )])
+            })?,
+        None => 0,
+    };
+    Ok(json!(
+        changes.iter().skip(start).cloned().collect::<Vec<_>>()
+    ))
 }
 
 fn sync_ack_change_ids_for_input(
@@ -2454,27 +2474,34 @@ fn sync_ack_change_ids_for_input(
         .collect::<Vec<_>>();
     let mut ack_change_ids = Vec::new();
     let mut errors = Vec::new();
+    let mut genesis_cursor_requested = false;
 
     if let Some(cursor_value) = object.get("cursor") {
         match cursor_value
             .as_str()
             .filter(|value| !value.trim().is_empty())
         {
-            Some(cursor) => match changes
-                .iter()
-                .position(|change| change.get("id").and_then(Value::as_str) == Some(cursor))
-            {
-                Some(index) => {
-                    for change in changes.iter().take(index + 1) {
-                        if let Some(change_id) = change.get("id").and_then(Value::as_str) {
-                            ack_change_ids.push(change_id.to_string());
+            Some(cursor) => {
+                if cursor == LOCAL_SYNC_GENESIS_CURSOR {
+                    genesis_cursor_requested = true;
+                } else {
+                    match changes
+                        .iter()
+                        .position(|change| change.get("id").and_then(Value::as_str) == Some(cursor))
+                    {
+                        Some(index) => {
+                            for change in changes.iter().take(index + 1) {
+                                if let Some(change_id) = change.get("id").and_then(Value::as_str) {
+                                    ack_change_ids.push(change_id.to_string());
+                                }
+                            }
                         }
+                        None => errors.push(format!(
+                            "cursor must reference an existing sync change: {cursor}"
+                        )),
                     }
                 }
-                None => errors.push(format!(
-                    "cursor must reference an existing sync change: {cursor}"
-                )),
-            },
+            }
             None => errors.push("cursor must be a non-empty string when present".to_string()),
         }
     }
@@ -2491,7 +2518,7 @@ fn sync_ack_change_ids_for_input(
     ack_change_ids.sort();
     ack_change_ids.dedup();
 
-    if ack_change_ids.is_empty() && errors.is_empty() {
+    if ack_change_ids.is_empty() && errors.is_empty() && !genesis_cursor_requested {
         errors.push("sync ack request must include cursor or changeIds".to_string());
     }
     for change_id in &ack_change_ids {
@@ -2740,16 +2767,31 @@ fn append_sync_log_change(document: &mut Value, change: Value) {
 fn next_sync_change_id(document: &mut Value) -> String {
     let fallback_sequence = document["syncChanges"]
         .as_array()
-        .map(|changes| changes.len() as u64 + 1)
+        .and_then(|changes| {
+            changes
+                .iter()
+                .filter_map(|change| change.get("id").and_then(Value::as_str))
+                .filter_map(|change_id| {
+                    change_id
+                        .strip_prefix("local_change_")
+                        .and_then(|suffix| suffix.parse::<u64>().ok())
+                })
+                .max()
+        })
+        .map(|sequence| sequence.saturating_add(1))
         .unwrap_or(1);
     let sync_state = document["syncState"]
         .as_object_mut()
         .expect("validated local ledger syncState should be an object");
-    let sequence = sync_state
+    let stored_sequence = sync_state
         .get("nextChangeSequence")
         .and_then(Value::as_u64)
         .unwrap_or(fallback_sequence);
-    sync_state.insert("nextChangeSequence".to_string(), json!(sequence + 1));
+    let sequence = stored_sequence.max(fallback_sequence);
+    sync_state.insert(
+        "nextChangeSequence".to_string(),
+        json!(sequence.saturating_add(1)),
+    );
     format!("local_change_{sequence:06}")
 }
 
@@ -6702,6 +6744,21 @@ mod tests {
         let error = ensure_real_and_fixture_paths_separate(fixture, real)
             .expect_err("real path must not look like fixture");
         assert!(error.contains("must not look like"));
+    }
+
+    #[test]
+    fn next_sync_change_id_recovers_from_regressed_sequence() {
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["syncChanges"] = json!([
+            {"id": "local_change_000007"},
+            {"id": "local_change_000042"}
+        ]);
+        document["syncState"]["nextChangeSequence"] = json!(2);
+
+        let change_id = next_sync_change_id(&mut document);
+
+        assert_eq!(change_id, "local_change_000043");
+        assert_eq!(document["syncState"]["nextChangeSequence"], 44);
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

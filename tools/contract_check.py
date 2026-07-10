@@ -152,6 +152,8 @@ def check_examples() -> None:
         fail("Empty bootstrap capabilities must not claim confirmed-ledger writes")
     if capabilities.get("proposalPersistence") != "memory":
         fail("Empty bootstrap capabilities must declare memory proposal persistence")
+    if require_path(empty_bootstrap, "data.syncCursor") != "local_cursor_0000":
+        fail("Empty bootstrap must use the local sync genesis cursor")
 
     ai_diff = examples.get("ai_modify_movement_diff.response.json")
     if ai_diff is None:
@@ -303,6 +305,8 @@ def check_rust_server() -> None:
         "ingest_sync_push",
         "append_sync_change",
         "sync_operation_for_movement",
+        "LOCAL_SYNC_GENESIS_CURSOR",
+        "stored_sequence.max(fallback_sequence)",
     ]
     missing_lock_snippets = [
         snippet for snippet in ledger_lock_snippets if snippet not in local_ledger_text
@@ -432,6 +436,10 @@ def main() -> None:
     counterparties_post_schema = doc["paths"]["/counterparties"]["post"]["requestBody"]["content"]["application/json"]["schema"].get("$ref")
     if counterparties_post_schema != "#/components/schemas/CreateCounterpartyInput":
         fail("POST /counterparties must use CreateCounterpartyInput, not the response Counterparty schema")
+    for path, method in (("/sync/changes", "get"), ("/sync/ack", "post")):
+        responses = doc["paths"][path][method].get("responses", {})
+        if "400" not in responses:
+            fail(f"{method.upper()} {path} must document invalid cursor responses")
     ok("Critical AI/DCA invariants are represented")
 
     check_examples()

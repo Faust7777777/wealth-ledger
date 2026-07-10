@@ -2385,7 +2385,7 @@ fn local_ledger_bootstrap(path: &FsPath, now: &str) -> io::Result<Value> {
             .get("ledgerVersion")
             .and_then(Value::as_i64)
             .unwrap_or(local_ledger::LEDGER_VERSION),
-        "syncCursor": sync_cursor_from_document(&document),
+        "syncCursor": local_ledger::sync_cursor_from_document(&document),
         "baseCurrency": document
             .get("baseCurrency")
             .and_then(Value::as_str)
@@ -2431,22 +2431,12 @@ fn ledger_capabilities(
     })
 }
 
-fn sync_cursor_from_document(document: &Value) -> String {
-    document
-        .get("syncState")
-        .and_then(|sync_state| sync_state.get("cursor"))
-        .and_then(Value::as_str)
-        .filter(|cursor| !cursor.trim().is_empty())
-        .unwrap_or("local_cursor_0000")
-        .to_string()
-}
-
 fn current_sync_cursor(state: &AppState, query: &HashMap<String, String>) -> String {
     if state.should_use_local_ledger(query)
         && let Some(path) = state.local_ledger_path.as_ref()
         && let Ok(document) = local_ledger::read_document(path)
     {
-        return sync_cursor_from_document(&document);
+        return local_ledger::sync_cursor_from_document(&document);
     }
     "rust_dev_cursor_0001".to_string()
 }
@@ -2868,13 +2858,13 @@ async fn sync_changes(
             .expect("local ledger path should exist when local ledger is selected");
         let since = query.get("since").map(String::as_str);
         return match local_ledger::list_sync_changes(path, since) {
-            Ok(changes) => envelope(json!({
-                "cursor": current_sync_cursor(&state, &query),
+            Ok((cursor, changes)) => envelope(json!({
+                "cursor": cursor,
                 "changes": changes,
                 "conflicts": []
             }))
             .into_response(),
-            Err(error) => ledger_io_error(error),
+            Err(error) => local_ledger_error(error, "invalid_sync_cursor"),
         };
     }
 
@@ -4402,6 +4392,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_local_ledger_sync_genesis_cursor_round_trips() {
+        let path = unique_test_ledger_path("sync_genesis_cursor");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (bootstrap_status, bootstrap_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/ledger/bootstrap").await;
+        assert_eq!(bootstrap_status, StatusCode::OK);
+        assert_eq!(
+            bootstrap_body["data"]["syncCursor"],
+            local_ledger::LOCAL_SYNC_GENESIS_CURSOR
+        );
+
+        let (changes_status, changes_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/sync/changes?since=local_cursor_0000",
+        )
+        .await;
+        assert_eq!(changes_status, StatusCode::OK);
+        assert_eq!(
+            changes_body["data"]["cursor"],
+            local_ledger::LOCAL_SYNC_GENESIS_CURSOR
+        );
+        assert_eq!(changes_body["data"]["changes"], json!([]));
+
+        let (ack_status, ack_body) = request_json_body_from(
+            router,
+            Method::POST,
+            "/v1/sync/ack",
+            json!({"cursor": local_ledger::LOCAL_SYNC_GENESIS_CURSOR}),
+        )
+        .await;
+        assert_eq!(ack_status, StatusCode::NO_CONTENT);
+        assert_eq!(ack_body, Value::Null);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn sync_ack_cursor_preserves_later_pending_changes() {
+        let path = unique_test_ledger_path("sync_ack_high_water");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        for display_name in ["同步账户一", "同步账户二"] {
+            let (status, _) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/accounts",
+                json!({
+                    "displayName": display_name,
+                    "accountType": "bank",
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": "cash_balance",
+                    "openingBalances": []
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let (ack_status, _) = request_json_body_from(
+            router,
+            Method::POST,
+            "/v1/sync/ack",
+            json!({"cursor": "local_change_000001"}),
+        )
+        .await;
+        assert_eq!(ack_status, StatusCode::NO_CONTENT);
+
+        let document = local_ledger::read_document(&path).expect("ledger should persist ack");
+        assert_eq!(
+            document["syncState"]["pendingChangeIds"],
+            json!(["local_change_000002"])
+        );
+        assert_eq!(
+            document["syncChanges"]
+                .as_array()
+                .expect("sync log should remain immutable")
+                .len(),
+            2
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_bootstrap_and_sync_cursor_use_real_local_state() {
         let path = unique_test_ledger_path("bootstrap_sync_cursor");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
@@ -4473,6 +4553,15 @@ mod tests {
         .await;
         assert_eq!(since_status, StatusCode::OK);
         assert_eq!(since_body["data"]["changes"], json!([]));
+
+        let (unknown_since_status, unknown_since_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/sync/changes?since=local_change_missing",
+        )
+        .await;
+        assert_eq!(unknown_since_status, StatusCode::BAD_REQUEST);
+        assert_eq!(unknown_since_body["error"]["code"], "invalid_sync_cursor");
 
         let (ack_status, ack_body) = request_json_body_from(
             router.clone(),

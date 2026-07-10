@@ -140,6 +140,7 @@ the JSON ledger when no `?scenario=` query is present:
 - snapshots: latest/list/manual baseline
 - taxonomy: categories, counterparties, counterparty merge proposal
 - portfolio read models: overview, allocation, holdings, quote summary
+- sync outbox: pull/ack plus idempotent remote log relay; no entity merge yet
 
 Passing `?scenario=degraded` still uses the virtual dev dataset for frontend
 demo integration.

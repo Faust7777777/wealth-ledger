@@ -59,7 +59,11 @@ DataSourceMode =
   "aiProposals": [],
   "evidenceRefs": [],
   "anomalies": [],
-  "syncState": {},
+  "syncState": {
+    "cursor": null,
+    "nextChangeSequence": 1,
+    "pendingChangeIds": []
+  },
   "syncChanges": [],
   "migrations": []
 }
@@ -71,6 +75,9 @@ DataSourceMode =
 - `movements` 是业务事件；`movementEntries` 是分录明细。
 - `aiProposals` 只保存候选与复核状态；确认前不得影响正式余额、净值、持仓。
 - `syncChanges` 是本地/远端同步变更日志，不等于业务流水。
+- 空日志对外使用 genesis cursor `local_cursor_0000`，磁盘上的 `syncState.cursor` 仍为 `null`。
+- `syncState.nextChangeSequence` 是持久化提示值；生成新 ID 时必须同时扫描已有最大 `local_change_N`，不得因字段回退而复用 change ID。
+- `pendingChangeIds` 是本地 outbox 的待上游确认集合，不代表每台客户端的独立同步进度。
 
 ## 3. 空账本初始化
 

@@ -121,7 +121,11 @@ SyncAckRequest {
 - 已实现本地 outbox 的第一步：account create / update / archive 会追加 `SyncChange`。
 - confirmed movement create / correction 会追加 `SyncChange`；draft、pending proposal、未确认图片/CSV 不进入 outbox。
 - `GET /v1/sync/changes?since=<cursor>` 可按本地 cursor 拉取之后的 change。
+- 空日志的 genesis cursor 是 `local_cursor_0000`；pull 接受它并返回完整保留日志，ack 它是幂等 no-op。
+- 除 genesis 外，未知 cursor 返回 400，不得静默从日志开头重放。
+- pull 的 `cursor` 与 `changes` 来自同一次 ledger 快照；新 change sequence 会以日志内最大 `local_change_N` 自愈，避免人工回退计数器后复用 ID。
 - `POST /v1/sync/ack` 可清理本地 `pendingChangeIds`，但不删除 `syncChanges` 日志。
+- 当前 ack 仅表示单一上游接受了本地 outbox 高水位，不是逐设备 delivery receipt。
 - `POST /v1/sync/push` 会把远端 `SyncChange` 作为同步日志中继保存，给它分配本地 server cursor；不会直接应用到账本实体。
 - 暂不做远端 merge、冲突解决、设备密钥和 E2EE。
 

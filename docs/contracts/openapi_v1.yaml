@@ -1044,6 +1044,10 @@ paths:
       parameters:
         - name: since
           in: query
+          description: >-
+            Pull changes after this cursor. local_cursor_0000 is the genesis
+            cursor and returns the full retained log; any other unknown cursor
+            is rejected instead of silently replaying from the beginning.
           schema:
             type: string
       responses:
@@ -1053,6 +1057,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SyncPullResponseEnvelope"
+        "400":
+          description: The since cursor is unknown or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
 
   /sync/push:
     post:
@@ -1089,6 +1099,9 @@ paths:
               properties:
                 cursor:
                   type: string
+                  description: >-
+                    Local outbox high-water cursor. local_cursor_0000 is the
+                    genesis cursor and acknowledges no changes.
                 changeIds:
                   type: array
                   items:
@@ -1100,6 +1113,12 @@ paths:
       responses:
         "204":
           description: Acknowledged.
+        "400":
+          description: The cursor or change ID is unknown or invalid.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
 
 components:
   securitySchemes:
@@ -2642,6 +2661,7 @@ components:
           properties:
             cursor:
               type: string
+              description: local_cursor_0000 for an empty retained sync log.
     SyncPullResponseEnvelope:
       type: object
       required: [ok, data]
@@ -2654,6 +2674,7 @@ components:
           properties:
             cursor:
               type: string
+              description: Cursor from the same ledger snapshot as changes.
             changes:
               type: array
               items:

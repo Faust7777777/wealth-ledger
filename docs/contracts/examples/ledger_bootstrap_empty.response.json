@@ -2,7 +2,7 @@
   "ok": true,
   "data": {
     "ledgerVersion": 1,
-    "syncCursor": "cursor_empty_0001",
+    "syncCursor": "local_cursor_0000",
     "baseCurrency": "CNY",
     "snapshot": null,
     "accounts": [],
