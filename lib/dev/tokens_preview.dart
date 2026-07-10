@@ -7,13 +7,19 @@ import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
 
 class TokensPreview extends StatelessWidget {
-  const TokensPreview({super.key, required this.isDark, required this.onToggleTheme});
+  const TokensPreview({
+    super.key,
+    required this.isDark,
+    required this.onToggleTheme,
+  });
 
   final bool isDark;
   final VoidCallback onToggleTheme;
 
-  Color get _textPrimary => isDark ? AppColors.textPrimary : AppColorsLight.textPrimary;
-  Color get _textSecondary => isDark ? AppColors.textSecondary : AppColorsLight.textSecondary;
+  Color get _textPrimary =>
+      isDark ? AppColors.textPrimary : AppColorsLight.textPrimary;
+  Color get _textSecondary =>
+      isDark ? AppColors.textSecondary : AppColorsLight.textSecondary;
 
   @override
   Widget build(BuildContext context) {
@@ -24,7 +30,9 @@ class TokensPreview extends StatelessWidget {
           IconButton(
             tooltip: isDark ? '切换浅色' : '切换深色',
             onPressed: onToggleTheme,
-            icon: Icon(isDark ? Icons.light_mode_outlined : Icons.dark_mode_outlined),
+            icon: Icon(
+              isDark ? Icons.light_mode_outlined : Icons.dark_mode_outlined,
+            ),
           ),
         ],
       ),
@@ -50,24 +58,33 @@ class TokensPreview extends StatelessWidget {
   }
 
   Widget _section(String t) => Padding(
-        padding: const EdgeInsets.only(bottom: AppSpacing.base),
-        child: Text(t, style: AppType.h2.copyWith(color: _textPrimary)),
-      );
+    padding: const EdgeInsets.only(bottom: AppSpacing.base),
+    child: Text(t, style: AppType.h2.copyWith(color: _textPrimary)),
+  );
 
   Widget _hero(BuildContext context) {
     final pos = isDark ? AppColors.positive : AppColorsLight.positive;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('净资产 · CNY', style: AppType.caption.copyWith(color: _textSecondary)),
+        Text(
+          '净资产 · CNY',
+          style: AppType.caption.copyWith(color: _textSecondary),
+        ),
         const SizedBox(height: AppSpacing.sm),
-        Text('≈ ¥245,678.90', style: AppType.display.copyWith(color: _textPrimary)),
+        Text(
+          '≈ ¥245,678.90',
+          style: AppType.display.copyWith(color: _textPrimary),
+        ),
         const SizedBox(height: AppSpacing.xs),
         Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(Icons.arrow_upward, size: 16, color: pos),
-            Text(' ¥1,245.67  +0.51%  今日', style: AppType.body.copyWith(color: pos)),
+            Text(
+              ' ¥1,245.67  +0.51%  今日',
+              style: AppType.body.copyWith(color: pos),
+            ),
           ],
         ),
       ],
@@ -97,17 +114,17 @@ class TokensPreview extends StatelessWidget {
   }
 
   Widget _pill(String label, Color c, String glyph) => Container(
-        padding: const EdgeInsets.symmetric(
-          horizontal: AppSpacing.md,
-          vertical: AppSpacing.xs,
-        ),
-        decoration: BoxDecoration(
-          color: c.withValues(alpha: 0.14),
-          borderRadius: BorderRadius.circular(AppRadius.pill),
-          border: Border.all(color: c.withValues(alpha: 0.5)),
-        ),
-        child: Text('$glyph  $label', style: AppType.micro.copyWith(color: c)),
-      );
+    padding: const EdgeInsets.symmetric(
+      horizontal: AppSpacing.md,
+      vertical: AppSpacing.xs,
+    ),
+    decoration: BoxDecoration(
+      color: c.withValues(alpha: 0.14),
+      borderRadius: BorderRadius.circular(AppRadius.pill),
+      border: Border.all(color: c.withValues(alpha: 0.5)),
+    ),
+    child: Text('$glyph  $label', style: AppType.micro.copyWith(color: c)),
+  );
 
   Widget _surfaces() {
     final d = isDark;
@@ -126,7 +143,9 @@ class TokensPreview extends StatelessWidget {
   }
 
   Widget _swatch(String name, Color c) {
-    final border = isDark ? AppColors.hairlineStrong : AppColorsLight.hairlineStrong;
+    final border = isDark
+        ? AppColors.hairlineStrong
+        : AppColorsLight.hairlineStrong;
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -147,10 +166,12 @@ class TokensPreview extends StatelessWidget {
 
   Widget _typeRamp() {
     Widget row(String label, TextStyle s) => Padding(
-          padding: const EdgeInsets.only(bottom: AppSpacing.sm),
-          child: Text('$label — 净资产 ¥245,678.90',
-              style: s.copyWith(color: _textPrimary)),
-        );
+      padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+      child: Text(
+        '$label — 净资产 ¥245,678.90',
+        style: s.copyWith(color: _textPrimary),
+      ),
+    );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -186,7 +207,10 @@ class TokensPreview extends StatelessWidget {
               children: [
                 SizedBox(
                   width: 48,
-                  child: Text(v.$1, style: AppType.micro.copyWith(color: _textSecondary)),
+                  child: Text(
+                    v.$1,
+                    style: AppType.micro.copyWith(color: _textSecondary),
+                  ),
                 ),
                 Container(width: v.$2, height: 12, color: c),
               ],

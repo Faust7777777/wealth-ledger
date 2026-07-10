@@ -60,6 +60,94 @@ void main() {
     );
   });
 
+  test('DevApiClient refreshes session on 401 and replays request', () async {
+    final store = MemoryAuthTokenStore();
+    await store.write(
+      const StoredAuthSession(
+        accessToken: 'access_expired',
+        refreshToken: 'refresh_old',
+        expiresAt: '2026-07-07T12:00:00+08:00',
+        deviceId: 'device_1',
+      ),
+    );
+
+    var refreshCalls = 0;
+    final client = DevApiClient(
+      'http://127.0.0.1:8790',
+      tokenStore: store,
+      client: MockClient((request) async {
+        if (request.url.path == '/v1/auth/refresh') {
+          refreshCalls++;
+          final body = jsonDecode(request.body) as Map<String, dynamic>;
+          expect(body['refreshToken'], 'refresh_old');
+          return http.Response(
+            jsonEncode({
+              'ok': true,
+              'data': {
+                'accessToken': 'access_new',
+                'refreshToken': 'refresh_new',
+                'expiresAt': '2026-07-07T13:00:00+08:00',
+                'deviceId': 'device_1',
+              },
+            }),
+            200,
+          );
+        }
+        if (request.headers['authorization'] == 'Bearer access_expired') {
+          return http.Response(jsonEncode({'ok': false}), 401);
+        }
+        expect(request.headers['authorization'], 'Bearer access_new');
+        return http.Response(
+          jsonEncode({
+            'ok': true,
+            'data': {
+              'items': ['acct_1'],
+            },
+          }),
+          200,
+        );
+      }),
+    );
+
+    final data = await client.getData('/v1/accounts');
+    expect((data as Map)['items'], ['acct_1']);
+    expect(refreshCalls, 1);
+    final stored = await store.read();
+    expect(stored?.accessToken, 'access_new');
+    expect(stored?.refreshToken, 'refresh_new');
+  });
+
+  test('DevApiClient surfaces 401 when refresh fails', () async {
+    final store = MemoryAuthTokenStore();
+    await store.write(
+      const StoredAuthSession(
+        accessToken: 'access_expired',
+        refreshToken: 'refresh_revoked',
+        expiresAt: '2026-07-07T12:00:00+08:00',
+        deviceId: 'device_1',
+      ),
+    );
+
+    final client = DevApiClient(
+      'http://127.0.0.1:8790',
+      tokenStore: store,
+      client: MockClient((request) async {
+        if (request.url.path == '/v1/auth/refresh') {
+          return http.Response(jsonEncode({'ok': false}), 401);
+        }
+        return http.Response(jsonEncode({'ok': false}), 401);
+      }),
+    );
+
+    await expectLater(
+      client.getData('/v1/accounts'),
+      throwsA(isA<ApiUnauthorizedException>()),
+    );
+    // refresh 失败不得破坏本地会话（留给用户手动重新登录）。
+    final stored = await store.read();
+    expect(stored?.refreshToken, 'refresh_revoked');
+  });
+
   test(
     'LocalServerAuthRepository parses login response without storing password',
     () async {

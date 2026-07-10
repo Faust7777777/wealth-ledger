@@ -69,6 +69,8 @@ class AuthController extends AsyncNotifier<AuthSessionVm?> {
       await ref.read(authTokenStoreProvider).write(session);
       state = AsyncData(session);
       ref.invalidate(authDevicesProvider);
+      // 登录前 bootstrap 会 401 → capabilities 回落只读；登录后必须重取。
+      ref.invalidate(capabilitiesProvider);
     } catch (error, stackTrace) {
       state = AsyncError<AuthSessionVm?>(error, stackTrace);
       rethrow;
@@ -89,6 +91,7 @@ class AuthController extends AsyncNotifier<AuthSessionVm?> {
       await ref.read(authTokenStoreProvider).write(session);
       state = AsyncData(session);
       ref.invalidate(authDevicesProvider);
+      ref.invalidate(capabilitiesProvider);
     } catch (error, stackTrace) {
       state = AsyncError<AuthSessionVm?>(error, stackTrace);
       rethrow;
@@ -108,6 +111,8 @@ class AuthController extends AsyncNotifier<AuthSessionVm?> {
     await ref.read(authTokenStoreProvider).clear();
     state = const AsyncData(null);
     ref.invalidate(authDevicesProvider);
+    // 登出后写能力随会话失效，重取（auth-on 时会回落只读）。
+    ref.invalidate(capabilitiesProvider);
   }
 
   Future<void> revokeDevice(String deviceId) async {

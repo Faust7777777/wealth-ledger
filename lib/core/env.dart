@@ -23,10 +23,10 @@ class AppEnvironment {
 
   /// 非生产数据来源角标：DEMO(fixture) / DEV(本地 Rust 服务)；real_local / api_remote 为 null。
   String? get devBannerLabel => switch (dataSourceMode) {
-        DataSourceMode.debugFixture => 'DEMO',
-        DataSourceMode.localServer => 'DEV',
-        _ => null,
-      };
+    DataSourceMode.debugFixture => 'DEMO',
+    DataSourceMode.localServer => 'DEV',
+    _ => null,
+  };
 
   /// 模式选择（默认 real_local 空账本）：
   ///  --dart-define=DATA_SOURCE=local_server 接本地 Rust 服务（real ledger via --ledger-path）
@@ -35,8 +35,10 @@ class AppEnvironment {
   factory AppEnvironment.fromBuildConfig() {
     const ds = String.fromEnvironment('DATA_SOURCE');
     const demo = bool.fromEnvironment('DEMO');
-    const apiBase =
-        String.fromEnvironment('API_BASE', defaultValue: 'http://127.0.0.1:8790');
+    const apiBase = String.fromEnvironment(
+      'API_BASE',
+      defaultValue: 'http://127.0.0.1:8790',
+    );
     const scenario = String.fromEnvironment('API_SCENARIO');
     final DataSourceMode mode;
     if (ds == 'local_server' || ds == 'dev_server' || ds == 'api_mock') {
@@ -55,5 +57,6 @@ class AppEnvironment {
 }
 
 /// 顶层覆盖点（测试/启动可 override）。
-final appEnvironmentProvider =
-    Provider<AppEnvironment>((ref) => AppEnvironment.fromBuildConfig());
+final appEnvironmentProvider = Provider<AppEnvironment>(
+  (ref) => AppEnvironment.fromBuildConfig(),
+);

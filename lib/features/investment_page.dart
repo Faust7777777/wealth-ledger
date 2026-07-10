@@ -136,12 +136,22 @@ class _HoldingTile extends StatelessWidget {
   }
 }
 
-class _ReminderTile extends ConsumerWidget {
+class _ReminderTile extends ConsumerStatefulWidget {
   const _ReminderTile({required this.r});
   final DcaReminderVm r;
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_ReminderTile> createState() => _ReminderTileState();
+}
+
+class _ReminderTileState extends ConsumerState<_ReminderTile> {
+  // 服务端写端点暂无幂等键；请求期间禁用按钮，防止连点生成重复候选。
+  bool _busy = false;
+
+  DcaReminderVm get r => widget.r;
+
+  @override
+  Widget build(BuildContext context) {
     return ListTile(
       contentPadding: EdgeInsets.zero,
       leading: const Icon(Icons.event_repeat_outlined),
@@ -157,17 +167,18 @@ class _ReminderTile extends ConsumerWidget {
             children: [
               OutlinedButton(
                 // 「记录已执行」只生成待确认候选；无候选持久化能力时禁用。
-                onPressed: ref.writeCapabilities.canPersistPendingProposal
-                    ? () => _record(context, ref)
-                    : null,
+                onPressed:
+                    _busy || !ref.writeCapabilities.canPersistPendingProposal
+                    ? null
+                    : _record,
                 child: const Text('记录已执行'),
               ),
               TextButton(
-                onPressed: () => _skip(context, ref),
+                onPressed: _busy ? null : _skip,
                 child: const Text('跳过本期'),
               ),
               TextButton(
-                onPressed: () => _snooze(context, ref),
+                onPressed: _busy ? null : _snooze,
                 child: const Text('明天提醒'),
               ),
             ],
@@ -177,48 +188,48 @@ class _ReminderTile extends ConsumerWidget {
     );
   }
 
-  void _refresh(WidgetRef ref) {
+  void _refresh() {
     ref.invalidate(dueRemindersProvider);
     ref.invalidate(dcaPlansProvider);
     ref.invalidate(overviewProvider);
   }
 
-  Future<void> _record(BuildContext context, WidgetRef ref) async {
+  Future<void> _run(Future<void> Function() op) async {
     final messenger = ScaffoldMessenger.of(context);
+    setState(() => _busy = true);
     try {
-      await ref.read(dcaRepositoryProvider).markExecutedAsProposal(r.id);
-      _refresh(ref);
-      ref.invalidate(aiPendingProvider);
-      messenger.showSnackBar(
-        const SnackBar(content: Text('已生成待确认记录（不下单 / 不转账）；见 AI 待确认')),
-      );
+      await op();
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
   }
 
-  Future<void> _skip(BuildContext context, WidgetRef ref) async {
+  Future<void> _record() => _run(() async {
     final messenger = ScaffoldMessenger.of(context);
-    try {
-      await ref.read(dcaRepositoryProvider).skipReminder(r.id);
-      _refresh(ref);
-      messenger.showSnackBar(const SnackBar(content: Text('已跳过本期定投提醒')));
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
-    }
-  }
+    await ref.read(dcaRepositoryProvider).markExecutedAsProposal(r.id);
+    _refresh();
+    ref.invalidate(aiPendingProvider);
+    messenger.showSnackBar(
+      const SnackBar(content: Text('已生成待确认记录（不下单 / 不转账）；见 AI 待确认')),
+    );
+  });
 
-  Future<void> _snooze(BuildContext context, WidgetRef ref) async {
+  Future<void> _skip() => _run(() async {
+    final messenger = ScaffoldMessenger.of(context);
+    await ref.read(dcaRepositoryProvider).skipReminder(r.id);
+    _refresh();
+    messenger.showSnackBar(const SnackBar(content: Text('已跳过本期定投提醒')));
+  });
+
+  Future<void> _snooze() => _run(() async {
     final messenger = ScaffoldMessenger.of(context);
     final until = _tomorrowIsoDate();
-    try {
-      await ref.read(dcaRepositoryProvider).snoozeReminder(r.id, until: until);
-      _refresh(ref);
-      messenger.showSnackBar(SnackBar(content: Text('已暂缓到 $until')));
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
-    }
-  }
+    await ref.read(dcaRepositoryProvider).snoozeReminder(r.id, until: until);
+    _refresh();
+    messenger.showSnackBar(SnackBar(content: Text('已暂缓到 $until')));
+  });
 }
 
 enum _PlanAction { edit, pause, resume, complete }

@@ -75,28 +75,91 @@ class DevApiClient {
     return body;
   }
 
-  Future<Object?> getData(String path) async => _handle(
-    await _client.get(Uri.parse(_url(path)), headers: await _headers()),
-    path,
-  );
+  Future<Object?> getData(String path) => _send('GET', path);
 
-  Future<Object?> postData(String path, {Object? body}) async => _handle(
-    await _client.post(
-      Uri.parse(_url(path)),
-      headers: await _headers(json: true),
-      body: body == null ? null : jsonEncode(body),
-    ),
-    path,
-  );
+  Future<Object?> postData(String path, {Object? body}) =>
+      _send('POST', path, body: body);
 
-  Future<Object?> patchData(String path, {Object? body}) async => _handle(
-    await _client.patch(
-      Uri.parse(_url(path)),
-      headers: await _headers(json: true),
-      body: body == null ? null : jsonEncode(body),
-    ),
-    path,
-  );
+  Future<Object?> patchData(String path, {Object? body}) =>
+      _send('PATCH', path, body: body);
+
+  /// 统一请求入口：access token 过期（401）时用 refresh token 换新并重放一次。
+  /// auth 端点自身不重试，避免刷新循环。
+  Future<Object?> _send(
+    String method,
+    String path, {
+    Object? body,
+    bool retried = false,
+  }) async {
+    final res = await _dispatch(method, path, body);
+    if (res.statusCode == 401 &&
+        !retried &&
+        !path.startsWith('/v1/auth/') &&
+        await _refreshSession()) {
+      return _send(method, path, body: body, retried: true);
+    }
+    return _handle(res, path);
+  }
+
+  Future<http.Response> _dispatch(
+    String method,
+    String path,
+    Object? body,
+  ) async {
+    final uri = Uri.parse(_url(path));
+    final encoded = body == null ? null : jsonEncode(body);
+    return switch (method) {
+      'GET' => _client.get(uri, headers: await _headers()),
+      'POST' => _client.post(
+        uri,
+        headers: await _headers(json: true),
+        body: encoded,
+      ),
+      'PATCH' => _client.patch(
+        uri,
+        headers: await _headers(json: true),
+        body: encoded,
+      ),
+      _ => throw ArgumentError.value(method, 'method'),
+    };
+  }
+
+  // 单飞：并发 401 只触发一次 refresh，避免旋转后旧 refresh token 互相失效。
+  Future<bool>? _refreshing;
+
+  Future<bool> _refreshSession() => _refreshing ??= _doRefreshSession()
+      .whenComplete(() => _refreshing = null);
+
+  Future<bool> _doRefreshSession() async {
+    final store = tokenStore;
+    if (store == null) return false;
+    final session = await store.read();
+    if (session == null || session.refreshToken.isEmpty) return false;
+    try {
+      final res = await _client.post(
+        Uri.parse('$baseUrl/v1/auth/refresh'),
+        headers: {'content-type': 'application/json'},
+        body: jsonEncode({'refreshToken': session.refreshToken}),
+      );
+      if (res.statusCode != 200) return false;
+      final decoded = jsonDecode(utf8.decode(res.bodyBytes));
+      final data = decoded is Map<String, dynamic>
+          ? (decoded['data'] ?? decoded)
+          : null;
+      if (data is! Map) return false;
+      final next = StoredAuthSession(
+        accessToken: '${data['accessToken'] ?? ''}',
+        refreshToken: '${data['refreshToken'] ?? ''}',
+        expiresAt: '${data['expiresAt'] ?? ''}',
+        deviceId: '${data['deviceId'] ?? ''}',
+      );
+      if (!next.isComplete) return false;
+      await store.write(next);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
 }
 
 // ———— 小工具 ————

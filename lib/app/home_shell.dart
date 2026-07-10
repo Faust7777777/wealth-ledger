@@ -77,6 +77,8 @@ class HomeShell extends ConsumerWidget {
     ref.invalidate(dueRemindersProvider);
     ref.invalidate(dcaPlansProvider);
     ref.invalidate(aiPendingProvider);
+    // 手动刷新兼作 capabilities 重试入口（server 后起时写入口能解锁）。
+    ref.invalidate(capabilitiesProvider);
   }
 
   @override

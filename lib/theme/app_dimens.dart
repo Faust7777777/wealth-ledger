@@ -4,9 +4,19 @@
 // 状态: 暂存稿；脚手架就绪后移入 app/lib/theme 并经 `flutter analyze` 验证。
 import 'package:flutter/painting.dart';
 
-abstract final class AppSpacing { // 4pt 基
-  static const double xxs = 2, xs = 4, sm = 8, md = 12, base = 16,
-      lg = 20, xl = 24, xxl = 32, xxxl = 40, huge = 48, giant = 64;
+abstract final class AppSpacing {
+  // 4pt 基
+  static const double xxs = 2,
+      xs = 4,
+      sm = 8,
+      md = 12,
+      base = 16,
+      lg = 20,
+      xl = 24,
+      xxl = 32,
+      xxxl = 40,
+      huge = 48,
+      giant = 64;
 }
 
 abstract final class AppRadius {
@@ -28,16 +38,17 @@ abstract final class AppElevation {
 }
 
 abstract final class AppLayout {
-  static const double railWidth = 256;      // Windows 左栏
-  static const double railCollapsed = 72;   // 图标栏（窄窗）
+  static const double railWidth = 256; // Windows 左栏
+  static const double railCollapsed = 72; // 图标栏（窄窗）
   static const double inspectorWidth = 384; // Windows 右栏
-  static const double contentMax = 720;     // 中栏内容最大宽
-  static const double contentMin = 560;     // 中栏可接受最小宽
+  static const double contentMax = 720; // 中栏内容最大宽
+  static const double contentMin = 560; // 中栏可接受最小宽
   static const double gutterDesktop = 24;
   static const double gutterMobile = 16;
 
   // 断点（三栏数学 256 + 24 + 560..720 + 24 + 384 ≈ 1248..1408 → 取 1360）
-  static const double bpCompact = 600;   // <600 手机：底栏 + FAB
-  static const double bpRailIcon = 960;  // <960：Rail 收为图标栏
-  static const double bpExpanded = 1360; // >=1360：完整三栏；600–1359：栏+主栏，右栏 slide-over
+  static const double bpCompact = 600; // <600 手机：底栏 + FAB
+  static const double bpRailIcon = 960; // <960：Rail 收为图标栏
+  static const double bpExpanded =
+      1360; // >=1360：完整三栏；600–1359：栏+主栏，右栏 slide-over
 }

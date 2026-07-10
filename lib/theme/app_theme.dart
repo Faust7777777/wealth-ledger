@@ -10,19 +10,24 @@ ThemeData buildLightTheme() => _build(Brightness.light);
 ThemeData _build(Brightness brightness) {
   final isDark = brightness == Brightness.dark;
 
-  final scheme = ColorScheme.fromSeed(
-    seedColor: isDark ? AppColors.brand : AppColorsLight.brand,
-    brightness: brightness,
-  ).copyWith(
-    primary: isDark ? AppColors.brand : AppColorsLight.brand,
-    onPrimary: isDark ? AppColors.onBrand : AppColorsLight.onBrand,
-    surface: isDark ? AppColors.surface1 : AppColorsLight.surface1,
-    onSurface: isDark ? AppColors.textPrimary : AppColorsLight.textPrimary,
-    error: isDark ? AppColors.error : AppColorsLight.error,
-  );
+  final scheme =
+      ColorScheme.fromSeed(
+        seedColor: isDark ? AppColors.brand : AppColorsLight.brand,
+        brightness: brightness,
+      ).copyWith(
+        primary: isDark ? AppColors.brand : AppColorsLight.brand,
+        onPrimary: isDark ? AppColors.onBrand : AppColorsLight.onBrand,
+        surface: isDark ? AppColors.surface1 : AppColorsLight.surface1,
+        onSurface: isDark ? AppColors.textPrimary : AppColorsLight.textPrimary,
+        error: isDark ? AppColors.error : AppColorsLight.error,
+      );
 
-  final textPrimary = isDark ? AppColors.textPrimary : AppColorsLight.textPrimary;
-  final textSecondary = isDark ? AppColors.textSecondary : AppColorsLight.textSecondary;
+  final textPrimary = isDark
+      ? AppColors.textPrimary
+      : AppColorsLight.textPrimary;
+  final textSecondary = isDark
+      ? AppColors.textSecondary
+      : AppColorsLight.textSecondary;
 
   return ThemeData(
     useMaterial3: true,
