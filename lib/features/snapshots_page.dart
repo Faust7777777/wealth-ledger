@@ -54,7 +54,7 @@ class SnapshotsPage extends ConsumerWidget {
         ],
       ),
       body: async.when(
-        loading: () => const Center(child: CircularProgressIndicator()),
+        loading: () => const ListSkeleton(),
         error: (e, _) => ErrorStateView(
           message: '$e',
           onRetry: () => ref.invalidate(snapshotsProvider),

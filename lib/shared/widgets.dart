@@ -73,6 +73,123 @@ class _RevealState extends State<Reveal> with SingleTickerProviderStateMixin {
   }
 }
 
+/// 骨架微光：低对比往返呼吸，占位加载态。比裸转圈更能预示内容结构。
+/// 尊重减弱动态效果（静态占位块）。
+class Shimmer extends StatefulWidget {
+  const Shimmer({super.key, required this.child});
+  final Widget child;
+
+  @override
+  State<Shimmer> createState() => _ShimmerState();
+}
+
+class _ShimmerState extends State<Shimmer> with SingleTickerProviderStateMixin {
+  // 在 initState 创建（非 late），避免 dispose 时惰性初始化触碰已失活的元素树。
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1100),
+    );
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // 减弱动态效果时不重复动画（也避免测试因无限动画无法 settle）。
+    final reduceMotion =
+        MediaQuery.maybeOf(context)?.disableAnimations ?? false;
+    if (reduceMotion) {
+      _controller.stop();
+    } else if (!_controller.isAnimating) {
+      _controller.repeat(reverse: true);
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (MediaQuery.maybeOf(context)?.disableAnimations ?? false) {
+      return Opacity(opacity: 0.5, child: widget.child);
+    }
+    return FadeTransition(
+      opacity: Tween<double>(
+        begin: 0.35,
+        end: 0.7,
+      ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeInOut)),
+      child: widget.child,
+    );
+  }
+}
+
+/// 单个骨架块（圆角占位条）。
+class SkeletonBar extends StatelessWidget {
+  const SkeletonBar({
+    super.key,
+    this.width,
+    this.height = 14,
+    this.radius = AppRadius.sm,
+  });
+  final double? width;
+  final double height;
+  final double radius;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: width,
+      height: height,
+      decoration: BoxDecoration(
+        color: Theme.of(context).dividerColor,
+        borderRadius: BorderRadius.circular(radius),
+      ),
+    );
+  }
+}
+
+/// 列表加载骨架：N 行「标题条 + 右侧金额条」，替代裸 CircularProgressIndicator。
+class ListSkeleton extends StatelessWidget {
+  const ListSkeleton({super.key, this.rows = 5});
+  final int rows;
+
+  @override
+  Widget build(BuildContext context) {
+    return Shimmer(
+      child: ListView.separated(
+        padding: const EdgeInsets.all(AppSpacing.base),
+        itemCount: rows,
+        separatorBuilder: (_, _) => const SizedBox(height: AppSpacing.lg),
+        itemBuilder: (context, i) => Row(
+          children: [
+            const SkeletonBar(width: 40, height: 40, radius: AppRadius.md),
+            const SizedBox(width: AppSpacing.md),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SkeletonBar(width: 140 - (i % 3) * 24),
+                  const SizedBox(height: AppSpacing.sm),
+                  const SkeletonBar(width: 88, height: 11),
+                ],
+              ),
+            ),
+            const SizedBox(width: AppSpacing.md),
+            const SkeletonBar(width: 72, height: 16),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 /// 按压反馈：按下时轻微缩放（tactile feedback），松开或取消回弹。
 /// 给可点击的卡片/行/主动作加触感；尊重减弱动态效果。
 class PressableScale extends StatefulWidget {

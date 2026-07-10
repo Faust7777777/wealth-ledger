@@ -17,7 +17,7 @@ class AccountsPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final async = ref.watch(accountsProvider);
     return async.when(
-      loading: () => const Center(child: CircularProgressIndicator()),
+      loading: () => const ListSkeleton(),
       error: (e, _) => ErrorStateView(
         message: '$e',
         onRetry: () => ref.invalidate(accountsProvider),

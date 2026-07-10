@@ -23,7 +23,7 @@ class InvestmentPage extends ConsumerWidget {
         ref.watch(dcaPlansProvider).asData?.value ?? const <DcaPlanVm>[];
 
     return holdings.when(
-      loading: () => const Center(child: CircularProgressIndicator()),
+      loading: () => const ListSkeleton(),
       error: (e, _) => ErrorStateView(
         message: '$e',
         onRetry: () => ref.invalidate(holdingsProvider),

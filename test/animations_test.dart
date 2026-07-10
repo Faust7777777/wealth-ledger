@@ -35,6 +35,15 @@ void main() {
     );
   });
 
+  testWidgets('ListSkeleton 渲染占位骨架且不阻塞 settle（reduce-motion）', (tester) async {
+    // 减弱动态效果下 Shimmer 为静态，pumpAndSettle 不会因无限动画挂起。
+    await tester.pumpWidget(
+      _host(const ListSkeleton(rows: 3), reduceMotion: true),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byType(SkeletonBar), findsWidgets);
+  });
+
   testWidgets('AnimatedMoneyText 呈现当前值并过渡到新值', (tester) async {
     await tester.pumpWidget(_host(const AnimatedMoneyText('¥100')));
     await tester.pumpAndSettle();
