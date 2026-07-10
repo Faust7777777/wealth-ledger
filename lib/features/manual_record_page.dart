@@ -107,7 +107,7 @@ class _ManualRecordPageState extends ConsumerState<ManualRecordPage> {
     if (ok != true) return;
     setState(() => _busy = true);
     try {
-      await ref
+      final result = await ref
           .read(movementRepositoryProvider)
           .createManualRecord(
             ManualRecordInput(
@@ -121,12 +121,18 @@ class _ManualRecordPageState extends ConsumerState<ManualRecordPage> {
               counterpartyId: _counterpartyId,
             ),
           );
+      // 只消费服务端确认结果：ledgerWrite 为真才算已入账并刷新账本派生视图。
       ref.invalidate(recentMovementsProvider);
       ref.invalidate(overviewProvider);
-      ref.invalidate(accountsProvider);
-      ref.invalidate(allocationProvider);
-      ref.invalidate(snapshotsProvider);
-      messenger.showSnackBar(const SnackBar(content: Text('已入账')));
+      if (result.ledgerWrite || result.snapshotInvalidated) {
+        ref.invalidate(accountsProvider);
+        ref.invalidate(allocationProvider);
+        ref.invalidate(snapshotsProvider);
+        ref.invalidate(anomaliesProvider);
+      }
+      messenger.showSnackBar(
+        SnackBar(content: Text(result.ledgerWrite ? '已入账' : '已提交候选，尚未入账')),
+      );
       if (mounted) router.pop();
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));

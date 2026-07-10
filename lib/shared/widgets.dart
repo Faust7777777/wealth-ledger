@@ -13,11 +13,11 @@ class ContentMaxWidth extends StatelessWidget {
   final double maxWidth;
   @override
   Widget build(BuildContext context) => Center(
-        child: ConstrainedBox(
-          constraints: BoxConstraints(maxWidth: maxWidth),
-          child: child,
-        ),
-      );
+    child: ConstrainedBox(
+      constraints: BoxConstraints(maxWidth: maxWidth),
+      child: child,
+    ),
+  );
 }
 
 /// 空状态：图标 + 一句话 + 可选动作。
@@ -47,7 +47,11 @@ class EmptyState extends StatelessWidget {
               Icon(icon, size: 40, color: t.colorScheme.outline),
               const SizedBox(height: AppSpacing.base),
             ],
-            Text(title, style: t.textTheme.titleMedium, textAlign: TextAlign.center),
+            Text(
+              title,
+              style: t.textTheme.titleMedium,
+              textAlign: TextAlign.center,
+            ),
             if (message != null) ...[
               const SizedBox(height: AppSpacing.sm),
               Text(
@@ -79,10 +83,49 @@ class SectionHeader extends StatelessWidget {
       padding: const EdgeInsets.fromLTRB(0, AppSpacing.lg, 0, AppSpacing.sm),
       child: Row(
         children: [
-          Expanded(child: Text(title, style: Theme.of(context).textTheme.titleLarge)),
+          Expanded(
+            child: Text(title, style: Theme.of(context).textTheme.titleLarge),
+          ),
           ?trailing,
         ],
       ),
+    );
+  }
+}
+
+/// 写入口统一提示：当前数据源无对应写能力时的原因文案。
+const String kReadOnlyHint =
+    '当前数据源只读：请以 local_server 可写模式启动（tools\\run_self_use_windows.ps1）';
+
+/// 写入口 gating 包装：capability 为 false 时禁用 [child] 并在下方给出原因。
+/// UI 只凭服务端 capabilities 决定可写性，不按数据源名称猜测。
+class WriteGate extends StatelessWidget {
+  const WriteGate({
+    super.key,
+    required this.enabled,
+    required this.child,
+    this.reason = kReadOnlyHint,
+  });
+  final bool enabled;
+  final Widget child;
+  final String reason;
+
+  @override
+  Widget build(BuildContext context) {
+    if (enabled) return child;
+    final t = Theme.of(context);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        AbsorbPointer(child: Opacity(opacity: 0.45, child: child)),
+        const SizedBox(height: AppSpacing.xs),
+        Text(
+          reason,
+          style: t.textTheme.bodySmall?.copyWith(color: t.colorScheme.outline),
+          textAlign: TextAlign.center,
+        ),
+      ],
     );
   }
 }

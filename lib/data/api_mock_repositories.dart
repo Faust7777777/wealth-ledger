@@ -24,7 +24,7 @@ class ApiUnauthorizedException implements Exception {
   ApiUnauthorizedException(this.path);
   final String path;
   @override
-  String toString() => '登录已失效或未登录（401）：$path';
+  String toString() => '登录已失效或未登录（401）：请到「设置 → 本地服务登录」重新登录后重试（$path）';
 }
 
 class DevApiClient {
@@ -597,7 +597,33 @@ AssetAllocationVm parseAssetAllocationData(Map<String, dynamic> j) =>
       netWorth: _money(j['netWorth']),
     );
 
+/// 公开以便单测直接喂 /v1/ledger/bootstrap 的 data.capabilities。
+LedgerCapabilitiesVm parseLedgerCapabilitiesData(Map<String, dynamic> j) =>
+    LedgerCapabilitiesVm(
+      dataSourceMode: '${j['dataSourceMode'] ?? 'unknown'}',
+      canWriteConfirmedLedger: _bool(j['canWriteConfirmedLedger']),
+      canCreateAccount: _bool(j['canCreateAccount']),
+      canRecordMovement: _bool(j['canRecordMovement']),
+      canConfirmProposal: _bool(j['canConfirmProposal']),
+      canPersistPendingProposal: _bool(j['canPersistPendingProposal']),
+      proposalPersistence: '${j['proposalPersistence'] ?? 'none'}',
+    );
+
 // ———— 仓库实现 ————
+class LocalServerLedgerRepository implements LedgerRepository {
+  LocalServerLedgerRepository(this._c);
+  final DevApiClient _c;
+
+  /// 能力来自 /v1/ledger/bootstrap；请求失败或字段缺失一律 fail-closed 只读。
+  @override
+  Future<LedgerCapabilitiesVm> getCapabilities() async {
+    final d = await _c.getData('/v1/ledger/bootstrap');
+    final caps = d is Map ? d['capabilities'] : null;
+    if (caps is! Map) return LedgerCapabilitiesVm.locked;
+    return parseLedgerCapabilitiesData(caps.cast<String, dynamic>());
+  }
+}
+
 class LocalServerAccountRepository implements AccountRepository {
   LocalServerAccountRepository(this._c);
   final DevApiClient _c;
@@ -794,7 +820,7 @@ class LocalServerMovementRepository implements MovementRepository {
   }
 
   @override
-  Future<MovementVm> createManualRecord(ManualRecordInput input) async {
+  Future<ConfirmResultVm> createManualRecord(ManualRecordInput input) async {
     final isIncome = input.type == MovementType.income;
     return _recordViaPipeline({
       'type': _movementTypeWire(input.type),
@@ -818,7 +844,7 @@ class LocalServerMovementRepository implements MovementRepository {
   }
 
   @override
-  Future<MovementVm> createTransfer(TransferInput input) async {
+  Future<ConfirmResultVm> createTransfer(TransferInput input) async {
     return _recordViaPipeline({
       'type': 'transfer',
       'occurredAt':
@@ -851,7 +877,7 @@ class LocalServerMovementRepository implements MovementRepository {
   }
 
   @override
-  Future<MovementVm> reconcileBalance(ReconcileInput input) async {
+  Future<ConfirmResultVm> reconcileBalance(ReconcileInput input) async {
     final delta = subtractDecimal(input.observedBalance, input.currentBalance);
     final isOut = delta.startsWith('-');
     final amount = isOut ? delta.substring(1) : delta;
@@ -893,14 +919,15 @@ class LocalServerMovementRepository implements MovementRepository {
   }
 
   // 候选 → 确认：草稿 → 提交复核 → 确认入账（均为用户主动发起的合法写路径）。
-  Future<MovementVm> _recordViaPipeline(Map<String, Object?> body) async {
+  // 返回服务端 confirm 结果；是否"已入账"由 ledgerWrite 决定，前端不猜测。
+  Future<ConfirmResultVm> _recordViaPipeline(Map<String, Object?> body) async {
     final draft = _m(await _c.postData('/v1/movements/drafts', body: body));
     final movementId = '${draft['id']}';
     final groupId = '${draft['atomicGroupId']}';
     await _c.postData('/v1/movements/$movementId/submit-review');
-    await _c.postData('/v1/atomic-groups/$groupId/confirm');
-    final confirmed = await _c.getData('/v1/movements/$movementId');
-    return _movement(confirmed == null ? draft : _m(confirmed));
+    return _confirmResult(
+      _m(await _c.postData('/v1/atomic-groups/$groupId/confirm')),
+    );
   }
 }
 

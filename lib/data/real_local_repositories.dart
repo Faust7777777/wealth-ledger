@@ -5,6 +5,23 @@ import '../core/types.dart';
 import 'repositories.dart';
 import 'view_models.dart';
 
+class RealLocalLedgerRepository implements LedgerRepository {
+  const RealLocalLedgerRepository();
+
+  /// real_local 目前是只读空壳：能力全 false，写入口由 UI 隐藏/禁用。
+  @override
+  Future<LedgerCapabilitiesVm> getCapabilities() async =>
+      const LedgerCapabilitiesVm(
+        dataSourceMode: 'real_local',
+        canWriteConfirmedLedger: false,
+        canCreateAccount: false,
+        canRecordMovement: false,
+        canConfirmProposal: false,
+        canPersistPendingProposal: false,
+        proposalPersistence: 'none',
+      );
+}
+
 class RealLocalAccountRepository implements AccountRepository {
   const RealLocalAccountRepository();
   @override
@@ -83,13 +100,13 @@ class RealLocalMovementRepository implements MovementRepository {
   @override
   Future<MovementVm?> getMovement(Id id) async => null;
   @override
-  Future<MovementVm> createManualRecord(ManualRecordInput input) async =>
+  Future<ConfirmResultVm> createManualRecord(ManualRecordInput input) async =>
       throw UnsupportedError('real_local 暂不支持手动记账；请用 local_server');
   @override
-  Future<MovementVm> createTransfer(TransferInput input) async =>
+  Future<ConfirmResultVm> createTransfer(TransferInput input) async =>
       throw UnsupportedError('real_local 暂不支持转账；请用 local_server');
   @override
-  Future<MovementVm> reconcileBalance(ReconcileInput input) async =>
+  Future<ConfirmResultVm> reconcileBalance(ReconcileInput input) async =>
       throw UnsupportedError('real_local 暂不支持余额校准；请用 local_server');
   @override
   Future<void> createCorrectionProposal(CreateCorrectionInput input) async =>

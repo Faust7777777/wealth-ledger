@@ -137,6 +137,26 @@ T _pick<T>(
 };
 
 // —— 仓库 provider（按 mode 选实现：real_local / debug_fixture / local_server）——
+final ledgerRepositoryProvider = Provider<LedgerRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalLedgerRepository(),
+    fixture: () => const FixtureLedgerRepository(),
+    api: () => LocalServerLedgerRepository(ref.watch(devApiClientProvider)),
+  ),
+);
+
+/// 账本能力（写入口 gating 的唯一口径）。UI 用 [writeCapabilities] 取值，
+/// 加载中 / 请求失败一律回落到 locked（fail-closed 只读）。
+final capabilitiesProvider = FutureProvider<LedgerCapabilitiesVm>(
+  (ref) => ref.watch(ledgerRepositoryProvider).getCapabilities(),
+);
+
+extension WriteCapabilitiesX on WidgetRef {
+  LedgerCapabilitiesVm get writeCapabilities =>
+      watch(capabilitiesProvider).asData?.value ?? LedgerCapabilitiesVm.locked;
+}
+
 final accountRepositoryProvider = Provider<AccountRepository>(
   (ref) => _pick(
     ref,

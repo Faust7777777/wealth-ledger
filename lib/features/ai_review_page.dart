@@ -124,14 +124,17 @@ class _GroupBlock extends ConsumerWidget {
               ),
               const SizedBox(width: AppSpacing.sm),
               FilledButton(
-                onPressed: () => _run(
-                  context,
-                  ref,
-                  () => ref
-                      .read(aiProposalRepositoryProvider)
-                      .approveAtomicGroup(g.id),
-                  '已接受该组',
-                ),
+                // 确认能力由服务端 capabilities 决定；不可确认时禁用。
+                onPressed: ref.writeCapabilities.canConfirmProposal
+                    ? () => _run(
+                        context,
+                        ref,
+                        () => ref
+                            .read(aiProposalRepositoryProvider)
+                            .approveAtomicGroup(g.id),
+                        '已接受该组',
+                      )
+                    : null,
                 child: const Text('接受整组'),
               ),
             ],

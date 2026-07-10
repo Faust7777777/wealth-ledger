@@ -30,14 +30,18 @@ class InvestmentPage extends ConsumerWidget {
       ),
       data: (hs) {
         final rs = reminders.asData?.value ?? const <DcaReminderVm>[];
+        final canPropose = ref.writeCapabilities.canPersistPendingProposal;
         if (hs.isEmpty && rs.isEmpty && plans.isEmpty) {
           return EmptyState(
             icon: Icons.trending_up_outlined,
             title: '还没有投资持仓',
             message: '可以先创建定投计划，或添加券商 / 交易所账户与持仓。这里只展示事实统计，非投资建议。',
-            action: FilledButton(
-              onPressed: () => context.push('/investment/dca/new'),
-              child: const Text('新建定投计划'),
+            action: WriteGate(
+              enabled: canPropose,
+              child: FilledButton(
+                onPressed: () => context.push('/investment/dca/new'),
+                child: const Text('新建定投计划'),
+              ),
             ),
           );
         }
@@ -46,10 +50,13 @@ class InvestmentPage extends ConsumerWidget {
           children: [
             Align(
               alignment: Alignment.centerLeft,
-              child: FilledButton.icon(
-                onPressed: () => context.push('/investment/dca/new'),
-                icon: const Icon(Icons.add),
-                label: const Text('新建定投计划'),
+              child: WriteGate(
+                enabled: canPropose,
+                child: FilledButton.icon(
+                  onPressed: () => context.push('/investment/dca/new'),
+                  icon: const Icon(Icons.add),
+                  label: const Text('新建定投计划'),
+                ),
               ),
             ),
             const SizedBox(height: AppSpacing.base),
@@ -149,7 +156,10 @@ class _ReminderTile extends ConsumerWidget {
             runSpacing: AppSpacing.xs,
             children: [
               OutlinedButton(
-                onPressed: () => _record(context, ref),
+                // 「记录已执行」只生成待确认候选；无候选持久化能力时禁用。
+                onPressed: ref.writeCapabilities.canPersistPendingProposal
+                    ? () => _record(context, ref)
+                    : null,
                 child: const Text('记录已执行'),
               ),
               TextButton(

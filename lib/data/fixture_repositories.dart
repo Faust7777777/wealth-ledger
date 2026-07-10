@@ -347,6 +347,23 @@ const AssetAllocationVm _allocation = AssetAllocationVm(
   netWorth: Money(amount: '245678.90', currency: 'CNY'),
 );
 
+class FixtureLedgerRepository implements LedgerRepository {
+  const FixtureLedgerRepository();
+
+  /// DEMO 演示只读：账户/流水/快照写入不可用；AI proposal 流可模拟（不落账）。
+  @override
+  Future<LedgerCapabilitiesVm> getCapabilities() async =>
+      const LedgerCapabilitiesVm(
+        dataSourceMode: 'debug_fixture',
+        canWriteConfirmedLedger: false,
+        canCreateAccount: false,
+        canRecordMovement: false,
+        canConfirmProposal: true,
+        canPersistPendingProposal: true,
+        proposalPersistence: 'memory',
+      );
+}
+
 class FixtureAccountRepository implements AccountRepository {
   const FixtureAccountRepository();
   @override
@@ -393,13 +410,13 @@ class FixtureMovementRepository implements MovementRepository {
       .cast<MovementVm?>()
       .firstWhere((m) => true, orElse: () => null);
   @override
-  Future<MovementVm> createManualRecord(ManualRecordInput input) async =>
+  Future<ConfirmResultVm> createManualRecord(ManualRecordInput input) async =>
       throw UnsupportedError('DEMO 演示只读，不支持手动记账；请用 local_server');
   @override
-  Future<MovementVm> createTransfer(TransferInput input) async =>
+  Future<ConfirmResultVm> createTransfer(TransferInput input) async =>
       throw UnsupportedError('DEMO 演示只读，不支持转账；请用 local_server');
   @override
-  Future<MovementVm> reconcileBalance(ReconcileInput input) async =>
+  Future<ConfirmResultVm> reconcileBalance(ReconcileInput input) async =>
       throw UnsupportedError('DEMO 演示只读，不支持余额校准；请用 local_server');
   @override
   Future<void> createCorrectionProposal(CreateCorrectionInput input) async {

@@ -265,6 +265,39 @@ class CreateCorrectionInput {
   final String reason;
 }
 
+/// 账本能力（/v1/ledger/bootstrap.data.capabilities 的前端投影）。
+/// 写入口 gating 的唯一口径：UI 不得按 DataSourceMode 猜测能力。
+class LedgerCapabilitiesVm {
+  const LedgerCapabilitiesVm({
+    required this.dataSourceMode,
+    required this.canWriteConfirmedLedger,
+    required this.canCreateAccount,
+    required this.canRecordMovement,
+    required this.canConfirmProposal,
+    required this.canPersistPendingProposal,
+    required this.proposalPersistence,
+  });
+
+  final String dataSourceMode;
+  final bool canWriteConfirmedLedger;
+  final bool canCreateAccount;
+  final bool canRecordMovement;
+  final bool canConfirmProposal;
+  final bool canPersistPendingProposal;
+  final String proposalPersistence; // none / memory / file
+
+  /// fail-closed 默认：能力未知（加载中 / 请求失败 / 字段缺失）时一律只读。
+  static const locked = LedgerCapabilitiesVm(
+    dataSourceMode: 'unknown',
+    canWriteConfirmedLedger: false,
+    canCreateAccount: false,
+    canRecordMovement: false,
+    canConfirmProposal: false,
+    canPersistPendingProposal: false,
+    proposalPersistence: 'none',
+  );
+}
+
 /// 确认 atomic group 的结果。UI 必须以 ledgerWrite 为准，不能自行猜测是否已入账。
 class ConfirmResultVm {
   const ConfirmResultVm({

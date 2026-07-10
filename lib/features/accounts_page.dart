@@ -21,14 +21,18 @@ class AccountsPage extends ConsumerWidget {
       error: (e, _) =>
           ErrorStateView(message: '$e', onRetry: () => ref.invalidate(accountsProvider)),
       data: (accounts) {
+        final canCreate = ref.writeCapabilities.canCreateAccount;
         if (accounts.isEmpty) {
           return EmptyState(
             icon: Icons.account_balance_wallet_outlined,
             title: '还没有账户',
             message: '添加你的第一个账户，开始记录净资产。',
-            action: FilledButton(
-              onPressed: () => context.push('/accounts/new'),
-              child: const Text('添加账户'),
+            action: WriteGate(
+              enabled: canCreate,
+              child: FilledButton(
+                onPressed: () => context.push('/accounts/new'),
+                child: const Text('添加账户'),
+              ),
             ),
           );
         }
@@ -38,7 +42,9 @@ class AccountsPage extends ConsumerWidget {
             ListTile(
               leading: const Icon(Icons.add),
               title: const Text('添加账户'),
-              onTap: () => context.push('/accounts/new'),
+              subtitle: canCreate ? null : const Text(kReadOnlyHint),
+              enabled: canCreate,
+              onTap: canCreate ? () => context.push('/accounts/new') : null,
             ),
             const Divider(height: 1),
             for (final a in accounts) ...[

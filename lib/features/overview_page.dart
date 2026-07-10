@@ -31,9 +31,12 @@ class OverviewPage extends ConsumerWidget {
             icon: Icons.savings_outlined,
             title: '今天开始记录你的净资产',
             message: '添加账户与初始余额后，这里会显示净值、账户健康与投资表现。',
-            action: FilledButton(
-              onPressed: () => context.push('/accounts/new'),
-              child: const Text('添加账户'),
+            action: WriteGate(
+              enabled: ref.writeCapabilities.canCreateAccount,
+              child: FilledButton(
+                onPressed: () => context.push('/accounts/new'),
+                child: const Text('添加账户'),
+              ),
             ),
           );
         }

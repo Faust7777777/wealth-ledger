@@ -5,6 +5,12 @@
 import 'view_models.dart';
 import '../core/types.dart';
 
+/// 账本能力：写入口 gating 的服务端口径（/v1/ledger/bootstrap.data.capabilities）。
+/// UI 只凭该结果显示/禁用写入口，不按 DataSourceMode 猜测。
+abstract interface class LedgerRepository {
+  Future<LedgerCapabilitiesVm> getCapabilities();
+}
+
 abstract interface class AccountRepository {
   Future<List<AccountVm>> listAccounts();
   Future<AccountVm?> getAccount(Id id);
@@ -46,13 +52,14 @@ abstract interface class MovementRepository {
 
   /// 手动记账：草稿 → 提交复核 → 确认入账（候选→确认，全程用户主动发起）。
   /// 仅 local_server 真实账本；real_local / DEMO 不支持。
-  Future<MovementVm> createManualRecord(ManualRecordInput input);
+  /// 返回服务端确认结果；UI 以 ledgerWrite 为准判断是否已入账。
+  Future<ConfirmResultVm> createManualRecord(ManualRecordInput input);
 
   /// 转账：账户间转移（双分录草稿 → 复核 → 确认）。仅 local_server。
-  Future<MovementVm> createTransfer(TransferInput input);
+  Future<ConfirmResultVm> createTransfer(TransferInput input);
 
   /// 余额观察/校准：对差额生成 adjustment 候选并确认入账。仅 local_server。
-  Future<MovementVm> reconcileBalance(ReconcileInput input);
+  Future<ConfirmResultVm> reconcileBalance(ReconcileInput input);
 
   /// 已确认记录更正：只生成 correction 候选；确认前不改原记录、不影响余额。
   Future<void> createCorrectionProposal(CreateCorrectionInput input);

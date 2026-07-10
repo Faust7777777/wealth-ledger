@@ -83,8 +83,9 @@ class HomeShell extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final useRail = MediaQuery.sizeOf(context).width >= AppLayout.bpRailIcon;
 
+    // FAB 常显；sheet 内条目按服务端 capabilities 逐项禁用并给出原因。
     final fab = FloatingActionButton.extended(
-      onPressed: () => showRecordSheet(context),
+      onPressed: () => showRecordSheet(context, ref.writeCapabilities),
       icon: const Icon(Icons.add),
       label: const Text('记录'),
     );

@@ -43,7 +43,10 @@ class SnapshotsPage extends ConsumerWidget {
         actions: [
           IconButton(
             tooltip: snapshots == null ? '创建快照' : '创建当前快照',
-            onPressed: snapshots == null
+            // 快照写入需要 canWriteConfirmedLedger（服务端 capabilities 口径）。
+            onPressed:
+                snapshots == null ||
+                    !ref.writeCapabilities.canWriteConfirmedLedger
                 ? null
                 : () => _createSnapshot(context, ref, reason),
             icon: const Icon(Icons.add_chart_outlined),
@@ -62,9 +65,12 @@ class SnapshotsPage extends ConsumerWidget {
               icon: Icons.history,
               title: '暂无快照',
               message: '创建第一条基线快照后，净值历史会在这里按时间列出。',
-              action: FilledButton(
-                onPressed: () => _createSnapshot(context, ref, 'baseline'),
-                child: const Text('创建基线快照'),
+              action: WriteGate(
+                enabled: ref.writeCapabilities.canWriteConfirmedLedger,
+                child: FilledButton(
+                  onPressed: () => _createSnapshot(context, ref, 'baseline'),
+                  child: const Text('创建基线快照'),
+                ),
               ),
             );
           }
