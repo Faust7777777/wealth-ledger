@@ -73,6 +73,51 @@ class _RevealState extends State<Reveal> with SingleTickerProviderStateMixin {
   }
 }
 
+/// 按压反馈：按下时轻微缩放（tactile feedback），松开或取消回弹。
+/// 给可点击的卡片/行/主动作加触感；尊重减弱动态效果。
+class PressableScale extends StatefulWidget {
+  const PressableScale({
+    super.key,
+    required this.child,
+    this.onTap,
+    this.pressedScale = 0.97,
+  });
+
+  final Widget child;
+  final VoidCallback? onTap;
+  final double pressedScale;
+
+  @override
+  State<PressableScale> createState() => _PressableScaleState();
+}
+
+class _PressableScaleState extends State<PressableScale> {
+  bool _pressed = false;
+
+  void _set(bool value) {
+    if (_pressed != value) setState(() => _pressed = value);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final reduceMotion =
+        MediaQuery.maybeOf(context)?.disableAnimations ?? false;
+    return GestureDetector(
+      onTap: widget.onTap,
+      onTapDown: widget.onTap == null ? null : (_) => _set(true),
+      onTapUp: widget.onTap == null ? null : (_) => _set(false),
+      onTapCancel: widget.onTap == null ? null : () => _set(false),
+      behavior: HitTestBehavior.opaque,
+      child: AnimatedScale(
+        scale: (_pressed && !reduceMotion) ? widget.pressedScale : 1.0,
+        duration: const Duration(milliseconds: 110),
+        curve: Curves.easeOut,
+        child: widget.child,
+      ),
+    );
+  }
+}
+
 /// 金额切换动画：值变化时新值淡入上滑、旧值淡出。左对齐，等宽数字保持成列。
 /// 不伪造中间数字（遵守「金额不过 double」），只在真实值之间过渡。
 class AnimatedMoneyText extends StatelessWidget {

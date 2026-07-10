@@ -179,7 +179,7 @@ class _Pending extends StatelessWidget {
             ),
             const SizedBox(height: AppSpacing.sm),
             for (final e in items)
-              InkWell(
+              PressableScale(
                 onTap: e.$3 == null
                     ? null
                     : () => e.$3 == '/investment'
@@ -246,15 +246,17 @@ class _MovementRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final amt = m.displayAmount;
-    return ListTile(
-      contentPadding: EdgeInsets.zero,
-      dense: true,
-      title: Text(m.title, style: AppType.body),
-      subtitle: m.inTransit ? Text('在途 · 非支出', style: AppType.caption) : null,
-      trailing: amt == null
-          ? null
-          : Text(formatMoney(amt), style: AppType.moneyRow),
+    return PressableScale(
       onTap: () => context.push('/movement/${m.id}'),
+      child: ListTile(
+        contentPadding: EdgeInsets.zero,
+        dense: true,
+        title: Text(m.title, style: AppType.body),
+        subtitle: m.inTransit ? Text('在途 · 非支出', style: AppType.caption) : null,
+        trailing: amt == null
+            ? null
+            : Text(formatMoney(amt), style: AppType.moneyRow),
+      ),
     );
   }
 }
@@ -266,15 +268,17 @@ class _AccountRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final v = a.value;
-    return ListTile(
-      contentPadding: EdgeInsets.zero,
-      dense: true,
-      title: Text(a.displayName, style: AppType.body),
-      trailing: Text(
-        v == null ? '—' : formatValued(v),
-        style: AppType.moneyRow,
-      ),
+    return PressableScale(
       onTap: () => context.push('/account/${a.id}'),
+      child: ListTile(
+        contentPadding: EdgeInsets.zero,
+        dense: true,
+        title: Text(a.displayName, style: AppType.body),
+        trailing: Text(
+          v == null ? '—' : formatValued(v),
+          style: AppType.moneyRow,
+        ),
+      ),
     );
   }
 }
