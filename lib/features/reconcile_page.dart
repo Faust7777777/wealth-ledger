@@ -33,7 +33,8 @@ class _ReconcilePageState extends ConsumerState<ReconcilePage> {
   }
 
   bool get _observedValid =>
-      RegExp(r'^\d+(\.\d+)?$').hasMatch(_observed.text.trim());
+      // 小数位对齐服务端上限（8 位）。
+      RegExp(r'^\d+(\.\d{1,8})?$').hasMatch(_observed.text.trim());
 
   bool _isZero(String d) => !RegExp(r'[1-9]').hasMatch(d);
 
