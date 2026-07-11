@@ -1,5 +1,7 @@
 // Wealth Ledger — 概览页（L0 净值 → L1 待处理 → L2 主要持仓 → L4 近期变动）。
 // 第一阶段：real_local 显空态；debug_fixture 显 DEMO 数据。布局从简，不铺满。
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -310,57 +312,142 @@ class _AllocationBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final slices = a.slices;
+    final muted = Theme.of(context).textTheme.bodySmall?.color;
+    final segments = [
+      for (var i = 0; i < slices.length; i++)
+        (_flex(slices[i].percent).toDouble(), _palette[i % _palette.length]),
+    ];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const SectionHeader(title: '资产构成'),
-        ClipRRect(
-          borderRadius: BorderRadius.circular(AppRadius.sm),
-          child: SizedBox(
-            height: 12,
-            child: Row(
-              children: [
-                for (var i = 0; i < slices.length; i++)
-                  Expanded(
-                    flex: _flex(slices[i].percent),
-                    child: Container(color: _palette[i % _palette.length]),
-                  ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: AppSpacing.sm),
-        Wrap(
-          spacing: AppSpacing.base,
-          runSpacing: AppSpacing.xs,
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            for (var i = 0; i < slices.length; i++)
-              Row(
-                mainAxisSize: MainAxisSize.min,
+            SizedBox(
+              width: 116,
+              height: 116,
+              child: CustomPaint(
+                painter: _RingPainter(
+                  segments,
+                  track: Theme.of(context).dividerColor,
+                ),
+                child: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('总资产', style: AppType.micro.copyWith(color: muted)),
+                      const SizedBox(height: 2),
+                      Text(
+                        formatMoney(a.totalAssets),
+                        style: AppType.titleM.copyWith(
+                          fontFeatures: AppType.tnum,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: AppSpacing.lg),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Container(
-                    width: 8,
-                    height: 8,
-                    decoration: BoxDecoration(
-                      color: _palette[i % _palette.length],
-                      shape: BoxShape.circle,
+                  for (var i = 0; i < slices.length; i++)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                        vertical: AppSpacing.xxs,
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 8,
+                            height: 8,
+                            decoration: BoxDecoration(
+                              color: _palette[i % _palette.length],
+                              borderRadius: BorderRadius.circular(2),
+                            ),
+                          ),
+                          const SizedBox(width: AppSpacing.sm),
+                          Expanded(
+                            child: Text(
+                              slices[i].category,
+                              style: AppType.caption,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          Text(
+                            '${slices[i].percent}%',
+                            style: AppType.caption.copyWith(color: muted),
+                          ),
+                          const SizedBox(width: AppSpacing.sm),
+                          Text(
+                            formatMoney(slices[i].value),
+                            style: AppType.moneyRow,
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: AppSpacing.xs),
-                  Text(
-                    '${slices[i].category} ${slices[i].percent}%',
-                    style: AppType.caption,
-                  ),
                 ],
               ),
+            ),
           ],
         ),
-        const SizedBox(height: AppSpacing.xs),
+        const SizedBox(height: AppSpacing.sm),
         Text(
           '− 负债 ${formatMoney(a.totalLiabilities)} → 净 ${formatMoney(a.netWorth)}',
-          style: AppType.caption,
+          style: AppType.caption.copyWith(color: muted),
         ),
       ],
     );
   }
+}
+
+/// 资产构成环形图：细描边弧段 + 段间留隙，契合 hairline 基调、非实心饼。
+class _RingPainter extends CustomPainter {
+  _RingPainter(this.segments, {required this.track});
+  final List<(double, Color)> segments; // (权重, 颜色)
+  final Color track;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const stroke = 12.0;
+    const gap = 0.05; // 段间弧隙（弧度）
+    final radius = (math.min(size.width, size.height) - stroke) / 2;
+    final rect = Rect.fromCircle(
+      center: Offset(size.width / 2, size.height / 2),
+      radius: radius,
+    );
+    final total = segments.fold<double>(0, (s, e) => s + e.$1);
+    if (total <= 0) return;
+    // 轨道底环
+    canvas.drawCircle(
+      rect.center,
+      radius,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = stroke
+        ..color = track,
+    );
+    var start = -math.pi / 2;
+    for (final (weight, color) in segments) {
+      final sweep = (weight / total) * (2 * math.pi);
+      canvas.drawArc(
+        rect,
+        start + gap / 2,
+        sweep - gap,
+        false,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = stroke
+          ..strokeCap = StrokeCap.round
+          ..color = color,
+      );
+      start += sweep;
+    }
+  }
+
+  @override
+  bool shouldRepaint(_RingPainter old) => old.segments != segments;
 }
