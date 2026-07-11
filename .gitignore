@@ -49,3 +49,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Preview-only golden renders (machine-dependent; regenerate with PREVIEW_GOLDENS=1)
+test/goldens/

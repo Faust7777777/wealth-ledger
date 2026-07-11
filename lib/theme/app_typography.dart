@@ -19,7 +19,12 @@ abstract final class AppType {
   /// 货币/数字统一等宽数字
   static const tnum = <FontFeature>[FontFeature.tabularFigures()];
 
+  // family + fallback 直接烘进每个样式：这些 AppType.* 会被组件子主题（AppBar/
+  // ListTile/Chip/Input 等）直接引用，不走 ThemeData.textTheme 的字体应用；若不
+  // 内置 family，list 行标题/顶栏标题等会脱离 MiSans、落到系统字体（与货币数字不一致）。
   static const display = TextStyle(
+    fontFamily: family,
+    fontFamilyFallback: familyFallback,
     fontSize: 52,
     height: 1.05,
     fontWeight: FontWeight.w600,
@@ -27,42 +32,58 @@ abstract final class AppType {
     fontFeatures: tnum,
   ); // Hero（移动端覆盖为 40）
   static const h1 = TextStyle(
+    fontFamily: family,
+    fontFamilyFallback: familyFallback,
     fontSize: 22,
     height: 1.30,
     fontWeight: FontWeight.w600,
   );
   static const h2 = TextStyle(
+    fontFamily: family,
+    fontFamilyFallback: familyFallback,
     fontSize: 18,
     height: 1.35,
     fontWeight: FontWeight.w600,
   );
   static const titleM = TextStyle(
+    fontFamily: family,
+    fontFamilyFallback: familyFallback,
     fontSize: 16,
     height: 1.40,
     fontWeight: FontWeight.w500,
   );
   static const body = TextStyle(
+    fontFamily: family,
+    fontFamilyFallback: familyFallback,
     fontSize: 14,
     height: 1.50,
     fontWeight: FontWeight.w400,
   );
   static const bodyStrong = TextStyle(
+    fontFamily: family,
+    fontFamilyFallback: familyFallback,
     fontSize: 14,
     height: 1.50,
     fontWeight: FontWeight.w500,
   );
   static const caption = TextStyle(
+    fontFamily: family,
+    fontFamilyFallback: familyFallback,
     fontSize: 12,
     height: 1.40,
     fontWeight: FontWeight.w400,
   );
   static const micro = TextStyle(
+    fontFamily: family,
+    fontFamilyFallback: familyFallback,
     fontSize: 11,
     height: 1.30,
     fontWeight: FontWeight.w500,
     letterSpacing: 0.3,
   ); // pill / badge
   static const moneyRow = TextStyle(
+    fontFamily: family,
+    fontFamilyFallback: familyFallback,
     fontSize: 14,
     height: 1.40,
     fontWeight: FontWeight.w500,
