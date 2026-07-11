@@ -31,7 +31,12 @@ class OverviewPage extends ConsumerWidget {
       data: (o) {
         if (o.isEmpty) {
           return EmptyState(
-            icon: Icons.savings_outlined,
+            illustration: Image.asset(
+              'assets/illustrations/net-worth-empty-state.png',
+              width: 168,
+              // 首屏品牌插画：金线日出越平缓水面，喻长期稳健增值。
+              semanticLabel: '开始记录净资产',
+            ),
             title: '今天开始记录你的净资产',
             message: '添加账户与初始余额后，这里会显示净值、账户健康与投资表现。',
             action: WriteGate(

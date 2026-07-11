@@ -86,6 +86,25 @@ void main() {
     );
   });
 
+  // 空态（real_local 默认空账本）：看首屏品牌插画落在暗底上的效果。
+  testWidgets('overview empty · phone', skip: !_previewEnabled, (tester) async {
+    await sized(tester, const Size(400, 880));
+    await tester.pumpWidget(const ProviderScope(child: WealthLedgerApp()));
+    await _settleEntrance(tester);
+    // Image.asset 异步解码；先在 runAsync 里预热到 image cache，再 pump 才能画出来。
+    await tester.runAsync(() async {
+      await precacheImage(
+        const AssetImage('assets/illustrations/net-worth-empty-state.png'),
+        tester.element(find.byType(WealthLedgerApp)),
+      );
+    });
+    await tester.pump();
+    await expectLater(
+      find.byType(WealthLedgerApp),
+      matchesGoldenFile('goldens/overview_empty_phone.png'),
+    );
+  });
+
   testWidgets('overview dark · desktop (rail)', skip: !_previewEnabled, (
     tester,
   ) async {

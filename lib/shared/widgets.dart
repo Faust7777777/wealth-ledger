@@ -286,18 +286,22 @@ class ContentMaxWidth extends StatelessWidget {
   );
 }
 
-/// 空状态：图标 + 一句话 + 可选动作。
+/// 空状态：图标或插画 + 一句话 + 可选动作。
 class EmptyState extends StatelessWidget {
   const EmptyState({
     super.key,
     required this.title,
     this.message,
     this.icon,
+    this.illustration,
     this.action,
   });
   final String title;
   final String? message;
   final IconData? icon;
+
+  /// 可选插画（优先于 icon）：用于首屏等重点空态，其余仍用简洁 icon。
+  final Widget? illustration;
   final Widget? action;
 
   @override
@@ -309,7 +313,10 @@ class EmptyState extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (icon != null) ...[
+            if (illustration != null) ...[
+              illustration!,
+              const SizedBox(height: AppSpacing.lg),
+            ] else if (icon != null) ...[
               Icon(icon, size: 40, color: t.colorScheme.outline),
               const SizedBox(height: AppSpacing.base),
             ],
