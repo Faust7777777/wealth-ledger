@@ -27,6 +27,14 @@ RUST_MANIFEST = ROOT / "server-rs" / "Cargo.toml"
 SERVER_SMOKE = ROOT / "tools" / "server_smoke.py"
 DEPLOY_ENV_EXAMPLE = ROOT / "deploy" / "finwealth-server.env.example"
 SYSTEMD_SERVICE = ROOT / "deploy" / "systemd" / "finwealth-server.service"
+VPS_BACKUP = ROOT / "tools" / "backup_vps_ledger.sh"
+VPS_RESTORE = ROOT / "tools" / "restore_vps_ledger.sh"
+VPS_BACKUP_RESTORE_SMOKE = ROOT / "tools" / "vps_backup_restore_smoke.sh"
+PACKAGE_SCRIPT = ROOT / "tools" / "package_release.ps1"
+WINDOWS_LAUNCHER = ROOT / "tools" / "windows_self_use_launcher.ps1"
+WINDOWS_LAUNCHER_CMD = ROOT / "tools" / "windows_self_use_launcher.cmd"
+WINDOWS_PACKAGE_DOC = ROOT / "docs" / "deploy" / "WINDOWS_SELF_USE_PACKAGE.md"
+PACKAGE_WORKFLOW = ROOT / ".github" / "workflows" / "package.yml"
 
 FORBIDDEN_ENDPOINTS = {
     "/transfers/execute",
@@ -39,6 +47,7 @@ FORBIDDEN_ENDPOINTS = {
 }
 
 HTTP_METHODS = {"GET", "POST", "PATCH", "PUT", "DELETE"}
+LEDGER_WRITE_METHODS = {"post", "patch", "put", "delete"}
 
 
 def fail(message: str) -> None:
@@ -286,6 +295,8 @@ def check_rust_server() -> None:
         "plaintext fallback is not allowed when FINWEALTH_REQUIRE_AUTH=true",
         "ConstantTimeEq",
         "token_hash_eq",
+        '"--validate-auth-state"',
+        "parse_auth_state_timestamp",
     ]
     missing = [snippet for snippet in required_snippets if snippet not in text]
     if missing:
@@ -309,6 +320,10 @@ def check_rust_server() -> None:
         "sync_operation_for_movement",
         "LOCAL_SYNC_GENESIS_CURSOR",
         "stored_sequence.max(fallback_sequence)",
+        "idempotencyState",
+        "idempotent_ledger_write",
+        "IdempotencyKeyReused",
+        "IDEMPOTENCY_MAX_RECORDS",
     ]
     missing_lock_snippets = [
         snippet for snippet in ledger_lock_snippets if snippet not in local_ledger_text
@@ -354,8 +369,14 @@ def check_server_smoke() -> None:
 def check_deploy_security_defaults() -> None:
     if not DEPLOY_ENV_EXAMPLE.exists():
         fail(f"Missing deploy env example: {DEPLOY_ENV_EXAMPLE}")
-    if not SYSTEMD_SERVICE.exists():
-        fail(f"Missing systemd service: {SYSTEMD_SERVICE}")
+    for required in (
+        SYSTEMD_SERVICE,
+        VPS_BACKUP,
+        VPS_RESTORE,
+        VPS_BACKUP_RESTORE_SMOKE,
+    ):
+        if not required.exists():
+            fail(f"Missing deploy safety artifact: {required}")
 
     env_text = DEPLOY_ENV_EXAMPLE.read_text(encoding="utf-8")
     if "FINWEALTH_QUOTE_PROVIDER=none" not in env_text:
@@ -376,7 +397,104 @@ def check_deploy_security_defaults() -> None:
     if missing:
         fail("Systemd service missing hardening snippets: " + ", ".join(missing))
 
+    backup_text = VPS_BACKUP.read_text(encoding="utf-8")
+    backup_snippets = [
+        "umask 077",
+        "systemctl stop",
+        "--validate-ledger",
+        "--validate-auth-state",
+        "SHA256SUMS",
+        "mktemp -d",
+        'mv -- "$STAGING" "$TARGET"',
+    ]
+    missing = [snippet for snippet in backup_snippets if snippet not in backup_text]
+    if missing:
+        fail("VPS backup script missing consistency safeguards: " + ", ".join(missing))
+
+    restore_text = VPS_RESTORE.read_text(encoding="utf-8")
+    restore_snippets = [
+        "verify_backup_directory",
+        "EXPECTED_LEDGER_HASH",
+        "AUTH_ACTION",
+        "COMMIT_STARTED",
+        "ROLLBACK_PERFORMED",
+        "rolling back current state",
+        "systemctl stop",
+        "systemctl start",
+        "--allow-unverified",
+    ]
+    missing = [snippet for snippet in restore_snippets if snippet not in restore_text]
+    if missing:
+        fail("VPS restore script missing consistency safeguards: " + ", ".join(missing))
+
     ok("Deploy security defaults passed")
+
+
+def check_release_packaging() -> None:
+    for required in (
+        PACKAGE_SCRIPT,
+        WINDOWS_LAUNCHER,
+        WINDOWS_LAUNCHER_CMD,
+        WINDOWS_PACKAGE_DOC,
+        PACKAGE_WORKFLOW,
+    ):
+        if not required.exists():
+            fail(f"Missing self-use packaging artifact: {required}")
+
+    package_text = PACKAGE_SCRIPT.read_text(encoding="utf-8")
+    required_package_snippets = [
+        "--dart-define=DATA_SOURCE=local_server",
+        "--dart-define=API_BASE=$WindowsApiBase",
+        "cargo.exe",
+        "--release",
+        "finwealth-server.exe",
+        "finwealth.build-config.json",
+        "package-manifest.json",
+        "[System.Uri]::TryCreate",
+        "stale APK could be mislabeled",
+        "AndroidReadOnlyPreview",
+        "android-readonly-preview-debug.apk",
+    ]
+    missing = [
+        snippet for snippet in required_package_snippets if snippet not in package_text
+    ]
+    if missing:
+        fail("Windows package script missing paired-build safeguards: " + ", ".join(missing))
+
+    launcher_text = WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+    required_launcher_snippets = [
+        "LOCALAPPDATA",
+        "--hash-password-stdin",
+        "FINWEALTH_REQUIRE_AUTH",
+        "FINWEALTH_AUTH_PASSWORD_HASH",
+        "FINWEALTH_QUOTE_PROVIDER",
+        "Get-FileHash",
+        "serverSha256",
+        "finwealth.build-config.json",
+        "--ledger-path",
+        "Wait-Health",
+        "Stop-Process",
+    ]
+    missing = [
+        snippet for snippet in required_launcher_snippets if snippet not in launcher_text
+    ]
+    if missing:
+        fail("Windows self-use launcher missing safety behavior: " + ", ".join(missing))
+
+    workflow_text = PACKAGE_WORKFLOW.read_text(encoding="utf-8")
+    required_workflow_snippets = [
+        "finwealth-windows-self-use-x64",
+        "include_android_readonly_preview",
+        "AndroidReadOnlyPreview",
+        "android-readonly-preview-debug",
+    ]
+    missing = [
+        snippet for snippet in required_workflow_snippets if snippet not in workflow_text
+    ]
+    if missing:
+        fail("Package workflow does not preserve package-mode boundaries: " + ", ".join(missing))
+
+    ok("Self-use release packaging checks passed")
 
 
 def missing_items(items: Iterable[Path]) -> list[Path]:
@@ -428,6 +546,36 @@ def main() -> None:
         fail("OpenAPI must document the local-server recent movements alias /movements/recent")
     if "AiFieldDiff" not in schemas:
         fail("OpenAPI must expose AiFieldDiff for old -> new review")
+    idempotency_parameter = doc["components"].get("parameters", {}).get(
+        "idempotencyKey", {}
+    )
+    idempotency_schema = idempotency_parameter.get("schema", {})
+    if idempotency_schema.get("minLength") != 1:
+        fail("Idempotency-Key must document minLength 1")
+    if idempotency_schema.get("maxLength") != 128:
+        fail("Idempotency-Key must document maxLength 128")
+    missing_idempotency: list[str] = []
+    for path, path_item in doc["paths"].items():
+        if path.startswith("/auth/") or not isinstance(path_item, dict):
+            continue
+        for method in LEDGER_WRITE_METHODS:
+            operation = path_item.get(method)
+            if not isinstance(operation, dict):
+                continue
+            parameters = operation.get("parameters", [])
+            if not any(
+                isinstance(parameter, dict)
+                and parameter.get("$ref")
+                == "#/components/parameters/idempotencyKey"
+                for parameter in parameters
+            ):
+                missing_idempotency.append(f"{method.upper()} {path}")
+    if missing_idempotency:
+        fail(
+            "Ledger write operations missing Idempotency-Key: "
+            + ", ".join(sorted(missing_idempotency))
+        )
+    ok("All documented ledger writes require Idempotency-Key")
     confirm_result = doc["components"]["schemas"].get("ConfirmResult", {})
     confirm_required = set(confirm_result.get("required", []))
     if "ledgerWrite" not in confirm_required:
@@ -472,6 +620,7 @@ def main() -> None:
     check_rust_server()
     check_server_smoke()
     check_deploy_security_defaults()
+    check_release_packaging()
 
     if not forbidden_present and not missing_from_openapi:
         ok("Contract check passed")

@@ -29,7 +29,7 @@ if ! id "$APP_USER" >/dev/null 2>&1; then
 fi
 
 install -d -m 0755 "$APP_DIR"
-install -d -m 0750 -o "$APP_USER" -g "$APP_USER" "$DATA_DIR"
+install -d -m 0700 -o "$APP_USER" -g "$APP_USER" "$DATA_DIR"
 install -d -m 0750 "$CONFIG_DIR"
 
 echo "Building release binary..."

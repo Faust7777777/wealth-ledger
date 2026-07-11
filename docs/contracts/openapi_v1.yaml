@@ -758,6 +758,8 @@ paths:
     post:
       tags: [Instruments]
       summary: Create an instrument.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
       requestBody:
         required: true
         content:
@@ -790,6 +792,7 @@ paths:
       summary: Update an instrument.
       parameters:
         - $ref: "#/components/parameters/instrumentId"
+        - $ref: "#/components/parameters/idempotencyKey"
       requestBody:
         required: true
         content:
@@ -1168,8 +1171,16 @@ components:
       name: Idempotency-Key
       in: header
       required: true
+      description: >-
+        Opaque retry key for ledger writes. Reuse the same key only for the
+        same operation and JSON request. A persisted replay returns the
+        original status/body and Idempotency-Replayed: true; reuse with a
+        different request returns 409 idempotency_key_reused.
       schema:
         type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[!-~]+$"
     accountId:
       name: accountId
       in: path

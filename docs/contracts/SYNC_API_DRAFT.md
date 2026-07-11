@@ -127,6 +127,8 @@ SyncAckRequest {
 - `POST /v1/sync/ack` 可清理本地 `pendingChangeIds`，但不删除 `syncChanges` 日志。
 - 当前 ack 仅表示单一上游接受了本地 outbox 高水位，不是逐设备 delivery receipt。
 - `POST /v1/sync/push` 会把远端 `SyncChange` 作为同步日志中继保存，给它分配本地 server cursor；不会直接应用到账本实体。
+- 持久化日志要求 change ID 唯一且严格递增，cursor 必须指向日志尾；pending outbox ID 必须唯一、存在且只属于本地产生的 change。
+- 远端 push 的 `deviceId` 不得冒用服务端保留的 `local_device`；`createdAt` 必须是 RFC3339，服务端保存的 `(sourceDeviceId, sourceChangeId)` 必须唯一。
 - 暂不做远端 merge、冲突解决、设备密钥和 E2EE。
 
 ## 5. 冲突处理

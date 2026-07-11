@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fs, io,
     ops::{Add, AddAssign, Neg, Sub},
     path::{Path, PathBuf},
@@ -11,7 +11,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 pub const LEDGER_VERSION: i64 = 1;
 pub const DEFAULT_BASE_CURRENCY: &str = "CNY";
 pub const LOCAL_SYNC_GENESIS_CURSOR: &str = "local_cursor_0000";
+pub const IDEMPOTENCY_STATE_VERSION: i64 = 1;
 const LOCAL_SYNC_DEVICE_ID: &str = "local_device";
+const IDEMPOTENCY_MAX_RECORDS: usize = 5_000;
 const INSTRUMENT_TYPES: &[&str] = &[
     "cash",
     "equity",
@@ -86,6 +88,10 @@ pub fn empty_document(base_currency: &str) -> Value {
             "pendingChangeIds": []
         },
         "syncChanges": [],
+        "idempotencyState": {
+            "version": IDEMPOTENCY_STATE_VERSION,
+            "records": {}
+        },
         "migrations": []
     })
 }
@@ -129,6 +135,14 @@ fn normalize_document_for_read(document: &mut Value) {
     object
         .entry("syncChanges".to_string())
         .or_insert_with(|| json!([]));
+    object
+        .entry("idempotencyState".to_string())
+        .or_insert_with(|| {
+            json!({
+                "version": IDEMPOTENCY_STATE_VERSION,
+                "records": {}
+            })
+        });
     let sync_state = object
         .entry("syncState".to_string())
         .or_insert_with(|| json!({}));
@@ -149,8 +163,224 @@ fn normalize_document_for_read(document: &mut Value) {
 pub enum LedgerError {
     InvalidInput(Vec<String>),
     Conflict(String),
+    IdempotencyKeyReused,
     NotFound(String),
     Io(io::Error),
+}
+
+#[derive(Debug)]
+pub struct IdempotencyRequest {
+    key_hash: String,
+    request_hash: String,
+    operation: String,
+    created_at: String,
+    expires_at: String,
+}
+
+impl IdempotencyRequest {
+    pub fn new(
+        key_hash: String,
+        request_hash: String,
+        operation: String,
+        created_at: String,
+        expires_at: String,
+    ) -> Self {
+        Self {
+            key_hash,
+            request_hash,
+            operation,
+            created_at,
+            expires_at,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct IdempotentResponse {
+    pub status_code: u16,
+    pub body: Value,
+    pub replayed: bool,
+}
+
+#[derive(Debug)]
+pub struct AiImportContext {
+    pub proposal_id: String,
+    pub atomic_group_id: String,
+    pub movement_id: String,
+    pub now: String,
+}
+
+fn successful_idempotent_response(status_code: u16, data: Value) -> IdempotentResponse {
+    IdempotentResponse {
+        status_code,
+        body: if status_code == 204 {
+            Value::Null
+        } else {
+            json!({
+                "ok": true,
+                "data": data
+            })
+        },
+        replayed: false,
+    }
+}
+
+fn idempotency_replay(
+    document: &mut Value,
+    request: &IdempotencyRequest,
+    now: &str,
+) -> Result<Option<IdempotentResponse>, LedgerError> {
+    let record = document["idempotencyState"]["records"]
+        .get(&request.key_hash)
+        .cloned();
+    let Some(record) = record else {
+        return Ok(None);
+    };
+
+    let expires_at = record
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .expect("validated idempotency record expiresAt should be a string");
+    if timestamp_is_at_or_before(expires_at, now) {
+        document["idempotencyState"]["records"]
+            .as_object_mut()
+            .expect("validated idempotency records should be an object")
+            .remove(&request.key_hash);
+        return Ok(None);
+    }
+
+    if record.get("operation").and_then(Value::as_str) != Some(request.operation.as_str())
+        || record.get("requestHash").and_then(Value::as_str) != Some(request.request_hash.as_str())
+    {
+        return Err(LedgerError::IdempotencyKeyReused);
+    }
+
+    let status_code = record
+        .get("statusCode")
+        .and_then(Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .expect("validated idempotency statusCode should fit u16");
+    let body = record
+        .get("responseBody")
+        .expect("validated idempotency responseBody should exist")
+        .clone();
+    Ok(Some(IdempotentResponse {
+        status_code,
+        body,
+        replayed: true,
+    }))
+}
+
+fn store_idempotency_response(
+    document: &mut Value,
+    request: &IdempotencyRequest,
+    response: &IdempotentResponse,
+) {
+    prune_idempotency_records(document, &request.created_at, Some(&request.key_hash));
+    document["idempotencyState"]["records"]
+        .as_object_mut()
+        .expect("validated idempotency records should be an object")
+        .insert(
+            request.key_hash.clone(),
+            json!({
+                "requestHash": request.request_hash,
+                "operation": request.operation,
+                "statusCode": response.status_code,
+                "responseBody": response.body,
+                "createdAt": request.created_at,
+                "expiresAt": request.expires_at
+            }),
+        );
+}
+
+fn prune_idempotency_records(document: &mut Value, now: &str, keep_key: Option<&str>) {
+    let records = document["idempotencyState"]["records"]
+        .as_object_mut()
+        .expect("validated idempotency records should be an object");
+    records.retain(|key, record| {
+        keep_key == Some(key.as_str())
+            || record
+                .get("expiresAt")
+                .and_then(Value::as_str)
+                .is_some_and(|expires_at| !timestamp_is_at_or_before(expires_at, now))
+    });
+
+    if records.len() < IDEMPOTENCY_MAX_RECORDS {
+        return;
+    }
+
+    let mut oldest = records
+        .iter()
+        .filter(|(key, _)| keep_key != Some(key.as_str()))
+        .map(|(key, record)| {
+            (
+                record
+                    .get("createdAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                key.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    oldest.sort_unstable();
+    let remove_count = records
+        .len()
+        .saturating_add(1)
+        .saturating_sub(IDEMPOTENCY_MAX_RECORDS);
+    for (_, key) in oldest.into_iter().take(remove_count) {
+        records.remove(&key);
+    }
+}
+
+fn timestamp_is_at_or_before(timestamp: &str, other: &str) -> bool {
+    let timestamp = OffsetDateTime::parse(timestamp, &Rfc3339)
+        .expect("validated timestamp should parse as RFC3339");
+    let other =
+        OffsetDateTime::parse(other, &Rfc3339).expect("server timestamp should parse as RFC3339");
+    timestamp <= other
+}
+
+fn idempotent_ledger_write<F>(
+    path: &Path,
+    request: &IdempotencyRequest,
+    status_code: u16,
+    mutation: F,
+) -> Result<IdempotentResponse, LedgerError>
+where
+    F: FnOnce(&mut Value) -> Result<Value, LedgerError>,
+{
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        if let Some(response) = idempotency_replay(&mut document, request, &request.created_at)? {
+            return Ok(response);
+        }
+
+        let data = mutation(&mut document)?;
+        let response = successful_idempotent_response(status_code, data);
+        store_idempotency_response(&mut document, request, &response);
+        write_document(path, &document)?;
+        Ok(response)
+    })
+}
+
+pub fn replay_idempotency(
+    path: &Path,
+    request: &IdempotencyRequest,
+) -> Result<Option<IdempotentResponse>, LedgerError> {
+    with_ledger_write_lock!(path, {
+        let mut document = load_or_initialize(path)?;
+        idempotency_replay(&mut document, request, &request.created_at)
+    })
+}
+
+pub fn persist_idempotent_result(
+    path: &Path,
+    status_code: u16,
+    data: Value,
+    request: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, request, status_code, |_| Ok(data))
 }
 
 impl From<io::Error> for LedgerError {
@@ -197,48 +427,32 @@ pub fn sync_cursor_from_document(document: &Value) -> String {
         .to_string()
 }
 
-pub fn ack_sync_changes(path: &Path, input: Value) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
-        let ack_change_ids = sync_ack_change_ids_for_input(&document, &input)?;
+pub fn ack_sync_changes(
+    path: &Path,
+    input: Value,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 204, |document| {
+        let ack_change_ids = sync_ack_change_ids_for_input(document, &input)?;
         let pending_change_ids = document["syncState"]["pendingChangeIds"]
             .as_array_mut()
             .expect("validated local ledger pendingChangeIds should be an array");
-        let pending_before = pending_change_ids
-            .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let acked_change_ids = ack_change_ids
-            .iter()
-            .filter(|change_id| pending_before.contains(change_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        let skipped_change_ids = ack_change_ids
-            .iter()
-            .filter(|change_id| !pending_before.contains(change_id))
-            .cloned()
-            .collect::<Vec<_>>();
-
         pending_change_ids.retain(|value| {
             value
                 .as_str()
                 .is_none_or(|change_id| !ack_change_ids.iter().any(|id| id == change_id))
         });
-        let pending_after = pending_change_ids.clone();
-        write_document(path, &document)?;
-        Ok(json!({
-            "cursor": document["syncState"]["cursor"],
-            "ackedChangeIds": acked_change_ids,
-            "skippedChangeIds": skipped_change_ids,
-            "pendingChangeIds": pending_after
-        }))
+        Ok(Value::Null)
     })
 }
 
-pub fn ingest_sync_push(path: &Path, input: Value, now: &str) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+pub fn ingest_sync_push(
+    path: &Path,
+    input: Value,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
         let (device_id, incoming_changes) = sync_push_changes_for_input(&input, now)?;
         let mut accepted_change_ids = Vec::new();
         let mut skipped_change_ids = Vec::new();
@@ -249,17 +463,16 @@ pub fn ingest_sync_push(path: &Path, input: Value, now: &str) -> Result<Value, L
                 .and_then(Value::as_str)
                 .expect("validated sourceChangeId should be a string")
                 .to_string();
-            if sync_source_change_exists(&document, &device_id, &source_change_id) {
+            if sync_source_change_exists(document, &device_id, &source_change_id) {
                 skipped_change_ids.push(source_change_id);
                 continue;
             }
 
-            incoming_change["id"] = json!(next_sync_change_id(&mut document));
-            append_sync_log_change(&mut document, incoming_change);
+            incoming_change["id"] = json!(next_sync_change_id(document));
+            append_sync_log_change(document, incoming_change);
             accepted_change_ids.push(source_change_id);
         }
 
-        write_document(path, &document)?;
         Ok(json!({
             "cursor": document["syncState"]["cursor"],
             "acceptedChangeIds": accepted_change_ids,
@@ -294,16 +507,24 @@ pub fn list_fx_rates(path: &Path, now: &str) -> io::Result<Value> {
     )))
 }
 
-pub fn refresh_quotes(path: &Path, input: Value, now: &str) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
+pub fn refresh_quotes(
+    path: &Path,
+    input: Value,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
         let Some(object) = input.as_object() else {
             return Err(LedgerError::InvalidInput(vec![
                 "quote refresh input must be a JSON object".to_string(),
             ]));
         };
 
-        let mut document = load_or_initialize(path)?;
-        let mut errors = Vec::new();
+        let mut errors = object
+            .get("_providerErrors")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let mut refreshed_quotes = Vec::new();
         let mut refreshed_fx_rates = Vec::new();
 
@@ -324,7 +545,7 @@ pub fn refresh_quotes(path: &Path, input: Value, now: &str) -> Result<Value, Led
                 for item in items {
                     match quote_from_refresh_input(item, now) {
                         Ok(quote) => {
-                            upsert_quote(&mut document, quote.clone());
+                            upsert_quote(document, quote.clone());
                             refreshed_quotes.push(project_quote_item(&quote, now));
                         }
                         Err(error) => errors.push(quote_refresh_error(
@@ -350,7 +571,7 @@ pub fn refresh_quotes(path: &Path, input: Value, now: &str) -> Result<Value, Led
                 for item in items {
                     match fx_rate_from_refresh_input(item, now) {
                         Ok(rate) => {
-                            upsert_fx_rate(&mut document, rate.clone());
+                            upsert_fx_rate(document, rate.clone());
                             refreshed_fx_rates.push(project_quote_item(&rate, now));
                         }
                         Err(error) => errors.push(quote_refresh_error(
@@ -372,9 +593,7 @@ pub fn refresh_quotes(path: &Path, input: Value, now: &str) -> Result<Value, Led
         }
 
         let wrote_any = !refreshed_quotes.is_empty() || !refreshed_fx_rates.is_empty();
-        if wrote_any {
-            write_document(path, &document)?;
-        } else if errors.is_empty() {
+        if !wrote_any && errors.is_empty() {
             errors.push(quote_refresh_error(
                 "request",
                 None,
@@ -535,9 +754,9 @@ pub fn create_account(
     input: Value,
     account_id: &str,
     now: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 201, |document| {
         let account = account_from_create_input(&input, account_id, now)?;
 
         {
@@ -557,15 +776,7 @@ pub fn create_account(
             accounts.push(account.clone());
         }
 
-        append_sync_change(
-            &mut document,
-            "account",
-            account_id,
-            "create",
-            &account,
-            now,
-        );
-        write_document(path, &document)?;
+        append_sync_change(document, "account", account_id, "create", &account, now);
         Ok(project_account_for_api(&account))
     })
 }
@@ -575,46 +786,34 @@ pub fn update_account(
     account_id: &str,
     patch: Value,
     now: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
-        let account = find_account_mut(&mut document, account_id).ok_or_else(|| {
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let account = find_account_mut(document, account_id).ok_or_else(|| {
             LedgerError::NotFound(format!("account does not exist: {account_id}"))
         })?;
         apply_account_patch(account, &patch, now)?;
         let projected = project_account_for_api(account);
-        append_sync_change(
-            &mut document,
-            "account",
-            account_id,
-            "update",
-            &projected,
-            now,
-        );
-        write_document(path, &document)?;
+        append_sync_change(document, "account", account_id, "update", &projected, now);
         Ok(projected)
     })
 }
 
-pub fn archive_account(path: &Path, account_id: &str, now: &str) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
-        let account = find_account_mut(&mut document, account_id).ok_or_else(|| {
+pub fn archive_account(
+    path: &Path,
+    account_id: &str,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let account = find_account_mut(document, account_id).ok_or_else(|| {
             LedgerError::NotFound(format!("account does not exist: {account_id}"))
         })?;
         account["status"] = json!("archived");
         account["visibility"] = json!("archived");
         account["updatedAt"] = json!(now);
         let projected = project_account_for_api(account);
-        append_sync_change(
-            &mut document,
-            "account",
-            account_id,
-            "update",
-            &projected,
-            now,
-        );
-        write_document(path, &document)?;
+        append_sync_change(document, "account", account_id, "update", &projected, now);
         Ok(projected)
     })
 }
@@ -661,11 +860,11 @@ pub fn create_movement_draft(
     movement_id: &str,
     atomic_group_id: &str,
     now: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 201, |document| {
         let movement =
-            movement_from_create_input(&document, &input, movement_id, atomic_group_id, now)?;
+            movement_from_create_input(document, &input, movement_id, atomic_group_id, now)?;
 
         {
             let movements = document["movements"]
@@ -686,7 +885,6 @@ pub fn create_movement_draft(
             }
         }
 
-        write_document(path, &document)?;
         Ok(project_movement_for_api(&movement))
     })
 }
@@ -697,9 +895,9 @@ pub fn create_correction_proposal(
     movement_id: &str,
     atomic_group_id: &str,
     now: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
         let Some(object) = input.as_object() else {
             return Err(LedgerError::InvalidInput(vec![
                 "correction input must be a JSON object".to_string(),
@@ -796,7 +994,6 @@ pub fn create_correction_proposal(
             }
         ]);
 
-        write_document(path, &document)?;
         Ok(group)
     })
 }
@@ -805,10 +1002,10 @@ pub fn submit_movement_review(
     path: &Path,
     movement_id: &str,
     now: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
-        let movement = find_movement_mut(&mut document, movement_id).ok_or_else(|| {
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let movement = find_movement_mut(document, movement_id).ok_or_else(|| {
             LedgerError::NotFound(format!("movement does not exist: {movement_id}"))
         })?;
 
@@ -831,7 +1028,6 @@ pub fn submit_movement_review(
         }
 
         let group = atomic_group_from_movement(movement, "pending");
-        write_document(path, &document)?;
         Ok(group)
     })
 }
@@ -840,18 +1036,13 @@ pub fn confirm_atomic_group(
     path: &Path,
     atomic_group_id: &str,
     now: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
-        if let Some(result) =
-            confirm_counterparty_merge_atomic_group(&mut document, atomic_group_id)?
-        {
-            write_document(path, &document)?;
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        if let Some(result) = confirm_counterparty_merge_atomic_group(document, atomic_group_id)? {
             return Ok(result);
         }
-        if let Some(result) = confirm_ai_movement_atomic_group(&mut document, atomic_group_id, now)?
-        {
-            write_document(path, &document)?;
+        if let Some(result) = confirm_ai_movement_atomic_group(document, atomic_group_id, now)? {
             return Ok(result);
         }
 
@@ -880,7 +1071,7 @@ pub fn confirm_atomic_group(
                         .and_then(Value::as_array)
                         .cloned()
                         .unwrap_or_default();
-                    apply_movement_entries(&mut document, &entries, now)?;
+                    apply_movement_entries(document, &entries, now)?;
                     confirmed_movement_ids.push(
                         movement
                             .get("id")
@@ -939,19 +1130,11 @@ pub fn confirm_atomic_group(
                 }
             }
             for (movement_id, operation, payload) in movement_sync_changes {
-                append_sync_change(
-                    &mut document,
-                    "movement",
-                    &movement_id,
-                    operation,
-                    &payload,
-                    now,
-                );
+                append_sync_change(document, "movement", &movement_id, operation, &payload, now);
             }
-            mark_dca_reminders_recorded_for_movements(&mut document, &candidate_movements, now);
+            mark_dca_reminders_recorded_for_movements(document, &candidate_movements, now);
         }
 
-        write_document(path, &document)?;
         Ok(json!({
             "atomicGroupId": atomic_group_id,
             "confirmedMovementIds": confirmed_movement_ids,
@@ -966,12 +1149,11 @@ pub fn reject_atomic_group(
     path: &Path,
     atomic_group_id: &str,
     now: &str,
-) -> Result<(), LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
-        if reject_ai_atomic_group(&mut document, atomic_group_id)? {
-            write_document(path, &document)?;
-            return Ok(());
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 204, |document| {
+        if reject_ai_atomic_group(document, atomic_group_id)? {
+            return Ok(Value::Null);
         }
 
         let mut found = false;
@@ -1008,8 +1190,7 @@ pub fn reject_atomic_group(
             )));
         }
 
-        write_document(path, &document)?;
-        Ok(())
+        Ok(Value::Null)
     })
 }
 
@@ -1029,10 +1210,10 @@ pub fn create_dca_plan(
     plan_id: &str,
     reminder_id: &str,
     now: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
-        let plan = dca_plan_from_create_input(&document, &input, plan_id, now)?;
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 201, |document| {
+        let plan = dca_plan_from_create_input(document, &input, plan_id, now)?;
         let reminder = dca_reminder_from_plan(&plan, reminder_id);
 
         document["dcaPlans"]
@@ -1044,7 +1225,6 @@ pub fn create_dca_plan(
             .expect("validated local ledger dcaReminders should be an array")
             .push(reminder);
 
-        write_document(path, &document)?;
         Ok(plan)
     })
 }
@@ -1054,13 +1234,12 @@ pub fn update_dca_plan(
     plan_id: &str,
     patch: Value,
     now: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
-
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
         if let Some(object) = patch.as_object()
             && let Some(Value::String(funding_account_id)) = object.get("fundingAccountId")
-            && !active_account_exists(&document, funding_account_id)
+            && !active_account_exists(document, funding_account_id)
         {
             return Err(LedgerError::InvalidInput(vec![
                 "fundingAccountId does not exist or is archived".to_string(),
@@ -1081,8 +1260,7 @@ pub fn update_dca_plan(
             plan.clone()
         };
 
-        sync_open_dca_reminders_for_plan(&mut document, plan_id, &projected, now);
-        write_document(path, &document)?;
+        sync_open_dca_reminders_for_plan(document, plan_id, &projected, now);
         Ok(projected)
     })
 }
@@ -1107,9 +1285,14 @@ pub fn list_due_dca_reminders(path: &Path) -> io::Result<Value> {
     Ok(json!(reminders))
 }
 
-pub fn skip_dca_reminder(path: &Path, reminder_id: &str, now: &str) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        update_dca_reminder_status(path, reminder_id, "skipped", None, now)
+pub fn skip_dca_reminder(
+    path: &Path,
+    reminder_id: &str,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        update_dca_reminder_status(document, reminder_id, "skipped", None, now)
     })
 }
 
@@ -1118,8 +1301,9 @@ pub fn snooze_dca_reminder(
     reminder_id: &str,
     input: Value,
     now: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
         let Some(object) = input.as_object() else {
             return Err(LedgerError::InvalidInput(vec![
                 "snooze input must be a JSON object".to_string(),
@@ -1131,7 +1315,7 @@ pub fn snooze_dca_reminder(
             return Err(LedgerError::InvalidInput(errors));
         }
 
-        update_dca_reminder_status(path, reminder_id, "snoozed", until, now)
+        update_dca_reminder_status(document, reminder_id, "snoozed", until, now)
     })
 }
 
@@ -1141,9 +1325,9 @@ pub fn mark_dca_executed_as_proposal(
     movement_id: &str,
     atomic_group_id: &str,
     now: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
         let reminder = document["dcaReminders"]
             .as_array()
             .expect("validated local ledger dcaReminders should be an array")
@@ -1189,7 +1373,7 @@ pub fn mark_dca_executed_as_proposal(
                     "DCA plan.fundingAccountId is required to record execution".to_string(),
                 ])
             })?;
-        if !active_account_exists(&document, funding_account_id) {
+        if !active_account_exists(document, funding_account_id) {
             return Err(LedgerError::NotFound(format!(
                 "DCA funding account does not exist or is archived: {funding_account_id}"
             )));
@@ -1294,7 +1478,6 @@ pub fn mark_dca_executed_as_proposal(
                 "severity": "info"
             }
         ]);
-        write_document(path, &document)?;
         Ok(group)
     })
 }
@@ -1375,9 +1558,13 @@ pub fn list_snapshots(path: &Path) -> io::Result<Value> {
     ))
 }
 
-pub fn create_manual_snapshot(path: &Path, input: Value, now: &str) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+pub fn create_manual_snapshot(
+    path: &Path,
+    input: Value,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
         let Some(object) = input.as_object() else {
             return Err(LedgerError::InvalidInput(vec![
                 "manual snapshot input must be a JSON object".to_string(),
@@ -1394,7 +1581,7 @@ pub fn create_manual_snapshot(path: &Path, input: Value, now: &str) -> Result<Va
             return Err(LedgerError::InvalidInput(errors));
         }
 
-        let mut snapshot = summarize_accounts(&document, now)?.latest_snapshot;
+        let mut snapshot = summarize_accounts(document, now)?.latest_snapshot;
         if snapshot.is_null() {
             return Err(LedgerError::Conflict(
                 "cannot create a manual snapshot before any included account exists".to_string(),
@@ -1407,7 +1594,6 @@ pub fn create_manual_snapshot(path: &Path, input: Value, now: &str) -> Result<Va
             .as_array_mut()
             .expect("validated local ledger snapshots should be an array")
             .push(snapshot.clone());
-        write_document(path, &document)?;
         Ok(snapshot)
     })
 }
@@ -1436,9 +1622,9 @@ pub fn create_instrument(
     path: &Path,
     input: Value,
     fallback_instrument_id: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 201, |document| {
         let instrument = instrument_from_input(&input, fallback_instrument_id)?;
         let instrument_id = instrument
             .get("id")
@@ -1459,7 +1645,6 @@ pub fn create_instrument(
             .as_array_mut()
             .expect("validated local ledger instruments should be an array")
             .push(instrument.clone());
-        write_document(path, &document)?;
         Ok(instrument)
     })
 }
@@ -1468,9 +1653,9 @@ pub fn update_instrument(
     path: &Path,
     instrument_id: &str,
     patch: Value,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
         let instrument = document["instruments"]
             .as_array_mut()
             .expect("validated local ledger instruments should be an array")
@@ -1481,7 +1666,6 @@ pub fn update_instrument(
             })?;
         apply_instrument_patch(instrument, &patch)?;
         let projected = instrument.clone();
-        write_document(path, &document)?;
         Ok(projected)
     })
 }
@@ -1496,22 +1680,29 @@ pub fn list_categories(path: &Path) -> io::Result<Value> {
     ))
 }
 
-pub fn create_category(path: &Path, input: Value, category_id: &str) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+pub fn create_category(
+    path: &Path,
+    input: Value,
+    category_id: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 201, |document| {
         let category = category_from_input(&input, category_id)?;
         document["categories"]
             .as_array_mut()
             .expect("validated local ledger categories should be an array")
             .push(category.clone());
-        write_document(path, &document)?;
         Ok(category)
     })
 }
 
-pub fn update_category(path: &Path, category_id: &str, patch: Value) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+pub fn update_category(
+    path: &Path,
+    category_id: &str,
+    patch: Value,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
         let category = document["categories"]
             .as_array_mut()
             .expect("validated local ledger categories should be an array")
@@ -1522,7 +1713,6 @@ pub fn update_category(path: &Path, category_id: &str, patch: Value) -> Result<V
             })?;
         apply_category_patch(category, &patch)?;
         let projected = category.clone();
-        write_document(path, &document)?;
         Ok(projected)
     })
 }
@@ -1541,15 +1731,14 @@ pub fn create_counterparty(
     path: &Path,
     input: Value,
     counterparty_id: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 201, |document| {
         let counterparty = counterparty_from_input(&input, counterparty_id)?;
         document["counterparties"]
             .as_array_mut()
             .expect("validated local ledger counterparties should be an array")
             .push(counterparty.clone());
-        write_document(path, &document)?;
         Ok(counterparty)
     })
 }
@@ -1558,9 +1747,9 @@ pub fn update_counterparty(
     path: &Path,
     counterparty_id: &str,
     patch: Value,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
         let counterparty = document["counterparties"]
             .as_array_mut()
             .expect("validated local ledger counterparties should be an array")
@@ -1573,7 +1762,6 @@ pub fn update_counterparty(
             })?;
         apply_counterparty_patch(counterparty, &patch)?;
         let projected = counterparty.clone();
-        write_document(path, &document)?;
         Ok(projected)
     })
 }
@@ -1584,10 +1772,10 @@ pub fn create_counterparty_merge_proposal(
     proposal_id: &str,
     atomic_group_id: &str,
     now: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
-        let group = counterparty_merge_group_from_input(&document, &input, atomic_group_id)?;
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let group = counterparty_merge_group_from_input(document, &input, atomic_group_id)?;
         let proposal = json!({
             "id": proposal_id,
             "status": "pending",
@@ -1608,7 +1796,6 @@ pub fn create_counterparty_merge_proposal(
             .as_array_mut()
             .expect("validated local ledger aiProposals should be an array")
             .push(proposal);
-        write_document(path, &document)?;
         Ok(group)
     })
 }
@@ -1617,30 +1804,31 @@ pub fn create_ai_import_proposal(
     path: &Path,
     input: Value,
     source_kind: &str,
-    proposal_id: &str,
-    atomic_group_id: &str,
-    movement_id: &str,
-    now: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+    context: &AiImportContext,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
         let groups = ai_import_groups_from_input(
-            &document,
+            document,
             &input,
             source_kind,
-            proposal_id,
-            atomic_group_id,
-            movement_id,
-            now,
+            &context.proposal_id,
+            &context.atomic_group_id,
+            &context.movement_id,
+            &context.now,
         )?;
-        let proposal =
-            ai_import_proposal_from_groups(&input, source_kind, proposal_id, groups, now);
+        let proposal = ai_import_proposal_from_groups(
+            &input,
+            source_kind,
+            &context.proposal_id,
+            groups,
+            &context.now,
+        );
 
         document["aiProposals"]
             .as_array_mut()
             .expect("validated local ledger aiProposals should be an array")
             .push(proposal.clone());
-        write_document(path, &document)?;
         Ok(proposal)
     })
 }
@@ -1651,14 +1839,14 @@ pub fn edit_ai_atomic_group(
     patch: Value,
     movement_id: &str,
     now: &str,
-) -> Result<Value, LedgerError> {
-    with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
         let source_id =
-            find_ai_proposal_id_for_group(&document, atomic_group_id).ok_or_else(|| {
+            find_ai_proposal_id_for_group(document, atomic_group_id).ok_or_else(|| {
                 LedgerError::NotFound(format!("AI atomic group does not exist: {atomic_group_id}"))
             })?;
-        let group = find_ai_atomic_group(&document, atomic_group_id).ok_or_else(|| {
+        let group = find_ai_atomic_group(document, atomic_group_id).ok_or_else(|| {
             LedgerError::NotFound(format!("AI atomic group does not exist: {atomic_group_id}"))
         })?;
 
@@ -1677,15 +1865,14 @@ pub fn edit_ai_atomic_group(
         }
 
         let edited_group = edited_ai_atomic_group_from_patch(
-            &document,
+            document,
             &group,
             &patch,
             &source_id,
             movement_id,
             now,
         )?;
-        replace_ai_atomic_group(&mut document, atomic_group_id, edited_group.clone())?;
-        write_document(path, &document)?;
+        replace_ai_atomic_group(document, atomic_group_id, edited_group.clone())?;
         Ok(edited_group)
     })
 }
@@ -1789,18 +1976,13 @@ pub fn validate_document(document: &Value) -> Result<(), Vec<String>> {
         require_array(object, key, &mut errors);
     }
 
-    match object.get("syncState").and_then(Value::as_object) {
-        Some(sync_state) => {
-            if sync_state
-                .get("pendingChangeIds")
-                .and_then(Value::as_array)
-                .is_none()
-            {
-                errors.push("syncState.pendingChangeIds must be an array".to_string());
-            }
-        }
-        None => errors.push("syncState must be an object".to_string()),
-    }
+    validate_sync_state_and_changes(
+        object.get("syncState"),
+        object.get("syncChanges"),
+        &mut errors,
+    );
+
+    validate_idempotency_state(object.get("idempotencyState"), &mut errors);
 
     if contains_fixture_marker(document) {
         errors.push("real local ledger must not contain debug fixture markers".to_string());
@@ -1938,6 +2120,318 @@ fn validate_accounts(accounts: Option<&Value>, errors: &mut Vec<String>) {
             }
         }
     }
+}
+
+fn validate_sync_state_and_changes(
+    sync_state: Option<&Value>,
+    sync_changes: Option<&Value>,
+    errors: &mut Vec<String>,
+) {
+    let Some(sync_state) = sync_state.and_then(Value::as_object) else {
+        errors.push("syncState must be an object".to_string());
+        return;
+    };
+    let cursor = match sync_state.get("cursor") {
+        Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
+        _ => {
+            errors.push("syncState.cursor must be null or a non-empty string".to_string());
+            None
+        }
+    };
+    if !matches!(
+        sync_state.get("nextChangeSequence").and_then(Value::as_u64),
+        Some(1..)
+    ) {
+        errors.push("syncState.nextChangeSequence must be a positive integer".to_string());
+    }
+    let pending: &[Value] = match sync_state.get("pendingChangeIds").and_then(Value::as_array) {
+        Some(pending) => pending,
+        None => {
+            errors.push("syncState.pendingChangeIds must be an array".to_string());
+            &[]
+        }
+    };
+    let Some(changes) = sync_changes.and_then(Value::as_array) else {
+        return;
+    };
+
+    let allowed_entity_types = [
+        "account",
+        "instrument",
+        "holding",
+        "movement",
+        "dca_plan",
+        "category",
+        "counterparty",
+        "quote",
+        "fx_rate",
+        "snapshot",
+        "ai_proposal",
+    ];
+    let allowed_operations = ["create", "update", "delete", "correction"];
+    let mut known_ids = BTreeMap::<String, (usize, bool)>::new();
+    let mut source_changes = BTreeSet::<(String, String)>::new();
+    let mut previous_sequence = None;
+
+    for (index, change) in changes.iter().enumerate() {
+        let path = format!("syncChanges[{index}]");
+        let Some(change) = change.as_object() else {
+            errors.push(format!("{path} must be an object"));
+            continue;
+        };
+
+        let change_id = change.get("id").and_then(Value::as_str);
+        let sequence = change_id.and_then(sync_change_sequence);
+        match (change_id, sequence) {
+            (Some(change_id), Some(sequence)) => {
+                if known_ids.contains_key(change_id) {
+                    errors.push(format!(
+                        "{path}.id is a duplicate sync change id: {change_id}"
+                    ));
+                }
+                if previous_sequence.is_some_and(|previous| sequence <= previous) {
+                    errors.push(format!(
+                        "{path}.id sequence must be strictly increasing in syncChanges"
+                    ));
+                }
+                previous_sequence = Some(sequence);
+            }
+            _ => errors.push(format!(
+                "{path}.id must be a canonical positive local_change_N id"
+            )),
+        }
+
+        let device_id = change
+            .get("deviceId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        if device_id.is_none() {
+            errors.push(format!("{path}.deviceId must be a non-empty string"));
+        }
+        if !matches!(
+            change.get("entityType").and_then(Value::as_str),
+            Some(value) if allowed_entity_types.contains(&value)
+        ) {
+            errors.push(format!("{path}.entityType is invalid"));
+        }
+        if change
+            .get("entityId")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            errors.push(format!("{path}.entityId must be a non-empty string"));
+        }
+        if !matches!(
+            change.get("operation").and_then(Value::as_str),
+            Some(value) if allowed_operations.contains(&value)
+        ) {
+            errors.push(format!("{path}.operation is invalid"));
+        }
+        if !change.contains_key("payload") {
+            errors.push(format!("{path}.payload must be present"));
+        }
+        if change
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339)
+            .is_none()
+        {
+            errors.push(format!("{path}.createdAt must be an RFC3339 timestamp"));
+        }
+
+        let source_device_id = change
+            .get("sourceDeviceId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        let source_change_id = change
+            .get("sourceChangeId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty());
+        let is_local = match (source_device_id, source_change_id) {
+            (None, None) => {
+                if device_id != Some(LOCAL_SYNC_DEVICE_ID) {
+                    errors.push(format!(
+                        "{path} non-local change must include sourceDeviceId/sourceChangeId"
+                    ));
+                }
+                if change.contains_key("receivedAt") {
+                    errors.push(format!("{path} local change must not include receivedAt"));
+                }
+                true
+            }
+            (Some(source_device_id), Some(source_change_id)) => {
+                if device_id != Some(source_device_id) {
+                    errors.push(format!("{path}.sourceDeviceId must equal deviceId"));
+                }
+                if source_device_id == LOCAL_SYNC_DEVICE_ID {
+                    errors.push(format!(
+                        "{path}.sourceDeviceId must not use the reserved local device id"
+                    ));
+                }
+                if !source_changes
+                    .insert((source_device_id.to_string(), source_change_id.to_string()))
+                {
+                    errors.push(format!(
+                        "{path} has duplicate sourceDeviceId/sourceChangeId"
+                    ));
+                }
+                if change
+                    .get("receivedAt")
+                    .and_then(Value::as_str)
+                    .and_then(parse_rfc3339)
+                    .is_none()
+                {
+                    errors.push(format!("{path}.receivedAt must be an RFC3339 timestamp"));
+                }
+                false
+            }
+            _ => {
+                errors.push(format!(
+                    "{path}.sourceDeviceId and sourceChangeId must appear together"
+                ));
+                false
+            }
+        };
+
+        if let Some(change_id) = change_id {
+            known_ids
+                .entry(change_id.to_string())
+                .or_insert((index, is_local));
+        }
+    }
+
+    match (changes.last(), cursor) {
+        (None, None) => {}
+        (None, Some(_)) => {
+            errors.push("syncState.cursor must be null for an empty log".to_string())
+        }
+        (Some(last), Some(cursor)) if last.get("id").and_then(Value::as_str) == Some(cursor) => {}
+        (Some(_), Some(_)) => {
+            errors.push("syncState.cursor must equal the last sync change id".to_string())
+        }
+        (Some(_), None) => {
+            errors.push("syncState.cursor must equal the last sync change id".to_string())
+        }
+    }
+
+    let mut pending_seen = BTreeSet::new();
+    let mut previous_pending_index = None;
+    for (index, pending_id) in pending.iter().enumerate() {
+        let Some(pending_id) = pending_id.as_str().filter(|value| !value.trim().is_empty()) else {
+            errors.push(format!(
+                "syncState.pendingChangeIds[{index}] must be a non-empty string"
+            ));
+            continue;
+        };
+        if !pending_seen.insert(pending_id) {
+            errors.push("syncState.pendingChangeIds must not contain duplicates".to_string());
+            continue;
+        }
+        let Some((log_index, is_local)) = known_ids.get(pending_id).copied() else {
+            errors.push(format!(
+                "syncState.pendingChangeIds contains unknown sync change id: {pending_id}"
+            ));
+            continue;
+        };
+        if !is_local {
+            errors.push(format!(
+                "syncState.pendingChangeIds must reference only local changes: {pending_id}"
+            ));
+        }
+        if previous_pending_index.is_some_and(|previous| log_index <= previous) {
+            errors.push("syncState.pendingChangeIds must follow sync log order".to_string());
+        }
+        previous_pending_index = Some(log_index);
+    }
+}
+
+fn sync_change_sequence(change_id: &str) -> Option<u64> {
+    let sequence = change_id
+        .strip_prefix("local_change_")?
+        .parse::<u64>()
+        .ok()?;
+    (sequence > 0 && change_id == format!("local_change_{sequence:06}")).then_some(sequence)
+}
+
+fn validate_idempotency_state(state: Option<&Value>, errors: &mut Vec<String>) {
+    let Some(state) = state.and_then(Value::as_object) else {
+        errors.push("idempotencyState must be an object".to_string());
+        return;
+    };
+
+    if state.get("version").and_then(Value::as_i64) != Some(IDEMPOTENCY_STATE_VERSION) {
+        errors.push(format!(
+            "idempotencyState.version must be {IDEMPOTENCY_STATE_VERSION}"
+        ));
+    }
+
+    let Some(records) = state.get("records").and_then(Value::as_object) else {
+        errors.push("idempotencyState.records must be an object".to_string());
+        return;
+    };
+
+    for (key_hash, record) in records {
+        let path = format!("idempotencyState.records.{key_hash}");
+        if !is_sha256_urlsafe_hash(key_hash) {
+            errors.push(format!("{path} key must be a SHA-256 URL-safe hash"));
+        }
+
+        let Some(record) = record.as_object() else {
+            errors.push(format!("{path} must be an object"));
+            continue;
+        };
+
+        match record.get("requestHash").and_then(Value::as_str) {
+            Some(hash) if is_sha256_urlsafe_hash(hash) => {}
+            _ => errors.push(format!(
+                "{path}.requestHash must be a SHA-256 URL-safe hash"
+            )),
+        }
+        if record
+            .get("operation")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("{path}.operation must be a non-empty string"));
+        }
+        if !matches!(
+            record.get("statusCode").and_then(Value::as_u64),
+            Some(100..=599)
+        ) {
+            errors.push(format!("{path}.statusCode must be an HTTP status code"));
+        }
+        if !record.contains_key("responseBody") {
+            errors.push(format!("{path}.responseBody must be present"));
+        }
+
+        let created_at = record.get("createdAt").and_then(Value::as_str);
+        let expires_at = record.get("expiresAt").and_then(Value::as_str);
+        let created = created_at.and_then(parse_rfc3339);
+        let expires = expires_at.and_then(parse_rfc3339);
+        if created.is_none() {
+            errors.push(format!("{path}.createdAt must be an RFC3339 timestamp"));
+        }
+        if expires.is_none() {
+            errors.push(format!("{path}.expiresAt must be an RFC3339 timestamp"));
+        }
+        if let (Some(created), Some(expires)) = (created, expires)
+            && expires <= created
+        {
+            errors.push(format!("{path}.expiresAt must be after createdAt"));
+        }
+    }
+}
+
+fn is_sha256_urlsafe_hash(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn parse_rfc3339(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339).ok()
 }
 
 fn find_account_mut<'a>(document: &'a mut Value, account_id: &str) -> Option<&'a mut Value> {
@@ -2566,6 +3060,11 @@ fn sync_push_changes_for_input(
             String::new()
         }
     };
+    if device_id == LOCAL_SYNC_DEVICE_ID {
+        errors.push(format!(
+            "deviceId must not use reserved id {LOCAL_SYNC_DEVICE_ID}"
+        ));
+    }
     let changes: &[Value] = match object.get("changes").and_then(Value::as_array) {
         Some(changes) => changes,
         None => {
@@ -2645,6 +3144,9 @@ fn sync_change_from_push_input(
         && change_device_id != request_device_id
     {
         errors.push("deviceId must match the request deviceId".to_string());
+    }
+    if created_at.as_deref().and_then(parse_rfc3339).is_none() {
+        errors.push("createdAt must be an RFC3339 timestamp".to_string());
     }
 
     if !errors.is_empty() {
@@ -6528,13 +7030,12 @@ fn stable_holding_id(account_id: &str, instrument_id: &str) -> String {
 }
 
 fn update_dca_reminder_status(
-    path: &Path,
+    document: &mut Value,
     reminder_id: &str,
     status: &str,
     snoozed_until: Option<String>,
     now: &str,
 ) -> Result<Value, LedgerError> {
-    let mut document = load_or_initialize(path)?;
     let reminder = document["dcaReminders"]
         .as_array_mut()
         .expect("validated local ledger dcaReminders should be an array")
@@ -6572,7 +7073,6 @@ fn update_dca_reminder_status(
         }
     }
 
-    write_document(path, &document)?;
     Ok(projected)
 }
 
@@ -6698,6 +7198,30 @@ mod tests {
     }
 
     #[test]
+    fn read_document_normalizes_legacy_missing_idempotency_state() {
+        let path = unique_temp_path("legacy_idempotency_normalization");
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document
+            .as_object_mut()
+            .expect("ledger should be an object")
+            .remove("idempotencyState");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("legacy ledger directory should exist");
+        }
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&document).expect("legacy ledger should serialize"),
+        )
+        .expect("legacy ledger should write");
+
+        let loaded = read_document(&path).expect("legacy ledger should normalize on read");
+        assert_eq!(loaded["idempotencyState"]["version"], 1);
+        assert_eq!(loaded["idempotencyState"]["records"], json!({}));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn write_document_rejects_debug_fixture_markers() {
         let path = unique_temp_path("fixture_reject");
         let mut document = empty_document(DEFAULT_BASE_CURRENCY);
@@ -6759,6 +7283,137 @@ mod tests {
 
         assert_eq!(change_id, "local_change_000043");
         assert_eq!(document["syncState"]["nextChangeSequence"], 44);
+    }
+
+    #[test]
+    fn validate_document_rejects_duplicate_sync_ids_and_dangling_pending_ids() {
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["syncChanges"] = json!([
+            {
+                "id": "local_change_000001",
+                "deviceId": LOCAL_SYNC_DEVICE_ID,
+                "entityType": "account",
+                "entityId": "acct_1",
+                "operation": "create",
+                "payload": {},
+                "createdAt": "2026-07-10T00:00:00Z"
+            },
+            {
+                "id": "local_change_000001",
+                "deviceId": LOCAL_SYNC_DEVICE_ID,
+                "entityType": "account",
+                "entityId": "acct_2",
+                "operation": "update",
+                "payload": {},
+                "createdAt": "2026-07-10T00:01:00Z"
+            }
+        ]);
+        document["syncState"]["cursor"] = json!("local_change_000001");
+        document["syncState"]["pendingChangeIds"] = json!([
+            "local_change_000001",
+            "local_change_000001",
+            "local_change_000099"
+        ]);
+
+        let errors = validate_document(&document).expect_err("invalid sync state must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("duplicate sync change id"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must not contain duplicates"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("unknown sync change id"))
+        );
+    }
+
+    #[test]
+    fn validate_document_requires_cursor_to_match_ordered_sync_log_tail() {
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["syncChanges"] = json!([
+            {
+                "id": "local_change_000002",
+                "deviceId": LOCAL_SYNC_DEVICE_ID,
+                "entityType": "account",
+                "entityId": "acct_2",
+                "operation": "create",
+                "payload": {},
+                "createdAt": "2026-07-10T00:00:00Z"
+            },
+            {
+                "id": "local_change_000001",
+                "deviceId": LOCAL_SYNC_DEVICE_ID,
+                "entityType": "account",
+                "entityId": "acct_1",
+                "operation": "create",
+                "payload": {},
+                "createdAt": "2026-07-10T00:01:00Z"
+            }
+        ]);
+        document["syncState"]["cursor"] = json!("local_change_000002");
+        document["syncState"]["nextChangeSequence"] = json!(1);
+
+        let errors = validate_document(&document).expect_err("invalid sync order must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("strictly increasing"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must equal the last sync change id"))
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.contains("nextChangeSequence must exceed"))
+        );
+    }
+
+    #[test]
+    fn validate_document_rejects_duplicate_remote_source_change() {
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["syncChanges"] = json!([
+            {
+                "id": "local_change_000001",
+                "deviceId": "remote_device",
+                "sourceDeviceId": "remote_device",
+                "sourceChangeId": "remote_change_1",
+                "entityType": "account",
+                "entityId": "acct_1",
+                "operation": "create",
+                "payload": {},
+                "createdAt": "2026-07-10T00:00:00Z",
+                "receivedAt": "2026-07-10T00:00:01Z"
+            },
+            {
+                "id": "local_change_000002",
+                "deviceId": "remote_device",
+                "sourceDeviceId": "remote_device",
+                "sourceChangeId": "remote_change_1",
+                "entityType": "account",
+                "entityId": "acct_1",
+                "operation": "update",
+                "payload": {},
+                "createdAt": "2026-07-10T00:01:00Z",
+                "receivedAt": "2026-07-10T00:01:01Z"
+            }
+        ]);
+        document["syncState"]["cursor"] = json!("local_change_000002");
+
+        let errors = validate_document(&document).expect_err("duplicate source must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("duplicate sourceDeviceId/sourceChangeId"))
+        );
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

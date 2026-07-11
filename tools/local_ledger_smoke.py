@@ -19,6 +19,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -36,13 +37,17 @@ def request_json(
     method: str = "GET",
     body: dict[str, Any] | None = None,
     expected_status: int = 200,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     data = None if body is None else json.dumps(body).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if method in {"POST", "PATCH", "PUT", "DELETE"}:
+        headers["Idempotency-Key"] = idempotency_key or f"smoke-{uuid.uuid4()}"
     request = urllib.request.Request(
         base + path,
         data=data,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(request, timeout=3) as response:
@@ -135,13 +140,21 @@ def wait_until_ready(base: str, process: subprocess.Popen[str]) -> None:
     raise RuntimeError(f"rust server did not become ready: {last_error}")
 
 
-def create_account(base: str, name: str, amount: str, *, account_type: str = "bank") -> dict[str, Any]:
+def create_account(
+    base: str,
+    name: str,
+    amount: str,
+    *,
+    account_type: str = "bank",
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
     return unwrap_data(
         request_json(
             base,
             "/v1/accounts",
             method="POST",
             expected_status=201,
+            idempotency_key=idempotency_key,
             body={
                 "displayName": name,
                 "institutionName": "local-ledger-smoke",
@@ -320,7 +333,20 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     )
     assert unknown_cursor["error"]["code"] == "invalid_sync_cursor"
 
-    cash = create_account(base, "Smoke Cash", "1000.00")
+    account_retry_key = "smoke-account-create-retry"
+    cash = create_account(
+        base,
+        "Smoke Cash",
+        "1000.00",
+        idempotency_key=account_retry_key,
+    )
+    replayed_cash = create_account(
+        base,
+        "Smoke Cash",
+        "1000.00",
+        idempotency_key=account_retry_key,
+    )
+    assert replayed_cash == cash
     reserve = create_account(base, "Smoke Reserve", "250.00", account_type="wallet")
     assert cash["cashBalances"][0]["amount"] == "1000.00"
 
@@ -441,6 +467,8 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     assert persisted["syncState"]["pendingChangeIds"] == []
     assert len(persisted["syncChanges"]) >= len(final_sync["changes"])
     assert any(item["source"]["kind"] == "ai_proposal" for item in persisted["movements"])
+    assert len(persisted["idempotencyState"]["records"]) >= 1
+    assert account_retry_key not in ledger_path.read_text(encoding="utf-8")
 
 
 def main() -> None:

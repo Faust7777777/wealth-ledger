@@ -4,6 +4,14 @@
 用途：在 Claude 前端返工期间，Codex 继续推进后端/接口方向时使用。  
 边界：不接手 Flutter UI，不改前端页面，不实现真实交易/转账能力。
 
+> 2026-07-11 状态注记：本文后续“当前状态”段落保留最初的执行基线，
+> 不应再被当作运行时能力清单。当前 OpenAPI 为 58 paths / 101 schemas；
+> `tools/mock_api_server.py` 仍是只读 mock，`server/dev_server.py` 仍是
+> 非持久化 skeleton，而 `server-rs/` 在 `--ledger-path` 模式下已经是真实
+> 可写的自用 JSON 账本实现（含本地认证、幂等写、同步日志、备份校验）。
+> 仍属 skeleton/integration boundary 的是模型 AI、完整远端多设备同步及
+> 任何真实交易/转账能力。
+
 ## 0. 当前已完成
 
 契约入口：

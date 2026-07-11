@@ -65,6 +65,10 @@ DataSourceMode =
     "pendingChangeIds": []
   },
   "syncChanges": [],
+  "idempotencyState": {
+    "version": 1,
+    "records": {}
+  },
   "migrations": []
 }
 ```
@@ -78,6 +82,11 @@ DataSourceMode =
 - 空日志对外使用 genesis cursor `local_cursor_0000`，磁盘上的 `syncState.cursor` 仍为 `null`。
 - `syncState.nextChangeSequence` 是持久化提示值；生成新 ID 时必须同时扫描已有最大 `local_change_N`，不得因字段回退而复用 change ID。
 - `pendingChangeIds` 是本地 outbox 的待上游确认集合，不代表每台客户端的独立同步进度。
+- `syncChanges[*].id` 必须是规范化、唯一且按日志顺序严格递增的 `local_change_N`；允许 sequence 有空洞，不允许重复或倒序。
+- 空日志的磁盘 cursor 必须为 `null`；非空日志的 `syncState.cursor` 必须等于最后一条 change ID。
+- `pendingChangeIds` 必须唯一、保持日志顺序、只引用仍存在的本地 change；远端中继 change 不得进入本地 outbox。
+- 远端中继 change 必须同时带 `sourceDeviceId` / `sourceChangeId`，二者组合在日志内唯一，并带合法 RFC3339 `receivedAt`；保留的本地 device id 不得被远端 push 冒用。
+- `idempotencyState.records` 以 `Idempotency-Key` 的 SHA-256 URL-safe 摘要为键；记录请求摘要、具体操作、首次状态码/响应体、创建与过期时间，不得保存原始 key。
 
 ## 3. 空账本初始化
 
@@ -94,6 +103,8 @@ DataSourceMode =
 正式账本写入必须满足：
 
 - 写操作以 atomic group 或单个明确命令为事务边界。
+- HTTP 写操作的业务变更与幂等结果必须进入同一份内存 document，并只调用一次 `write_document`；不得在业务写入成功后另写旁路 cache。
+- 同 key、同请求命中未过期记录时不得再次执行领域修改；必须原样重放保存的状态码/响应体。同 key、不同请求必须拒绝。
 - 写入前完成金额、币种、账户引用、分录方向、AI validation 等校验。
 - decimal string 必须使用统一校验口径；当前最多允许 8 位小数。
 - 已确认记录更正必须生成 correction movement，不静默覆盖原记录。

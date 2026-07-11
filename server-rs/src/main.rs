@@ -5,7 +5,7 @@ use argon2::{
 use axum::{
     Json, Router,
     extract::{Json as JsonExtractor, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get, patch, post},
@@ -39,6 +39,8 @@ use yahoo_finance_api as yahoo;
 const EMPTY_BOOTSTRAP: &str =
     include_str!("../../docs/contracts/examples/ledger_bootstrap_empty.response.json");
 const REFRESH_TOKEN_TTL_DAYS: i64 = 30;
+const IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
+const IDEMPOTENCY_RETENTION_DAYS: i64 = 30;
 const OVERVIEW_EMPTY: &str =
     include_str!("../../docs/contracts/examples/portfolio_overview_empty.response.json");
 const OVERVIEW_DEGRADED: &str =
@@ -847,6 +849,7 @@ async fn main() {
 enum LedgerCommand {
     Init(PathBuf),
     Validate(PathBuf),
+    ValidateAuthState(PathBuf),
     CheckPaths {
         real_path: PathBuf,
         fixture_path: PathBuf,
@@ -903,6 +906,12 @@ where
                     args.next().expect("--validate-ledger requires a file path"),
                 )));
             }
+            "--validate-auth-state" => {
+                return Some(LedgerCommand::ValidateAuthState(PathBuf::from(
+                    args.next()
+                        .expect("--validate-auth-state requires a file path"),
+                )));
+            }
             "--check-ledger-paths" => {
                 let real_path = PathBuf::from(
                     args.next()
@@ -943,6 +952,15 @@ fn run_ledger_command(command: LedgerCommand) -> std::io::Result<()> {
                 path.display(),
                 document["ledgerVersion"],
                 document["baseCurrency"]
+            );
+            Ok(())
+        }
+        LedgerCommand::ValidateAuthState(path) => {
+            let state = read_auth_state(&path)?;
+            println!(
+                "validated auth state at {} (devices {})",
+                path.display(),
+                state.devices.len()
             );
             Ok(())
         }
@@ -1074,7 +1092,7 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/snapshots/latest", get(snapshot_latest))
         .route("/v1/snapshots", get(snapshots))
         .route("/v1/snapshots/manual", post(create_manual_snapshot))
-        .route("/v1/snapshots/invalidate", post(no_content))
+        .route("/v1/snapshots/invalidate", post(invalidate_snapshots))
         .route("/v1/categories", get(categories).post(create_category))
         .route(
             "/v1/categories/{category_id}",
@@ -1346,16 +1364,24 @@ async fn accounts(
     envelope(state.ledger.accounts(DevScenario::from_query(&query))).into_response()
 }
 
-async fn create_account(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+async fn create_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
     let now = current_timestamp();
+    let idempotency = match idempotency_request(&headers, "POST /v1/accounts", &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
     let account_id = next_local_account_id();
 
-    match local_ledger::create_account(path, input, &account_id, &now) {
-        Ok(account) => (StatusCode::CREATED, envelope(account)).into_response(),
+    match local_ledger::create_account(path, input, &account_id, &now, &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_account_input"),
     }
 }
@@ -1363,14 +1389,21 @@ async fn create_account(State(state): State<AppState>, Json(input): Json<Value>)
 async fn update_account(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
+    headers: HeaderMap,
     Json(patch): Json<Value>,
 ) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
-    match local_ledger::update_account(path, &account_id, patch, &current_timestamp()) {
-        Ok(account) => envelope(account).into_response(),
+    let now = current_timestamp();
+    let operation = format!("PATCH /v1/accounts/{account_id}");
+    let idempotency = match idempotency_request(&headers, &operation, &patch, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::update_account(path, &account_id, patch, &now, &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_account_patch"),
     }
 }
@@ -1378,13 +1411,20 @@ async fn update_account(
 async fn archive_account(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
-    match local_ledger::archive_account(path, &account_id, &current_timestamp()) {
-        Ok(account) => envelope(account).into_response(),
+    let now = current_timestamp();
+    let operation = format!("POST /v1/accounts/{account_id}/archive");
+    let idempotency = match idempotency_request(&headers, &operation, &Value::Null, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::archive_account(path, &account_id, &now, &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_account_archive"),
     }
 }
@@ -1561,6 +1601,7 @@ async fn movement_detail(
 
 async fn create_movement_draft(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<Value>,
 ) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
@@ -1568,11 +1609,23 @@ async fn create_movement_draft(
     };
 
     let now = current_timestamp();
+    let idempotency = match idempotency_request(&headers, "POST /v1/movements/drafts", &input, &now)
+    {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
     let movement_id = next_local_movement_id();
     let atomic_group_id = next_local_atomic_group_id();
 
-    match local_ledger::create_movement_draft(path, input, &movement_id, &atomic_group_id, &now) {
-        Ok(movement) => (StatusCode::CREATED, envelope(movement)).into_response(),
+    match local_ledger::create_movement_draft(
+        path,
+        input,
+        &movement_id,
+        &atomic_group_id,
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_movement_draft_input"),
     }
 }
@@ -1580,23 +1633,39 @@ async fn create_movement_draft(
 async fn submit_movement_review(
     State(state): State<AppState>,
     Path(movement_id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
-    match local_ledger::submit_movement_review(path, &movement_id, &current_timestamp()) {
-        Ok(group) => envelope(group).into_response(),
+    let now = current_timestamp();
+    let operation = format!("POST /v1/movements/{movement_id}/submit-review");
+    let idempotency = match idempotency_request(&headers, &operation, &Value::Null, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::submit_movement_review(path, &movement_id, &now, &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_movement_review_submit"),
     }
 }
 
-async fn create_correction(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+async fn create_correction(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
     let now = current_timestamp();
+    let idempotency =
+        match idempotency_request(&headers, "POST /v1/movements/corrections", &input, &now) {
+            Ok(request) => request,
+            Err(_) => return invalid_idempotency_key(),
+        };
     let movement_id = next_local_movement_id();
     let atomic_group_id = next_local_atomic_group_id();
 
@@ -1606,8 +1675,9 @@ async fn create_correction(State(state): State<AppState>, Json(input): Json<Valu
         &movement_id,
         &atomic_group_id,
         &now,
+        &idempotency,
     ) {
-        Ok(group) => envelope(group).into_response(),
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_correction_input"),
     }
 }
@@ -1630,17 +1700,25 @@ async fn dca_plans(
     envelope(state.ledger.dca_plans(DevScenario::from_query(&query))).into_response()
 }
 
-async fn create_dca_plan(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+async fn create_dca_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
     let now = current_timestamp();
+    let idempotency = match idempotency_request(&headers, "POST /v1/dca/plans", &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
     let plan_id = next_local_dca_plan_id();
     let reminder_id = next_local_dca_reminder_id();
 
-    match local_ledger::create_dca_plan(path, input, &plan_id, &reminder_id, &now) {
-        Ok(plan) => (StatusCode::CREATED, envelope(plan)).into_response(),
+    match local_ledger::create_dca_plan(path, input, &plan_id, &reminder_id, &now, &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_dca_plan_input"),
     }
 }
@@ -1648,14 +1726,21 @@ async fn create_dca_plan(State(state): State<AppState>, Json(input): Json<Value>
 async fn update_dca_plan(
     State(state): State<AppState>,
     Path(plan_id): Path<String>,
+    headers: HeaderMap,
     Json(patch): Json<Value>,
 ) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
-    match local_ledger::update_dca_plan(path, &plan_id, patch, &current_timestamp()) {
-        Ok(plan) => envelope(plan).into_response(),
+    let now = current_timestamp();
+    let operation = format!("PATCH /v1/dca/plans/{plan_id}");
+    let idempotency = match idempotency_request(&headers, &operation, &patch, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::update_dca_plan(path, &plan_id, patch, &now, &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_dca_plan_patch"),
     }
 }
@@ -1735,34 +1820,60 @@ async fn ai_proposal(
 
 async fn ai_proposal_from_text(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<Value>,
 ) -> Response {
-    create_ai_import_proposal(state, input, "user_text").await
+    create_ai_import_proposal(state, headers, input, "user_text").await
 }
 
 async fn ai_proposal_from_image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<Value>,
 ) -> Response {
-    create_ai_import_proposal(state, input, "user_image").await
+    create_ai_import_proposal(state, headers, input, "user_image").await
 }
 
-async fn ai_proposal_from_csv(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
-    create_ai_import_proposal(state, input, "csv_import").await
+async fn ai_proposal_from_csv(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    create_ai_import_proposal(state, headers, input, "csv_import").await
 }
 
-async fn create_ai_import_proposal(state: AppState, input: Value, source_kind: &str) -> Response {
+async fn create_ai_import_proposal(
+    state: AppState,
+    headers: HeaderMap,
+    input: Value,
+    source_kind: &str,
+) -> Response {
     if let Some(path) = state.local_ledger_path.as_ref() {
+        let now = current_timestamp();
+        let operation = match source_kind {
+            "user_text" => "POST /v1/ai/proposals/from-text",
+            "user_image" => "POST /v1/ai/proposals/from-image",
+            "csv_import" => "POST /v1/ai/proposals/from-csv",
+            _ => "POST /v1/ai/proposals",
+        };
+        let idempotency = match idempotency_request(&headers, operation, &input, &now) {
+            Ok(request) => request,
+            Err(_) => return invalid_idempotency_key(),
+        };
+        let context = local_ledger::AiImportContext {
+            proposal_id: next_local_ai_proposal_id(),
+            atomic_group_id: next_local_atomic_group_id(),
+            movement_id: next_local_movement_id(),
+            now,
+        };
         return match local_ledger::create_ai_import_proposal(
             path,
             input,
             source_kind,
-            &next_local_ai_proposal_id(),
-            &next_local_atomic_group_id(),
-            &next_local_movement_id(),
-            &current_timestamp(),
+            &context,
+            &idempotency,
         ) {
-            Ok(proposal) => envelope(proposal).into_response(),
+            Ok(response) => idempotent_response(response),
             Err(error) => local_ledger_error(error, "invalid_ai_import_proposal"),
         };
     }
@@ -1773,9 +1884,15 @@ async fn create_ai_import_proposal(state: AppState, input: Value, source_kind: &
 async fn mark_dca_executed_as_proposal(
     State(state): State<AppState>,
     Path(reminder_id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     if let Some(path) = state.local_ledger_path.as_ref() {
         let now = current_timestamp();
+        let operation = format!("POST /v1/dca/reminders/{reminder_id}/mark-executed-as-proposal");
+        let idempotency = match idempotency_request(&headers, &operation, &Value::Null, &now) {
+            Ok(request) => request,
+            Err(_) => return invalid_idempotency_key(),
+        };
         let movement_id = next_local_movement_id();
         let atomic_group_id = next_local_atomic_group_id();
         return match local_ledger::mark_dca_executed_as_proposal(
@@ -1784,8 +1901,9 @@ async fn mark_dca_executed_as_proposal(
             &movement_id,
             &atomic_group_id,
             &now,
+            &idempotency,
         ) {
-            Ok(group) => envelope(group).into_response(),
+            Ok(response) => idempotent_response(response),
             Err(error) => local_ledger_error(error, "invalid_dca_mark_executed"),
         };
     }
@@ -1802,13 +1920,20 @@ async fn mark_dca_executed_as_proposal(
 async fn skip_dca_reminder(
     State(state): State<AppState>,
     Path(reminder_id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
-    match local_ledger::skip_dca_reminder(path, &reminder_id, &current_timestamp()) {
-        Ok(reminder) => envelope(reminder).into_response(),
+    let now = current_timestamp();
+    let operation = format!("POST /v1/dca/reminders/{reminder_id}/skip");
+    let idempotency = match idempotency_request(&headers, &operation, &Value::Null, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::skip_dca_reminder(path, &reminder_id, &now, &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_dca_reminder_skip"),
     }
 }
@@ -1816,14 +1941,21 @@ async fn skip_dca_reminder(
 async fn snooze_dca_reminder(
     State(state): State<AppState>,
     Path(reminder_id): Path<String>,
+    headers: HeaderMap,
     Json(input): Json<Value>,
 ) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
-    match local_ledger::snooze_dca_reminder(path, &reminder_id, input, &current_timestamp()) {
-        Ok(reminder) => envelope(reminder).into_response(),
+    let now = current_timestamp();
+    let operation = format!("POST /v1/dca/reminders/{reminder_id}/snooze");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::snooze_dca_reminder(path, &reminder_id, input, &now, &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_dca_reminder_snooze"),
     }
 }
@@ -1831,14 +1963,19 @@ async fn snooze_dca_reminder(
 async fn confirm_atomic_group(
     State(state): State<AppState>,
     Path(atomic_group_id): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
 ) -> Response {
     if let Some(path) = state.local_ledger_path.as_ref() {
-        return match local_ledger::confirm_atomic_group(
-            path,
-            &atomic_group_id,
-            &current_timestamp(),
-        ) {
-            Ok(result) => envelope(result).into_response(),
+        let now = current_timestamp();
+        let operation = format!("POST {}", uri.path());
+        let idempotency = match idempotency_request(&headers, &operation, &Value::Null, &now) {
+            Ok(request) => request,
+            Err(_) => return invalid_idempotency_key(),
+        };
+        return match local_ledger::confirm_atomic_group(path, &atomic_group_id, &now, &idempotency)
+        {
+            Ok(response) => idempotent_response(response),
             Err(error) => local_ledger_error(error, "invalid_atomic_group_confirm"),
         };
     }
@@ -1855,11 +1992,18 @@ async fn confirm_atomic_group(
 async fn reject_atomic_group(
     State(state): State<AppState>,
     Path(atomic_group_id): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
 ) -> Response {
     if let Some(path) = state.local_ledger_path.as_ref() {
-        return match local_ledger::reject_atomic_group(path, &atomic_group_id, &current_timestamp())
-        {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        let now = current_timestamp();
+        let operation = format!("POST {}", uri.path());
+        let idempotency = match idempotency_request(&headers, &operation, &Value::Null, &now) {
+            Ok(request) => request,
+            Err(_) => return invalid_idempotency_key(),
+        };
+        return match local_ledger::reject_atomic_group(path, &atomic_group_id, &now, &idempotency) {
+            Ok(response) => idempotent_response(response),
             Err(error) => local_ledger_error(error, "invalid_atomic_group_reject"),
         };
     }
@@ -1877,17 +2021,25 @@ async fn reject_atomic_group(
 async fn edit_atomic_group(
     State(state): State<AppState>,
     Path(atomic_group_id): Path<String>,
+    headers: HeaderMap,
     Json(patch): Json<Value>,
 ) -> Response {
     if let Some(path) = state.local_ledger_path.as_ref() {
+        let now = current_timestamp();
+        let operation = format!("POST /v1/ai/atomic-groups/{atomic_group_id}/edit");
+        let idempotency = match idempotency_request(&headers, &operation, &patch, &now) {
+            Ok(request) => request,
+            Err(_) => return invalid_idempotency_key(),
+        };
         return match local_ledger::edit_ai_atomic_group(
             path,
             &atomic_group_id,
             patch,
             &next_local_movement_id(),
-            &current_timestamp(),
+            &now,
+            &idempotency,
         ) {
-            Ok(group) => envelope(group).into_response(),
+            Ok(response) => idempotent_response(response),
             Err(error) => local_ledger_error(error, "invalid_ai_atomic_group_edit"),
         };
     }
@@ -1958,6 +2110,7 @@ async fn fx_rates(
 async fn refresh_quotes(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     Json(input): Json<Value>,
 ) -> Response {
     if state.should_use_local_ledger(&query) {
@@ -1966,58 +2119,37 @@ async fn refresh_quotes(
             .as_ref()
             .expect("local ledger path should exist when local ledger is selected");
         let now = current_timestamp();
+        let idempotency =
+            match idempotency_request(&headers, "POST /v1/quotes/refresh", &input, &now) {
+                Ok(request) => request,
+                Err(_) => return invalid_idempotency_key(),
+            };
+        match local_ledger::replay_idempotency(path, &idempotency) {
+            Ok(Some(response)) => return idempotent_response(response),
+            Ok(None) => {}
+            Err(error) => return local_ledger_error(error, "invalid_quote_refresh_input"),
+        }
         let input = match enrich_quote_refresh_with_yahoo(path, input, &now).await {
             Ok(input) => input,
-            Err(error_result) => return envelope(error_result).into_response(),
-        };
-        let provider_errors = quote_provider_errors(&input);
-        if input.get("quotes").is_none()
-            && input.get("fxRates").is_none()
-            && !provider_errors.is_empty()
-        {
-            return envelope(json!({
-                "status": "offline",
-                "quotes": [],
-                "fxRates": [],
-                "errors": provider_errors,
-                "completedAt": now
-            }))
-            .into_response();
-        }
-        return match local_ledger::refresh_quotes(path, input, &now) {
-            Ok(result) => {
-                envelope(merge_quote_provider_errors(result, provider_errors)).into_response()
+            Err(error_result) => {
+                return match local_ledger::persist_idempotent_result(
+                    path,
+                    200,
+                    error_result,
+                    &idempotency,
+                ) {
+                    Ok(response) => idempotent_response(response),
+                    Err(error) => local_ledger_error(error, "invalid_quote_refresh_input"),
+                };
             }
+        };
+        return match local_ledger::refresh_quotes(path, input, &now, &idempotency) {
+            Ok(response) => idempotent_response(response),
             Err(error) => local_ledger_error(error, "invalid_quote_refresh_input"),
         };
     }
 
     example_json(QUOTE_STALE).into_response()
-}
-
-fn quote_provider_errors(input: &Value) -> Vec<Value> {
-    input
-        .get("_providerErrors")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn merge_quote_provider_errors(mut result: Value, provider_errors: Vec<Value>) -> Value {
-    if provider_errors.is_empty() {
-        return result;
-    }
-    let had_errors = result
-        .get("errors")
-        .and_then(Value::as_array)
-        .is_some_and(|errors| !errors.is_empty());
-    if let Some(errors) = result.get_mut("errors").and_then(Value::as_array_mut) {
-        errors.extend(provider_errors);
-    }
-    if !had_errors && result.get("status").and_then(Value::as_str) == Some("success") {
-        result["status"] = json!("partial_success");
-    }
-    result
 }
 
 async fn enrich_quote_refresh_with_yahoo(
@@ -2517,14 +2649,21 @@ async fn snapshots(
 
 async fn create_manual_snapshot(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<Value>,
 ) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
-    match local_ledger::create_manual_snapshot(path, input, &current_timestamp()) {
-        Ok(snapshot) => envelope(snapshot).into_response(),
+    let now = current_timestamp();
+    let idempotency = match idempotency_request(&headers, "POST /v1/snapshots/manual", &input, &now)
+    {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_manual_snapshot(path, input, &now, &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_manual_snapshot"),
     }
 }
@@ -2547,13 +2686,22 @@ async fn instruments(
     envelope(json!([])).into_response()
 }
 
-async fn create_instrument(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+async fn create_instrument(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
-    match local_ledger::create_instrument(path, input, &next_local_instrument_id()) {
-        Ok(instrument) => (StatusCode::CREATED, envelope(instrument)).into_response(),
+    let now = current_timestamp();
+    let idempotency = match idempotency_request(&headers, "POST /v1/instruments", &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_instrument(path, input, &next_local_instrument_id(), &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_instrument_input"),
     }
 }
@@ -2587,14 +2735,21 @@ async fn instrument_detail(
 async fn update_instrument(
     State(state): State<AppState>,
     Path(instrument_id): Path<String>,
+    headers: HeaderMap,
     Json(patch): Json<Value>,
 ) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
-    match local_ledger::update_instrument(path, &instrument_id, patch) {
-        Ok(instrument) => envelope(instrument).into_response(),
+    let now = current_timestamp();
+    let operation = format!("PATCH /v1/instruments/{instrument_id}");
+    let idempotency = match idempotency_request(&headers, &operation, &patch, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::update_instrument(path, &instrument_id, patch, &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_instrument_patch"),
     }
 }
@@ -2701,13 +2856,22 @@ async fn categories(
     envelope(json!([])).into_response()
 }
 
-async fn create_category(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+async fn create_category(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
-    match local_ledger::create_category(path, input, &next_local_category_id()) {
-        Ok(category) => (StatusCode::CREATED, envelope(category)).into_response(),
+    let now = current_timestamp();
+    let idempotency = match idempotency_request(&headers, "POST /v1/categories", &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_category(path, input, &next_local_category_id(), &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_category_input"),
     }
 }
@@ -2740,14 +2904,21 @@ async fn category_detail(
 async fn update_category(
     State(state): State<AppState>,
     Path(category_id): Path<String>,
+    headers: HeaderMap,
     Json(patch): Json<Value>,
 ) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
-    match local_ledger::update_category(path, &category_id, patch) {
-        Ok(category) => envelope(category).into_response(),
+    let now = current_timestamp();
+    let operation = format!("PATCH /v1/categories/{category_id}");
+    let idempotency = match idempotency_request(&headers, &operation, &patch, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::update_category(path, &category_id, patch, &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_category_patch"),
     }
 }
@@ -2770,13 +2941,27 @@ async fn counterparties(
     envelope(json!([])).into_response()
 }
 
-async fn create_counterparty(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+async fn create_counterparty(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
-    match local_ledger::create_counterparty(path, input, &next_local_counterparty_id()) {
-        Ok(counterparty) => (StatusCode::CREATED, envelope(counterparty)).into_response(),
+    let now = current_timestamp();
+    let idempotency = match idempotency_request(&headers, "POST /v1/counterparties", &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_counterparty(
+        path,
+        input,
+        &next_local_counterparty_id(),
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_counterparty_input"),
     }
 }
@@ -2809,34 +2994,53 @@ async fn counterparty_detail(
 async fn update_counterparty(
     State(state): State<AppState>,
     Path(counterparty_id): Path<String>,
+    headers: HeaderMap,
     Json(patch): Json<Value>,
 ) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
-    match local_ledger::update_counterparty(path, &counterparty_id, patch) {
-        Ok(counterparty) => envelope(counterparty).into_response(),
+    let now = current_timestamp();
+    let operation = format!("PATCH /v1/counterparties/{counterparty_id}");
+    let idempotency = match idempotency_request(&headers, &operation, &patch, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::update_counterparty(path, &counterparty_id, patch, &idempotency) {
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_counterparty_patch"),
     }
 }
 
 async fn create_counterparty_merge_proposal(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<Value>,
 ) -> Response {
     let Some(path) = state.local_ledger_path.as_ref() else {
         return not_implemented().await;
     };
 
+    let now = current_timestamp();
+    let idempotency = match idempotency_request(
+        &headers,
+        "POST /v1/counterparties/merge-proposal",
+        &input,
+        &now,
+    ) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
     match local_ledger::create_counterparty_merge_proposal(
         path,
         input,
         &next_local_ai_proposal_id(),
         &next_local_atomic_group_id(),
-        &current_timestamp(),
+        &now,
+        &idempotency,
     ) {
-        Ok(group) => envelope(group).into_response(),
+        Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_counterparty_merge_proposal"),
     }
 }
@@ -2880,8 +3084,19 @@ async fn sync_changes(
 async fn sync_push(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     Json(input): Json<Value>,
 ) -> Response {
+    let local_idempotency = if state.should_use_local_ledger(&query) {
+        let now = current_timestamp();
+        let idempotency = match idempotency_request(&headers, "POST /v1/sync/push", &input, &now) {
+            Ok(request) => request,
+            Err(_) => return invalid_idempotency_key(),
+        };
+        Some((now, idempotency))
+    } else {
+        None
+    };
     let Some(object) = input.as_object() else {
         return bad_request(
             "invalid_sync_push",
@@ -2914,8 +3129,10 @@ async fn sync_push(
             .local_ledger_path
             .as_ref()
             .expect("local ledger path should exist when local ledger is selected");
-        return match local_ledger::ingest_sync_push(path, input, &current_timestamp()) {
-            Ok(result) => envelope(result).into_response(),
+        let (now, idempotency) =
+            local_idempotency.expect("local idempotency should exist for local ledger");
+        return match local_ledger::ingest_sync_push(path, input, &now, &idempotency) {
+            Ok(response) => idempotent_response(response),
             Err(error) => local_ledger_error(error, "invalid_sync_push"),
         };
     }
@@ -2930,6 +3147,7 @@ async fn sync_push(
 async fn sync_ack(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     Json(input): Json<Value>,
 ) -> Response {
     if state.should_use_local_ledger(&query) {
@@ -2937,8 +3155,13 @@ async fn sync_ack(
             .local_ledger_path
             .as_ref()
             .expect("local ledger path should exist when local ledger is selected");
-        return match local_ledger::ack_sync_changes(path, input) {
-            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        let now = current_timestamp();
+        let idempotency = match idempotency_request(&headers, "POST /v1/sync/ack", &input, &now) {
+            Ok(request) => request,
+            Err(_) => return invalid_idempotency_key(),
+        };
+        return match local_ledger::ack_sync_changes(path, input, &idempotency) {
+            Ok(response) => idempotent_response(response),
             Err(error) => local_ledger_error(error, "invalid_sync_ack"),
         };
     }
@@ -2946,8 +3169,25 @@ async fn sync_ack(
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn no_content() -> StatusCode {
-    StatusCode::NO_CONTENT
+async fn invalidate_snapshots(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<JsonExtractor<Value>>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let body = body.map_or(Value::Null, |JsonExtractor(value)| value);
+    let now = current_timestamp();
+    let idempotency =
+        match idempotency_request(&headers, "POST /v1/snapshots/invalidate", &body, &now) {
+            Ok(request) => request,
+            Err(_) => return invalid_idempotency_key(),
+        };
+    match local_ledger::persist_idempotent_result(path, 204, Value::Null, &idempotency) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_snapshot_invalidation"),
+    }
 }
 
 async fn not_implemented() -> Response {
@@ -2987,6 +3227,93 @@ fn envelope(data: Value) -> Json<Value> {
         "ok": true,
         "data": data
     }))
+}
+
+#[derive(Debug)]
+struct InvalidIdempotencyKey;
+
+fn idempotency_request(
+    headers: &HeaderMap,
+    operation: &str,
+    body: &Value,
+    now: &str,
+) -> Result<local_ledger::IdempotencyRequest, InvalidIdempotencyKey> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let Some(value) = values.next() else {
+        return Err(InvalidIdempotencyKey);
+    };
+    if values.next().is_some() {
+        return Err(InvalidIdempotencyKey);
+    }
+    let Ok(key) = value.to_str() else {
+        return Err(InvalidIdempotencyKey);
+    };
+    if key.is_empty()
+        || key.len() > IDEMPOTENCY_KEY_MAX_BYTES
+        || !key.bytes().all(|byte| matches!(byte, 0x21..=0x7e))
+    {
+        return Err(InvalidIdempotencyKey);
+    }
+
+    let canonical = canonical_json(body);
+    let request_material = serde_json::to_vec(&json!({
+        "operation": operation,
+        "body": canonical
+    }))
+    .expect("canonical idempotency request should serialize");
+    let created_at =
+        OffsetDateTime::parse(now, &Rfc3339).expect("server timestamp should parse as RFC3339");
+    let expires_at = (created_at + Duration::days(IDEMPOTENCY_RETENTION_DAYS))
+        .format(&Rfc3339)
+        .expect("idempotency expiry should format as RFC3339");
+
+    Ok(local_ledger::IdempotencyRequest::new(
+        token_hash(key),
+        URL_SAFE_NO_PAD.encode(Sha256::digest(request_material)),
+        operation.to_string(),
+        now.to_string(),
+        expires_at,
+    ))
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(canonical_json).collect()),
+        Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in entries {
+                canonical.insert(key.clone(), canonical_json(value));
+            }
+            Value::Object(canonical)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn invalid_idempotency_key() -> Response {
+    bad_request(
+        "invalid_idempotency_key",
+        "Idempotency-Key must be supplied exactly once as 1-128 visible ASCII characters.",
+        json!({ "header": "Idempotency-Key" }),
+    )
+}
+
+fn idempotent_response(result: local_ledger::IdempotentResponse) -> Response {
+    let status = StatusCode::from_u16(result.status_code)
+        .expect("validated idempotency response status should be an HTTP status");
+    let mut response = if result.body.is_null() {
+        status.into_response()
+    } else {
+        (status, Json(result.body)).into_response()
+    };
+    if result.replayed {
+        response
+            .headers_mut()
+            .insert("idempotency-replayed", HeaderValue::from_static("true"));
+    }
+    response
 }
 
 fn current_timestamp() -> String {
@@ -3087,7 +3414,7 @@ fn validate_auth_config(config: &AuthConfig) -> Result<(), Vec<String>> {
                 .push("FINWEALTH_REQUIRE_AUTH=true requires FINWEALTH_AUTH_USERNAME".to_string()),
         }
         match config.password_hash.as_deref() {
-            Some(value) if PasswordHash::new(value).is_ok() => {}
+            Some(value) if is_argon2_password_hash(value) => {}
             Some(_) => errors.push(
                 "FINWEALTH_AUTH_PASSWORD_HASH must be a valid Argon2 password hash".to_string(),
             ),
@@ -3107,7 +3434,7 @@ fn validate_auth_config(config: &AuthConfig) -> Result<(), Vec<String>> {
     } else if config
         .password_hash
         .as_deref()
-        .is_some_and(|value| !value.trim().is_empty() && PasswordHash::new(value).is_err())
+        .is_some_and(|value| !value.trim().is_empty() && !is_argon2_password_hash(value))
     {
         errors
             .push("FINWEALTH_AUTH_PASSWORD_HASH must be a valid Argon2 password hash".to_string());
@@ -3118,6 +3445,11 @@ fn validate_auth_config(config: &AuthConfig) -> Result<(), Vec<String>> {
     } else {
         Err(errors)
     }
+}
+
+fn is_argon2_password_hash(value: &str) -> bool {
+    PasswordHash::new(value)
+        .is_ok_and(|hash| matches!(hash.algorithm.as_str(), "argon2d" | "argon2i" | "argon2id"))
 }
 
 fn random_token(prefix: &str) -> String {
@@ -3229,6 +3561,40 @@ fn auth_state_from_json(value: &Value) -> Result<AuthState, String> {
         let refresh_expires_at = optional_auth_state_string(device, "refreshExpiresAt")
             .unwrap_or_else(|| default_refresh_expires_at(&created_at));
         let last_seen_at = required_auth_state_string(device, "lastSeenAt", index)?;
+        if state.devices.contains_key(&id) {
+            return Err(format!("devices[{index}].id must be unique"));
+        }
+        for (key, hash) in [
+            ("refreshTokenHash", refresh_token_hash.as_str()),
+            ("accessTokenHash", access_token_hash.as_str()),
+        ] {
+            if !is_sha256_urlsafe_hash(hash) {
+                return Err(format!(
+                    "devices[{index}].{key} must be a SHA-256 URL-safe hash"
+                ));
+            }
+        }
+        let created = parse_auth_state_timestamp(&created_at, index, "createdAt")?;
+        let access_expires =
+            parse_auth_state_timestamp(&access_expires_at, index, "accessExpiresAt")?;
+        let refresh_expires =
+            parse_auth_state_timestamp(&refresh_expires_at, index, "refreshExpiresAt")?;
+        let last_seen = parse_auth_state_timestamp(&last_seen_at, index, "lastSeenAt")?;
+        if access_expires <= created {
+            return Err(format!(
+                "devices[{index}].accessExpiresAt must be after createdAt"
+            ));
+        }
+        if refresh_expires <= created {
+            return Err(format!(
+                "devices[{index}].refreshExpiresAt must be after createdAt"
+            ));
+        }
+        if last_seen < created {
+            return Err(format!(
+                "devices[{index}].lastSeenAt must not be before createdAt"
+            ));
+        }
         state.devices.insert(
             id.clone(),
             AuthDevice {
@@ -3244,6 +3610,22 @@ fn auth_state_from_json(value: &Value) -> Result<AuthState, String> {
         );
     }
     Ok(state)
+}
+
+fn is_sha256_urlsafe_hash(value: &str) -> bool {
+    value.len() == 43
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn parse_auth_state_timestamp(
+    value: &str,
+    index: usize,
+    key: &str,
+) -> Result<OffsetDateTime, String> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|_| format!("devices[{index}].{key} must be an RFC3339 timestamp"))
 }
 
 fn required_auth_state_string(
@@ -3397,6 +3779,23 @@ fn bad_request(code: &str, message: &str, details: Value) -> Response {
         .into_response()
 }
 
+fn conflict(code: &str, message: &str, details: Value) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "ok": false,
+            "error": {
+                "code": code,
+                "message": message,
+                "severity": "warning",
+                "retryable": false,
+                "details": details
+            }
+        })),
+    )
+        .into_response()
+}
+
 fn unauthorized(code: &str, message: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -3456,6 +3855,11 @@ fn local_ledger_error(error: local_ledger::LedgerError, invalid_code: &str) -> R
         local_ledger::LedgerError::Conflict(message) => {
             bad_request("local_ledger_conflict", &message, json!({}))
         }
+        local_ledger::LedgerError::IdempotencyKeyReused => conflict(
+            "idempotency_key_reused",
+            "Idempotency-Key was already used for a different request.",
+            json!({ "header": "Idempotency-Key" }),
+        ),
         local_ledger::LedgerError::NotFound(message) => {
             not_found("local_ledger_not_found", &message)
         }
@@ -3783,6 +4187,16 @@ mod tests {
         assert_eq!(
             read_ledger_command_from([
                 "finwealth-server",
+                "--validate-auth-state",
+                "ledger.auth.json"
+            ]),
+            Some(LedgerCommand::ValidateAuthState(PathBuf::from(
+                "ledger.auth.json"
+            )))
+        );
+        assert_eq!(
+            read_ledger_command_from([
+                "finwealth-server",
                 "--check-ledger-paths",
                 "ledger.json",
                 "ledger.fixture.json"
@@ -3805,6 +4219,36 @@ mod tests {
             "--hash-password-stdin"
         ]));
         assert!(!should_hash_password_from_stdin(["finwealth-server"]));
+    }
+
+    #[test]
+    fn auth_state_validation_rejects_duplicate_devices_and_invalid_security_fields() {
+        let device = json!({
+            "id": "device_duplicate",
+            "name": "Test device",
+            "refreshTokenHash": token_hash("refresh"),
+            "accessTokenHash": token_hash("access"),
+            "accessExpiresAt": "2026-07-11T01:00:00Z",
+            "refreshExpiresAt": "2026-08-11T00:00:00Z",
+            "createdAt": "2026-07-11T00:00:00Z",
+            "lastSeenAt": "2026-07-11T00:00:00Z"
+        });
+        let duplicate = json!({
+            "version": 1,
+            "devices": [device.clone(), device.clone()]
+        });
+        let error = auth_state_from_json(&duplicate)
+            .err()
+            .expect("duplicate device must fail");
+        assert!(error.contains("id must be unique"));
+
+        let mut invalid = device;
+        invalid["refreshTokenHash"] = json!("not-a-hash");
+        invalid["lastSeenAt"] = json!("not-a-time");
+        let error = auth_state_from_json(&json!({"version": 1, "devices": [invalid]}))
+            .err()
+            .expect("invalid auth security fields must fail");
+        assert!(error.contains("SHA-256 URL-safe hash"));
     }
 
     #[test]
@@ -3880,13 +4324,36 @@ mod tests {
         uri: &str,
         body: Value,
     ) -> (StatusCode, Value) {
+        let idempotency_key = next_local_id("test_idempotency");
+        let (status, _, body) = request_json_body_with_idempotency_from(
+            router,
+            method,
+            uri,
+            body,
+            Some(&idempotency_key),
+        )
+        .await;
+        (status, body)
+    }
+
+    async fn request_json_body_with_idempotency_from(
+        router: Router,
+        method: Method,
+        uri: &str,
+        body: Value,
+        idempotency_key: Option<&str>,
+    ) -> (StatusCode, HeaderMap, Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("host", "127.0.0.1");
+        if let Some(idempotency_key) = idempotency_key {
+            builder = builder.header("idempotency-key", idempotency_key);
+        }
         let response = router
             .oneshot(
-                Request::builder()
-                    .method(method)
-                    .uri(uri)
-                    .header("content-type", "application/json")
-                    .header("host", "127.0.0.1")
+                builder
                     .body(Body::from(
                         serde_json::to_vec(&body).expect("request body should serialize"),
                     ))
@@ -3895,6 +4362,7 @@ mod tests {
             .await
             .expect("router should respond");
         let status = response.status();
+        let headers = response.headers().clone();
         let bytes = to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("response body should read");
@@ -3903,7 +4371,7 @@ mod tests {
         } else {
             serde_json::from_slice(&bytes).expect("response body should be JSON")
         };
-        (status, body)
+        (status, headers, body)
     }
 
     async fn request_json_with_bearer_from(
@@ -3975,6 +4443,22 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("plaintext fallback"))
         );
+    }
+
+    #[test]
+    fn auth_config_rejects_a_valid_non_argon2_phc_hash() {
+        let non_argon2 = "$pbkdf2-sha256$i=600000,l=32$c29tZXNhbHQxMjM0NTY3OA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        PasswordHash::new(non_argon2).expect("test fixture should be valid PHC syntax");
+        let config = AuthConfig {
+            username: Some("wu".to_string()),
+            password_hash: Some(non_argon2.to_string()),
+            dev_plain_password: None,
+            require_auth: true,
+            state_path: None,
+        };
+
+        let errors = validate_auth_config(&config).expect_err("non-Argon2 hash must fail closed");
+        assert!(errors.iter().any(|error| error.contains("Argon2")));
     }
 
     #[test]
@@ -4693,6 +5177,39 @@ mod tests {
             "local_change_000002"
         );
 
+        for invalid_push in [
+            json!({
+                "deviceId": "device_bad_time",
+                "changes": [{
+                    "id": "remote_bad_time",
+                    "deviceId": "device_bad_time",
+                    "entityType": "account",
+                    "entityId": "acct_bad_time",
+                    "operation": "create",
+                    "payload": {},
+                    "createdAt": "not-a-time"
+                }]
+            }),
+            json!({
+                "deviceId": "local_device",
+                "changes": [{
+                    "id": "remote_reserved_device",
+                    "deviceId": "local_device",
+                    "entityType": "account",
+                    "entityId": "acct_reserved",
+                    "operation": "create",
+                    "payload": {},
+                    "createdAt": "2026-06-28T00:00:00Z"
+                }]
+            }),
+        ] {
+            let (invalid_status, invalid_body) =
+                request_json_body_from(router.clone(), Method::POST, "/v1/sync/push", invalid_push)
+                    .await;
+            assert_eq!(invalid_status, StatusCode::BAD_REQUEST);
+            assert_eq!(invalid_body["error"]["code"], "invalid_sync_push");
+        }
+
         let (push_status, push_body) = request_json_body_from(
             router,
             Method::POST,
@@ -4783,6 +5300,185 @@ mod tests {
 
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"]["code"], "host_header_forbidden");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_create_requires_idempotency_key() {
+        let path = unique_test_ledger_path("account_idempotency_required");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (status, _, body) = request_json_body_with_idempotency_from(
+            router,
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "缺少幂等键",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": []
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_idempotency_key");
+        assert_eq!(
+            local_ledger::read_document(&path).expect("ledger should remain readable")["accounts"],
+            json!([])
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn every_local_ledger_write_route_requires_idempotency_key() {
+        let path = unique_test_ledger_path("all_idempotency_required");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+        let routes = [
+            (Method::POST, "/v1/accounts"),
+            (Method::PATCH, "/v1/accounts/missing"),
+            (Method::POST, "/v1/accounts/missing/archive"),
+            (Method::POST, "/v1/movements/drafts"),
+            (Method::POST, "/v1/movements/missing/submit-review"),
+            (Method::POST, "/v1/movements/corrections"),
+            (Method::POST, "/v1/atomic-groups/missing/confirm"),
+            (Method::POST, "/v1/atomic-groups/missing/reject"),
+            (Method::POST, "/v1/dca/plans"),
+            (Method::PATCH, "/v1/dca/plans/missing"),
+            (
+                Method::POST,
+                "/v1/dca/reminders/missing/mark-executed-as-proposal",
+            ),
+            (Method::POST, "/v1/dca/reminders/missing/skip"),
+            (Method::POST, "/v1/dca/reminders/missing/snooze"),
+            (Method::POST, "/v1/ai/proposals/from-text"),
+            (Method::POST, "/v1/ai/proposals/from-image"),
+            (Method::POST, "/v1/ai/proposals/from-csv"),
+            (Method::POST, "/v1/ai/atomic-groups/missing/approve"),
+            (Method::POST, "/v1/ai/atomic-groups/missing/reject"),
+            (Method::POST, "/v1/ai/atomic-groups/missing/edit"),
+            (Method::POST, "/v1/quotes/refresh"),
+            (Method::POST, "/v1/instruments"),
+            (Method::PATCH, "/v1/instruments/missing"),
+            (Method::POST, "/v1/snapshots/manual"),
+            (Method::POST, "/v1/snapshots/invalidate"),
+            (Method::POST, "/v1/categories"),
+            (Method::PATCH, "/v1/categories/missing"),
+            (Method::POST, "/v1/counterparties"),
+            (Method::PATCH, "/v1/counterparties/missing"),
+            (Method::POST, "/v1/counterparties/merge-proposal"),
+            (Method::POST, "/v1/sync/push"),
+            (Method::POST, "/v1/sync/ack"),
+        ];
+
+        for (method, uri) in routes {
+            let (status, _, body) = request_json_body_with_idempotency_from(
+                router.clone(),
+                method.clone(),
+                uri,
+                json!({}),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}: {body}");
+            assert_eq!(
+                body["error"]["code"], "invalid_idempotency_key",
+                "{method} {uri}: {body}"
+            );
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_create_idempotency_replays_across_restart_and_rejects_reuse() {
+        let path = unique_test_ledger_path("account_idempotency_replay");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let idempotency_key = "account-create-retry-key";
+        let input = json!({
+            "displayName": "幂等账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "cash_balance",
+            "openingBalances": [{"currency": "CNY", "amount": "10.00"}]
+        });
+
+        let first_router = app_with_state(AppState::local(path.clone()));
+        let (first_status, first_headers, first_body) = request_json_body_with_idempotency_from(
+            first_router,
+            Method::POST,
+            "/v1/accounts",
+            input.clone(),
+            Some(idempotency_key),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::CREATED);
+        assert!(first_headers.get("idempotency-replayed").is_none());
+
+        let restarted_router = app_with_state(AppState::local(path.clone()));
+        let (replay_status, replay_headers, replay_body) = request_json_body_with_idempotency_from(
+            restarted_router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            input,
+            Some(idempotency_key),
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::CREATED);
+        assert_eq!(replay_body, first_body);
+        assert_eq!(
+            replay_headers
+                .get("idempotency-replayed")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+
+        let (reuse_status, _, reuse_body) = request_json_body_with_idempotency_from(
+            restarted_router,
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "不同请求",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": []
+            }),
+            Some(idempotency_key),
+        )
+        .await;
+        assert_eq!(reuse_status, StatusCode::CONFLICT);
+        assert_eq!(reuse_body["error"]["code"], "idempotency_key_reused");
+
+        let document = local_ledger::read_document(&path).expect("ledger should remain readable");
+        assert_eq!(
+            document["accounts"]
+                .as_array()
+                .expect("accounts should be an array")
+                .len(),
+            1
+        );
+        assert_eq!(
+            document["idempotencyState"]["records"]
+                .as_object()
+                .expect("idempotency records should be an object")
+                .len(),
+            1
+        );
+        let raw = fs::read_to_string(&path).expect("ledger should be readable as text");
+        assert!(!raw.contains(idempotency_key));
 
         let _ = std::fs::remove_file(path);
     }

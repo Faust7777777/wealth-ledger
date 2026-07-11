@@ -1,9 +1,13 @@
 # finwealth-server
 
-Rust/Axum server skeleton for Finwealth.
+Rust/Axum server for Finwealth development and private self-use.
 
-This is not the production service yet. It exists to prove the HTTP API shape
-and product boundaries before real storage, auth, AI, quotes, or sync are added.
+With `--ledger-path` it is a real write-capable implementation backed by a
+validated, atomically replaced JSON ledger. It includes persistent local auth,
+idempotent write handling, portfolio derivation, proposal confirmation, and a
+local sync log. Without `--ledger-path` it remains a deterministic in-memory dev
+server. It is not a multi-tenant production service: AI is not model-backed and
+there is no complete multi-device sync coordinator.
 
 ## Run
 
@@ -40,16 +44,17 @@ cargo run --manifest-path server-rs/Cargo.toml -- --port 8791 --ledger-path .\tm
 ## Boundaries
 
 - localhost only
-- no persistence by default
+- no persistence in the default deterministic dev mode
 - `--ledger-path` enables real-local JSON persistence for accounts, movements,
   DCA plans/reminders, AI proposals, snapshots, categories, counterparties, and
   derived portfolio read models
-- configurable local auth for login/refresh/devices; dev-compatible tokens are
-  used only when auth env vars are absent
-- no real AI
+- persistent configurable local auth for login/refresh/devices; dev-compatible
+  tokens are used only when auth env vars are absent
+- no model-backed AI; import routes create reviewable proposals only
 - outbound quote/FX/historical-price fetches are disabled by default; set
   `FINWEALTH_QUOTE_PROVIDER=yahoo` to opt in when symbols are configured
-- no real sync
+- validated local sync log/outbox and HTTP push/pull/ack shapes, but no remote
+  coordinator or background transport
 - no transfer execution
 - no broker order endpoints
 - no AI direct ledger writes
@@ -57,13 +62,12 @@ cargo run --manifest-path server-rs/Cargo.toml -- --port 8791 --ledger-path .\tm
 
 ## Internal boundary
 
-Routes now use `AppState { ledger: DevLedgerCore }` as the backend seam.
-`DevLedgerCore` is deterministic and in-memory; it owns the empty/degraded dev
-dataset selection. HTTP handlers should stay thin: parse path/query, call the
-ledger facade, then wrap the result in the shared response envelope.
-
-When real local storage is added, replace the dev core/store behind this facade
-instead of letting route handlers talk directly to SQLite, sync, quotes, or AI.
+`DevLedgerCore` owns deterministic empty/degraded data when no ledger path is
+mounted. With `--ledger-path`, handlers route writes through `local_ledger`,
+which validates the full document and serializes mutation plus idempotency
+record into one file replacement. HTTP handlers should remain thin and must not
+bypass that module for persistent writes. The JSON store is the current
+self-use implementation, not a debug fixture or a future database abstraction.
 
 ## Dev scenarios
 
@@ -126,6 +130,7 @@ behind the same ledger boundary instead of changing route handlers.
 ```powershell
 cargo run --manifest-path server-rs/Cargo.toml -- --init-ledger .\tmp\ledger.json
 cargo run --manifest-path server-rs/Cargo.toml -- --validate-ledger .\tmp\ledger.json
+cargo run --manifest-path server-rs/Cargo.toml -- --validate-auth-state .\tmp\ledger.auth.json
 cargo run --manifest-path server-rs/Cargo.toml -- --check-ledger-paths .\tmp\ledger.json .\tmp\ledger.fixture.json
 ```
 
@@ -147,6 +152,14 @@ demo integration.
 
 The validator rejects debug fixture markers and basic invalid money shapes so a
 real-local file cannot silently become demo data.
+
+All real-local ledger mutation routes require `Idempotency-Key` (1–128 visible
+ASCII characters). The server stores only SHA-256 key/request hashes plus the
+original successful response inside `ledger.json`; the domain mutation and
+idempotency record are committed by the same atomic file replacement. Retrying
+the same request replays the saved response with `Idempotency-Replayed: true`.
+Reusing a key for a different request returns `409 idempotency_key_reused`.
+Records expire after 30 days and are capped at 5000 entries.
 
 DCA "record executed" in real-local mode may persist a pending proposal/draft so
 the review flow survives refresh/restart. It still does not place orders,
@@ -195,7 +208,7 @@ removes it afterwards:
 python tools\local_ledger_smoke.py
 ```
 
-It verifies account create/update, manual movement confirmation, DCA
+It verifies persistent account-create replay, account update, manual movement confirmation, DCA
 record-executed confirmation, CSV/image proposal creation, AI approval, snapshot
 creation, derived overview/allocation values, forbidden broker endpoints, and
 on-disk persistence.

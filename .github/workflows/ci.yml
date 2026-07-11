@@ -31,7 +31,10 @@ jobs:
         run: python -m py_compile tools/contract_check.py tools/mock_api_server.py tools/server_smoke.py tools/local_ledger_smoke.py server/dev_server.py
 
       - name: Check shell scripts
-        run: bash -n tools/install_vps_systemd.sh tools/backup_vps_ledger.sh tools/restore_vps_ledger.sh
+        run: bash -n tools/install_vps_systemd.sh tools/backup_vps_ledger.sh tools/restore_vps_ledger.sh tools/vps_backup_restore_smoke.sh
+
+      - name: Run VPS backup and restore smoke
+        run: bash tools/vps_backup_restore_smoke.sh
 
       - name: Check Rust formatting
         run: cargo fmt --manifest-path server-rs/Cargo.toml --check
@@ -53,6 +56,14 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server-rs
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -85,12 +96,9 @@ jobs:
       - name: Run Flutter tests
         run: flutter test
 
-      - name: Build Windows app
-        run: flutter build windows
-
-      - name: Check Windows package script
+      - name: Build and check paired Windows self-use package
         shell: pwsh
-        run: ./tools/package_release.ps1 -SkipBuild -WindowsOnly -OutputDir tmp/package-ci
+        run: ./tools/package_release.ps1 -WindowsOnly -OutputDir tmp/package-ci
 
   flutter-android:
     name: Flutter Android

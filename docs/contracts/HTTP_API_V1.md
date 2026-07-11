@@ -38,7 +38,11 @@ Base path:
 
 写请求约束：
 
-- 所有非幂等写请求必须支持 `Idempotency-Key`。
+- 除认证生命周期接口外，所有账本写请求必须携带 `Idempotency-Key`；取值为 1–128 个可见 ASCII 字符。
+- 客户端重试同一操作时必须复用原 key；同 key、同操作、同 JSON 请求会返回首次提交的原始 HTTP 状态码和响应体，并附 `Idempotency-Replayed: true`。
+- 同 key 用于不同路径或不同 JSON 请求返回 `409 idempotency_key_reused`；缺失、重复或格式非法返回 `400 invalid_idempotency_key`。
+- 服务端只在 `ledger.json` 保存 key 的 SHA-256 摘要、请求摘要、操作名、完整响应与时间戳，不保存原始 key；业务变更和幂等记录必须通过同一次临时文件写入与原子 rename 提交。
+- 当前幂等记录保留 30 天，最多 5000 条；超过上限优先淘汰最早记录。保留期结束后再次使用旧 key 会被视为新请求。
 - 所有写请求必须鉴权。
 - debug fixture / DEMO 数据禁止上传。
 - 服务端不得提供转账、下单、交易权限接口。
@@ -304,7 +308,9 @@ POST /v1/sync/ack
 - `POST /v1/sync/ack` 接收 `cursor` 或 `changeIds`，成功后清理本地 `pendingChangeIds`，但保留 `syncChanges` 日志。
 - 当前 ack 是单一上游对本地 outbox 的高水位确认，不代表每台 Android/Windows 设备分别收妥。
 - 新 change ID 必须同时参考 `nextChangeSequence` 和已有最大 `local_change_N`，防止计数器回退后复用 ID。
+- 磁盘日志中的 change ID 必须唯一且严格递增；非空日志 cursor 必须等于日志尾，pending ID 必须唯一、存在、保持日志顺序且只指向本地 change。
 - `POST /v1/sync/push` 会把远端 `SyncChange` 作为同步日志中继保存，并返回 `acceptedChangeIds` / `skippedChangeIds`；不会直接应用到账本实体。
+- 远端 push 的 `createdAt` 必须是 RFC3339，不能冒用保留设备 ID `local_device`；相同 `(sourceDeviceId, sourceChangeId)` 只保存一次。
 - 不做远端 merge、不做冲突解决、不做 E2EE 同步。
 
 ## 13. 明确禁止的 HTTP 端点

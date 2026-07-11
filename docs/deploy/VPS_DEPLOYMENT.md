@@ -101,18 +101,37 @@ sudo bash tools/backup_vps_ledger.sh
 ```
 
 Default output goes to `/var/backups/finwealth/<UTC timestamp>/` with a SHA-256
-manifest. Copy that directory off the VPS periodically.
+manifest. The script stops `finwealth-server.service` only when it was active,
+copies ledger and auth state into a private staging directory, validates the
+copies with the installed Rust binary, writes `manifest.txt` plus safe
+`SHA256SUMS`, atomically publishes the backup directory, and restores the
+service to its prior active state. Copy the complete directory off the VPS
+periodically; individual files are not a complete verified backup.
 
 Restore from a backup directory:
 
 ```bash
 sudo bash tools/restore_vps_ledger.sh /var/backups/finwealth/<timestamp>
-sudo systemctl restart finwealth-server.service
 ```
 
-The restore script validates the backup ledger when `/opt/finwealth/finwealth-server`
-exists and creates a pre-restore backup of the current ledger before overwriting.
-Use `--force` only for non-interactive restore automation.
+The restore script requires and verifies the directory manifest/checksums,
+validates both ledger and auth state, stops the service if active, creates a
+pre-restore backup, stages replacements in `/var/lib/finwealth`, and validates
+the installed files again. A failure after replacement begins rolls both files
+back before the service is restarted. If a verified backup says it contains no
+auth state, restore removes the current auth file rather than creating a mixed
+ledger/auth snapshot. The service is returned to its prior active state
+automatically. If the restored files pass validation but the service cannot
+return to active state, both pre-restore files are restored and service startup
+is retried before the command exits with failure.
+
+`--force` skips only the interactive `RESTORE` prompt; it never bypasses
+checksums or semantic validation. Restoring a legacy standalone `ledger.json`
+requires explicit `--allow-unverified` and keeps the current auth state. The
+emergency environment flags `FINWEALTH_ALLOW_UNVALIDATED_BACKUP=true` and
+`FINWEALTH_ALLOW_UNVALIDATED_RESTORE=true` should be used only to preserve or
+recover damaged data when the validator is unavailable; such backups record
+that validation did not pass.
 
 ## 4. Run Flutter against the VPS
 
