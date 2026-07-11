@@ -13,6 +13,7 @@ import 'package:finwealth/core/env.dart';
 import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/view_models.dart';
 import 'package:finwealth/features/manual_record_page.dart';
+import 'package:finwealth/features/overview_page.dart';
 import 'package:finwealth/theme/app_theme.dart';
 
 Future<void> _loadFonts() async {
@@ -123,6 +124,31 @@ void main() {
     await expectLater(
       find.byType(WealthLedgerApp),
       matchesGoldenFile('goldens/overview_dark_desktop.png'),
+    );
+  });
+
+  // 浅色主题的概览内容（页面直 pump + 浅色主题）：核验整套子主题在 light 下不漏暗色。
+  testWidgets('overview content · light', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 1100));
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          appEnvironmentProvider.overrideWithValue(
+            const AppEnvironment(dataSourceMode: DataSourceMode.debugFixture),
+          ),
+        ],
+        child: MaterialApp(
+          theme: buildLightTheme(),
+          home: const Scaffold(body: OverviewPage()),
+        ),
+      ),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(OverviewPage),
+      matchesGoldenFile('goldens/overview_light.png'),
     );
   });
 
