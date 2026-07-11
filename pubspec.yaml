@@ -74,6 +74,11 @@ flutter:
     - family: MiSans
       fonts:
         - asset: assets/fonts/MiSans.ttf
+    # 思源宋（Noto Serif SC，OFL）子集，仅供 Hero 大数字 + 各级标题用，正文仍 MiSans。
+    - family: NotoSerifSC
+      fonts:
+        - asset: assets/fonts/NotoSerifSC-600.ttf
+          weight: 600
 
   # To add assets to your application, add an assets section, like this:
   # assets:

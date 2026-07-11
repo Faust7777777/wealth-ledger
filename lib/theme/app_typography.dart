@@ -16,6 +16,11 @@ abstract final class AppType {
     'sans-serif',
   ];
 
+  /// 编辑感衬线：仅用于 Hero 大数字与各级标题（display/h1/h2），
+  /// 与无衬线正文形成反差＝高端信号。缺字回退 MiSans。
+  static const serifFamily = 'NotoSerifSC';
+  static const serifFallback = <String>['MiSans', ...familyFallback];
+
   /// 货币/数字统一等宽数字
   static const tnum = <FontFeature>[FontFeature.tabularFigures()];
 
@@ -23,24 +28,24 @@ abstract final class AppType {
   // ListTile/Chip/Input 等）直接引用，不走 ThemeData.textTheme 的字体应用；若不
   // 内置 family，list 行标题/顶栏标题等会脱离 MiSans、落到系统字体（与货币数字不一致）。
   static const display = TextStyle(
-    fontFamily: family,
-    fontFamilyFallback: familyFallback,
+    fontFamily: serifFamily,
+    fontFamilyFallback: serifFallback,
     fontSize: 52,
     height: 1.05,
     fontWeight: FontWeight.w600,
     letterSpacing: -0.5,
     fontFeatures: tnum,
-  ); // Hero（移动端覆盖为 40）
+  ); // Hero 净值（衬线；移动端覆盖为 40）
   static const h1 = TextStyle(
-    fontFamily: family,
-    fontFamilyFallback: familyFallback,
+    fontFamily: serifFamily,
+    fontFamilyFallback: serifFallback,
     fontSize: 22,
     height: 1.30,
     fontWeight: FontWeight.w600,
   );
   static const h2 = TextStyle(
-    fontFamily: family,
-    fontFamilyFallback: familyFallback,
+    fontFamily: serifFamily,
+    fontFamilyFallback: serifFallback,
     fontSize: 18,
     height: 1.35,
     fontWeight: FontWeight.w600,

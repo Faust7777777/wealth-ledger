@@ -25,6 +25,12 @@ Future<void> _loadFonts() async {
     final loader = FontLoader(family)..addFont(Future.value(toData()));
     await loader.load();
   }
+  // 衬线（Hero/标题）
+  final serif = File('assets/fonts/NotoSerifSC-600.ttf').readAsBytesSync();
+  await (FontLoader(
+        'NotoSerifSC',
+      )..addFont(Future.value(ByteData.view(Uint8List.fromList(serif).buffer))))
+      .load();
   await _loadMaterialIcons();
 }
 
