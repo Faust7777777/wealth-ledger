@@ -248,9 +248,7 @@ ThemeData _build(Brightness brightness) {
       ),
       iconTheme: WidgetStateProperty.resolveWith(
         (states) => IconThemeData(
-          color: states.contains(WidgetState.selected)
-              ? brand
-              : textSecondary,
+          color: states.contains(WidgetState.selected) ? brand : textSecondary,
         ),
       ),
     ),
