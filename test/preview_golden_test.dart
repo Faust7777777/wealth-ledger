@@ -108,7 +108,7 @@ void main() {
   testWidgets('overview dark · desktop (rail)', skip: !_previewEnabled, (
     tester,
   ) async {
-    await sized(tester, const Size(1280, 860));
+    await sized(tester, const Size(1440, 900));
     await tester.pumpWidget(
       ProviderScope(
         overrides: [
