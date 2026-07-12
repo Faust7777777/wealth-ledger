@@ -83,19 +83,53 @@ class _GroupBlock extends ConsumerWidget {
     AiOperation.classify => '分类',
   };
 
+  // 操作语义色：新增=绿 / 修改=蓝 / 更正=琥珀 / 归并=鸢尾 / 分类=金。
+  Color _opColor(bool dark) => switch (g.operation) {
+    AiOperation.create => dark ? AppColors.positive : AppColorsLight.positive,
+    AiOperation.modify => dark ? AppColors.info : AppColorsLight.info,
+    AiOperation.correction => dark ? AppColors.warning : AppColorsLight.warning,
+    AiOperation.merge => dark ? AppColors.inTransit : AppColorsLight.inTransit,
+    AiOperation.classify => dark ? AppColors.brand : AppColorsLight.brand,
+  };
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final opColor = _opColor(dark);
+    final surface = dark ? AppColors.surface2 : AppColorsLight.surface2;
+    // 每个 atomic group 框成独立子面板：强化「逐组确认」的最小单元感。
+    return Container(
+      margin: const EdgeInsets.only(bottom: AppSpacing.sm),
+      padding: const EdgeInsets.all(AppSpacing.sm),
+      decoration: BoxDecoration(
+        color: surface,
+        borderRadius: BorderRadius.circular(AppRadius.md),
+        border: Border.all(
+          color: Theme.of(context).dividerColor,
+          width: AppStroke.hairline,
+        ),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Chip(
-                label: Text(_opLabel),
-                visualDensity: VisualDensity.compact,
-                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: AppSpacing.sm,
+                  vertical: 2,
+                ),
+                decoration: BoxDecoration(
+                  color: opColor.withValues(alpha: dark ? 0.18 : 0.14),
+                  borderRadius: BorderRadius.circular(AppRadius.sm),
+                ),
+                child: Text(
+                  _opLabel,
+                  style: AppType.micro.copyWith(
+                    color: opColor,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
               ),
               const SizedBox(width: AppSpacing.sm),
               Expanded(child: Text(g.title, style: AppType.bodyStrong)),

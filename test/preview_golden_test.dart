@@ -13,6 +13,7 @@ import 'package:finwealth/core/env.dart';
 import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/view_models.dart';
 import 'package:finwealth/features/accounts_page.dart';
+import 'package:finwealth/features/ai_review_page.dart';
 import 'package:finwealth/features/investment_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/overview_page.dart';
@@ -187,6 +188,26 @@ void main() {
     await expectLater(
       find.byType(InvestmentPage),
       matchesGoldenFile('goldens/investment_empty.png'),
+    );
+  });
+
+  // AI 复核页（fixture 提案）：核验语义色操作胶囊 + 逐组子面板 + old→new diff。
+  testWidgets('ai review · dark', skip: !_previewEnabled, (tester) async {
+    await sized(tester, const Size(400, 940));
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          appEnvironmentProvider.overrideWithValue(
+            const AppEnvironment(dataSourceMode: DataSourceMode.debugFixture),
+          ),
+        ],
+        child: MaterialApp(theme: buildDarkTheme(), home: const AiReviewPage()),
+      ),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(AiReviewPage),
+      matchesGoldenFile('goldens/ai_review_dark.png'),
     );
   });
 
