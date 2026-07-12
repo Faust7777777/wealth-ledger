@@ -17,6 +17,12 @@ Rust server becomes the write-capable, validated JSON ledger when started with
 multi-device sync coordinator, so those surfaces remain proposal/contract
 implementations rather than production integrations.
 
+Real-local mode also implements account subscription schedules (for example
+ChatGPT or Claude memberships), including original-currency amounts, calendar
+billing anchors, finite durations, reminders, cancellation, and confirm-before-
+write charge proposals. See
+`docs/handoffs/2026-07-13-subscriptions-frontend.md` for Flutter integration.
+
 ## Contract checks
 
 ```bash

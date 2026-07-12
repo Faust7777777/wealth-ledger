@@ -389,6 +389,57 @@ UI 动作：
 - `跳过本期`：记录提醒状态，不生成交易。
 - `稍后提醒`：snooze。
 
+## 9A. Subscription
+
+订阅计划描述未来的周期性付款；它本身不是已发生的账本交易。
+
+```ts
+SubscriptionBillingCycle {
+  unit: "day" | "week" | "month" | "year";
+  interval: number;
+}
+
+SubscriptionDuration {
+  unit: "day" | "month" | "year";
+  count: number;
+}
+
+Subscription {
+  id: ID;
+  displayName: string;
+  provider: string;
+  planName?: string;
+  amount: Money;
+  paymentAccountId: ID;
+  billingCycle: SubscriptionBillingCycle;
+  billingAnchorDay: number;
+  startDate: ISODate;
+  duration?: SubscriptionDuration;
+  endDate?: ISODate;
+  nextChargeDate?: ISODate;
+  autoRenew: boolean;
+  reminderDaysBefore: number;
+  status: "trial" | "active" | "paused" | "cancelled" | "expired";
+  pendingChargeMovementId?: ID;
+  pendingChargeDate?: ISODate;
+  lastChargeDate?: ISODate;
+  lastChargeMovementId?: ID;
+  note?: string;
+  createdAt: ISODateTime;
+  updatedAt: ISODateTime;
+}
+```
+
+规则：
+
+- `amount` 保留订阅原币种（如 USD），不得在计划层静默换算为本位币。
+- `duration` 与 `endDate` 二选一；固定终止日期优先于 `autoRenew`，到期后必须显式延长。
+- 月度和年度周期以 `billingAnchorDay` 为锚点；短月份可落在月末，后续月份恢复原锚点。
+- 到期提醒只生成 `pending_review` 支出候选；确认前不影响账户余额。
+- 同一订阅、同一计费日期最多存在一个待确认扣费候选。
+- 候选确认后才推进 `nextChargeDate`；拒绝后保持原计费日期，可重新生成候选。
+- 取消保留历史扣费，但清空未来计费日期；存在待确认扣费时必须先处理候选。
+
 ## 10. Quote / FXRate
 
 ```ts

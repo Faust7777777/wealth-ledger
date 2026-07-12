@@ -1059,6 +1059,23 @@ fn app_with_state(state: AppState) -> Router {
             "/v1/dca/reminders/{reminder_id}/snooze",
             post(snooze_dca_reminder),
         )
+        .route(
+            "/v1/subscriptions",
+            get(subscriptions).post(create_subscription),
+        )
+        .route("/v1/subscriptions/upcoming", get(upcoming_subscriptions))
+        .route(
+            "/v1/subscriptions/{subscription_id}",
+            get(subscription_detail).patch(update_subscription),
+        )
+        .route(
+            "/v1/subscriptions/{subscription_id}/cancel",
+            post(cancel_subscription),
+        )
+        .route(
+            "/v1/subscriptions/{subscription_id}/charge-proposal",
+            post(create_subscription_charge_proposal),
+        )
         .route("/v1/ai/proposals/from-text", post(ai_proposal_from_text))
         .route("/v1/ai/proposals/from-image", post(ai_proposal_from_image))
         .route("/v1/ai/proposals/from-csv", post(ai_proposal_from_csv))
@@ -1960,6 +1977,172 @@ async fn snooze_dca_reminder(
     }
 }
 
+async fn subscriptions(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when selected");
+        return match local_ledger::list_subscriptions(path) {
+            Ok(items) => envelope(items).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+    envelope(json!([])).into_response()
+}
+
+async fn subscription_detail(
+    State(state): State<AppState>,
+    Path(subscription_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when selected");
+        return match local_ledger::get_subscription(path, &subscription_id) {
+            Ok(Some(item)) => envelope(item).into_response(),
+            Ok(None) => not_found(
+                "subscription_not_found",
+                "Subscription does not exist in the local ledger.",
+            ),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+    not_found(
+        "subscription_not_found",
+        "Subscription does not exist in deterministic dev mode.",
+    )
+}
+
+async fn upcoming_subscriptions(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let days = match query.get("days") {
+        None => 30_i64,
+        Some(value) => match value.parse::<i64>() {
+            Ok(value @ 1..=365) => value,
+            _ => {
+                return bad_request(
+                    "invalid_subscription_window",
+                    "days must be an integer from 1 to 365",
+                    json!({"field": "days"}),
+                );
+            }
+        },
+    };
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when selected");
+        let through_date = (OffsetDateTime::now_utc().date() + Duration::days(days)).to_string();
+        return match local_ledger::list_upcoming_subscriptions(path, &through_date) {
+            Ok(items) => envelope(items).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+    envelope(json!([])).into_response()
+}
+
+async fn create_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let idempotency = match idempotency_request(&headers, "POST /v1/subscriptions", &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_subscription(
+        path,
+        input,
+        &next_local_subscription_id(),
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_subscription_input"),
+    }
+}
+
+async fn update_subscription(
+    State(state): State<AppState>,
+    Path(subscription_id): Path<String>,
+    headers: HeaderMap,
+    Json(patch): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("PATCH /v1/subscriptions/{subscription_id}");
+    let idempotency = match idempotency_request(&headers, &operation, &patch, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::update_subscription(path, &subscription_id, patch, &now, &idempotency) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_subscription_patch"),
+    }
+}
+
+async fn cancel_subscription(
+    State(state): State<AppState>,
+    Path(subscription_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("POST /v1/subscriptions/{subscription_id}/cancel");
+    let idempotency = match idempotency_request(&headers, &operation, &Value::Null, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::cancel_subscription(path, &subscription_id, &now, &idempotency) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_subscription_cancel"),
+    }
+}
+
+async fn create_subscription_charge_proposal(
+    State(state): State<AppState>,
+    Path(subscription_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("POST /v1/subscriptions/{subscription_id}/charge-proposal");
+    let idempotency = match idempotency_request(&headers, &operation, &Value::Null, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_subscription_charge_proposal(
+        path,
+        &subscription_id,
+        &next_local_movement_id(),
+        &next_local_atomic_group_id(),
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_subscription_charge_proposal"),
+    }
+}
+
 async fn confirm_atomic_group(
     State(state): State<AppState>,
     Path(atomic_group_id): Path<String>,
@@ -2526,6 +2709,7 @@ fn local_ledger_bootstrap(path: &FsPath, now: &str) -> io::Result<Value> {
         "accounts": local_ledger::list_accounts(path)?,
         "categories": local_ledger::list_categories(path)?,
         "counterparties": local_ledger::list_counterparties(path)?,
+        "subscriptions": local_ledger::list_subscriptions(path)?,
         "capabilities": ledger_capabilities(
             "real_local",
             true,
@@ -2554,6 +2738,7 @@ fn ledger_capabilities(
         "canWriteConfirmedLedger": can_write_confirmed_ledger,
         "canCreateAccount": can_write_confirmed_ledger,
         "canRecordMovement": can_write_confirmed_ledger,
+        "canManageSubscriptions": can_write_confirmed_ledger,
         "canConfirmProposal": true,
         "canPersistPendingProposal": proposal_persistence != "none",
         "proposalPersistence": proposal_persistence,
@@ -3342,6 +3527,10 @@ fn next_local_dca_reminder_id() -> String {
     next_local_id("rem_local")
 }
 
+fn next_local_subscription_id() -> String {
+    next_local_id("sub_local")
+}
+
 fn next_local_category_id() -> String {
     next_local_id("cat_local")
 }
@@ -3853,7 +4042,7 @@ fn local_ledger_error(error: local_ledger::LedgerError, invalid_code: &str) -> R
             json!({ "errors": errors }),
         ),
         local_ledger::LedgerError::Conflict(message) => {
-            bad_request("local_ledger_conflict", &message, json!({}))
+            conflict("local_ledger_conflict", &message, json!({}))
         }
         local_ledger::LedgerError::IdempotencyKeyReused => conflict(
             "idempotency_key_reused",
@@ -5359,6 +5548,10 @@ mod tests {
             ),
             (Method::POST, "/v1/dca/reminders/missing/skip"),
             (Method::POST, "/v1/dca/reminders/missing/snooze"),
+            (Method::POST, "/v1/subscriptions"),
+            (Method::PATCH, "/v1/subscriptions/missing"),
+            (Method::POST, "/v1/subscriptions/missing/cancel"),
+            (Method::POST, "/v1/subscriptions/missing/charge-proposal"),
             (Method::POST, "/v1/ai/proposals/from-text"),
             (Method::POST, "/v1/ai/proposals/from-image"),
             (Method::POST, "/v1/ai/proposals/from-csv"),
@@ -7727,6 +7920,185 @@ mod tests {
             "10.12"
         );
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn subscriptions_schedule_foreign_currency_charges_without_writing_before_confirmation() {
+        let path = unique_test_ledger_path("subscription_charge_flow");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "美元信用卡",
+                "accountType": "credit_card",
+                "defaultCurrency": "USD",
+                "supportedCurrencies": ["USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "USD", "amount": "100.00"}]
+            }),
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id")
+            .to_string();
+
+        let (create_status, create_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/subscriptions",
+            json!({
+                "displayName": "ChatGPT Plus",
+                "provider": "OpenAI",
+                "planName": "Plus",
+                "amount": {"amount": "20.00", "currency": "USD"},
+                "paymentAccountId": account_id,
+                "billingCycle": {"unit": "month", "interval": 1},
+                "startDate": "2026-01-31",
+                "duration": {"unit": "month", "count": 3},
+                "reminderDaysBefore": 3,
+                "autoRenew": false
+            }),
+        )
+        .await;
+        assert_eq!(create_status, StatusCode::CREATED, "{create_body}");
+        let subscription_id = create_body["data"]["id"]
+            .as_str()
+            .expect("subscription id")
+            .to_string();
+        assert_eq!(create_body["data"]["amount"]["currency"], "USD");
+        assert_eq!(create_body["data"]["billingAnchorDay"], 31);
+        assert_eq!(create_body["data"]["endDate"], "2026-04-29");
+        assert_eq!(create_body["data"]["nextChargeDate"], "2026-01-31");
+
+        let (upcoming_status, upcoming_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/subscriptions/upcoming?days=365",
+        )
+        .await;
+        assert_eq!(upcoming_status, StatusCode::OK);
+        assert_eq!(upcoming_body["data"][0]["id"], subscription_id);
+
+        let charge_uri = format!("/v1/subscriptions/{subscription_id}/charge-proposal");
+        let (proposal_status, proposal_body) =
+            request_json_from(router.clone(), Method::POST, &charge_uri).await;
+        assert_eq!(proposal_status, StatusCode::CREATED, "{proposal_body}");
+        assert_eq!(proposal_body["data"]["status"], "pending");
+        assert_eq!(
+            proposal_body["data"]["proposedMovements"][0]["displayAmount"]["amount"],
+            "20.00"
+        );
+        let atomic_group_id = proposal_body["data"]["id"]
+            .as_str()
+            .expect("atomic group id")
+            .to_string();
+
+        let (account_before_status, account_before_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(account_before_status, StatusCode::OK);
+        assert_eq!(account_before_body["data"]["value"]["amount"], "100.00");
+
+        let (duplicate_status, duplicate_body) =
+            request_json_from(router.clone(), Method::POST, &charge_uri).await;
+        assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate_body}");
+
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{atomic_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+        assert_eq!(confirm_body["data"]["ledgerWrite"], true);
+
+        let (first_detail_status, first_detail) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/subscriptions/{subscription_id}"),
+        )
+        .await;
+        assert_eq!(first_detail_status, StatusCode::OK);
+        assert_eq!(first_detail["data"]["lastChargeDate"], "2026-01-31");
+        assert_eq!(first_detail["data"]["nextChargeDate"], "2026-02-28");
+
+        let (second_status, second_body) =
+            request_json_from(router.clone(), Method::POST, &charge_uri).await;
+        assert_eq!(second_status, StatusCode::CREATED);
+        let second_group = second_body["data"]["id"].as_str().expect("second group");
+        let (second_confirm_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{second_group}/confirm"),
+        )
+        .await;
+        assert_eq!(second_confirm_status, StatusCode::OK);
+        let (_, second_detail) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/subscriptions/{subscription_id}"),
+        )
+        .await;
+        assert_eq!(second_detail["data"]["nextChargeDate"], "2026-03-31");
+
+        let (third_status, third_body) =
+            request_json_from(router.clone(), Method::POST, &charge_uri).await;
+        assert_eq!(third_status, StatusCode::CREATED);
+        let third_group = third_body["data"]["id"].as_str().expect("third group");
+        let (reject_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{third_group}/reject"),
+        )
+        .await;
+        assert_eq!(reject_status, StatusCode::NO_CONTENT);
+        let (_, rejected_detail) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/subscriptions/{subscription_id}"),
+        )
+        .await;
+        assert_eq!(rejected_detail["data"]["nextChargeDate"], "2026-03-31");
+        assert!(
+            rejected_detail["data"]
+                .get("pendingChargeMovementId")
+                .is_none()
+        );
+
+        let (cancel_status, cancel_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/subscriptions/{subscription_id}/cancel"),
+        )
+        .await;
+        assert_eq!(cancel_status, StatusCode::OK);
+        assert_eq!(cancel_body["data"]["status"], "cancelled");
+        assert_eq!(cancel_body["data"]["nextChargeDate"], Value::Null);
+
+        let (account_after_status, account_after_body) =
+            request_json_from(router, Method::GET, &format!("/v1/accounts/{account_id}")).await;
+        assert_eq!(account_after_status, StatusCode::OK);
+        assert_eq!(account_after_body["data"]["value"]["amount"], "60.00");
+
+        let document = local_ledger::read_document(&path).expect("subscription should persist");
+        assert!(
+            document["syncChanges"]
+                .as_array()
+                .expect("sync log")
+                .iter()
+                .any(|change| change["entityType"] == "subscription")
+        );
         let _ = std::fs::remove_file(path);
     }
 

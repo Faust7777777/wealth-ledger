@@ -72,6 +72,7 @@ SyncEntityType =
   | "holding"
   | "movement"
   | "dca_plan"
+  | "subscription"
   | "category"
   | "counterparty"
   | "quote"

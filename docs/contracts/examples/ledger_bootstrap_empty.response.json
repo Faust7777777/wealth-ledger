@@ -8,11 +8,13 @@
     "accounts": [],
     "categories": [],
     "counterparties": [],
+    "subscriptions": [],
     "capabilities": {
       "dataSourceMode": "dev_empty",
       "canWriteConfirmedLedger": false,
       "canCreateAccount": false,
       "canRecordMovement": false,
+      "canManageSubscriptions": false,
       "canConfirmProposal": true,
       "canPersistPendingProposal": true,
       "proposalPersistence": "memory",

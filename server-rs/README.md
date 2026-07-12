@@ -208,10 +208,11 @@ removes it afterwards:
 python tools\local_ledger_smoke.py
 ```
 
-It verifies persistent account-create replay, account update, manual movement confirmation, DCA
-record-executed confirmation, CSV/image proposal creation, AI approval, snapshot
-creation, derived overview/allocation values, forbidden broker endpoints, and
-on-disk persistence.
+It verifies persistent account-create replay, account update, manual movement
+confirmation, DCA record-executed confirmation, a foreign-currency subscription
+charge proposal and confirmation, CSV/image proposal creation, AI approval,
+snapshot creation, derived overview/allocation values, forbidden broker
+endpoints, and on-disk persistence.
 
 ## Checks
 

@@ -6,7 +6,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{
+    Date, Duration, Month, OffsetDateTime,
+    format_description::well_known::{Iso8601, Rfc3339},
+};
 
 pub const LEDGER_VERSION: i64 = 1;
 pub const DEFAULT_BASE_CURRENCY: &str = "CNY";
@@ -74,6 +77,7 @@ pub fn empty_document(base_currency: &str) -> Value {
         "movementEntries": [],
         "dcaPlans": [],
         "dcaReminders": [],
+        "subscriptions": [],
         "categories": [],
         "counterparties": [],
         "quotes": [],
@@ -132,6 +136,9 @@ fn normalize_document_for_read(document: &mut Value) {
     let Some(object) = document.as_object_mut() else {
         return;
     };
+    object
+        .entry("subscriptions".to_string())
+        .or_insert_with(|| json!([]));
     object
         .entry("syncChanges".to_string())
         .or_insert_with(|| json!([]));
@@ -1133,6 +1140,7 @@ pub fn confirm_atomic_group(
                 append_sync_change(document, "movement", &movement_id, operation, &payload, now);
             }
             mark_dca_reminders_recorded_for_movements(document, &candidate_movements, now);
+            mark_subscriptions_charged_for_movements(document, &candidate_movements, now)?;
         }
 
         Ok(json!({
@@ -1156,7 +1164,20 @@ pub fn reject_atomic_group(
             return Ok(Value::Null);
         }
 
-        let mut found = false;
+        let candidate_movements = document["movements"]
+            .as_array()
+            .expect("validated local ledger movements should be an array")
+            .iter()
+            .filter(|movement| {
+                movement.get("atomicGroupId").and_then(Value::as_str) == Some(atomic_group_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if candidate_movements.is_empty() {
+            return Err(LedgerError::NotFound(format!(
+                "atomic group does not exist: {atomic_group_id}"
+            )));
+        }
         let movements = document["movements"]
             .as_array_mut()
             .expect("validated local ledger movements should be an array");
@@ -1164,7 +1185,6 @@ pub fn reject_atomic_group(
         for movement in movements.iter_mut().filter(|movement| {
             movement.get("atomicGroupId").and_then(Value::as_str) == Some(atomic_group_id)
         }) {
-            found = true;
             match movement.get("status").and_then(Value::as_str) {
                 Some("draft" | "pending_review") => {
                     movement["status"] = json!("cancelled");
@@ -1184,11 +1204,7 @@ pub fn reject_atomic_group(
             }
         }
 
-        if !found {
-            return Err(LedgerError::NotFound(format!(
-                "atomic group does not exist: {atomic_group_id}"
-            )));
-        }
+        clear_rejected_subscription_charge_proposals(document, &candidate_movements, now);
 
         Ok(Value::Null)
     })
@@ -1478,6 +1494,311 @@ pub fn mark_dca_executed_as_proposal(
                 "severity": "info"
             }
         ]);
+        Ok(group)
+    })
+}
+
+pub fn list_subscriptions(path: &Path) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    let mut items = document["subscriptions"]
+        .as_array()
+        .expect("validated local ledger subscriptions should be an array")
+        .clone();
+    items.sort_by(|left, right| {
+        left.get("nextChargeDate")
+            .and_then(Value::as_str)
+            .unwrap_or("9999-12-31")
+            .cmp(
+                right
+                    .get("nextChargeDate")
+                    .and_then(Value::as_str)
+                    .unwrap_or("9999-12-31"),
+            )
+            .then_with(|| {
+                left.get("displayName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(
+                        right
+                            .get("displayName")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+            })
+    });
+    Ok(json!(items))
+}
+
+pub fn get_subscription(path: &Path, subscription_id: &str) -> io::Result<Option<Value>> {
+    let document = load_or_initialize(path)?;
+    Ok(document["subscriptions"]
+        .as_array()
+        .expect("validated local ledger subscriptions should be an array")
+        .iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(subscription_id))
+        .cloned())
+}
+
+pub fn list_upcoming_subscriptions(path: &Path, through_date: &str) -> io::Result<Value> {
+    let document = load_or_initialize(path)?;
+    let items = document["subscriptions"]
+        .as_array()
+        .expect("validated local ledger subscriptions should be an array")
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("status").and_then(Value::as_str),
+                Some("trial" | "active")
+            ) && item
+                .get("nextChargeDate")
+                .and_then(Value::as_str)
+                .is_some_and(|date| date <= through_date)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(json!(items))
+}
+
+pub fn create_subscription(
+    path: &Path,
+    input: Value,
+    subscription_id: &str,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 201, |document| {
+        let subscription = subscription_from_create_input(document, &input, subscription_id, now)?;
+        document["subscriptions"]
+            .as_array_mut()
+            .expect("validated local ledger subscriptions should be an array")
+            .push(subscription.clone());
+        append_sync_change(
+            document,
+            "subscription",
+            subscription_id,
+            "create",
+            &subscription,
+            now,
+        );
+        Ok(subscription)
+    })
+}
+
+pub fn update_subscription(
+    path: &Path,
+    subscription_id: &str,
+    patch: Value,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        validate_subscription_payment_account_patch(document, &patch)?;
+        let updated = {
+            let subscription =
+                find_subscription_mut(document, subscription_id).ok_or_else(|| {
+                    LedgerError::NotFound(format!("subscription does not exist: {subscription_id}"))
+                })?;
+            apply_subscription_patch(subscription, &patch, now)?;
+            subscription.clone()
+        };
+        append_sync_change(
+            document,
+            "subscription",
+            subscription_id,
+            "update",
+            &updated,
+            now,
+        );
+        Ok(updated)
+    })
+}
+
+pub fn cancel_subscription(
+    path: &Path,
+    subscription_id: &str,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let cancelled = {
+            let subscription =
+                find_subscription_mut(document, subscription_id).ok_or_else(|| {
+                    LedgerError::NotFound(format!("subscription does not exist: {subscription_id}"))
+                })?;
+            if subscription
+                .get("pendingChargeMovementId")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                return Err(LedgerError::Conflict(
+                    "reject the pending subscription charge proposal before cancellation"
+                        .to_string(),
+                ));
+            }
+            match subscription.get("status").and_then(Value::as_str) {
+                Some("cancelled") => {}
+                Some("expired") => {
+                    return Err(LedgerError::Conflict(
+                        "expired subscription cannot be cancelled".to_string(),
+                    ));
+                }
+                Some(_) => {
+                    subscription["status"] = json!("cancelled");
+                    subscription["cancelledAt"] = json!(now);
+                    subscription["autoRenew"] = json!(false);
+                    subscription["nextChargeDate"] = Value::Null;
+                    subscription["updatedAt"] = json!(now);
+                }
+                None => {
+                    return Err(LedgerError::InvalidInput(vec![
+                        "subscription.status is missing".to_string(),
+                    ]));
+                }
+            }
+            subscription.clone()
+        };
+        append_sync_change(
+            document,
+            "subscription",
+            subscription_id,
+            "update",
+            &cancelled,
+            now,
+        );
+        Ok(cancelled)
+    })
+}
+
+pub fn create_subscription_charge_proposal(
+    path: &Path,
+    subscription_id: &str,
+    movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 201, |document| {
+        let subscription = document["subscriptions"]
+            .as_array()
+            .expect("validated local ledger subscriptions should be an array")
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(subscription_id))
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("subscription does not exist: {subscription_id}"))
+            })?;
+        if !matches!(
+            subscription.get("status").and_then(Value::as_str),
+            Some("trial" | "active")
+        ) {
+            return Err(LedgerError::Conflict(
+                "subscription must be trial or active to generate a charge".to_string(),
+            ));
+        }
+        if subscription
+            .get("pendingChargeMovementId")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            return Err(LedgerError::Conflict(
+                "subscription already has a pending charge proposal".to_string(),
+            ));
+        }
+        let charge_date = subscription
+            .get("nextChargeDate")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::Conflict("subscription has no next charge date".to_string())
+            })?;
+        let payment_account_id = subscription
+            .get("paymentAccountId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![
+                    "subscription.paymentAccountId is missing".to_string(),
+                ])
+            })?;
+        if !active_account_exists(document, payment_account_id) {
+            return Err(LedgerError::NotFound(format!(
+                "subscription payment account does not exist or is archived: {payment_account_id}"
+            )));
+        }
+        let amount = subscription
+            .get("amount")
+            .and_then(|money| money.get("amount"))
+            .and_then(Value::as_str)
+            .expect("validated subscription amount should exist");
+        let currency = subscription
+            .get("amount")
+            .and_then(|money| money.get("currency"))
+            .and_then(Value::as_str)
+            .expect("validated subscription currency should exist");
+        let display_name = subscription
+            .get("displayName")
+            .and_then(Value::as_str)
+            .expect("validated subscription displayName should exist");
+        let provider = subscription
+            .get("provider")
+            .and_then(Value::as_str)
+            .expect("validated subscription provider should exist");
+        let mut movement = movement_from_create_input(
+            document,
+            &json!({
+                "type": "expense",
+                "occurredAt": format!("{charge_date}T00:00:00Z"),
+                "title": format!("{display_name} 订阅扣款"),
+                "description": format!("{provider} 订阅的待确认计划扣款；确认前不影响正式账本。"),
+                "entries": [{
+                    "accountId": payment_account_id,
+                    "amount": amount,
+                    "currency": currency,
+                    "direction": "out",
+                    "role": "source"
+                }],
+                "tags": ["subscription"]
+            }),
+            movement_id,
+            atomic_group_id,
+            now,
+        )?;
+        movement["status"] = json!("pending_review");
+        movement["subscriptionId"] = json!(subscription_id);
+        movement["scheduledChargeDate"] = json!(charge_date);
+        movement["source"] = json!({
+            "kind": "system",
+            "sourceId": subscription_id,
+            "createdBy": "system"
+        });
+
+        document["movements"]
+            .as_array_mut()
+            .expect("validated local ledger movements should be an array")
+            .push(movement.clone());
+        if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
+            let movement_entries = document["movementEntries"]
+                .as_array_mut()
+                .expect("validated local ledger movementEntries should be an array");
+            for entry in entries {
+                let mut indexed_entry = entry.clone();
+                indexed_entry["movementId"] = json!(movement_id);
+                indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+                movement_entries.push(indexed_entry);
+            }
+        }
+        let subscription_mut = find_subscription_mut(document, subscription_id)
+            .expect("subscription should still exist");
+        subscription_mut["pendingChargeMovementId"] = json!(movement_id);
+        subscription_mut["pendingChargeDate"] = json!(charge_date);
+        subscription_mut["updatedAt"] = json!(now);
+
+        let mut group = atomic_group_from_movement(&movement, "pending");
+        group["subscriptionId"] = json!(subscription_id);
+        group["scheduledChargeDate"] = json!(charge_date);
+        group["warnings"] = json!([{
+            "code": "subscription_charge_requires_confirmation",
+            "message": "该订阅扣款只是候选；用户确认后才写入正式账本。",
+            "severity": "info"
+        }]);
         Ok(group)
     })
 }
@@ -1962,6 +2283,7 @@ pub fn validate_document(document: &Value) -> Result<(), Vec<String>> {
         "movementEntries",
         "dcaPlans",
         "dcaReminders",
+        "subscriptions",
         "categories",
         "counterparties",
         "quotes",
@@ -1989,6 +2311,11 @@ pub fn validate_document(document: &Value) -> Result<(), Vec<String>> {
     }
 
     validate_accounts(object.get("accounts"), &mut errors);
+    validate_subscriptions(
+        object.get("subscriptions"),
+        object.get("accounts"),
+        &mut errors,
+    );
 
     if errors.is_empty() {
         Ok(())
@@ -2122,6 +2449,210 @@ fn validate_accounts(accounts: Option<&Value>, errors: &mut Vec<String>) {
     }
 }
 
+fn validate_subscriptions(
+    subscriptions: Option<&Value>,
+    accounts: Option<&Value>,
+    errors: &mut Vec<String>,
+) {
+    let Some(subscriptions) = subscriptions.and_then(Value::as_array) else {
+        return;
+    };
+    let account_ids = accounts
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(Value::as_str))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut ids = BTreeSet::new();
+
+    for (index, subscription) in subscriptions.iter().enumerate() {
+        let path = format!("subscriptions[{index}]");
+        let Some(object) = subscription.as_object() else {
+            errors.push(format!("{path} must be an object"));
+            continue;
+        };
+        for key in ["id", "displayName", "provider", "paymentAccountId"] {
+            if object
+                .get(key)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                errors.push(format!("{path}.{key} must be a non-empty string"));
+            }
+        }
+        if let Some(id) = object.get("id").and_then(Value::as_str)
+            && !ids.insert(id)
+        {
+            errors.push(format!("duplicate subscription id: {id}"));
+        }
+        if let Some(account_id) = object.get("paymentAccountId").and_then(Value::as_str)
+            && !account_ids.contains(account_id)
+        {
+            errors.push(format!("{path}.paymentAccountId must reference an account"));
+        }
+        match object.get("amount").and_then(Value::as_object) {
+            Some(amount) => {
+                if amount
+                    .get("amount")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| !is_positive_decimal_string(value))
+                {
+                    errors.push(format!(
+                        "{path}.amount.amount must be a positive decimal string"
+                    ));
+                }
+                if amount
+                    .get("currency")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    errors.push(format!("{path}.amount.currency must be non-empty"));
+                }
+            }
+            None => errors.push(format!("{path}.amount must be an object")),
+        }
+        validate_subscription_cycle(object.get("billingCycle"), &path, errors);
+        validate_subscription_duration(object.get("duration"), &path, errors);
+        let start = validate_iso_date_field(object.get("startDate"), &path, "startDate", errors);
+        let end = match object.get("endDate") {
+            None | Some(Value::Null) => None,
+            value => validate_iso_date_field(value, &path, "endDate", errors),
+        };
+        let next = match object.get("nextChargeDate") {
+            None | Some(Value::Null) => None,
+            value => validate_iso_date_field(value, &path, "nextChargeDate", errors),
+        };
+        if let (Some(start), Some(end)) = (start, end)
+            && end < start
+        {
+            errors.push(format!("{path}.endDate must be on or after startDate"));
+        }
+        if let (Some(start), Some(next)) = (start, next)
+            && next < start
+        {
+            errors.push(format!(
+                "{path}.nextChargeDate must be on or after startDate"
+            ));
+        }
+        let status = object.get("status").and_then(Value::as_str);
+        if !matches!(
+            status,
+            Some("trial" | "active" | "paused" | "cancelled" | "expired")
+        ) {
+            errors.push(format!("{path}.status is invalid"));
+        }
+        if matches!(status, Some("trial" | "active")) && next.is_none() {
+            errors.push(format!(
+                "{path}.nextChargeDate is required while trial or active"
+            ));
+        }
+        if matches!(status, Some("cancelled" | "expired")) && next.is_some() {
+            errors.push(format!(
+                "{path}.nextChargeDate must be null while cancelled or expired"
+            ));
+        }
+        if object.get("autoRenew").and_then(Value::as_bool).is_none() {
+            errors.push(format!("{path}.autoRenew must be a boolean"));
+        }
+        if !matches!(
+            object.get("billingAnchorDay").and_then(Value::as_u64),
+            Some(1..=31)
+        ) {
+            errors.push(format!(
+                "{path}.billingAnchorDay must be an integer from 1 to 31"
+            ));
+        }
+        if !matches!(
+            object.get("reminderDaysBefore").and_then(Value::as_u64),
+            Some(0..=365)
+        ) {
+            errors.push(format!(
+                "{path}.reminderDaysBefore must be an integer from 0 to 365"
+            ));
+        }
+        let pending_movement = object
+            .get("pendingChargeMovementId")
+            .and_then(Value::as_str);
+        let pending_date = object.get("pendingChargeDate").and_then(Value::as_str);
+        if pending_movement.is_some() != pending_date.is_some() {
+            errors.push(format!(
+                "{path}.pendingChargeMovementId and pendingChargeDate must appear together"
+            ));
+        }
+        if let Some(date) = pending_date
+            && Date::parse(date, &Iso8601::DATE).is_err()
+        {
+            errors.push(format!("{path}.pendingChargeDate must be an ISO date"));
+        }
+    }
+}
+
+fn validate_subscription_cycle(value: Option<&Value>, path: &str, errors: &mut Vec<String>) {
+    let Some(cycle) = value.and_then(Value::as_object) else {
+        errors.push(format!("{path}.billingCycle must be an object"));
+        return;
+    };
+    if !matches!(
+        cycle.get("unit").and_then(Value::as_str),
+        Some("day" | "week" | "month" | "year")
+    ) {
+        errors.push(format!("{path}.billingCycle.unit is invalid"));
+    }
+    if !matches!(cycle.get("interval").and_then(Value::as_u64), Some(1..=365)) {
+        errors.push(format!(
+            "{path}.billingCycle.interval must be an integer from 1 to 365"
+        ));
+    }
+}
+
+fn validate_subscription_duration(value: Option<&Value>, path: &str, errors: &mut Vec<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    let Some(duration) = value.as_object() else {
+        errors.push(format!("{path}.duration must be an object"));
+        return;
+    };
+    if !matches!(
+        duration.get("unit").and_then(Value::as_str),
+        Some("day" | "month" | "year")
+    ) {
+        errors.push(format!("{path}.duration.unit is invalid"));
+    }
+    if !matches!(
+        duration.get("count").and_then(Value::as_u64),
+        Some(1..=1200)
+    ) {
+        errors.push(format!(
+            "{path}.duration.count must be an integer from 1 to 1200"
+        ));
+    }
+}
+
+fn validate_iso_date_field(
+    value: Option<&Value>,
+    path: &str,
+    key: &str,
+    errors: &mut Vec<String>,
+) -> Option<Date> {
+    match value.and_then(Value::as_str) {
+        Some(value) => match Date::parse(value, &Iso8601::DATE) {
+            Ok(date) => Some(date),
+            Err(_) => {
+                errors.push(format!("{path}.{key} must be an ISO date"));
+                None
+            }
+        },
+        None => {
+            errors.push(format!("{path}.{key} must be an ISO date"));
+            None
+        }
+    }
+}
+
 fn validate_sync_state_and_changes(
     sync_state: Option<&Value>,
     sync_changes: Option<&Value>,
@@ -2162,6 +2693,7 @@ fn validate_sync_state_and_changes(
         "holding",
         "movement",
         "dca_plan",
+        "subscription",
         "category",
         "counterparty",
         "quote",
@@ -3115,6 +3647,7 @@ fn sync_change_from_push_input(
             "holding",
             "movement",
             "dca_plan",
+            "subscription",
             "category",
             "counterparty",
             "quote",
@@ -5161,6 +5694,474 @@ fn required_string(
     }
 }
 
+fn subscription_from_create_input(
+    document: &Value,
+    input: &Value,
+    subscription_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "subscription input must be a JSON object".to_string(),
+        ]));
+    };
+    let mut errors = Vec::new();
+    let display_name = required_string(object, "displayName", &mut errors);
+    let provider = required_string(object, "provider", &mut errors);
+    let plan_name = optional_string(object, "planName", &mut errors);
+    let payment_account_id = required_string(object, "paymentAccountId", &mut errors);
+    let amount = normalized_subscription_amount(object.get("amount"), &mut errors);
+    let billing_cycle = normalized_subscription_cycle(object.get("billingCycle"), &mut errors);
+    let start_date =
+        normalized_subscription_date(object.get("startDate"), "startDate", &mut errors);
+    let next_charge_date = match object.get("nextChargeDate") {
+        None => start_date,
+        value => normalized_subscription_date(value, "nextChargeDate", &mut errors),
+    };
+    let duration = normalized_subscription_duration(object.get("duration"), &mut errors);
+    let supplied_end_date = match object.get("endDate") {
+        None | Some(Value::Null) => None,
+        value => normalized_subscription_date(value, "endDate", &mut errors),
+    };
+    if duration.is_some() && supplied_end_date.is_some() {
+        errors.push("duration and endDate are mutually exclusive".to_string());
+    }
+    let status = match object.get("status") {
+        None => Some("active".to_string()),
+        Some(Value::String(value)) if matches!(value.as_str(), "trial" | "active" | "paused") => {
+            Some(value.clone())
+        }
+        _ => {
+            errors.push("status must be trial, active, or paused on create".to_string());
+            None
+        }
+    };
+    let auto_renew = match object.get("autoRenew") {
+        None => Some(true),
+        Some(Value::Bool(value)) => Some(*value),
+        _ => {
+            errors.push("autoRenew must be a boolean".to_string());
+            None
+        }
+    };
+    let reminder_days_before = match object.get("reminderDaysBefore") {
+        None => Some(3_u64),
+        Some(value) => match value.as_u64() {
+            Some(value @ 0..=365) => Some(value),
+            _ => {
+                errors.push("reminderDaysBefore must be an integer from 0 to 365".to_string());
+                None
+            }
+        },
+    };
+    let note = optional_string(object, "note", &mut errors);
+
+    if let Some(account_id) = payment_account_id.as_deref()
+        && !active_account_exists(document, account_id)
+    {
+        errors.push("paymentAccountId does not exist or is archived".to_string());
+    }
+    if let (Some(start), Some(next)) = (start_date, next_charge_date)
+        && next < start
+    {
+        errors.push("nextChargeDate must be on or after startDate".to_string());
+    }
+    let computed_end_date = match (start_date, duration.as_ref()) {
+        (Some(start), Some(duration)) => {
+            subscription_duration_end_date(start, duration, &mut errors)
+        }
+        _ => supplied_end_date,
+    };
+    if let (Some(start), Some(end)) = (start_date, computed_end_date)
+        && end < start
+    {
+        errors.push("endDate must be on or after startDate".to_string());
+    }
+    if let (Some(next), Some(end)) = (next_charge_date, computed_end_date)
+        && next > end
+    {
+        errors.push("nextChargeDate must not be after endDate".to_string());
+    }
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    let mut subscription = json!({
+        "id": subscription_id,
+        "displayName": display_name.expect("validated displayName"),
+        "provider": provider.expect("validated provider"),
+        "amount": amount.expect("validated amount"),
+        "paymentAccountId": payment_account_id.expect("validated paymentAccountId"),
+        "billingCycle": billing_cycle.expect("validated billingCycle"),
+        "billingAnchorDay": start_date.expect("validated startDate").day(),
+        "startDate": start_date.expect("validated startDate").to_string(),
+        "endDate": computed_end_date.map(|date| date.to_string()),
+        "nextChargeDate": next_charge_date.expect("validated nextChargeDate").to_string(),
+        "autoRenew": auto_renew.expect("validated autoRenew"),
+        "reminderDaysBefore": reminder_days_before.expect("validated reminderDaysBefore"),
+        "status": status.expect("validated status"),
+        "createdAt": now,
+        "updatedAt": now
+    });
+    if let Some(plan_name) = plan_name {
+        subscription["planName"] = json!(plan_name);
+    }
+    if let Some(duration) = duration {
+        subscription["duration"] = duration;
+    }
+    if let Some(note) = note {
+        subscription["note"] = json!(note);
+    }
+    Ok(subscription)
+}
+
+fn validate_subscription_payment_account_patch(
+    document: &Value,
+    patch: &Value,
+) -> Result<(), LedgerError> {
+    let Some(object) = patch.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "subscription patch must be a JSON object".to_string(),
+        ]));
+    };
+    if let Some(value) = object.get("paymentAccountId") {
+        let Some(account_id) = value.as_str().filter(|value| !value.is_empty()) else {
+            return Err(LedgerError::InvalidInput(vec![
+                "paymentAccountId must be a non-empty string".to_string(),
+            ]));
+        };
+        if !active_account_exists(document, account_id) {
+            return Err(LedgerError::InvalidInput(vec![
+                "paymentAccountId does not exist or is archived".to_string(),
+            ]));
+        }
+    }
+    Ok(())
+}
+
+fn apply_subscription_patch(
+    subscription: &mut Value,
+    patch: &Value,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let object = patch
+        .as_object()
+        .expect("subscription patch object validated before mutation");
+    let allowed = [
+        "displayName",
+        "provider",
+        "planName",
+        "amount",
+        "paymentAccountId",
+        "billingCycle",
+        "startDate",
+        "duration",
+        "endDate",
+        "nextChargeDate",
+        "autoRenew",
+        "reminderDaysBefore",
+        "status",
+        "note",
+    ];
+    let unknown = object
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(LedgerError::InvalidInput(vec![format!(
+            "unsupported subscription patch fields: {}",
+            unknown.join(", ")
+        )]));
+    }
+    if object.contains_key("duration") && object.contains_key("endDate") {
+        return Err(LedgerError::InvalidInput(vec![
+            "duration and endDate are mutually exclusive".to_string(),
+        ]));
+    }
+
+    let mut candidate = subscription.clone();
+    for key in ["displayName", "provider", "paymentAccountId"] {
+        if let Some(value) = object.get(key) {
+            candidate[key] = value.clone();
+        }
+    }
+    for key in ["planName", "note"] {
+        if let Some(value) = object.get(key) {
+            if value.is_null() {
+                candidate
+                    .as_object_mut()
+                    .expect("subscription should be an object")
+                    .remove(key);
+            } else {
+                candidate[key] = value.clone();
+            }
+        }
+    }
+    for key in [
+        "amount",
+        "billingCycle",
+        "startDate",
+        "nextChargeDate",
+        "autoRenew",
+        "reminderDaysBefore",
+    ] {
+        if let Some(value) = object.get(key) {
+            candidate[key] = value.clone();
+        }
+    }
+    if object.contains_key("startDate") {
+        let mut date_errors = Vec::new();
+        if let Some(start) =
+            normalized_subscription_date(candidate.get("startDate"), "startDate", &mut date_errors)
+        {
+            candidate["billingAnchorDay"] = json!(start.day());
+        }
+        if !date_errors.is_empty() {
+            return Err(LedgerError::InvalidInput(date_errors));
+        }
+    }
+    if let Some(value) = object.get("status") {
+        if !matches!(value.as_str(), Some("trial" | "active" | "paused")) {
+            return Err(LedgerError::InvalidInput(vec![
+                "status patch must be trial, active, or paused; use cancel endpoint to cancel"
+                    .to_string(),
+            ]));
+        }
+        candidate["status"] = value.clone();
+    }
+    if let Some(value) = object.get("duration") {
+        if value.is_null() {
+            candidate
+                .as_object_mut()
+                .expect("subscription should be an object")
+                .remove("duration");
+            candidate["endDate"] = Value::Null;
+        } else {
+            let mut errors = Vec::new();
+            let duration = normalized_subscription_duration(Some(value), &mut errors);
+            let start =
+                normalized_subscription_date(candidate.get("startDate"), "startDate", &mut errors);
+            let end = match (start, duration.as_ref()) {
+                (Some(start), Some(duration)) => {
+                    subscription_duration_end_date(start, duration, &mut errors)
+                }
+                _ => None,
+            };
+            if !errors.is_empty() {
+                return Err(LedgerError::InvalidInput(errors));
+            }
+            candidate["duration"] = duration.expect("validated duration");
+            candidate["endDate"] = json!(end.expect("validated end date").to_string());
+        }
+    } else if let Some(value) = object.get("endDate") {
+        candidate
+            .as_object_mut()
+            .expect("subscription should be an object")
+            .remove("duration");
+        candidate["endDate"] = value.clone();
+    } else if object.contains_key("startDate")
+        && let Some(duration) = candidate.get("duration").cloned()
+    {
+        let mut errors = Vec::new();
+        let start =
+            normalized_subscription_date(candidate.get("startDate"), "startDate", &mut errors);
+        let end =
+            start.and_then(|start| subscription_duration_end_date(start, &duration, &mut errors));
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
+        candidate["endDate"] = json!(end.expect("validated end date").to_string());
+    }
+
+    candidate["updatedAt"] = json!(now);
+    let payment_id = candidate
+        .get("paymentAccountId")
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
+    let fake_accounts = json!([{ "id": payment_id }]);
+    let candidate_array = json!([candidate.clone()]);
+    let mut errors = Vec::new();
+    validate_subscriptions(Some(&candidate_array), Some(&fake_accounts), &mut errors);
+    if let (Some(next), Some(end)) = (
+        candidate
+            .get("nextChargeDate")
+            .and_then(Value::as_str)
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok()),
+        candidate
+            .get("endDate")
+            .and_then(Value::as_str)
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok()),
+    ) && next > end
+    {
+        errors.push("nextChargeDate must not be after endDate".to_string());
+    }
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+    *subscription = candidate;
+    Ok(())
+}
+
+fn normalized_subscription_amount(
+    value: Option<&Value>,
+    errors: &mut Vec<String>,
+) -> Option<Value> {
+    let money = normalized_required_money(value, "amount", errors)?;
+    if money
+        .get("amount")
+        .and_then(Value::as_str)
+        .is_none_or(|amount| !is_positive_decimal_string(amount))
+    {
+        errors.push("amount.amount must be a positive decimal string".to_string());
+        return None;
+    }
+    Some(money)
+}
+
+fn normalized_subscription_cycle(value: Option<&Value>, errors: &mut Vec<String>) -> Option<Value> {
+    let Some(object) = value.and_then(Value::as_object) else {
+        errors.push("billingCycle must be an object".to_string());
+        return None;
+    };
+    let unit = match object.get("unit").and_then(Value::as_str) {
+        Some(value @ ("day" | "week" | "month" | "year")) => Some(value),
+        _ => {
+            errors.push("billingCycle.unit must be day, week, month, or year".to_string());
+            None
+        }
+    };
+    let interval = match object.get("interval").and_then(Value::as_u64) {
+        Some(value @ 1..=365) => Some(value),
+        _ => {
+            errors.push("billingCycle.interval must be an integer from 1 to 365".to_string());
+            None
+        }
+    };
+    match (unit, interval) {
+        (Some(unit), Some(interval)) => Some(json!({"unit": unit, "interval": interval})),
+        _ => None,
+    }
+}
+
+fn normalized_subscription_duration(
+    value: Option<&Value>,
+    errors: &mut Vec<String>,
+) -> Option<Value> {
+    let value = value?;
+    let Some(object) = value.as_object() else {
+        errors.push("duration must be an object".to_string());
+        return None;
+    };
+    let unit = match object.get("unit").and_then(Value::as_str) {
+        Some(value @ ("day" | "month" | "year")) => Some(value),
+        _ => {
+            errors.push("duration.unit must be day, month, or year".to_string());
+            None
+        }
+    };
+    let count = match object.get("count").and_then(Value::as_u64) {
+        Some(value @ 1..=1200) => Some(value),
+        _ => {
+            errors.push("duration.count must be an integer from 1 to 1200".to_string());
+            None
+        }
+    };
+    match (unit, count) {
+        (Some(unit), Some(count)) => Some(json!({"unit": unit, "count": count})),
+        _ => None,
+    }
+}
+
+fn normalized_subscription_date(
+    value: Option<&Value>,
+    label: &str,
+    errors: &mut Vec<String>,
+) -> Option<Date> {
+    match value.and_then(Value::as_str) {
+        Some(value) => match Date::parse(value, &Iso8601::DATE) {
+            Ok(date) => Some(date),
+            Err(_) => {
+                errors.push(format!("{label} must be an ISO date in YYYY-MM-DD format"));
+                None
+            }
+        },
+        None => {
+            errors.push(format!("{label} is required"));
+            None
+        }
+    }
+}
+
+fn subscription_duration_end_date(
+    start: Date,
+    duration: &Value,
+    errors: &mut Vec<String>,
+) -> Option<Date> {
+    let unit = duration.get("unit").and_then(Value::as_str)?;
+    let count = duration.get("count").and_then(Value::as_u64)?;
+    let exclusive_end = advance_subscription_date(start, unit, count).or_else(|| {
+        errors.push("duration exceeds supported calendar range".to_string());
+        None
+    })?;
+    exclusive_end.checked_sub(Duration::days(1)).or_else(|| {
+        errors.push("duration end date is out of range".to_string());
+        None
+    })
+}
+
+fn advance_subscription_date(date: Date, unit: &str, count: u64) -> Option<Date> {
+    match unit {
+        "day" => date.checked_add(Duration::days(i64::try_from(count).ok()?)),
+        "week" => date.checked_add(Duration::weeks(i64::try_from(count).ok()?)),
+        "month" => add_calendar_months(date, i32::try_from(count).ok()?),
+        "year" => add_calendar_months(date, i32::try_from(count.checked_mul(12)?).ok()?),
+        _ => None,
+    }
+}
+
+fn advance_subscription_billing_date(
+    date: Date,
+    unit: &str,
+    count: u64,
+    anchor_day: u8,
+) -> Option<Date> {
+    match unit {
+        "month" => add_calendar_months_with_anchor(date, i32::try_from(count).ok()?, anchor_day),
+        "year" => add_calendar_months_with_anchor(
+            date,
+            i32::try_from(count.checked_mul(12)?).ok()?,
+            anchor_day,
+        ),
+        _ => advance_subscription_date(date, unit, count),
+    }
+}
+
+fn add_calendar_months(date: Date, months: i32) -> Option<Date> {
+    add_calendar_months_with_anchor(date, months, date.day())
+}
+
+fn add_calendar_months_with_anchor(date: Date, months: i32, anchor_day: u8) -> Option<Date> {
+    let month_index = date.year().checked_mul(12)? + i32::from(u8::from(date.month())) - 1;
+    let next_index = month_index.checked_add(months)?;
+    let year = next_index.div_euclid(12);
+    let month_number = u8::try_from(next_index.rem_euclid(12) + 1).ok()?;
+    let month = Month::try_from(month_number).ok()?;
+    let day = anchor_day.min(month.length(year));
+    Date::from_calendar_date(year, month, day).ok()
+}
+
+fn find_subscription_mut<'a>(
+    document: &'a mut Value,
+    subscription_id: &str,
+) -> Option<&'a mut Value> {
+    document["subscriptions"]
+        .as_array_mut()
+        .expect("validated local ledger subscriptions should be an array")
+        .iter_mut()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(subscription_id))
+}
+
 fn optional_string(
     object: &serde_json::Map<String, Value>,
     key: &str,
@@ -5759,6 +6760,143 @@ fn mark_dca_reminders_recorded_for_movements(document: &mut Value, movements: &[
     {
         plan["lastActionAt"] = json!(now);
         plan["updatedAt"] = json!(now);
+    }
+}
+
+fn mark_subscriptions_charged_for_movements(
+    document: &mut Value,
+    movements: &[Value],
+    now: &str,
+) -> Result<(), LedgerError> {
+    let charges = movements
+        .iter()
+        .filter_map(|movement| {
+            Some((
+                movement.get("subscriptionId")?.as_str()?.to_string(),
+                movement.get("id")?.as_str()?.to_string(),
+                movement.get("scheduledChargeDate")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    for (subscription_id, movement_id, charge_date) in charges {
+        let updated = {
+            let subscription =
+                find_subscription_mut(document, &subscription_id).ok_or_else(|| {
+                    LedgerError::NotFound(format!(
+                        "subscription for confirmed charge does not exist: {subscription_id}"
+                    ))
+                })?;
+            if subscription
+                .get("pendingChargeMovementId")
+                .and_then(Value::as_str)
+                != Some(movement_id.as_str())
+            {
+                return Err(LedgerError::Conflict(format!(
+                    "subscription pending charge does not match movement: {subscription_id}"
+                )));
+            }
+            let charge_date_value = Date::parse(&charge_date, &Iso8601::DATE).map_err(|_| {
+                LedgerError::InvalidInput(vec![
+                    "scheduled subscription charge date is invalid".to_string(),
+                ])
+            })?;
+            let unit = subscription
+                .get("billingCycle")
+                .and_then(|value| value.get("unit"))
+                .and_then(Value::as_str)
+                .expect("validated subscription billingCycle.unit")
+                .to_string();
+            let interval = subscription
+                .get("billingCycle")
+                .and_then(|value| value.get("interval"))
+                .and_then(Value::as_u64)
+                .expect("validated subscription billingCycle.interval");
+            let anchor_day = subscription
+                .get("billingAnchorDay")
+                .and_then(Value::as_u64)
+                .and_then(|value| u8::try_from(value).ok())
+                .expect("validated subscription billingAnchorDay");
+            let next =
+                advance_subscription_billing_date(charge_date_value, &unit, interval, anchor_day)
+                    .ok_or_else(|| {
+                    LedgerError::InvalidInput(vec![
+                        "next subscription charge date exceeds supported calendar range"
+                            .to_string(),
+                    ])
+                })?;
+            let end = subscription
+                .get("endDate")
+                .and_then(Value::as_str)
+                .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+
+            subscription["lastChargeDate"] = json!(charge_date);
+            subscription["lastChargeMovementId"] = json!(movement_id);
+            subscription["updatedAt"] = json!(now);
+            subscription
+                .as_object_mut()
+                .expect("subscription should be an object")
+                .remove("pendingChargeMovementId");
+            subscription
+                .as_object_mut()
+                .expect("subscription should be an object")
+                .remove("pendingChargeDate");
+            if end.is_some_and(|end| next > end) {
+                subscription["nextChargeDate"] = Value::Null;
+                subscription["status"] = json!("expired");
+            } else {
+                subscription["nextChargeDate"] = json!(next.to_string());
+                if subscription.get("status").and_then(Value::as_str) == Some("trial") {
+                    subscription["status"] = json!("active");
+                }
+            }
+            subscription.clone()
+        };
+        append_sync_change(
+            document,
+            "subscription",
+            &subscription_id,
+            "update",
+            &updated,
+            now,
+        );
+    }
+    Ok(())
+}
+
+fn clear_rejected_subscription_charge_proposals(
+    document: &mut Value,
+    movements: &[Value],
+    now: &str,
+) {
+    let charges = movements
+        .iter()
+        .filter_map(|movement| {
+            Some((
+                movement.get("subscriptionId")?.as_str()?.to_string(),
+                movement.get("id")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (subscription_id, movement_id) in charges {
+        let Some(subscription) = find_subscription_mut(document, &subscription_id) else {
+            continue;
+        };
+        if subscription
+            .get("pendingChargeMovementId")
+            .and_then(Value::as_str)
+            == Some(movement_id.as_str())
+        {
+            subscription
+                .as_object_mut()
+                .expect("subscription should be an object")
+                .remove("pendingChargeMovementId");
+            subscription
+                .as_object_mut()
+                .expect("subscription should be an object")
+                .remove("pendingChargeDate");
+            subscription["updatedAt"] = json!(now);
+        }
     }
 }
 
@@ -7180,6 +8318,7 @@ mod tests {
         assert_eq!(document["baseCurrency"], DEFAULT_BASE_CURRENCY);
         assert_eq!(document["accounts"], json!([]));
         assert_eq!(document["movements"], json!([]));
+        assert_eq!(document["subscriptions"], json!([]));
         assert_eq!(document["aiProposals"], json!([]));
     }
 
@@ -7205,6 +8344,10 @@ mod tests {
             .as_object_mut()
             .expect("ledger should be an object")
             .remove("idempotencyState");
+        document
+            .as_object_mut()
+            .expect("ledger should be an object")
+            .remove("subscriptions");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("legacy ledger directory should exist");
         }
@@ -7217,6 +8360,7 @@ mod tests {
         let loaded = read_document(&path).expect("legacy ledger should normalize on read");
         assert_eq!(loaded["idempotencyState"]["version"], 1);
         assert_eq!(loaded["idempotencyState"]["records"], json!({}));
+        assert_eq!(loaded["subscriptions"], json!([]));
 
         let _ = fs::remove_file(path);
     }

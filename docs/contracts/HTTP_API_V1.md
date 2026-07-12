@@ -216,6 +216,28 @@ POST  /v1/dca/reminders/{reminderId}/snooze
 - 不连接券商交易接口。
 - 用户确认前不写 confirmed/effective ledger；确认 atomic group 后才影响余额、持仓、净值和快照。
 
+## 7A. Subscriptions
+
+```http
+GET   /v1/subscriptions
+POST  /v1/subscriptions
+GET   /v1/subscriptions/upcoming?days=30
+GET   /v1/subscriptions/{subscriptionId}
+PATCH /v1/subscriptions/{subscriptionId}
+POST  /v1/subscriptions/{subscriptionId}/cancel
+POST  /v1/subscriptions/{subscriptionId}/charge-proposal
+```
+
+订阅用于管理 ChatGPT Plus、Claude Pro 等周期性服务费用：
+
+- 金额始终保存原币种，不因首页本位币估值而改写原始订阅金额。
+- `billingCycle` 支持日、周、自然月、自然年及正整数间隔。
+- 自然月/年保留最初扣款日作为 `billingAnchorDay`；31 日遇短月取月末，后续月份恢复锚点，不永久漂移到 28 日。
+- 创建时可提供 `duration` 或 `endDate`，二者互斥；不提供表示持续订阅。
+- subscription 计划本身不写支出。`charge-proposal` 只创建 `pending_review` expense，确认 atomic group 后才影响账户余额并推进 `nextChargeDate`；拒绝后允许重新生成同一期候选。
+- 取消不会删除历史 movement，只停止未来计划扣款。
+- 所有写操作必须提供 `Idempotency-Key`。
+
 ## 8. AI Proposals
 
 ```http

@@ -51,6 +51,7 @@ DataSourceMode =
   "movementEntries": [],
   "dcaPlans": [],
   "dcaReminders": [],
+  "subscriptions": [],
   "categories": [],
   "counterparties": [],
   "quotes": [],
@@ -92,11 +93,27 @@ DataSourceMode =
 
 第一次创建 `ledger.json` 时：
 
-- `accounts`、`holdings`、`movements`、`movementEntries`、`dcaPlans`、`aiProposals` 必须为空。
+- `accounts`、`holdings`、`movements`、`movementEntries`、`dcaPlans`、`subscriptions`、`aiProposals` 必须为空。
 - base currency 默认 `CNY`。
 - 不得自动注入示例资产。
 - 不得默认加载 fixture。
 - 首页应显示空状态 CTA：建账户 / 记录基线。
+
+## 3A. 订阅计划
+
+`subscriptions` 保存周期费用计划，不等同于 confirmed movement。旧 v1 账本缺少该字段时读取层补成空数组，不要求手工迁移。
+
+核心字段：
+
+- `amount`：正数 decimal string + 原币种。
+- `billingCycle`：`day|week|month|year` 与正整数 `interval`。
+- `billingAnchorDay`：自然月/年计算锚点，短月只临时落到月末。
+- `startDate`、可选 `duration`/`endDate`、可空 `nextChargeDate`。
+- `paymentAccountId`：必须引用现有账户。
+- `status`：`trial|active|paused|cancelled|expired`。
+- `pendingChargeMovementId` 与 `pendingChargeDate` 必须成对出现。
+
+生成扣款候选时只新增 `pending_review` movement。确认 atomic group 后，订阅才记录 `lastChargeMovementId/lastChargeDate` 并推进下次日期；拒绝候选则清除 pending 引用但保留原计划日期。
 
 ## 4. 写入原则
 

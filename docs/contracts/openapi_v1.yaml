@@ -18,6 +18,7 @@ tags:
   - name: Portfolio
   - name: Movements
   - name: DCA
+  - name: Subscriptions
   - name: AI Proposals
   - name: Quotes
   - name: Instruments
@@ -548,6 +549,132 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DcaReminderResponse"
+
+  /subscriptions:
+    get:
+      tags: [Subscriptions]
+      summary: List account subscriptions ordered by next charge date.
+      responses:
+        "200":
+          description: Subscriptions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionListResponse"
+    post:
+      tags: [Subscriptions]
+      summary: Create a recurring subscription plan; does not write an expense.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSubscriptionRequest"
+      responses:
+        "201":
+          description: Subscription created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionResponse"
+
+  /subscriptions/upcoming:
+    get:
+      tags: [Subscriptions]
+      summary: List active or trial subscriptions due within a future window.
+      parameters:
+        - name: days
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 365
+            default: 30
+      responses:
+        "200":
+          description: Upcoming subscriptions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionListResponse"
+
+  /subscriptions/{subscriptionId}:
+    parameters:
+      - name: subscriptionId
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/ID"
+    get:
+      tags: [Subscriptions]
+      summary: Get one subscription.
+      responses:
+        "200":
+          description: Subscription.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionResponse"
+    patch:
+      tags: [Subscriptions]
+      summary: Update subscription schedule or metadata.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSubscriptionRequest"
+      responses:
+        "200":
+          description: Updated subscription.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionResponse"
+
+  /subscriptions/{subscriptionId}/cancel:
+    post:
+      tags: [Subscriptions]
+      summary: Cancel future renewal without deleting historical charges.
+      parameters:
+        - name: subscriptionId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Cancelled subscription.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionResponse"
+
+  /subscriptions/{subscriptionId}/charge-proposal:
+    post:
+      tags: [Subscriptions]
+      summary: Generate one pending expense proposal for the next scheduled charge.
+      description: The confirmed ledger changes only after the atomic group is confirmed.
+      parameters:
+        - name: subscriptionId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "201":
+          description: Pending subscription charge proposal.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
 
   /ai/proposals/from-text:
     post:
@@ -1954,6 +2081,193 @@ components:
           items:
             $ref: "#/components/schemas/DcaReminder"
 
+    SubscriptionBillingCycle:
+      type: object
+      required: [unit, interval]
+      properties:
+        unit:
+          enum: [day, week, month, year]
+        interval:
+          type: integer
+          minimum: 1
+          maximum: 365
+    SubscriptionDuration:
+      type: object
+      required: [unit, count]
+      properties:
+        unit:
+          enum: [day, month, year]
+        count:
+          type: integer
+          minimum: 1
+          maximum: 1200
+    Subscription:
+      type: object
+      required:
+        - id
+        - displayName
+        - provider
+        - amount
+        - paymentAccountId
+        - billingCycle
+        - billingAnchorDay
+        - startDate
+        - autoRenew
+        - reminderDaysBefore
+        - status
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        displayName:
+          type: string
+        provider:
+          type: string
+        planName:
+          type: string
+        amount:
+          $ref: "#/components/schemas/Money"
+        paymentAccountId:
+          $ref: "#/components/schemas/ID"
+        billingCycle:
+          $ref: "#/components/schemas/SubscriptionBillingCycle"
+        billingAnchorDay:
+          type: integer
+          minimum: 1
+          maximum: 31
+          description: Original calendar day retained across short months.
+        startDate:
+          $ref: "#/components/schemas/ISODate"
+        duration:
+          $ref: "#/components/schemas/SubscriptionDuration"
+        endDate:
+          anyOf:
+            - $ref: "#/components/schemas/ISODate"
+            - type: "null"
+        nextChargeDate:
+          anyOf:
+            - $ref: "#/components/schemas/ISODate"
+            - type: "null"
+        autoRenew:
+          type: boolean
+        reminderDaysBefore:
+          type: integer
+          minimum: 0
+          maximum: 365
+        status:
+          enum: [trial, active, paused, cancelled, expired]
+        pendingChargeMovementId:
+          $ref: "#/components/schemas/ID"
+        pendingChargeDate:
+          $ref: "#/components/schemas/ISODate"
+        lastChargeMovementId:
+          $ref: "#/components/schemas/ID"
+        lastChargeDate:
+          $ref: "#/components/schemas/ISODate"
+        cancelledAt:
+          $ref: "#/components/schemas/ISODateTime"
+        note:
+          type: string
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        updatedAt:
+          $ref: "#/components/schemas/ISODateTime"
+    CreateSubscriptionRequest:
+      type: object
+      required: [displayName, provider, amount, paymentAccountId, billingCycle, startDate]
+      properties:
+        displayName:
+          type: string
+        provider:
+          type: string
+        planName:
+          type: string
+        amount:
+          $ref: "#/components/schemas/Money"
+        paymentAccountId:
+          $ref: "#/components/schemas/ID"
+        billingCycle:
+          $ref: "#/components/schemas/SubscriptionBillingCycle"
+        startDate:
+          $ref: "#/components/schemas/ISODate"
+        duration:
+          $ref: "#/components/schemas/SubscriptionDuration"
+        endDate:
+          $ref: "#/components/schemas/ISODate"
+        nextChargeDate:
+          $ref: "#/components/schemas/ISODate"
+        autoRenew:
+          type: boolean
+          default: true
+        reminderDaysBefore:
+          type: integer
+          minimum: 0
+          maximum: 365
+          default: 3
+        status:
+          enum: [trial, active, paused]
+          default: active
+        note:
+          type: string
+      description: duration and endDate are mutually exclusive.
+    UpdateSubscriptionRequest:
+      type: object
+      minProperties: 1
+      properties:
+        displayName:
+          type: string
+        provider:
+          type: string
+        planName:
+          type: [string, "null"]
+        amount:
+          $ref: "#/components/schemas/Money"
+        paymentAccountId:
+          $ref: "#/components/schemas/ID"
+        billingCycle:
+          $ref: "#/components/schemas/SubscriptionBillingCycle"
+        startDate:
+          $ref: "#/components/schemas/ISODate"
+        duration:
+          anyOf:
+            - $ref: "#/components/schemas/SubscriptionDuration"
+            - type: "null"
+        endDate:
+          anyOf:
+            - $ref: "#/components/schemas/ISODate"
+            - type: "null"
+        nextChargeDate:
+          $ref: "#/components/schemas/ISODate"
+        autoRenew:
+          type: boolean
+        reminderDaysBefore:
+          type: integer
+          minimum: 0
+          maximum: 365
+        status:
+          enum: [trial, active, paused]
+        note:
+          type: [string, "null"]
+    SubscriptionResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/Subscription"
+    SubscriptionListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Subscription"
+
     EvidenceRef:
       type: object
       required: [id, type, label]
@@ -2583,7 +2897,7 @@ components:
           const: true
         data:
           type: object
-          required: [ledgerVersion, syncCursor, baseCurrency, accounts, categories, counterparties, capabilities]
+          required: [ledgerVersion, syncCursor, baseCurrency, accounts, categories, counterparties, subscriptions, capabilities]
           properties:
             ledgerVersion:
               type: integer
@@ -2605,6 +2919,10 @@ components:
               type: array
               items:
                 $ref: "#/components/schemas/Counterparty"
+            subscriptions:
+              type: array
+              items:
+                $ref: "#/components/schemas/Subscription"
             capabilities:
               $ref: "#/components/schemas/LedgerCapabilities"
 
@@ -2615,6 +2933,7 @@ components:
         - canWriteConfirmedLedger
         - canCreateAccount
         - canRecordMovement
+        - canManageSubscriptions
         - canConfirmProposal
         - canPersistPendingProposal
         - proposalPersistence
@@ -2631,6 +2950,8 @@ components:
         canCreateAccount:
           type: boolean
         canRecordMovement:
+          type: boolean
+        canManageSubscriptions:
           type: boolean
         canConfirmProposal:
           type: boolean
@@ -2665,6 +2986,7 @@ components:
             - holding
             - movement
             - dca_plan
+            - subscription
             - category
             - counterparty
             - quote

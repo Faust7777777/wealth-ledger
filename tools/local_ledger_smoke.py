@@ -146,6 +146,7 @@ def create_account(
     amount: str,
     *,
     account_type: str = "bank",
+    currency: str = "CNY",
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     return unwrap_data(
@@ -159,13 +160,13 @@ def create_account(
                 "displayName": name,
                 "institutionName": "local-ledger-smoke",
                 "accountType": account_type,
-                "defaultCurrency": "CNY",
-                "supportedCurrencies": ["CNY"],
+                "defaultCurrency": currency,
+                "supportedCurrencies": [currency],
                 "includeInNetWorth": True,
                 "balanceMode": "cash_balance",
                 "openingBalances": [
                     {
-                        "currency": "CNY",
+                        "currency": currency,
                         "amount": amount,
                         "quality": "exact",
                     }
@@ -309,6 +310,56 @@ def create_image_proposal_without_writing(base: str) -> None:
     assert proposal["status"] == "pending"
 
 
+def create_and_confirm_subscription_charge(base: str, account_id: str) -> dict[str, Any]:
+    subscription = unwrap_data(
+        request_json(
+            base,
+            "/v1/subscriptions",
+            method="POST",
+            expected_status=201,
+            body={
+                "displayName": "ChatGPT Plus smoke",
+                "provider": "OpenAI",
+                "planName": "Plus",
+                "amount": {"amount": "20.00", "currency": "USD"},
+                "paymentAccountId": account_id,
+                "billingCycle": {"unit": "month", "interval": 1},
+                "startDate": "2026-01-31",
+                "duration": {"unit": "month", "count": 3},
+                "autoRenew": False,
+                "reminderDaysBefore": 3,
+            },
+        )
+    )
+    assert subscription["nextChargeDate"] == "2026-01-31"
+
+    upcoming = unwrap_data(request_json(base, "/v1/subscriptions/upcoming?days=365"))
+    assert subscription["id"] in {item["id"] for item in upcoming}
+
+    group = unwrap_data(
+        request_json(
+            base,
+            f"/v1/subscriptions/{subscription['id']}/charge-proposal",
+            method="POST",
+            expected_status=201,
+        )
+    )
+    before = unwrap_data(request_json(base, f"/v1/accounts/{account_id}"))
+    assert before["cashBalances"][0]["amount"] == "100.00"
+
+    confirmed = unwrap_data(
+        request_json(base, f"/v1/atomic-groups/{group['id']}/confirm", method="POST")
+    )
+    assert confirmed["ledgerWrite"] is True
+    after = unwrap_data(request_json(base, f"/v1/accounts/{account_id}"))
+    assert after["cashBalances"][0]["amount"] == "80.00"
+
+    refreshed = unwrap_data(request_json(base, f"/v1/subscriptions/{subscription['id']}"))
+    assert refreshed["nextChargeDate"] == "2026-02-28"
+    assert refreshed.get("pendingChargeMovementId") is None
+    return refreshed
+
+
 def run_smoke(base: str, ledger_path: Path) -> None:
     assert unwrap_data(request_json(base, "/v1/accounts")) == []
 
@@ -405,6 +456,16 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     allocation = unwrap_data(request_json(base, "/v1/portfolio/allocation"))
     assert allocation["netWorth"]["amount"] == "1325.66", allocation
 
+    subscription_account = create_account(
+        base,
+        "Smoke USD Card",
+        "100.00",
+        account_type="virtual_card",
+        currency="USD",
+    )
+    subscription = create_and_confirm_subscription_charge(base, subscription_account["id"])
+    assert subscription["lastChargeDate"] == "2026-01-31"
+
     movements = unwrap_data(request_json(base, "/v1/movements"))
     confirmed_ids = {item["id"] for item in movements if item["status"] == "confirmed"}
     assert expense["id"] in confirmed_ids
@@ -433,7 +494,7 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     )
     assert remote_push["acceptedChangeIds"] == ["smoke_remote_change_000001"]
     assert remote_push["skippedChangeIds"] == []
-    assert len(unwrap_data(request_json(base, "/v1/accounts"))) == 2
+    assert len(unwrap_data(request_json(base, "/v1/accounts"))) == 3
 
     final_sync = unwrap_data(request_json(base, "/v1/sync/changes"))
     assert final_sync["cursor"].startswith("local_change_")
@@ -462,7 +523,8 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     assert forbidden["error"]["code"] == "forbidden_product_boundary"
 
     persisted = json.loads(ledger_path.read_text(encoding="utf-8"))
-    assert len(persisted["accounts"]) == 2
+    assert len(persisted["accounts"]) == 3
+    assert len(persisted["subscriptions"]) == 1
     assert len(persisted["snapshots"]) == 1
     assert persisted["syncState"]["pendingChangeIds"] == []
     assert len(persisted["syncChanges"]) >= len(final_sync["changes"])
