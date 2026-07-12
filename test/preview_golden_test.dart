@@ -13,6 +13,7 @@ import 'package:finwealth/core/env.dart';
 import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/view_models.dart';
 import 'package:finwealth/features/accounts_page.dart';
+import 'package:finwealth/features/investment_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/overview_page.dart';
 import 'package:finwealth/theme/app_theme.dart';
@@ -156,6 +157,33 @@ void main() {
     await expectLater(
       find.byType(OverviewPage),
       matchesGoldenFile('goldens/overview_light.png'),
+    );
+  });
+
+  // 投资空态（real_local 默认空）：核验第二枚品牌插画（同心弧+圆）落在暗底上的效果。
+  testWidgets('investment empty · dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 880));
+    await tester.pumpWidget(
+      ProviderScope(
+        child: MaterialApp(
+          theme: buildDarkTheme(),
+          home: const Scaffold(body: InvestmentPage()),
+        ),
+      ),
+    );
+    await _settleEntrance(tester);
+    await tester.runAsync(() async {
+      await precacheImage(
+        const AssetImage('assets/illustrations/investment-empty-state.png'),
+        tester.element(find.byType(InvestmentPage)),
+      );
+    });
+    await tester.pump();
+    await expectLater(
+      find.byType(InvestmentPage),
+      matchesGoldenFile('goldens/investment_empty.png'),
     );
   });
 
