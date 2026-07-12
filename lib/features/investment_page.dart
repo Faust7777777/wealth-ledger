@@ -113,6 +113,7 @@ class _HoldingTile extends StatelessWidget {
     }
     return ListTile(
       contentPadding: EdgeInsets.zero,
+      leading: LeadingAvatar.mono(h.symbol),
       title: Text(
         '${h.displayName} · ${h.symbol} · ${h.quantity}',
         style: AppType.bodyStrong,

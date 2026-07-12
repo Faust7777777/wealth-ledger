@@ -49,7 +49,7 @@ class LiabilitiesPage extends ConsumerWidget {
               child: PressableScale(
                 onTap: () => context.push('/account/${a.id}'),
                 child: ListTile(
-                  leading: Icon(accountTypeIcon(a.accountType)),
+                  leading: LeadingAvatar.icon(accountTypeIcon(a.accountType)),
                   title: Text(a.displayName),
                   subtitle: Text(
                     a.note == null

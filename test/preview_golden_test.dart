@@ -12,6 +12,7 @@ import 'package:finwealth/app/app.dart';
 import 'package:finwealth/core/env.dart';
 import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/view_models.dart';
+import 'package:finwealth/features/accounts_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/overview_page.dart';
 import 'package:finwealth/theme/app_theme.dart';
@@ -155,6 +156,29 @@ void main() {
     await expectLater(
       find.byType(OverviewPage),
       matchesGoldenFile('goldens/overview_light.png'),
+    );
+  });
+
+  // 账户列表（fixture）：核验 LeadingAvatar 类型图标徽标落在行首的效果。
+  testWidgets('accounts list · dark', skip: !_previewEnabled, (tester) async {
+    await sized(tester, const Size(400, 900));
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          appEnvironmentProvider.overrideWithValue(
+            const AppEnvironment(dataSourceMode: DataSourceMode.debugFixture),
+          ),
+        ],
+        child: MaterialApp(
+          theme: buildDarkTheme(),
+          home: const Scaffold(body: AccountsPage()),
+        ),
+      ),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(AccountsPage),
+      matchesGoldenFile('goldens/accounts_dark.png'),
     );
   });
 
