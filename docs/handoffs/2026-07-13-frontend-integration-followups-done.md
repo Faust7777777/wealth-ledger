@@ -35,8 +35,19 @@
 - `3b530f2` Noto Serif SC 标题/Hero 衬线层级
 - `00e1f9a` 资产构成环形图（替代扁条，中心总资产 + 类·%·额 图例）
 - `99c1fc8` nav icon theme 格式化收口
+- `0fc6ba0`/`d6cb85a`/`ecaab1d` `LeadingAvatar` 原语 + 全列表行首徽标（概览/投资/
+  账户/负债/账户详情：持仓用符号首字母 monogram，账户用类型图标，品牌金 tint）
+- `bf2eff3` 投资空态第二枚品牌插画（金线同心弧+圆，与首屏日出成套）
+- `b340535` 衬线字重反差（Hero display=700、各级标题=500；打包 NotoSerifSC-500/700
+  两个 OFL 子集，替代原单一 600）
 - 更早：子主题、动效原语（Reveal/PressableScale/AnimatedMoneyText/Shimmer）、
   骨架屏、capability gating、401 自动刷新，见 `2026-07-07`/`2026-07-11` 文档。
+
+**字体资产现状（供合并核对）**：`assets/fonts/` = NotoSansSC-400（正文，7.1MB）、
+NotoSerifSC-500 + NotoSerifSC-700（标题/Hero，各 ~320KB），均 OFL；`licenses/` 两份
+OFL.txt + `SOURCE.md`。原 MiSans.ttf 与 NotoSerifSC-600.ttf 已移除。
+`assets/illustrations/` = net-worth-empty-state.png + investment-empty-state.png（两枚
+Codex 生成的金线徽记）。
 
 ## 预览自检工具
 
