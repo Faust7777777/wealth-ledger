@@ -27,12 +27,15 @@ Future<void> _loadFonts() async {
     final loader = FontLoader(family)..addFont(Future.value(toData()));
     await loader.load();
   }
-  // 衬线（Hero/标题）
-  final serif = File('assets/fonts/NotoSerifSC-600.ttf').readAsBytesSync();
-  await (FontLoader(
-        'NotoSerifSC',
-      )..addFont(Future.value(ByteData.view(Uint8List.fromList(serif).buffer))))
-      .load();
+  // 衬线（Hero=700 / 标题=500）：两个字重都注册到同一 family，按字重匹配。
+  final serifLoader = FontLoader('NotoSerifSC');
+  for (final w in ['500', '700']) {
+    final b = File('assets/fonts/NotoSerifSC-$w.ttf').readAsBytesSync();
+    serifLoader.addFont(
+      Future.value(ByteData.view(Uint8List.fromList(b).buffer)),
+    );
+  }
+  await serifLoader.load();
   await _loadMaterialIcons();
 }
 

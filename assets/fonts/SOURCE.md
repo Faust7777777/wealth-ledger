@@ -23,20 +23,22 @@
   Ext-B（U+3400–4DBF）等生僻字未含，缺字回退系统字体。
 - 许可：`licenses/NotoSansSC-OFL.txt`。
 
-## NotoSerifSC-600.ttf — Hero 大数字/各级标题 衬线
+## NotoSerifSC-500.ttf / NotoSerifSC-700.ttf — 各级标题(500)/Hero 大数字(700) 衬线
 
 - 字体：Google **Noto Serif SC**（思源宋体，OFL 1.1）。
 - 官方来源：https://github.com/google/fonts/tree/main/ofl/notoserifsc
   （许可：https://github.com/google/fonts/blob/main/ofl/notoserifsc/OFL.txt）
-- 制作：从 `NotoSerifSC-VF.ttf` 定格 `wght=600`，仅裁 `lib/` 内出现的字符 +
-  ASCII + ¥≈ 等符号（标题/Hero 专用，非正文；缺字回退 NotoSansSC）：
+- 制作：从 `NotoSerifSC-VF.ttf` 分别定格 `wght=500` 与 `wght=700`，仅裁 `lib/` 内
+  出现的字符 + ASCII + ¥≈ 等符号（标题/Hero 专用，非正文；缺字回退 NotoSansSC）：
 
   ```bash
-  python -m fontTools.varLib.instancer NotoSerifSC-VF.ttf wght=600 -o nssc-600.ttf
-  # text-file 为 lib 下所有 .dart 内容的拼接
-  pyftsubset nssc-600.ttf --text-file=<all-lib-dart> \
-    --unicodes="U+0020-007E,U+00A5,U+00B7,U+2212,U+2248,U+2026,U+2018-201F,U+3000-303F,U+FF01-FF60,U+2033,U+00D7,U+2192,U+2013-2014" \
-    --output-file=NotoSerifSC-600.ttf --no-hinting --desubroutinize
+  for W in 500 700; do
+    python -m fontTools.varLib.instancer NotoSerifSC-VF.ttf wght=$W -o nssc-$W.ttf
+    # text-file 为 lib 下所有 .dart 内容的拼接
+    pyftsubset nssc-$W.ttf --text-file=<all-lib-dart> \
+      --unicodes="U+0020-007E,U+00A5,U+00B7,U+2212,U+2248,U+2026,U+2018-201F,U+3000-303F,U+FF01-FF60,U+2033,U+00D7,U+2192,U+2013-2014" \
+      --output-file=NotoSerifSC-$W.ttf --no-hinting --desubroutinize
+  done
   ```
 
 - 许可：`licenses/NotoSerifSC-OFL.txt`。

@@ -32,7 +32,7 @@ abstract final class AppType {
     fontFamilyFallback: serifFallback,
     fontSize: 52,
     height: 1.05,
-    fontWeight: FontWeight.w600,
+    fontWeight: FontWeight.w700, // Hero 用最重字重，更有分量
     letterSpacing: -0.5,
     fontFeatures: tnum,
   ); // Hero 净值（衬线；移动端覆盖为 40）
@@ -41,14 +41,14 @@ abstract final class AppType {
     fontFamilyFallback: serifFallback,
     fontSize: 22,
     height: 1.30,
-    fontWeight: FontWeight.w600,
+    fontWeight: FontWeight.w500, // 标题较轻，与 Hero 拉开层次
   );
   static const h2 = TextStyle(
     fontFamily: serifFamily,
     fontFamilyFallback: serifFallback,
     fontSize: 18,
     height: 1.35,
-    fontWeight: FontWeight.w600,
+    fontWeight: FontWeight.w500,
   );
   static const titleM = TextStyle(
     fontFamily: family,
