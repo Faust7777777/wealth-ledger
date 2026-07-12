@@ -9,6 +9,7 @@ import '../core/types.dart';
 import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../shared/widgets.dart';
+import '../theme/app_colors.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
 
@@ -33,12 +34,27 @@ Widget _entryRow(
   Map<String, String> nameById,
 ) {
   final isIn = e.direction == 'in';
+  final muted = Theme.of(context).textTheme.bodySmall?.color;
   return Padding(
-    padding: const EdgeInsets.symmetric(vertical: AppSpacing.xxs),
+    padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
     child: Row(
       children: [
-        Icon(isIn ? Icons.arrow_downward : Icons.arrow_upward, size: 16),
-        const SizedBox(width: AppSpacing.xs),
+        // 方向指示：中性小圆（in 收/out 付）。方向≠盈亏，故不上语义色。
+        Container(
+          width: 28,
+          height: 28,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: Theme.of(context).dividerColor,
+            shape: BoxShape.circle,
+          ),
+          child: Icon(
+            isIn ? Icons.south_east : Icons.north_east,
+            size: 15,
+            color: muted,
+          ),
+        ),
+        const SizedBox(width: AppSpacing.sm),
         Expanded(
           child: Text(
             nameById[e.accountId] ?? e.accountId,
@@ -113,9 +129,29 @@ class MovementDetailPage extends ConsumerWidget {
                   ),
                 ],
                 if (m.entries.isNotEmpty) ...[
-                  const Divider(),
                   const SectionHeader(title: '分录'),
-                  for (final e in m.entries) _entryRow(context, e, nameById),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: AppSpacing.sm,
+                      vertical: AppSpacing.xs,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).brightness == Brightness.dark
+                          ? AppColors.surface2
+                          : AppColorsLight.surface2,
+                      borderRadius: BorderRadius.circular(AppRadius.md),
+                      border: Border.all(
+                        color: Theme.of(context).dividerColor,
+                        width: AppStroke.hairline,
+                      ),
+                    ),
+                    child: Column(
+                      children: [
+                        for (final e in m.entries)
+                          _entryRow(context, e, nameById),
+                      ],
+                    ),
+                  ),
                 ],
                 const SizedBox(height: AppSpacing.lg),
                 // 更正=生成候选：还需服务端 canPersistPendingProposal 能力。
