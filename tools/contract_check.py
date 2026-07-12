@@ -267,7 +267,7 @@ def check_dev_server() -> None:
 
 def check_rust_server() -> None:
     if not RUST_SERVER.exists():
-        fail(f"Missing Rust server skeleton: {RUST_SERVER}")
+        fail(f"Missing Rust server implementation: {RUST_SERVER}")
     if not RUST_MANIFEST.exists():
         fail(f"Missing Rust server manifest: {RUST_MANIFEST}")
 
@@ -452,6 +452,8 @@ def check_release_packaging() -> None:
         "package-manifest.json",
         "[System.Uri]::TryCreate",
         "stale APK could be mislabeled",
+        "CLIENT_IDEMPOTENCY_BLOCKER",
+        "CheckReadinessOnly",
         "AndroidReadOnlyPreview",
         "android-readonly-preview-debug.apk",
     ]

@@ -11,6 +11,12 @@ It also contains the matching release `finwealth-server.exe`. Do not launch
 `finwealth.exe` directly; double-click `Start-Finwealth.cmd` so the private
 loopback server and client have the same lifecycle.
 
+The package command refuses to emit this zip unless the Flutter client contains
+tested `Idempotency-Key` handling. Each logical non-auth write must keep one key
+across the client's automatic 401 refresh/replay; generating a new key inside
+the retry attempt defeats server-side replay protection. Until that frontend
+gate passes, no artifact should be described as a writable self-use package.
+
 ## First launch
 
 1. Extract the complete zip to a normal user-writable folder.

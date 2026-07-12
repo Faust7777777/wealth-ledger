@@ -1279,8 +1279,8 @@ fn assert_loopback(addr: SocketAddr) {
 async fn health() -> Json<Value> {
     envelope(json!({
         "status": "ok",
-        "serverTime": "2026-06-25T12:00:00+08:00",
-        "version": "rust-dev-skeleton-0.1.0"
+        "serverTime": current_timestamp(),
+        "version": env!("CARGO_PKG_VERSION")
     }))
 }
 
@@ -3197,7 +3197,7 @@ async fn not_implemented() -> Response {
             "ok": false,
             "error": {
                 "code": "rust_dev_route_not_implemented",
-                "message": "This endpoint exists in the API contract but is not implemented in the Rust skeleton yet.",
+                "message": "This write endpoint requires --ledger-path and is unavailable in deterministic Rust dev mode.",
                 "severity": "warning",
                 "retryable": false
             }
@@ -7736,6 +7736,17 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], true);
         assert_eq!(body["data"]["status"], "ok");
+        assert_eq!(body["data"]["version"], env!("CARGO_PKG_VERSION"));
+        let server_time = body["data"]["serverTime"]
+            .as_str()
+            .expect("health serverTime should be a string");
+        let parsed = OffsetDateTime::parse(server_time, &Rfc3339)
+            .expect("health serverTime should be current RFC3339 output");
+        let age_seconds = (OffsetDateTime::now_utc() - parsed).whole_seconds().abs();
+        assert!(
+            age_seconds <= 5,
+            "health serverTime should reflect request time, age={age_seconds}s"
+        );
     }
 
     #[tokio::test]

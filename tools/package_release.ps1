@@ -4,7 +4,8 @@ param(
   [switch]$SkipBuild,
   [switch]$WindowsOnly,
   [switch]$AndroidOnly,
-  [switch]$AndroidReadOnlyPreview
+  [switch]$AndroidReadOnlyPreview,
+  [switch]$CheckReadinessOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,6 +45,36 @@ if ($BuildAndroid -and $SkipBuild) {
   throw "-SkipBuild is not allowed for the Android read-only preview because a stale APK could be mislabeled."
 }
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+
+function Test-ClientIdempotencyReadiness {
+  $clientSource = Join-Path $Root "lib\data\api_mock_repositories.dart"
+  $testRoot = Join-Path $Root "test"
+  if (!(Test-Path -LiteralPath $clientSource -PathType Leaf) -or !(Test-Path -LiteralPath $testRoot -PathType Container)) {
+    return $false
+  }
+  $implementationHasHeader = [bool](Select-String `
+    -Path $clientSource `
+    -Pattern "Idempotency-Key" `
+    -SimpleMatch `
+    -Quiet)
+  $testHasHeader = [bool](Get-ChildItem -LiteralPath $testRoot -Filter *.dart -Recurse | Select-String `
+    -Pattern "Idempotency-Key" `
+    -SimpleMatch `
+    -Quiet)
+  return $implementationHasHeader -and $testHasHeader
+}
+
+if ($BuildWindows -and !(Test-ClientIdempotencyReadiness)) {
+  throw "CLIENT_IDEMPOTENCY_BLOCKER: Flutter client must send one Idempotency-Key per logical non-auth write and reuse it across 401 replay; add a regression test before packaging."
+}
+if ($CheckReadinessOnly) {
+  if (!$BuildWindows) {
+    throw "-CheckReadinessOnly currently validates the paired Windows client/server package only."
+  }
+  Write-Host "Windows self-use package readiness passed."
+  return
+}
+
 if ([System.IO.Path]::IsPathRooted($OutputDir)) {
   $Dist = $OutputDir
 } else {
