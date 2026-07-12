@@ -3,6 +3,7 @@
 // 写路径只生成 proposal；禁用端点以 403 呈现。（文件名暂留 api_mock_repositories.dart 以免动测试导入。）
 // 形状对齐 docs/contracts（DATA_SCHEMA_V1 / examples / FRONTEND_API_INTEGRATION_HANDOFF_V1）。
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:http/http.dart' as http;
 
@@ -39,6 +40,7 @@ class DevApiClient {
   final String scenario;
   final AuthTokenStore? tokenStore;
   final http.Client _client;
+  final Random _rng = Random.secure();
 
   Future<Map<String, String>> _headers({bool json = false}) async {
     final headers = <String, String>{};
@@ -48,6 +50,17 @@ class DevApiClient {
       headers['authorization'] = 'Bearer $token';
     }
     return headers;
+  }
+
+  /// 后端要求所有非 auth 持久化写入（POST/PATCH/PUT/DELETE）带 Idempotency-Key。
+  static bool _needsIdempotencyKey(String method, String path) =>
+      method != 'GET' && !path.startsWith('/v1/auth/');
+
+  /// 128-bit 高熵 key，小写 hex（32 字符，可见 ASCII）。一个逻辑写操作一个 key，
+  /// 包括其 401 refresh 后的自动重放；不持久化、不记录。
+  String _newIdempotencyKey() {
+    final bytes = List<int>.generate(16, (_) => _rng.nextInt(256));
+    return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
   }
 
   String _url(String path) => scenario.isEmpty
@@ -84,19 +97,30 @@ class DevApiClient {
       _send('PATCH', path, body: body);
 
   /// 统一请求入口：access token 过期（401）时用 refresh token 换新并重放一次。
-  /// auth 端点自身不重试，避免刷新循环。
+  /// auth 端点自身不重试，避免刷新循环。写入的 Idempotency-Key 在首次调用前生成，
+  /// 401 重放时复用同一个（不重新生成）。
   Future<Object?> _send(
     String method,
     String path, {
     Object? body,
     bool retried = false,
+    String? idempotencyKey,
   }) async {
-    final res = await _dispatch(method, path, body);
+    final key =
+        idempotencyKey ??
+        (_needsIdempotencyKey(method, path) ? _newIdempotencyKey() : null);
+    final res = await _dispatch(method, path, body, key);
     if (res.statusCode == 401 &&
         !retried &&
         !path.startsWith('/v1/auth/') &&
         await _refreshSession()) {
-      return _send(method, path, body: body, retried: true);
+      return _send(
+        method,
+        path,
+        body: body,
+        retried: true,
+        idempotencyKey: key,
+      );
     }
     return _handle(res, path);
   }
@@ -105,21 +129,16 @@ class DevApiClient {
     String method,
     String path,
     Object? body,
+    String? idempotencyKey,
   ) async {
     final uri = Uri.parse(_url(path));
     final encoded = body == null ? null : jsonEncode(body);
+    final headers = await _headers(json: method != 'GET');
+    if (idempotencyKey != null) headers['idempotency-key'] = idempotencyKey;
     return switch (method) {
-      'GET' => _client.get(uri, headers: await _headers()),
-      'POST' => _client.post(
-        uri,
-        headers: await _headers(json: true),
-        body: encoded,
-      ),
-      'PATCH' => _client.patch(
-        uri,
-        headers: await _headers(json: true),
-        body: encoded,
-      ),
+      'GET' => _client.get(uri, headers: headers),
+      'POST' => _client.post(uri, headers: headers, body: encoded),
+      'PATCH' => _client.patch(uri, headers: headers, body: encoded),
       _ => throw ArgumentError.value(method, 'method'),
     };
   }
