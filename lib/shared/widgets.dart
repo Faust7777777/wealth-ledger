@@ -235,6 +235,44 @@ class _PressableScaleState extends State<PressableScale> {
   }
 }
 
+/// 行首徽标：品牌金 tint 圆角方块内放单字 monogram 或类型图标。
+/// 给纯文字列表行加视觉锚点与节奏（持仓用符号首字母，账户用类型图标）。
+class LeadingAvatar extends StatelessWidget {
+  const LeadingAvatar.mono(this.mono, {super.key, this.size = 36})
+    : icon = null;
+  const LeadingAvatar.icon(this.icon, {super.key, this.size = 36})
+    : mono = null;
+
+  final String? mono;
+  final IconData? icon;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final brand = Theme.of(context).colorScheme.primary;
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    return Container(
+      width: size,
+      height: size,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        color: brand.withValues(alpha: dark ? 0.16 : 0.12),
+        borderRadius: BorderRadius.circular(AppRadius.sm),
+      ),
+      child: mono != null
+          ? Text(
+              String.fromCharCodes(mono!.runes.take(1)).toUpperCase(),
+              style: TextStyle(
+                color: brand,
+                fontSize: size * 0.42,
+                fontWeight: FontWeight.w600,
+              ),
+            )
+          : Icon(icon, size: size * 0.5, color: brand),
+    );
+  }
+}
+
 /// 金额切换动画：值变化时新值淡入上滑、旧值淡出。左对齐，等宽数字保持成列。
 /// 不伪造中间数字（遵守「金额不过 double」），只在真实值之间过渡。
 class AnimatedMoneyText extends StatelessWidget {

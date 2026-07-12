@@ -14,6 +14,7 @@ import '../shared/widgets.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
+import 'account_visuals.dart';
 
 class OverviewPage extends ConsumerWidget {
   const OverviewPage({super.key});
@@ -237,6 +238,7 @@ class _HoldingRow extends StatelessWidget {
     return ListTile(
       contentPadding: EdgeInsets.zero,
       dense: true,
+      leading: LeadingAvatar.mono(h.symbol),
       title: Text('${h.symbol} · ${h.quantity}', style: AppType.bodyStrong),
       subtitle: pnl.isEmpty
           ? null
@@ -280,6 +282,7 @@ class _AccountRow extends StatelessWidget {
       child: ListTile(
         contentPadding: EdgeInsets.zero,
         dense: true,
+        leading: LeadingAvatar.icon(accountTypeIcon(a.accountType)),
         title: Text(a.displayName, style: AppType.body),
         trailing: Text(
           v == null ? '—' : formatValued(v),
