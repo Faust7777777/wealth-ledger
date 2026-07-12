@@ -1,4 +1,4 @@
-// 视觉预览（非回归断言）：用真实主题 + 真实 MiSans 字体把关键页渲成 PNG，
+// 视觉预览（非回归断言）：用真实主题 + 真实 Noto Sans/Serif SC 字体把关键页渲成 PNG，
 // 供人肉眼/模型核验子主题、字体、间距、动效入场后的静态形态。
 // 生成：PREVIEW_GOLDENS=1 flutter test --update-goldens test/preview_golden_test.dart
 // 默认在普通 `flutter test` 中跳过（golden 依赖字体/Skia，跨机不稳，不做门禁）。
@@ -17,11 +17,11 @@ import 'package:finwealth/features/overview_page.dart';
 import 'package:finwealth/theme/app_theme.dart';
 
 Future<void> _loadFonts() async {
-  final bytes = File('assets/fonts/MiSans.ttf').readAsBytesSync();
+  final bytes = File('assets/fonts/NotoSansSC-400.ttf').readAsBytesSync();
   ByteData toData() => ByteData.view(Uint8List.fromList(bytes).buffer);
-  // 应用 family 首选 Inter（未打包）→ 回退 MiSans；两个 family 都注册成 MiSans 字形，
+  // 应用 family 首选 Inter（未打包）→ 回退 NotoSansSC；两个 family 都注册成正文体字形，
   // 保证 golden 里所有文字都实打实渲染。
-  for (final family in ['MiSans', 'Inter']) {
+  for (final family in ['NotoSansSC', 'Inter']) {
     final loader = FontLoader(family)..addFont(Future.value(toData()));
     await loader.load();
   }

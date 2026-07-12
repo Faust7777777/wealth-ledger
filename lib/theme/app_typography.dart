@@ -1,15 +1,15 @@
 // Wealth Ledger — P0 typography tokens.
 // 来源真相: project-context/DESIGN_V1.md §8。
-// 中文优先(MiSans) + Latin/数字(Inter)；货币统一开启 tabular figures 以对齐成列。
+// 中文优先(Noto Sans SC) + Latin/数字(Inter)；货币统一开启 tabular figures 对齐成列。
 // Hero 仅在 NetWorthHero 用 display（移动端降至 40）。
-// 字体: MiSans 已打包（pubspec fonts）；family='Inter' 未打包，回退链首选 MiSans，
-//       故全局以 MiSans 渲染，tabular figures 生效。Inter 官方 TTF 到位后可设为首选。
+// 字体(均 OFL,见 assets/fonts/SOURCE.md): 正文=NotoSansSC 子集；标题/Hero=NotoSerifSC 子集。
+//       family='Inter' 未打包，回退链首选 NotoSansSC，故全局以其渲染，tabular figures 生效。
 import 'package:flutter/painting.dart';
 
 abstract final class AppType {
   static const family = 'Inter';
   static const familyFallback = <String>[
-    'MiSans',
+    'NotoSansSC',
     'Microsoft YaHei',
     'PingFang SC',
     'Noto Sans SC',
@@ -17,16 +17,16 @@ abstract final class AppType {
   ];
 
   /// 编辑感衬线：仅用于 Hero 大数字与各级标题（display/h1/h2），
-  /// 与无衬线正文形成反差＝高端信号。缺字回退 MiSans。
+  /// 与无衬线正文形成反差＝高端信号。缺字回退无衬线正文体（NotoSansSC）。
   static const serifFamily = 'NotoSerifSC';
-  static const serifFallback = <String>['MiSans', ...familyFallback];
+  static const serifFallback = familyFallback;
 
   /// 货币/数字统一等宽数字
   static const tnum = <FontFeature>[FontFeature.tabularFigures()];
 
   // family + fallback 直接烘进每个样式：这些 AppType.* 会被组件子主题（AppBar/
   // ListTile/Chip/Input 等）直接引用，不走 ThemeData.textTheme 的字体应用；若不
-  // 内置 family，list 行标题/顶栏标题等会脱离 MiSans、落到系统字体（与货币数字不一致）。
+  // 内置 family，list 行标题/顶栏标题等会脱离正文体、落到系统字体（与货币数字不一致）。
   static const display = TextStyle(
     fontFamily: serifFamily,
     fontFamilyFallback: serifFallback,
