@@ -223,4 +223,9 @@ class RealLocalSubscriptionRepository implements SubscriptionRepository {
   @override
   Future<AiAtomicGroupVm> createChargeProposal(Id id) async =>
       throw UnsupportedError('real_local 暂不支持生成扣费候选；请用 local_server');
+  @override
+  Future<SubscriptionDueScanResultVm> scanDueChargeProposals({
+    required IsoDate throughDate,
+    int limit = 100,
+  }) async => throw UnsupportedError('real_local 暂不支持到期扫描；请用 local_server');
 }

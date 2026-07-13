@@ -633,4 +633,9 @@ class FixtureSubscriptionRepository implements SubscriptionRepository {
   @override
   Future<AiAtomicGroupVm> createChargeProposal(Id id) async =>
       throw UnsupportedError('DEMO 演示只读，不会真的生成扣费候选；请用 local_server');
+  @override
+  Future<SubscriptionDueScanResultVm> scanDueChargeProposals({
+    required IsoDate throughDate,
+    int limit = 100,
+  }) async => throw UnsupportedError('DEMO 演示只读，不会真的扫描生成扣费候选；请用 local_server');
 }

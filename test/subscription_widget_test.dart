@@ -71,6 +71,11 @@ class _FakeSubRepo implements SubscriptionRepository {
   Future<SubscriptionVm> cancelSubscription(Id id) =>
       onCancel?.call() ?? (throw UnsupportedError('no cancel'));
   @override
+  Future<SubscriptionDueScanResultVm> scanDueChargeProposals({
+    required IsoDate throughDate,
+    int limit = 100,
+  }) => throw UnsupportedError('no scan');
+  @override
   Future<List<SubscriptionVm>> listSubscriptions() async => const [];
   @override
   Future<List<SubscriptionVm>> listUpcomingSubscriptions({
