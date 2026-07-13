@@ -64,11 +64,32 @@ flag.
 
 ## Integrity metadata
 
-`package-manifest.json` records the package mode, API base, bundled server path,
-and server SHA-256. `finwealth.build-config.json` records the Flutter compile-
-time data source. The launcher validates both files and the server checksum
-before starting. These checks detect accidental corruption or mixed build
-outputs; they are not a publisher signature and do not establish provenance.
+`package-manifest.json` records separate client/server versions, the source Git
+commit and dirty flag, package mode, API base, and SHA-256 values for the client,
+server, both launchers, and Flutter build metadata. `finwealth.build-config.json`
+records the same source identity and compile-time data source. Packaging refuses
+a dirty source tree unless `-AllowDirtySource` is explicitly supplied, and dirty
+source cannot use `-SkipBuild`.
+
+Before archiving, and again after expanding the finished zip, the launcher runs
+`-PackageIntegrityOnly` to verify all recorded files without reading or creating
+the user's `%LOCALAPPDATA%` state. The zip has a sibling `.zip.sha256` file, and
+the Package workflow uploads both. These checks detect accidental corruption or
+mixed build outputs; they are not a publisher signature and do not establish
+cryptographic provenance.
+
+Readiness is behavioral rather than a string-only gate: packaging requires the
+named idempotency regression cases and runs `test/auth_client_test.dart`. CI no
+longer converts a failed client readiness check into a successful warning, and
+the manual Package workflow first runs contract, Rust, smoke, Flutter analyze,
+and Flutter test gates.
+
+The launcher-only integrity behavior can be regression-tested without building
+Flutter or touching real user state:
+
+```powershell
+pwsh -NoProfile -File tools\package_integrity_smoke.ps1
+```
 
 ## Android is intentionally separate
 

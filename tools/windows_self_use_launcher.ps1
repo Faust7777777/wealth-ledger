@@ -1,6 +1,7 @@
 param(
   [switch]$ResetAuth,
-  [switch]$CheckOnly
+  [switch]$CheckOnly,
+  [switch]$PackageIntegrityOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -93,30 +94,57 @@ function Assert-PackageIntegrity {
   param(
     [string]$ManifestPath,
     [string]$BuildPath,
-    [string]$BundledServerPath
+    [string]$ClientPath,
+    [string]$BundledServerPath,
+    [string]$LauncherPowerShellPath,
+    [string]$LauncherCmdPath
   )
   $manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json
   $build = Get-Content -Raw -LiteralPath $BuildPath | ConvertFrom-Json
   if (
-    $manifest.packageFormat -ne 1 -or
+    $manifest.packageFormat -ne 2 -or
+    [string]$manifest.clientVersion -eq "" -or
+    [string]$manifest.serverVersion -eq "" -or
+    [string]$manifest.sourceCommit -notmatch '^[0-9a-fA-F]{40}$' -or
+    $manifest.sourceDirty -isnot [bool] -or
     $manifest.dataSource -cne "local_server" -or
     $manifest.apiBase -cne $ApiBase -or
+    $manifest.client -cne "finwealth.exe" -or
+    [string]$manifest.clientSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
     $manifest.server -cne "server/finwealth-server.exe" -or
-    $manifest.launcher -cne "Start-Finwealth.cmd" -or
-    [string]$manifest.serverSha256 -notmatch '^[0-9a-fA-F]{64}$'
+    [string]$manifest.serverSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
+    $manifest.launcherPowerShell -cne "Start-Finwealth.ps1" -or
+    [string]$manifest.launcherPowerShellSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
+    $manifest.launcherCmd -cne "Start-Finwealth.cmd" -or
+    [string]$manifest.launcherCmdSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
+    $manifest.buildConfig -cne "finwealth.build-config.json" -or
+    [string]$manifest.buildConfigSha256 -notmatch '^[0-9a-fA-F]{64}$'
   ) {
     throw "Package manifest is invalid or does not describe this self-use package."
   }
   if (
+    $build.buildFormat -ne 2 -or
     $build.dataSource -cne "local_server" -or
     $build.apiBase -cne $ApiBase -or
-    $build.serverBundled -ne $true
+    $build.serverBundled -ne $true -or
+    $build.clientVersion -cne $manifest.clientVersion -or
+    $build.serverVersion -cne $manifest.serverVersion -or
+    $build.sourceCommit -cne $manifest.sourceCommit -or
+    $build.sourceDirty -ne $manifest.sourceDirty
   ) {
     throw "Flutter build metadata is missing or does not match the bundled local server."
   }
-  $actualServerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $BundledServerPath).Hash
-  if ($actualServerHash -cne ([string]$manifest.serverSha256).ToUpperInvariant()) {
-    throw "Bundled server checksum does not match package-manifest.json."
+  foreach ($check in @(
+    @($ClientPath, [string]$manifest.clientSha256, "client"),
+    @($BundledServerPath, [string]$manifest.serverSha256, "server"),
+    @($LauncherPowerShellPath, [string]$manifest.launcherPowerShellSha256, "PowerShell launcher"),
+    @($LauncherCmdPath, [string]$manifest.launcherCmdSha256, "CMD launcher"),
+    @($BuildPath, [string]$manifest.buildConfigSha256, "build config")
+  )) {
+    $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $check[0]).Hash.ToLowerInvariant()
+    if ($actualHash -cne $check[1].ToLowerInvariant()) {
+      throw "Packaged $($check[2]) checksum does not match package-manifest.json."
+    }
   }
 }
 
@@ -151,7 +179,15 @@ foreach ($required in @($ServerExe, $ClientExe, $PackageManifestPath, $BuildConf
 Assert-PackageIntegrity `
   -ManifestPath $PackageManifestPath `
   -BuildPath $BuildConfigPath `
-  -BundledServerPath $ServerExe
+  -ClientPath $ClientExe `
+  -BundledServerPath $ServerExe `
+  -LauncherPowerShellPath (Join-Path $InstallDir "Start-Finwealth.ps1") `
+  -LauncherCmdPath (Join-Path $InstallDir "Start-Finwealth.cmd")
+
+if ($PackageIntegrityOnly) {
+  Write-Host "Package integrity check passed."
+  return
+}
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 
 if ($ResetAuth) {

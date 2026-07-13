@@ -53,9 +53,11 @@ movement 的自动合并。
 
 ### P0：修复 CI/package 假绿
 
-当前 CI 会捕获 `CLIENT_IDEMPOTENCY_BLOCKER` 并只写 Warning，可能没有产出 Windows 包
-却显示成功。前端已具备真实幂等测试后，应让 readiness/build 失败直接使 job 失败，并让
-手动 Package workflow 先跑 Flutter、Rust、contract 和 smoke 门禁。
+审查时 CI 会捕获 `CLIENT_IDEMPOTENCY_BLOCKER` 并只写 Warning，可能没有产出 Windows
+包却显示成功。本轮已移除该吞错路径，并让 readiness 运行明确的 auth client 行为测试；
+手动 Package workflow 在构建前运行 Flutter、Rust、contract 和 smoke 门禁。包 manifest
+升级为记录 source commit/dirty 状态和 client/server/launcher/build-config 哈希，zip 另带
+SHA-256，且归档前后均运行无用户状态副作用的 launcher integrity check。
 
 ### P1：修复已公开查询语义
 

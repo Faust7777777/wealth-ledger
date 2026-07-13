@@ -92,7 +92,9 @@ jobs:
 
       - name: Run local Windows backup and restore smoke
         shell: pwsh
-        run: ./tools/local_backup_restore_smoke.ps1
+        run: |
+          ./tools/local_backup_restore_smoke.ps1
+          ./tools/package_integrity_smoke.ps1
 
       - name: Analyze Flutter
         run: flutter analyze
@@ -103,16 +105,8 @@ jobs:
       - name: Build and check paired Windows self-use package
         shell: pwsh
         run: |
-          try {
-            ./tools/package_release.ps1 -WindowsOnly -CheckReadinessOnly
-            ./tools/package_release.ps1 -WindowsOnly -OutputDir tmp/package-ci
-          } catch {
-            if ($_.Exception.Message -like "CLIENT_IDEMPOTENCY_BLOCKER:*") {
-              Write-Warning "Paired package intentionally blocked until the Flutter client implements tested Idempotency-Key reuse."
-            } else {
-              throw
-            }
-          }
+          ./tools/package_release.ps1 -WindowsOnly -CheckReadinessOnly
+          ./tools/package_release.ps1 -WindowsOnly -OutputDir tmp/package-ci
 
   flutter-android:
     name: Flutter Android

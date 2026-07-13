@@ -5,7 +5,8 @@ param(
   [switch]$WindowsOnly,
   [switch]$AndroidOnly,
   [switch]$AndroidReadOnlyPreview,
-  [switch]$CheckReadinessOnly
+  [switch]$CheckReadinessOnly,
+  [switch]$AllowDirtySource
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,27 +47,77 @@ if ($BuildAndroid -and $SkipBuild) {
 }
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
-function Test-ClientIdempotencyReadiness {
-  $clientSource = Join-Path $Root "lib\data\api_mock_repositories.dart"
-  $testRoot = Join-Path $Root "test"
-  if (!(Test-Path -LiteralPath $clientSource -PathType Leaf) -or !(Test-Path -LiteralPath $testRoot -PathType Container)) {
-    return $false
+function Resolve-FlutterExecutable {
+  $flutter = Get-Command flutter -ErrorAction SilentlyContinue
+  if ($flutter) {
+    return $flutter.Source
   }
-  $implementationHasHeader = [bool](Select-String `
-    -Path $clientSource `
-    -Pattern "Idempotency-Key" `
-    -SimpleMatch `
-    -Quiet)
-  $testHasHeader = [bool](Get-ChildItem -LiteralPath $testRoot -Filter *.dart -Recurse | Select-String `
-    -Pattern "Idempotency-Key" `
-    -SimpleMatch `
-    -Quiet)
-  return $implementationHasHeader -and $testHasHeader
+  $candidate = Join-Path $env:USERPROFILE "tools\flutter\bin\flutter.bat"
+  if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+    return $candidate
+  }
+  throw "flutter not found. Install Flutter or add it to PATH."
 }
 
-if ($BuildWindows -and !(Test-ClientIdempotencyReadiness)) {
-  throw "CLIENT_IDEMPOTENCY_BLOCKER: Flutter client must send one Idempotency-Key per logical non-auth write and reuse it across 401 replay; add a regression test before packaging."
+function Assert-ClientIdempotencyReadiness {
+  $clientSource = Join-Path $Root "lib\data\api_mock_repositories.dart"
+  $testPath = Join-Path $Root "test\auth_client_test.dart"
+  if (!(Test-Path -LiteralPath $clientSource -PathType Leaf) -or !(Test-Path -LiteralPath $testPath -PathType Leaf)) {
+    throw "CLIENT_IDEMPOTENCY_BLOCKER: Flutter client source or auth client regression test is missing."
+  }
+  $clientText = Get-Content -Raw -LiteralPath $clientSource
+  $testText = Get-Content -Raw -LiteralPath $testPath
+  foreach ($required in @(
+    "Idempotency-Key",
+    "idempotencyKey: key",
+    "method != 'GET'",
+    "Random.secure()"
+  )) {
+    if (!$clientText.Contains($required)) {
+      throw "CLIENT_IDEMPOTENCY_BLOCKER: Flutter client is missing required idempotency behavior marker: $required"
+    }
+  }
+  foreach ($required in @(
+    "write requests carry a 128-bit hex Idempotency-Key; GET does not",
+    "two independent writes use different Idempotency-Keys",
+    "401 replay reuses the same Idempotency-Key; auth refresh has none"
+  )) {
+    if (!$testText.Contains($required)) {
+      throw "CLIENT_IDEMPOTENCY_BLOCKER: auth_client_test.dart is missing required behavior test: $required"
+    }
+  }
+
+  $flutterExe = Resolve-FlutterExecutable
+  & $flutterExe test $testPath
+  if ($LASTEXITCODE -ne 0) {
+    throw "CLIENT_IDEMPOTENCY_BLOCKER: auth client behavior tests failed."
+  }
 }
+
+if ($BuildWindows) {
+  Assert-ClientIdempotencyReadiness
+}
+
+$git = Get-Command git -ErrorAction SilentlyContinue
+if (!$git) {
+  throw "git not found; package provenance cannot be recorded."
+}
+$SourceCommit = (& $git.Source -C $Root rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $SourceCommit -notmatch '^[0-9a-fA-F]{40}$') {
+  throw "Unable to resolve the source Git commit."
+}
+$SourceStatus = @(& $git.Source -C $Root status --porcelain)
+if ($LASTEXITCODE -ne 0) {
+  throw "Unable to inspect the source Git worktree."
+}
+$SourceDirty = $SourceStatus.Count -gt 0
+if ($SourceDirty -and !$AllowDirtySource) {
+  throw "Source worktree is dirty. Commit/stash changes, or pass -AllowDirtySource for an explicitly non-release self-use build."
+}
+if ($SourceDirty -and $SkipBuild) {
+  throw "-SkipBuild cannot verify dirty source against existing binaries. Rebuild without -SkipBuild."
+}
+
 if ($CheckReadinessOnly) {
   if (!$BuildWindows) {
     throw "-CheckReadinessOnly currently validates the paired Windows client/server package only."
@@ -84,20 +135,14 @@ New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 
 $FlutterExe = $null
 if (!$SkipBuild) {
-  $Flutter = Get-Command flutter -ErrorAction SilentlyContinue
-  if (!$Flutter) {
-    $candidate = Join-Path $env:USERPROFILE "tools\flutter\bin\flutter.bat"
-    if (Test-Path $candidate) {
-      $FlutterExe = $candidate
-    } else {
-      throw "flutter not found. Install Flutter or add it to PATH."
-    }
-  } else {
-    $FlutterExe = $Flutter.Source
-  }
+  $FlutterExe = Resolve-FlutterExecutable
 }
 
 $VersionLine = (Select-String -Path (Join-Path $Root "pubspec.yaml") -Pattern "^version:\s*(.+)$").Matches.Groups[1].Value.Trim()
+$ServerVersion = (Select-String -Path (Join-Path $Root "server-rs\Cargo.toml") -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+if ([string]::IsNullOrWhiteSpace($VersionLine) -or [string]::IsNullOrWhiteSpace($ServerVersion)) {
+  throw "Client or server version metadata is missing."
+}
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $PackageName = "finwealth-$VersionLine-$Stamp"
 
@@ -124,9 +169,15 @@ if ($BuildWindows) {
       throw "Flutter Windows self-use build failed."
     }
     $buildConfig = [ordered]@{
+      buildFormat = 2
       dataSource = "local_server"
       apiBase = $WindowsApiBase
       serverBundled = $true
+      clientVersion = $VersionLine
+      serverVersion = $ServerVersion
+      sourceCommit = $SourceCommit.ToLowerInvariant()
+      sourceDirty = $SourceDirty
+      builtAt = (Get-Date).ToUniversalTime().ToString("o")
     } | ConvertTo-Json -Compress
     [System.IO.File]::WriteAllText($BuildConfigPath, $buildConfig, [System.Text.UTF8Encoding]::new($false))
   }
@@ -144,7 +195,16 @@ if ($BuildWindows) {
     }
   }
   $buildConfig = Get-Content -Raw -LiteralPath $BuildConfigPath | ConvertFrom-Json
-  if ($buildConfig.dataSource -ne "local_server" -or $buildConfig.apiBase -ne $WindowsApiBase -or $buildConfig.serverBundled -ne $true) {
+  if (
+    $buildConfig.buildFormat -ne 2 -or
+    $buildConfig.dataSource -ne "local_server" -or
+    $buildConfig.apiBase -ne $WindowsApiBase -or
+    $buildConfig.serverBundled -ne $true -or
+    $buildConfig.clientVersion -ne $VersionLine -or
+    $buildConfig.serverVersion -ne $ServerVersion -or
+    ([string]$buildConfig.sourceCommit).ToLowerInvariant() -ne $SourceCommit.ToLowerInvariant() -or
+    $buildConfig.sourceDirty -ne $SourceDirty
+  ) {
     throw "Existing Windows build was not produced for the requested self-use local_server configuration. Re-run without -SkipBuild."
   }
 
@@ -162,16 +222,35 @@ if ($BuildWindows) {
     Copy-Item -LiteralPath (Join-Path $Root "tools\windows_self_use_launcher.cmd") -Destination (Join-Path $Stage "Start-Finwealth.cmd")
     Copy-Item -LiteralPath (Join-Path $Root "docs\deploy\WINDOWS_SELF_USE_PACKAGE.md") -Destination (Join-Path $Stage "README.md")
 
-    $serverHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ServerRelease).Hash.ToLowerInvariant()
+    $packagedClient = Join-Path $Stage "finwealth.exe"
+    $packagedServer = Join-Path $ServerDir "finwealth-server.exe"
+    $packagedLauncherPs1 = Join-Path $Stage "Start-Finwealth.ps1"
+    $packagedLauncherCmd = Join-Path $Stage "Start-Finwealth.cmd"
+    $packagedBuildConfig = Join-Path $Stage "finwealth.build-config.json"
+    $clientHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $packagedClient).Hash.ToLowerInvariant()
+    $serverHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $packagedServer).Hash.ToLowerInvariant()
+    $launcherPs1Hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $packagedLauncherPs1).Hash.ToLowerInvariant()
+    $launcherCmdHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $packagedLauncherCmd).Hash.ToLowerInvariant()
+    $buildConfigHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $packagedBuildConfig).Hash.ToLowerInvariant()
     $packageManifest = [ordered]@{
-      packageFormat = 1
-      version = $VersionLine
+      packageFormat = 2
+      clientVersion = $VersionLine
+      serverVersion = $ServerVersion
       createdAt = (Get-Date).ToUniversalTime().ToString("o")
+      sourceCommit = $SourceCommit.ToLowerInvariant()
+      sourceDirty = $SourceDirty
       dataSource = "local_server"
       apiBase = $WindowsApiBase
+      client = "finwealth.exe"
+      clientSha256 = $clientHash
       server = "server/finwealth-server.exe"
       serverSha256 = $serverHash
-      launcher = "Start-Finwealth.cmd"
+      launcherPowerShell = "Start-Finwealth.ps1"
+      launcherPowerShellSha256 = $launcherPs1Hash
+      launcherCmd = "Start-Finwealth.cmd"
+      launcherCmdSha256 = $launcherCmdHash
+      buildConfig = "finwealth.build-config.json"
+      buildConfigSha256 = $buildConfigHash
     } | ConvertTo-Json -Compress
     [System.IO.File]::WriteAllText(
       (Join-Path $Stage "package-manifest.json"),
@@ -179,12 +258,32 @@ if ($BuildWindows) {
       [System.Text.UTF8Encoding]::new($false)
     )
 
+    & $packagedLauncherPs1 -PackageIntegrityOnly
+    if ($LASTEXITCODE -ne 0) {
+      throw "Staged Windows package failed launcher integrity check."
+    }
+
     $ZipPath = Join-Path $Dist "$PackageName-windows-self-use-x64.zip"
     if (Test-Path $ZipPath) {
       throw "Package already exists: $ZipPath"
     }
     Compress-Archive -Path (Join-Path $Stage "*") -DestinationPath $ZipPath
+    $VerifyDir = Join-Path $Dist ".verify-$PackageName-windows-x64"
+    try {
+      Expand-Archive -LiteralPath $ZipPath -DestinationPath $VerifyDir
+      & (Join-Path $VerifyDir "Start-Finwealth.ps1") -PackageIntegrityOnly
+      if ($LASTEXITCODE -ne 0) {
+        throw "Archived Windows package failed launcher integrity check."
+      }
+    } finally {
+      if (Test-Path -LiteralPath $VerifyDir) {
+        Remove-Item -LiteralPath $VerifyDir -Recurse -Force
+      }
+    }
+    $zipHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ZipPath).Hash.ToLowerInvariant()
+    "$zipHash  $(Split-Path -Leaf $ZipPath)" | Set-Content -LiteralPath "$ZipPath.sha256" -Encoding ASCII
     Write-Host "Windows self-use package: $ZipPath"
+    Write-Host "Windows self-use package SHA-256: $ZipPath.sha256"
   } finally {
     if (Test-Path $Stage) {
       Remove-Item -LiteralPath $Stage -Recurse -Force
@@ -206,5 +305,8 @@ if ($BuildAndroid) {
   }
   $ApkTarget = Join-Path $Dist "$PackageName-android-readonly-preview-debug.apk"
   Copy-Item -LiteralPath $ApkSource -Destination $ApkTarget
+  $apkHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ApkTarget).Hash.ToLowerInvariant()
+  "$apkHash  $(Split-Path -Leaf $ApkTarget)" | Set-Content -LiteralPath "$ApkTarget.sha256" -Encoding ASCII
   Write-Host "Android read-only preview package: $ApkTarget"
+  Write-Host "Android read-only preview SHA-256: $ApkTarget.sha256"
 }

@@ -34,10 +34,12 @@ LOCAL_BACKUP = ROOT / "tools" / "backup_local_ledger.ps1"
 LOCAL_RESTORE = ROOT / "tools" / "restore_local_ledger.ps1"
 LOCAL_BACKUP_RESTORE_SMOKE = ROOT / "tools" / "local_backup_restore_smoke.ps1"
 PACKAGE_SCRIPT = ROOT / "tools" / "package_release.ps1"
+PACKAGE_INTEGRITY_SMOKE = ROOT / "tools" / "package_integrity_smoke.ps1"
 WINDOWS_LAUNCHER = ROOT / "tools" / "windows_self_use_launcher.ps1"
 WINDOWS_LAUNCHER_CMD = ROOT / "tools" / "windows_self_use_launcher.cmd"
 WINDOWS_PACKAGE_DOC = ROOT / "docs" / "deploy" / "WINDOWS_SELF_USE_PACKAGE.md"
 PACKAGE_WORKFLOW = ROOT / ".github" / "workflows" / "package.yml"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 
 FORBIDDEN_ENDPOINTS = {
     "/transfers/execute",
@@ -496,10 +498,12 @@ def check_deploy_security_defaults() -> None:
 def check_release_packaging() -> None:
     for required in (
         PACKAGE_SCRIPT,
+        PACKAGE_INTEGRITY_SMOKE,
         WINDOWS_LAUNCHER,
         WINDOWS_LAUNCHER_CMD,
         WINDOWS_PACKAGE_DOC,
         PACKAGE_WORKFLOW,
+        CI_WORKFLOW,
     ):
         if not required.exists():
             fail(f"Missing self-use packaging artifact: {required}")
@@ -516,6 +520,15 @@ def check_release_packaging() -> None:
         "[System.Uri]::TryCreate",
         "stale APK could be mislabeled",
         "CLIENT_IDEMPOTENCY_BLOCKER",
+        "auth_client_test.dart",
+        "flutterExe test $testPath",
+        "AllowDirtySource",
+        "sourceCommit",
+        "clientSha256",
+        "launcherPowerShellSha256",
+        "buildConfigSha256",
+        "Expand-Archive",
+        '"$ZipPath.sha256"',
         "CheckReadinessOnly",
         "AndroidReadOnlyPreview",
         "android-readonly-preview-debug.apk",
@@ -535,6 +548,11 @@ def check_release_packaging() -> None:
         "FINWEALTH_QUOTE_PROVIDER",
         "Get-FileHash",
         "serverSha256",
+        "clientSha256",
+        "launcherPowerShellSha256",
+        "buildConfigSha256",
+        "PackageIntegrityOnly",
+        "packageFormat -ne 2",
         "finwealth.build-config.json",
         "--ledger-path",
         "Wait-Health",
@@ -546,9 +564,34 @@ def check_release_packaging() -> None:
     if missing:
         fail("Windows self-use launcher missing safety behavior: " + ", ".join(missing))
 
+    package_integrity_smoke_text = PACKAGE_INTEGRITY_SMOKE.read_text(encoding="utf-8")
+    package_integrity_smoke_snippets = [
+        "PackageIntegrityOnly",
+        "unexpectedly touched user state",
+        "tampered client",
+        "Windows package integrity smoke passed",
+    ]
+    missing = [
+        snippet
+        for snippet in package_integrity_smoke_snippets
+        if snippet not in package_integrity_smoke_text
+    ]
+    if missing:
+        fail("Package integrity smoke missing regression coverage: " + ", ".join(missing))
+
     workflow_text = PACKAGE_WORKFLOW.read_text(encoding="utf-8")
     required_workflow_snippets = [
         "finwealth-windows-self-use-x64",
+        "verify-windows-source:",
+        "cargo clippy",
+        "python tools/contract_check.py",
+        "python tools/local_ledger_smoke.py",
+        "local_backup_restore_smoke.ps1",
+        "package_integrity_smoke.ps1",
+        "flutter analyze",
+        "flutter test",
+        "needs: verify-windows-source",
+        "*-windows-self-use-x64.zip.sha256",
         "include_android_readonly_preview",
         "AndroidReadOnlyPreview",
         "android-readonly-preview-debug",
@@ -558,6 +601,12 @@ def check_release_packaging() -> None:
     ]
     if missing:
         fail("Package workflow does not preserve package-mode boundaries: " + ", ".join(missing))
+
+    ci_workflow_text = CI_WORKFLOW.read_text(encoding="utf-8")
+    if "CLIENT_IDEMPOTENCY_BLOCKER" in ci_workflow_text:
+        fail("CI must not swallow the client idempotency packaging blocker")
+    if "package_release.ps1 -WindowsOnly -OutputDir" not in ci_workflow_text:
+        fail("CI must build the paired Windows package rather than readiness-check only")
 
     ok("Self-use release packaging checks passed")
 
