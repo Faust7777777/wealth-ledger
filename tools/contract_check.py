@@ -1322,6 +1322,8 @@ def check_release_packaging() -> None:
         "frontend_local_server_smoke.ps1",
         "flutter analyze",
         "flutter test",
+        "flutter-version: 3.44.4",
+        "Verify source remained clean",
         "needs: [verify-windows-source, verify-linux-server]",
         "*-windows-self-use-x64.zip.sha256",
         "include_android_readonly_preview",
@@ -1351,6 +1353,8 @@ def check_release_packaging() -> None:
         fail("CI must execute the contract checks")
     if "tools/requirements.txt" not in ci_workflow_text:
         fail("CI must install the pinned Python tooling dependencies")
+    if "flutter-version: 3.44.4" not in ci_workflow_text:
+        fail("CI must pin the reviewed Flutter toolchain version")
 
     ok("Self-use release packaging checks passed")
 
