@@ -310,6 +310,69 @@ void main() {
     });
   });
 
+  group('cat12: pending 时取消门控（本地禁用，非 409 兜底）', () {
+    OutlinedButton cancelButton(WidgetTester tester) =>
+        tester.widget<OutlinedButton>(
+          find.ancestor(
+            of: find.text('取消订阅'),
+            // OutlinedButton.icon 实际是私有子类，byType 精确匹配不到，用 is 判断。
+            matching: find.byWidgetPredicate((w) => w is OutlinedButton),
+          ),
+        );
+
+    testWidgets('pending 时取消按钮禁用：不弹确认框、不调用 Repository', (tester) async {
+      var cancelCalls = 0;
+      _tallView(tester);
+      await tester.pumpWidget(
+        _app(
+          const SubscriptionDetailPage(subscriptionId: 'sub_1'),
+          overrides: [
+            capabilitiesProvider.overrideWith((ref) async => _canManage),
+            accountsProvider.overrideWith((ref) async => const [_account]),
+            subscriptionByIdProvider(
+              'sub_1',
+            ).overrideWith((ref) async => _sub(pending: true)),
+            subscriptionRepositoryProvider.overrideWithValue(
+              _FakeSubRepo(
+                onCancel: () async {
+                  cancelCalls += 1;
+                  return _sub(status: SubscriptionStatus.cancelled);
+                },
+              ),
+            ),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(cancelButton(tester).onPressed, isNull);
+      await tester.tap(find.text('取消订阅'), warnIfMissed: false);
+      await tester.pumpAndSettle();
+      expect(find.text('取消未来扣费'), findsNothing); // 无确认对话框
+      expect(cancelCalls, 0);
+      // 恢复路径仍在：顶部待确认提示条的「前往审核」。
+      expect(find.text('前往审核'), findsWidgets);
+    });
+
+    testWidgets('无 pending 的可排期订阅取消仍可用', (tester) async {
+      _tallView(tester);
+      await tester.pumpWidget(
+        _app(
+          const SubscriptionDetailPage(subscriptionId: 'sub_1'),
+          overrides: [
+            capabilitiesProvider.overrideWith((ref) async => _canManage),
+            accountsProvider.overrideWith((ref) async => const [_account]),
+            subscriptionByIdProvider(
+              'sub_1',
+            ).overrideWith((ref) async => _sub()),
+            subscriptionRepositoryProvider.overrideWithValue(_FakeSubRepo()),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(cancelButton(tester).onPressed, isNotNull);
+    });
+  });
+
   group('cat11: 手机与宽屏无 overflow', () {
     Future<void> pumpAt(WidgetTester tester, Size size, Widget page) async {
       tester.view.physicalSize = size;
