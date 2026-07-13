@@ -83,7 +83,10 @@ class HomeShell extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final useRail = MediaQuery.sizeOf(context).width >= AppLayout.bpRailIcon;
+    final width = MediaQuery.sizeOf(context).width;
+    final useRail = width >= AppLayout.bpRailIcon;
+    // 宽屏（>=1360）用 256px 扩展侧栏（图标+文字横排），否则窄图标栏。
+    final extendedRail = width >= AppLayout.bpExpanded;
 
     // FAB 常显；sheet 内条目按服务端 capabilities 逐项禁用并给出原因。
     final fab = FloatingActionButton.extended(
@@ -126,10 +129,23 @@ class HomeShell extends ConsumerWidget {
             NavigationRail(
               selectedIndex: navigationShell.currentIndex,
               onDestinationSelected: _go,
-              labelType: NavigationRailLabelType.all,
+              extended: extendedRail,
+              minExtendedWidth: AppLayout.railWidth,
+              // 扩展态下标签横排（labelType 须为 none）；窄栏则图标上方显文字。
+              labelType: extendedRail
+                  ? NavigationRailLabelType.none
+                  : NavigationRailLabelType.all,
               leading: Padding(
-                padding: const EdgeInsets.symmetric(vertical: AppSpacing.md),
-                child: fab,
+                padding: EdgeInsets.symmetric(
+                  vertical: AppSpacing.md,
+                  horizontal: extendedRail ? AppSpacing.base : 0,
+                ),
+                child: Align(
+                  alignment: extendedRail
+                      ? Alignment.centerLeft
+                      : Alignment.center,
+                  child: fab,
+                ),
               ),
               destinations: [
                 for (final d in _dests)

@@ -17,7 +17,7 @@ class LiabilitiesPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final async = ref.watch(liabilitiesProvider);
     return async.when(
-      loading: () => const Center(child: CircularProgressIndicator()),
+      loading: () => const ListSkeleton(),
       error: (e, _) => ErrorStateView(
         message: '$e',
         onRetry: () => ref.invalidate(liabilitiesProvider),
@@ -44,19 +44,24 @@ class LiabilitiesPage extends ConsumerWidget {
           itemBuilder: (context, i) {
             final a = items[i];
             final v = a.value;
-            return ListTile(
-              leading: Icon(accountTypeIcon(a.accountType)),
-              title: Text(a.displayName),
-              subtitle: Text(
-                a.note == null
-                    ? accountTypeLabel(a.accountType)
-                    : '${accountTypeLabel(a.accountType)} · ${a.note}',
+            return Reveal(
+              delay: Duration(milliseconds: (i * 40).clamp(0, 240)),
+              child: PressableScale(
+                onTap: () => context.push('/account/${a.id}'),
+                child: ListTile(
+                  leading: LeadingAvatar.icon(accountTypeIcon(a.accountType)),
+                  title: Text(a.displayName),
+                  subtitle: Text(
+                    a.note == null
+                        ? accountTypeLabel(a.accountType)
+                        : '${accountTypeLabel(a.accountType)} · ${a.note}',
+                  ),
+                  trailing: Text(
+                    v == null ? '—' : formatValued(v),
+                    style: AppType.moneyRow,
+                  ),
+                ),
               ),
-              trailing: Text(
-                v == null ? '—' : formatValued(v),
-                style: AppType.moneyRow,
-              ),
-              onTap: () => context.push('/account/${a.id}'),
             );
           },
         );

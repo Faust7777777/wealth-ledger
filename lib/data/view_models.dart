@@ -276,6 +276,7 @@ class LedgerCapabilitiesVm {
     required this.canConfirmProposal,
     required this.canPersistPendingProposal,
     required this.proposalPersistence,
+    this.canManageSubscriptions = false,
   });
 
   final String dataSourceMode;
@@ -286,6 +287,9 @@ class LedgerCapabilitiesVm {
   final bool canPersistPendingProposal;
   final String proposalPersistence; // none / memory / file
 
+  /// 订阅管理写入口 gating（创建/编辑/取消/生成扣费候选）。缺失时 fail-closed。
+  final bool canManageSubscriptions;
+
   /// fail-closed 默认：能力未知（加载中 / 请求失败 / 字段缺失）时一律只读。
   static const locked = LedgerCapabilitiesVm(
     dataSourceMode: 'unknown',
@@ -295,6 +299,7 @@ class LedgerCapabilitiesVm {
     canConfirmProposal: false,
     canPersistPendingProposal: false,
     proposalPersistence: 'none',
+    canManageSubscriptions: false,
   );
 }
 
@@ -685,4 +690,152 @@ class AssetAllocationVm {
   final Money totalLiabilities;
   final Money netWorth;
   bool get isEmpty => slices.isEmpty;
+}
+
+// ———————————— 订阅管理（Subscriptions） ————————————
+// 对齐 finwealth-backend 契约：openapi Subscription / DATA_SCHEMA 9A / HTTP_API 7A。
+// 订阅计划不是已发生流水；charge-proposal 只生成 pending_review 候选，确认后才动余额。
+
+enum SubscriptionStatus { trial, active, paused, cancelled, expired }
+
+enum BillingUnit { day, week, month, year }
+
+enum SubscriptionDurationUnit { day, month, year }
+
+/// 计费周期：unit + 正整数 interval（如 每 1 month）。
+class SubscriptionBillingCycleVm {
+  const SubscriptionBillingCycleVm({
+    required this.unit,
+    required this.interval,
+  });
+  final BillingUnit unit;
+  final int interval;
+}
+
+/// 持续时长：unit + count（与 endDate 二选一）。
+class SubscriptionDurationVm {
+  const SubscriptionDurationVm({required this.unit, required this.count});
+  final SubscriptionDurationUnit unit;
+  final int count;
+}
+
+/// 订阅（服务端投影）。金额保持原币 Money，日期为本地日历 YYYY-MM-DD 字符串。
+class SubscriptionVm {
+  const SubscriptionVm({
+    required this.id,
+    required this.displayName,
+    required this.provider,
+    this.planName,
+    required this.amount,
+    required this.paymentAccountId,
+    required this.billingCycle,
+    required this.billingAnchorDay,
+    required this.startDate,
+    this.duration,
+    this.endDate,
+    this.nextChargeDate,
+    required this.autoRenew,
+    required this.reminderDaysBefore,
+    required this.status,
+    this.pendingChargeMovementId,
+    this.pendingChargeDate,
+    this.lastChargeMovementId,
+    this.lastChargeDate,
+    this.cancelledAt,
+    this.note,
+  });
+
+  final Id id;
+  final String displayName;
+  final String provider;
+  final String? planName;
+  final Money amount;
+  final Id paymentAccountId;
+  final SubscriptionBillingCycleVm billingCycle;
+  final int billingAnchorDay; // 1–31，短月取月末后恢复锚点
+  final IsoDate startDate;
+  final SubscriptionDurationVm? duration;
+  final IsoDate? endDate;
+  final IsoDate? nextChargeDate;
+  final bool autoRenew;
+  final int reminderDaysBefore;
+  final SubscriptionStatus status;
+  final Id? pendingChargeMovementId;
+  final IsoDate? pendingChargeDate;
+  final Id? lastChargeMovementId;
+  final IsoDate? lastChargeDate;
+  final IsoDateTime? cancelledAt;
+  final String? note;
+
+  /// 本期已有待确认扣费候选：禁重复生成、禁取消，引导去 AI 审核。
+  bool get hasPendingCharge =>
+      pendingChargeMovementId != null || pendingChargeDate != null;
+
+  /// 仍有未来扣费的活跃态（trial/active）；paused/cancelled/expired 不显示扣费动作。
+  bool get isSchedulable =>
+      status == SubscriptionStatus.trial || status == SubscriptionStatus.active;
+}
+
+/// 创建订阅输入。duration 与 endDate 互斥（UI 层保证只带其一）。
+class CreateSubscriptionInput {
+  const CreateSubscriptionInput({
+    required this.displayName,
+    required this.provider,
+    this.planName,
+    required this.amount,
+    required this.paymentAccountId,
+    required this.billingCycle,
+    required this.startDate,
+    this.duration,
+    this.endDate,
+    this.autoRenew = true,
+    this.reminderDaysBefore = 3,
+    this.note,
+  });
+
+  final String displayName;
+  final String provider;
+  final String? planName;
+  final Money amount;
+  final Id paymentAccountId;
+  final SubscriptionBillingCycleVm billingCycle;
+  final IsoDate startDate;
+  final SubscriptionDurationVm? duration;
+  final IsoDate? endDate;
+  final bool autoRenew;
+  final int reminderDaysBefore;
+  final String? note;
+}
+
+/// 编辑订阅输入（PATCH，整表单字段替换语义；可空字段传 null 表示清除）。
+class UpdateSubscriptionInput {
+  const UpdateSubscriptionInput({
+    required this.displayName,
+    required this.provider,
+    required this.planName,
+    required this.amount,
+    required this.paymentAccountId,
+    required this.billingCycle,
+    required this.startDate,
+    required this.duration,
+    required this.endDate,
+    required this.autoRenew,
+    required this.reminderDaysBefore,
+    required this.status,
+    required this.note,
+  });
+
+  final String displayName;
+  final String provider;
+  final String? planName;
+  final Money amount;
+  final Id paymentAccountId;
+  final SubscriptionBillingCycleVm billingCycle;
+  final IsoDate startDate;
+  final SubscriptionDurationVm? duration; // 与 endDate 互斥
+  final IsoDate? endDate;
+  final bool autoRenew;
+  final int reminderDaysBefore;
+  final SubscriptionStatus status;
+  final String? note;
 }

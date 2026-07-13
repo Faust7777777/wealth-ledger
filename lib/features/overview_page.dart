@@ -1,5 +1,7 @@
 // Wealth Ledger — 概览页（L0 净值 → L1 待处理 → L2 主要持仓 → L4 近期变动）。
 // 第一阶段：real_local 显空态；debug_fixture 显 DEMO 数据。布局从简，不铺满。
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -12,6 +14,7 @@ import '../shared/widgets.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
+import 'account_visuals.dart';
 
 class OverviewPage extends ConsumerWidget {
   const OverviewPage({super.key});
@@ -31,7 +34,12 @@ class OverviewPage extends ConsumerWidget {
       data: (o) {
         if (o.isEmpty) {
           return EmptyState(
-            icon: Icons.savings_outlined,
+            illustration: Image.asset(
+              'assets/illustrations/net-worth-empty-state.png',
+              width: 168,
+              // 首屏品牌插画：金线日出越平缓水面，喻长期稳健增值。
+              semanticLabel: '开始记录净资产',
+            ),
             title: '今天开始记录你的净资产',
             message: '添加账户与初始余额后，这里会显示净值、账户健康与投资表现。',
             action: WriteGate(
@@ -46,10 +54,18 @@ class OverviewPage extends ConsumerWidget {
         return ListView(
           padding: const EdgeInsets.all(AppSpacing.xl),
           children: [
-            _Hero(o: o),
-            if (o.pendingSummary.total > 0) _Pending(s: o.pendingSummary),
+            // 首屏关键块轻微错峰入场；列表行不参与，避免滚动时反复触发。
+            Reveal(child: _Hero(o: o)),
+            if (o.pendingSummary.total > 0)
+              Reveal(
+                delay: const Duration(milliseconds: 70),
+                child: _Pending(s: o.pendingSummary),
+              ),
             if (allocation != null && !allocation.isEmpty)
-              _AllocationBar(a: allocation),
+              Reveal(
+                delay: const Duration(milliseconds: 130),
+                child: _AllocationBar(a: allocation),
+              ),
             if (o.primaryHoldings.isNotEmpty) ...[
               const SectionHeader(title: '主要持仓'),
               for (final h in o.primaryHoldings) _HoldingRow(h: h),
@@ -115,7 +131,11 @@ class _Hero extends StatelessWidget {
       children: [
         Text('净资产 · CNY', style: muted),
         const SizedBox(height: AppSpacing.sm),
-        Text(amount, style: Theme.of(context).textTheme.displayLarge),
+        // 值变化时在真实数字之间过渡（淡入上滑），不伪造中间金额。
+        AnimatedMoneyText(
+          amount,
+          style: Theme.of(context).textTheme.displayLarge,
+        ),
         ?deltaLine,
         if (!o.quoteStatusSummary.allFresh)
           Padding(
@@ -167,7 +187,7 @@ class _Pending extends StatelessWidget {
             ),
             const SizedBox(height: AppSpacing.sm),
             for (final e in items)
-              InkWell(
+              PressableScale(
                 onTap: e.$3 == null
                     ? null
                     : () => e.$3 == '/investment'
@@ -218,6 +238,7 @@ class _HoldingRow extends StatelessWidget {
     return ListTile(
       contentPadding: EdgeInsets.zero,
       dense: true,
+      leading: LeadingAvatar.mono(h.symbol),
       title: Text('${h.symbol} · ${h.quantity}', style: AppType.bodyStrong),
       subtitle: pnl.isEmpty
           ? null
@@ -234,15 +255,17 @@ class _MovementRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final amt = m.displayAmount;
-    return ListTile(
-      contentPadding: EdgeInsets.zero,
-      dense: true,
-      title: Text(m.title, style: AppType.body),
-      subtitle: m.inTransit ? Text('在途 · 非支出', style: AppType.caption) : null,
-      trailing: amt == null
-          ? null
-          : Text(formatMoney(amt), style: AppType.moneyRow),
+    return PressableScale(
       onTap: () => context.push('/movement/${m.id}'),
+      child: ListTile(
+        contentPadding: EdgeInsets.zero,
+        dense: true,
+        title: Text(m.title, style: AppType.body),
+        subtitle: m.inTransit ? Text('在途 · 非支出', style: AppType.caption) : null,
+        trailing: amt == null
+            ? null
+            : Text(formatMoney(amt), style: AppType.moneyRow),
+      ),
     );
   }
 }
@@ -254,15 +277,18 @@ class _AccountRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final v = a.value;
-    return ListTile(
-      contentPadding: EdgeInsets.zero,
-      dense: true,
-      title: Text(a.displayName, style: AppType.body),
-      trailing: Text(
-        v == null ? '—' : formatValued(v),
-        style: AppType.moneyRow,
-      ),
+    return PressableScale(
       onTap: () => context.push('/account/${a.id}'),
+      child: ListTile(
+        contentPadding: EdgeInsets.zero,
+        dense: true,
+        leading: LeadingAvatar.icon(accountTypeIcon(a.accountType)),
+        title: Text(a.displayName, style: AppType.body),
+        trailing: Text(
+          v == null ? '—' : formatValued(v),
+          style: AppType.moneyRow,
+        ),
+      ),
     );
   }
 }
@@ -289,57 +315,142 @@ class _AllocationBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final slices = a.slices;
+    final muted = Theme.of(context).textTheme.bodySmall?.color;
+    final segments = [
+      for (var i = 0; i < slices.length; i++)
+        (_flex(slices[i].percent).toDouble(), _palette[i % _palette.length]),
+    ];
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const SectionHeader(title: '资产构成'),
-        ClipRRect(
-          borderRadius: BorderRadius.circular(AppRadius.sm),
-          child: SizedBox(
-            height: 12,
-            child: Row(
-              children: [
-                for (var i = 0; i < slices.length; i++)
-                  Expanded(
-                    flex: _flex(slices[i].percent),
-                    child: Container(color: _palette[i % _palette.length]),
-                  ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: AppSpacing.sm),
-        Wrap(
-          spacing: AppSpacing.base,
-          runSpacing: AppSpacing.xs,
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            for (var i = 0; i < slices.length; i++)
-              Row(
-                mainAxisSize: MainAxisSize.min,
+            SizedBox(
+              width: 116,
+              height: 116,
+              child: CustomPaint(
+                painter: _RingPainter(
+                  segments,
+                  track: Theme.of(context).dividerColor,
+                ),
+                child: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('总资产', style: AppType.micro.copyWith(color: muted)),
+                      const SizedBox(height: 2),
+                      Text(
+                        formatMoney(a.totalAssets),
+                        style: AppType.titleM.copyWith(
+                          fontFeatures: AppType.tnum,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: AppSpacing.lg),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Container(
-                    width: 8,
-                    height: 8,
-                    decoration: BoxDecoration(
-                      color: _palette[i % _palette.length],
-                      shape: BoxShape.circle,
+                  for (var i = 0; i < slices.length; i++)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                        vertical: AppSpacing.xxs,
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 8,
+                            height: 8,
+                            decoration: BoxDecoration(
+                              color: _palette[i % _palette.length],
+                              borderRadius: BorderRadius.circular(2),
+                            ),
+                          ),
+                          const SizedBox(width: AppSpacing.sm),
+                          Expanded(
+                            child: Text(
+                              slices[i].category,
+                              style: AppType.caption,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          Text(
+                            '${slices[i].percent}%',
+                            style: AppType.caption.copyWith(color: muted),
+                          ),
+                          const SizedBox(width: AppSpacing.sm),
+                          Text(
+                            formatMoney(slices[i].value),
+                            style: AppType.moneyRow,
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: AppSpacing.xs),
-                  Text(
-                    '${slices[i].category} ${slices[i].percent}%',
-                    style: AppType.caption,
-                  ),
                 ],
               ),
+            ),
           ],
         ),
-        const SizedBox(height: AppSpacing.xs),
+        const SizedBox(height: AppSpacing.sm),
         Text(
           '− 负债 ${formatMoney(a.totalLiabilities)} → 净 ${formatMoney(a.netWorth)}',
-          style: AppType.caption,
+          style: AppType.caption.copyWith(color: muted),
         ),
       ],
     );
   }
+}
+
+/// 资产构成环形图：细描边弧段 + 段间留隙，契合 hairline 基调、非实心饼。
+class _RingPainter extends CustomPainter {
+  _RingPainter(this.segments, {required this.track});
+  final List<(double, Color)> segments; // (权重, 颜色)
+  final Color track;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const stroke = 12.0;
+    const gap = 0.05; // 段间弧隙（弧度）
+    final radius = (math.min(size.width, size.height) - stroke) / 2;
+    final rect = Rect.fromCircle(
+      center: Offset(size.width / 2, size.height / 2),
+      radius: radius,
+    );
+    final total = segments.fold<double>(0, (s, e) => s + e.$1);
+    if (total <= 0) return;
+    // 轨道底环
+    canvas.drawCircle(
+      rect.center,
+      radius,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = stroke
+        ..color = track,
+    );
+    var start = -math.pi / 2;
+    for (final (weight, color) in segments) {
+      final sweep = (weight / total) * (2 * math.pi);
+      canvas.drawArc(
+        rect,
+        start + gap / 2,
+        sweep - gap,
+        false,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = stroke
+          ..strokeCap = StrokeCap.round
+          ..color = color,
+      );
+      start += sweep;
+    }
+  }
+
+  @override
+  bool shouldRepaint(_RingPainter old) => old.segments != segments;
 }

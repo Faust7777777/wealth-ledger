@@ -60,6 +60,122 @@ void main() {
     );
   });
 
+  test(
+    'write requests carry a 128-bit hex Idempotency-Key; GET does not',
+    () async {
+      String? postKey;
+      var getHadKey = true;
+      final client = DevApiClient(
+        'http://127.0.0.1:8790',
+        client: MockClient((request) async {
+          if (request.method == 'POST') {
+            postKey = request.headers['idempotency-key'];
+          } else if (request.method == 'GET') {
+            getHadKey = request.headers.containsKey('idempotency-key');
+          }
+          return http.Response(
+            jsonEncode({'ok': true, 'data': <String, dynamic>{}}),
+            200,
+          );
+        }),
+      );
+      await client.postData('/v1/movements/drafts', body: {'x': 1});
+      await client.getData('/v1/accounts');
+      expect(postKey, isNotNull);
+      expect(postKey, matches(RegExp(r'^[0-9a-f]{32}$')));
+      expect(getHadKey, isFalse);
+    },
+  );
+
+  test('PATCH carries an Idempotency-Key', () async {
+    String? key;
+    final client = DevApiClient(
+      'http://127.0.0.1:8790',
+      client: MockClient((request) async {
+        key = request.headers['idempotency-key'];
+        return http.Response(
+          jsonEncode({'ok': true, 'data': <String, dynamic>{}}),
+          200,
+        );
+      }),
+    );
+    await client.patchData('/v1/dca/plans/plan_1', body: {'x': 1});
+    expect(key, matches(RegExp(r'^[0-9a-f]{32}$')));
+  });
+
+  test('two independent writes use different Idempotency-Keys', () async {
+    final keys = <String>[];
+    final client = DevApiClient(
+      'http://127.0.0.1:8790',
+      client: MockClient((request) async {
+        final k = request.headers['idempotency-key'];
+        if (k != null) keys.add(k);
+        return http.Response(
+          jsonEncode({'ok': true, 'data': <String, dynamic>{}}),
+          200,
+        );
+      }),
+    );
+    await client.postData('/v1/movements/drafts', body: {'x': 1});
+    await client.postData('/v1/movements/drafts', body: {'x': 2});
+    expect(keys, hasLength(2));
+    expect(keys[0], isNot(keys[1]));
+  });
+
+  test(
+    '401 replay reuses the same Idempotency-Key; auth refresh has none',
+    () async {
+      final store = MemoryAuthTokenStore();
+      await store.write(
+        const StoredAuthSession(
+          accessToken: 'access_expired',
+          refreshToken: 'refresh_old',
+          expiresAt: '2026-07-13T12:00:00+08:00',
+          deviceId: 'device_1',
+        ),
+      );
+      final businessKeys = <String>[];
+      var refreshHadKey = true;
+      final client = DevApiClient(
+        'http://127.0.0.1:8790',
+        tokenStore: store,
+        client: MockClient((request) async {
+          if (request.url.path == '/v1/auth/refresh') {
+            refreshHadKey = request.headers.containsKey('idempotency-key');
+            return http.Response(
+              jsonEncode({
+                'ok': true,
+                'data': {
+                  'accessToken': 'access_new',
+                  'refreshToken': 'refresh_new',
+                  'expiresAt': '2026-07-13T13:00:00+08:00',
+                  'deviceId': 'device_1',
+                },
+              }),
+              200,
+            );
+          }
+          final k = request.headers['idempotency-key'];
+          if (k != null) businessKeys.add(k);
+          if (request.headers['authorization'] == 'Bearer access_expired') {
+            return http.Response(jsonEncode({'ok': false}), 401);
+          }
+          return http.Response(
+            jsonEncode({
+              'ok': true,
+              'data': {'id': 'mov_1'},
+            }),
+            200,
+          );
+        }),
+      );
+      await client.postData('/v1/movements/drafts', body: {'x': 1});
+      expect(businessKeys, hasLength(2)); // 首次(401) + 刷新后重放
+      expect(businessKeys[0], businessKeys[1]); // 复用同一 key
+      expect(refreshHadKey, isFalse); // auth refresh 不带业务幂等 key
+    },
+  );
+
   test('DevApiClient refreshes session on 401 and replays request', () async {
     final store = MemoryAuthTokenStore();
     await store.write(

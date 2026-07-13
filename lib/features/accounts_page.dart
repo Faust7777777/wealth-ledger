@@ -17,7 +17,7 @@ class AccountsPage extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final async = ref.watch(accountsProvider);
     return async.when(
-      loading: () => const Center(child: CircularProgressIndicator()),
+      loading: () => const ListSkeleton(),
       error: (e, _) => ErrorStateView(
         message: '$e',
         onRetry: () => ref.invalidate(accountsProvider),
@@ -49,20 +49,25 @@ class AccountsPage extends ConsumerWidget {
               onTap: canCreate ? () => context.push('/accounts/new') : null,
             ),
             const Divider(height: 1),
-            for (final a in accounts) ...[
-              ListTile(
-                leading: Icon(accountTypeIcon(a.accountType)),
-                title: Text(a.displayName),
-                subtitle: Text(
-                  a.note == null
-                      ? accountTypeLabel(a.accountType)
-                      : '${accountTypeLabel(a.accountType)} · ${a.note}',
+            for (final (i, a) in accounts.indexed) ...[
+              Reveal(
+                delay: Duration(milliseconds: (i * 40).clamp(0, 240)),
+                child: PressableScale(
+                  onTap: () => context.push('/account/${a.id}'),
+                  child: ListTile(
+                    leading: LeadingAvatar.icon(accountTypeIcon(a.accountType)),
+                    title: Text(a.displayName),
+                    subtitle: Text(
+                      a.note == null
+                          ? accountTypeLabel(a.accountType)
+                          : '${accountTypeLabel(a.accountType)} · ${a.note}',
+                    ),
+                    trailing: Text(
+                      a.value == null ? '—' : formatValued(a.value!),
+                      style: AppType.moneyRow,
+                    ),
+                  ),
                 ),
-                trailing: Text(
-                  a.value == null ? '—' : formatValued(a.value!),
-                  style: AppType.moneyRow,
-                ),
-                onTap: () => context.push('/account/${a.id}'),
               ),
               const Divider(height: 1),
             ],

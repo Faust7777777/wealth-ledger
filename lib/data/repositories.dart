@@ -115,3 +115,23 @@ abstract interface class SnapshotRepository {
   Future<List<NetWorthSnapshotVm>> listSnapshots();
   Future<NetWorthSnapshotVm> createManualSnapshot({required String reason});
 }
+
+/// 订阅管理：计划本身不写流水；charge-proposal 只生成待确认候选，确认后才动余额。
+/// 所有写方法复用 DevApiClient 的幂等请求路径；能力由 canManageSubscriptions 门控。
+abstract interface class SubscriptionRepository {
+  Future<List<SubscriptionVm>> listSubscriptions();
+  Future<List<SubscriptionVm>> listUpcomingSubscriptions({int days = 30});
+  Future<SubscriptionVm> getSubscription(Id id);
+  Future<SubscriptionVm> createSubscription(CreateSubscriptionInput input);
+  Future<SubscriptionVm> updateSubscription(
+    Id id,
+    UpdateSubscriptionInput input,
+  );
+
+  /// 取消未来扣费（不删历史）。有待确认候选时服务端返回 409。
+  Future<SubscriptionVm> cancelSubscription(Id id);
+
+  /// 生成本期待确认扣费候选（pending_review）。返回 atomic group，交 AI 复核确认。
+  /// 本期已有候选时服务端返回 409。
+  Future<AiAtomicGroupVm> createChargeProposal(Id id);
+}

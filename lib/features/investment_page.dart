@@ -23,7 +23,7 @@ class InvestmentPage extends ConsumerWidget {
         ref.watch(dcaPlansProvider).asData?.value ?? const <DcaPlanVm>[];
 
     return holdings.when(
-      loading: () => const Center(child: CircularProgressIndicator()),
+      loading: () => const ListSkeleton(),
       error: (e, _) => ErrorStateView(
         message: '$e',
         onRetry: () => ref.invalidate(holdingsProvider),
@@ -33,7 +33,12 @@ class InvestmentPage extends ConsumerWidget {
         final canPropose = ref.writeCapabilities.canPersistPendingProposal;
         if (hs.isEmpty && rs.isEmpty && plans.isEmpty) {
           return EmptyState(
-            icon: Icons.trending_up_outlined,
+            illustration: Image.asset(
+              'assets/illustrations/investment-empty-state.png',
+              width: 176,
+              // 品牌插画：金线同心弧 + 圆，与首屏日出成套，喻稳健长期积累。
+              semanticLabel: '开始你的投资记录',
+            ),
             title: '还没有投资持仓',
             message: '可以先创建定投计划，或添加券商 / 交易所账户与持仓。这里只展示事实统计，非投资建议。',
             action: WriteGate(
@@ -113,6 +118,7 @@ class _HoldingTile extends StatelessWidget {
     }
     return ListTile(
       contentPadding: EdgeInsets.zero,
+      leading: LeadingAvatar.mono(h.symbol),
       title: Text(
         '${h.displayName} · ${h.symbol} · ${h.quantity}',
         style: AppType.bodyStrong,

@@ -25,6 +25,9 @@ import '../features/overview_page.dart';
 import '../features/reconcile_page.dart';
 import '../features/settings_page.dart';
 import '../features/snapshots_page.dart';
+import '../features/subscription_detail_page.dart';
+import '../features/subscription_form_page.dart';
+import '../features/subscriptions_page.dart';
 import '../features/taxonomy_page.dart';
 import '../features/transfer_page.dart';
 import 'home_shell.dart';
@@ -108,6 +111,25 @@ final appRouter = GoRouter(
     GoRoute(path: '/snapshots', builder: (c, s) => const SnapshotsPage()),
     GoRoute(path: '/settings', builder: (c, s) => const SettingsPage()),
     GoRoute(path: '/taxonomy', builder: (c, s) => const TaxonomyPage()),
+    // 订阅：/new 必须在 /:id 之前声明，否则 "new" 会被当作 id。
+    GoRoute(
+      path: '/subscriptions',
+      builder: (c, s) => const SubscriptionsPage(),
+    ),
+    GoRoute(
+      path: '/subscriptions/new',
+      builder: (c, s) => const SubscriptionFormPage(),
+    ),
+    GoRoute(
+      path: '/subscriptions/:id/edit',
+      builder: (c, s) =>
+          SubscriptionFormPage(existing: s.extra as SubscriptionVm?),
+    ),
+    GoRoute(
+      path: '/subscriptions/:id',
+      builder: (c, s) =>
+          SubscriptionDetailPage(subscriptionId: s.pathParameters['id']!),
+    ),
     GoRoute(
       path: '/movement/:id/correction',
       builder: (c, s) => CorrectionPage(movementId: s.pathParameters['id']!),

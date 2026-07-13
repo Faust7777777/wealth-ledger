@@ -560,3 +560,77 @@ class FixtureSnapshotRepository implements SnapshotRepository {
     required String reason,
   }) async => throw UnsupportedError('DEMO 演示只读，不支持创建快照；请用 local_server');
 }
+
+// 演示订阅（DEMO 只读；非持久化，不会真的生成扣费候选）。
+const List<SubscriptionVm> _subscriptions = [
+  SubscriptionVm(
+    id: 'sub_chatgpt',
+    displayName: 'ChatGPT Plus',
+    provider: 'OpenAI',
+    planName: 'Plus',
+    amount: Money(amount: '20.00', currency: 'USD'),
+    paymentAccountId: 'acct_us_broker',
+    billingCycle: SubscriptionBillingCycleVm(
+      unit: BillingUnit.month,
+      interval: 1,
+    ),
+    billingAnchorDay: 5,
+    startDate: '2026-01-05',
+    nextChargeDate: '2026-08-05',
+    autoRenew: true,
+    reminderDaysBefore: 3,
+    status: SubscriptionStatus.active,
+  ),
+  SubscriptionVm(
+    id: 'sub_claude',
+    displayName: 'Claude Pro',
+    provider: 'Anthropic',
+    planName: 'Pro',
+    amount: Money(amount: '20.00', currency: 'USD'),
+    paymentAccountId: 'acct_us_broker',
+    billingCycle: SubscriptionBillingCycleVm(
+      unit: BillingUnit.month,
+      interval: 1,
+    ),
+    billingAnchorDay: 12,
+    startDate: '2026-03-12',
+    nextChargeDate: '2026-07-12',
+    autoRenew: true,
+    reminderDaysBefore: 3,
+    status: SubscriptionStatus.active,
+    pendingChargeMovementId: 'mov_pending_claude',
+    pendingChargeDate: '2026-07-12',
+  ),
+];
+
+class FixtureSubscriptionRepository implements SubscriptionRepository {
+  const FixtureSubscriptionRepository();
+  @override
+  Future<List<SubscriptionVm>> listSubscriptions() async => _subscriptions;
+  @override
+  Future<List<SubscriptionVm>> listUpcomingSubscriptions({
+    int days = 30,
+  }) async => _subscriptions.where((s) => s.isSchedulable).toList();
+  @override
+  Future<SubscriptionVm> getSubscription(Id id) async =>
+      _subscriptions.cast<SubscriptionVm?>().firstWhere(
+        (s) => s!.id == id,
+        orElse: () => null,
+      ) ??
+      _subscriptions.first;
+  @override
+  Future<SubscriptionVm> createSubscription(
+    CreateSubscriptionInput input,
+  ) async => throw UnsupportedError('DEMO 演示只读，不支持创建订阅；请用 local_server');
+  @override
+  Future<SubscriptionVm> updateSubscription(
+    Id id,
+    UpdateSubscriptionInput input,
+  ) async => throw UnsupportedError('DEMO 演示只读，不支持编辑订阅；请用 local_server');
+  @override
+  Future<SubscriptionVm> cancelSubscription(Id id) async =>
+      throw UnsupportedError('DEMO 演示只读，不支持取消订阅；请用 local_server');
+  @override
+  Future<AiAtomicGroupVm> createChargeProposal(Id id) async =>
+      throw UnsupportedError('DEMO 演示只读，不会真的生成扣费候选；请用 local_server');
+}

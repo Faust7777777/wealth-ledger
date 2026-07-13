@@ -63,6 +63,25 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
+  assets:
+    - assets/illustrations/
+
+  # 打包字体均为 SIL OFL 1.1（可随源码分发）；来源/命令见 assets/fonts/SOURCE.md，
+  # 许可全文见 assets/fonts/licenses/。family='Inter' 未打包→回退链首选 NotoSansSC。
+  fonts:
+    # 正文/UI 无衬线：Noto Sans SC 子集（覆盖 CJK U+4E00-9FFF + ASCII + 符号）。
+    - family: NotoSansSC
+      fonts:
+        - asset: assets/fonts/NotoSansSC-400.ttf
+          weight: 400
+    # 思源宋（Noto Serif SC，OFL）子集，Hero 大数字用 700、各级标题用 500，正文仍无衬线。
+    - family: NotoSerifSC
+      fonts:
+        - asset: assets/fonts/NotoSerifSC-500.ttf
+          weight: 500
+        - asset: assets/fonts/NotoSerifSC-700.ttf
+          weight: 700
+
   # To add assets to your application, add an assets section, like this:
   # assets:
   #   - images/a_dot_burr.jpeg

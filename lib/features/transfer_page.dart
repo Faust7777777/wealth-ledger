@@ -35,7 +35,8 @@ class _TransferPageState extends ConsumerState<TransferPage> {
 
   bool get _amountValid {
     final t = _amount.text.trim();
-    if (!RegExp(r'^\d+(\.\d+)?$').hasMatch(t)) return false;
+    // 小数位对齐服务端上限（8 位）；超出会被 local ledger 拒绝。
+    if (!RegExp(r'^\d+(\.\d{1,8})?$').hasMatch(t)) return false;
     final v = double.tryParse(t);
     return v != null && v > 0;
   }
