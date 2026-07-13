@@ -190,6 +190,12 @@ POST  /v1/atomic-groups/{atomicGroupId}/reject
 POST  /v1/movements/corrections
 ```
 
+查询语义：
+
+- `/movements?status=<MovementStatus>&limit=1..200` 先按状态过滤，再截断；未传参数时保留账本顺序。
+- `/movements/recent?limit=1..200` 按 `occurredAt`、`recordedAt`、`id` 稳定倒序，缺省返回最近 20 条。
+- 非法 status 或 limit 返回 400 `invalid_movement_query`，不得静默忽略。
+
 规则：
 
 - draft / pending review 不影响正式余额。
@@ -286,6 +292,8 @@ POST /v1/snapshots/invalidate
 
 规则：
 
+- 不传 `from/to` 时返回全部持久化快照，按 `snapshotAt` 倒序。
+- 日期范围为包含首尾的本地日历日期；`from/to` 必须同时出现，格式错误或 `to < from` 返回 400 `invalid_snapshot_range`。
 - 首页默认较上次快照。
 - 只有全 fresh 时才展示今日涨跌。
 

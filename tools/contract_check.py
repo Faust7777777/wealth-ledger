@@ -302,6 +302,10 @@ def check_rust_server() -> None:
         "token_hash_eq",
         '"--validate-auth-state"',
         "parse_auth_state_timestamp",
+        "parse_movement_list_query",
+        "invalid_movement_query",
+        "parse_optional_snapshot_range",
+        "invalid_snapshot_range",
     ]
     missing = [snippet for snippet in required_snippets if snippet not in text]
     if missing:
@@ -658,6 +662,30 @@ def main() -> None:
         fail("OpenAPI must document the local-server holdings alias /holdings")
     if "/movements/recent" not in paths:
         fail("OpenAPI must document the local-server recent movements alias /movements/recent")
+    movement_parameters = {
+        parameter.get("name"): parameter
+        for parameter in doc["paths"]["/movements"]["get"].get("parameters", [])
+        if isinstance(parameter, dict)
+    }
+    movement_limit_schema = movement_parameters.get("limit", {}).get("schema", {})
+    if movement_limit_schema.get("minimum") != 1 or movement_limit_schema.get("maximum") != 200:
+        fail("Movement limit must stay bounded to 1..200")
+    recent_parameters = {
+        parameter.get("name"): parameter
+        for parameter in doc["paths"]["/movements/recent"]["get"].get("parameters", [])
+        if isinstance(parameter, dict)
+    }
+    if recent_parameters.get("limit", {}).get("schema", {}).get("default") != 20:
+        fail("Recent movements must document the server default limit of 20")
+    snapshot_parameters = {
+        parameter.get("name"): parameter
+        for parameter in doc["paths"]["/snapshots"]["get"].get("parameters", [])
+        if isinstance(parameter, dict)
+    }
+    if set(snapshot_parameters) != {"from", "to"}:
+        fail("Snapshot list must document paired from/to filters")
+    if any(parameter.get("required") is True for parameter in snapshot_parameters.values()):
+        fail("Snapshot from/to filters must remain optional as a pair")
     if "AiFieldDiff" not in schemas:
         fail("OpenAPI must expose AiFieldDiff for old -> new review")
     idempotency_parameter = doc["components"].get("parameters", {}).get(

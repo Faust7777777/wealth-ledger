@@ -296,12 +296,14 @@ paths:
       parameters:
         - name: limit
           in: query
+          description: Optional maximum result count; base list preserves ledger order.
           schema:
             type: integer
             minimum: 1
             maximum: 200
         - name: status
           in: query
+          description: Optional exact MovementStatus filter applied before limit.
           schema:
             $ref: "#/components/schemas/MovementStatus"
       responses:
@@ -319,10 +321,12 @@ paths:
       parameters:
         - name: limit
           in: query
+          description: Maximum recent-first result count; defaults to 20.
           schema:
             type: integer
             minimum: 1
             maximum: 200
+            default: 20
       responses:
         "200":
           description: Recent movements.
@@ -977,12 +981,14 @@ paths:
       parameters:
         - name: from
           in: query
-          required: true
+          required: false
+          description: Inclusive snapshot date; must be supplied together with to.
           schema:
             $ref: "#/components/schemas/ISODate"
         - name: to
           in: query
-          required: true
+          required: false
+          description: Inclusive snapshot date; must be supplied together with from.
           schema:
             $ref: "#/components/schemas/ISODate"
       responses:

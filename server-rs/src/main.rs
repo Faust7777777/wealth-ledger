@@ -1028,7 +1028,7 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/holdings", get(holdings))
         .route("/v1/portfolio/allocation", get(asset_allocation))
         .route("/v1/movements", get(movements))
-        .route("/v1/movements/recent", get(movements))
+        .route("/v1/movements/recent", get(recent_movements))
         .route("/v1/movements/drafts", post(create_movement_draft))
         .route("/v1/movements/{movement_id}", get(movement_detail))
         .route(
@@ -1570,18 +1570,75 @@ async fn movements(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    let (status, limit) = match parse_movement_list_query(&query, None) {
+        Ok(options) => options,
+        Err(errors) => {
+            return bad_request(
+                "invalid_movement_query",
+                "Movement list query is invalid.",
+                json!({ "errors": errors }),
+            );
+        }
+    };
     if state.should_use_local_ledger(&query) {
         let path = state
             .local_ledger_path
             .as_ref()
             .expect("local ledger path should exist when local ledger is selected");
         return match local_ledger::list_movements(path) {
-            Ok(movements) => envelope(movements).into_response(),
+            Ok(movements) => envelope(filter_and_order_movements(
+                movements,
+                status.as_deref(),
+                limit,
+                false,
+            ))
+            .into_response(),
             Err(error) => ledger_io_error(error),
         };
     }
 
-    envelope(state.ledger.movements(DevScenario::from_query(&query))).into_response()
+    envelope(filter_and_order_movements(
+        state.ledger.movements(DevScenario::from_query(&query)),
+        status.as_deref(),
+        limit,
+        false,
+    ))
+    .into_response()
+}
+
+async fn recent_movements(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let (status, limit) = match parse_movement_list_query(&query, Some(20)) {
+        Ok(options) => options,
+        Err(errors) => {
+            return bad_request(
+                "invalid_movement_query",
+                "Recent movement query is invalid.",
+                json!({ "errors": errors }),
+            );
+        }
+    };
+    let movements = if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        match local_ledger::list_movements(path) {
+            Ok(movements) => movements,
+            Err(error) => return ledger_io_error(error),
+        }
+    } else {
+        state.ledger.movements(DevScenario::from_query(&query))
+    };
+    envelope(filter_and_order_movements(
+        movements,
+        status.as_deref(),
+        limit,
+        true,
+    ))
+    .into_response()
 }
 
 async fn movement_detail(
@@ -2591,6 +2648,142 @@ fn parse_historical_price_dates(
     Ok((from_date, to_date))
 }
 
+fn parse_movement_list_query(
+    query: &HashMap<String, String>,
+    default_limit: Option<usize>,
+) -> Result<(Option<String>, Option<usize>), Vec<String>> {
+    const STATUSES: &[&str] = &[
+        "draft",
+        "pending_review",
+        "confirmed",
+        "in_transit",
+        "cancelled",
+        "reversed",
+    ];
+    let mut errors = Vec::new();
+    let status = query.get("status").and_then(|value| {
+        if STATUSES.contains(&value.as_str()) {
+            Some(value.clone())
+        } else {
+            errors.push(format!("status must be one of: {}", STATUSES.join(", ")));
+            None
+        }
+    });
+    let limit = match query.get("limit") {
+        Some(value) => match value.parse::<usize>() {
+            Ok(value @ 1..=200) => Some(value),
+            _ => {
+                errors.push("limit must be an integer from 1 to 200".to_string());
+                None
+            }
+        },
+        None => default_limit,
+    };
+
+    if errors.is_empty() {
+        Ok((status, limit))
+    } else {
+        Err(errors)
+    }
+}
+
+fn filter_and_order_movements(
+    movements: Value,
+    status: Option<&str>,
+    limit: Option<usize>,
+    recent_first: bool,
+) -> Value {
+    let mut items = movements.as_array().cloned().unwrap_or_default();
+    if let Some(status) = status {
+        items.retain(|movement| movement.get("status").and_then(Value::as_str) == Some(status));
+    }
+    if recent_first {
+        items.sort_by(|left, right| {
+            let left_occurred = left
+                .get("occurredAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let right_occurred = right
+                .get("occurredAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let left_recorded = left
+                .get("recordedAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let right_recorded = right
+                .get("recordedAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let left_id = left.get("id").and_then(Value::as_str).unwrap_or_default();
+            let right_id = right.get("id").and_then(Value::as_str).unwrap_or_default();
+            right_occurred
+                .cmp(left_occurred)
+                .then_with(|| right_recorded.cmp(left_recorded))
+                .then_with(|| right_id.cmp(left_id))
+        });
+    }
+    if let Some(limit) = limit {
+        items.truncate(limit);
+    }
+    json!(items)
+}
+
+fn parse_optional_snapshot_range(
+    query: &HashMap<String, String>,
+) -> Result<Option<(Date, Date)>, Vec<String>> {
+    match (query.get("from"), query.get("to")) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            Err(vec!["from and to must be provided together".to_string()])
+        }
+        (Some(from), Some(to)) => {
+            let mut errors = Vec::new();
+            let from_date = Date::parse(from, &Iso8601::DATE).map_err(|_| {
+                errors.push("from must be an ISO date in YYYY-MM-DD format".to_string());
+            });
+            let to_date = Date::parse(to, &Iso8601::DATE).map_err(|_| {
+                errors.push("to must be an ISO date in YYYY-MM-DD format".to_string());
+            });
+            if !errors.is_empty() {
+                return Err(errors);
+            }
+            let from_date = from_date.expect("validated from date");
+            let to_date = to_date.expect("validated to date");
+            if to_date < from_date {
+                return Err(vec!["to must be on or after from".to_string()]);
+            }
+            Ok(Some((from_date, to_date)))
+        }
+    }
+}
+
+fn filter_and_order_snapshots(snapshots: Value, range: Option<(Date, Date)>) -> Value {
+    let mut items = snapshots.as_array().cloned().unwrap_or_default();
+    if let Some((from, to)) = range {
+        items.retain(|snapshot| {
+            snapshot
+                .get("snapshotAt")
+                .and_then(Value::as_str)
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+                .map(OffsetDateTime::date)
+                .is_some_and(|date| date >= from && date <= to)
+        });
+    }
+    items.sort_by(|left, right| {
+        right
+            .get("snapshotAt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                left.get("snapshotAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+    });
+    json!(items)
+}
+
 fn parse_iso_date_query(
     query: &HashMap<String, String>,
     key: &str,
@@ -2818,18 +3011,32 @@ async fn snapshots(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    let range = match parse_optional_snapshot_range(&query) {
+        Ok(range) => range,
+        Err(errors) => {
+            return bad_request(
+                "invalid_snapshot_range",
+                "Snapshot date range is invalid.",
+                json!({ "errors": errors }),
+            );
+        }
+    };
     if state.should_use_local_ledger(&query) {
         let path = state
             .local_ledger_path
             .as_ref()
             .expect("local ledger path should exist when local ledger is selected");
         return match local_ledger::list_snapshots(path) {
-            Ok(snapshots) => envelope(snapshots).into_response(),
+            Ok(snapshots) => envelope(filter_and_order_snapshots(snapshots, range)).into_response(),
             Err(error) => ledger_io_error(error),
         };
     }
 
-    envelope(state.ledger.snapshots(DevScenario::from_query(&query))).into_response()
+    envelope(filter_and_order_snapshots(
+        state.ledger.snapshots(DevScenario::from_query(&query)),
+        range,
+    ))
+    .into_response()
 }
 
 async fn create_manual_snapshot(
@@ -7814,6 +8021,112 @@ mod tests {
 
         let persisted = local_ledger::read_document(&path).expect("ledger should persist snapshot");
         assert_eq!(persisted["snapshots"][0]["netWorth"]["amount"], "100.00");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn movement_and_snapshot_queries_apply_documented_filters_and_ordering() {
+        let path = unique_test_ledger_path("movement_snapshot_queries");
+        let mut document = local_ledger::empty_document("CNY");
+        document["movements"] = json!([
+            {
+                "id": "mov_query_1",
+                "atomicGroupId": "ag_query_1",
+                "type": "expense",
+                "occurredAt": "2026-01-01T08:00:00Z",
+                "recordedAt": "2026-01-01T09:00:00Z",
+                "status": "confirmed",
+                "title": "old confirmed",
+                "entries": []
+            },
+            {
+                "id": "mov_query_2",
+                "atomicGroupId": "ag_query_2",
+                "type": "expense",
+                "occurredAt": "2026-01-03T08:00:00Z",
+                "recordedAt": "2026-01-03T09:00:00Z",
+                "status": "pending_review",
+                "title": "new pending",
+                "entries": []
+            },
+            {
+                "id": "mov_query_3",
+                "atomicGroupId": "ag_query_3",
+                "type": "income",
+                "occurredAt": "2026-01-02T08:00:00Z",
+                "recordedAt": "2026-01-02T09:00:00Z",
+                "status": "confirmed",
+                "title": "middle confirmed",
+                "entries": []
+            }
+        ]);
+        document["snapshots"] = json!([
+            {"id": "snap_query_1", "snapshotAt": "2026-01-01T00:00:00Z"},
+            {"id": "snap_query_2", "snapshotAt": "2026-01-02T00:00:00Z"},
+            {"id": "snap_query_3", "snapshotAt": "2026-01-03T00:00:00Z"}
+        ]);
+        local_ledger::write_document(&path, &document).expect("query fixture should persist");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (filtered_status, filtered_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/movements?status=confirmed&limit=1",
+        )
+        .await;
+        assert_eq!(filtered_status, StatusCode::OK);
+        assert_eq!(
+            filtered_body["data"].as_array().expect("movements").len(),
+            1
+        );
+        assert_eq!(filtered_body["data"][0]["id"], "mov_query_1");
+
+        let (recent_status, recent_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/movements/recent?limit=2").await;
+        assert_eq!(recent_status, StatusCode::OK);
+        assert_eq!(recent_body["data"][0]["id"], "mov_query_2");
+        assert_eq!(recent_body["data"][1]["id"], "mov_query_3");
+
+        for uri in [
+            "/v1/movements?limit=0",
+            "/v1/movements?limit=201",
+            "/v1/movements?limit=many",
+            "/v1/movements?status=unknown",
+        ] {
+            let (status, body) = request_json_from(router.clone(), Method::GET, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(body["error"]["code"], "invalid_movement_query", "{uri}");
+        }
+
+        let (snapshots_status, snapshots_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/snapshots").await;
+        assert_eq!(snapshots_status, StatusCode::OK);
+        assert_eq!(snapshots_body["data"][0]["id"], "snap_query_3");
+        assert_eq!(snapshots_body["data"][2]["id"], "snap_query_1");
+
+        let (range_status, range_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/snapshots?from=2026-01-02&to=2026-01-02",
+        )
+        .await;
+        assert_eq!(range_status, StatusCode::OK);
+        assert_eq!(
+            range_body["data"],
+            json!([{"id": "snap_query_2", "snapshotAt": "2026-01-02T00:00:00Z"}])
+        );
+
+        for uri in [
+            "/v1/snapshots?from=2026-01-01",
+            "/v1/snapshots?to=2026-01-03",
+            "/v1/snapshots?from=2026-02-01&to=2026-01-01",
+            "/v1/snapshots?from=not-a-date&to=2026-01-01",
+        ] {
+            let (status, body) = request_json_from(router.clone(), Method::GET, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(body["error"]["code"], "invalid_snapshot_range", "{uri}");
+        }
 
         let _ = std::fs::remove_file(path);
     }

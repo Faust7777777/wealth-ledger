@@ -61,9 +61,13 @@ SHA-256，且归档前后均运行无用户状态副作用的 launcher integrity
 
 ### P1：修复已公开查询语义
 
-- `/movements` 已声明 `limit/status`，real-local 尚未完整执行过滤和限制。
-- `/movements/recent` 应按时间倒序，而不是依赖文件插入顺序。
-- `/snapshots` 已声明 `from/to`，服务端应校验并过滤，不能忽略参数。
+本轮已完成：
+
+- `/movements` 执行 `status` 过滤和 1..200 `limit`。
+- `/movements/recent` 按 `occurredAt`、`recordedAt`、`id` 稳定倒序，缺省 20。
+- `/snapshots` 无参数返回全部且按时间倒序；可选的 `from/to` 必须成对、格式有效并
+  执行包含首尾过滤。
+- OpenAPI、HTTP Markdown、contract checker 和 Rust 路由回归测试同步更新。
 
 ### P1：订阅到期批量维护
 

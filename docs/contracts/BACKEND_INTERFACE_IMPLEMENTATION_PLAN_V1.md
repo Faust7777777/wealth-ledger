@@ -10,7 +10,7 @@
 > 非持久化 skeleton，而 `server-rs/` 在 `--ledger-path` 模式下已经是真实
 > 可写的自用 JSON 账本实现（含本地认证、幂等写、同步日志、订阅管理、
 > Windows/VPS 校验备份恢复）。当前实际 OpenAPI 为 63 paths / 108 schemas，
-> Rust 回归测试为 76 项；上句旧计数只用于说明历史漂移。
+> Rust 回归测试为 77 项；上句旧计数只用于说明历史漂移。
 > 仍属 skeleton/integration boundary 的是模型 AI、完整远端多设备同步及
 > 任何真实交易/转账能力。
 
