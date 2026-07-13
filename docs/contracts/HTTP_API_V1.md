@@ -232,6 +232,7 @@ GET   /v1/subscriptions/{subscriptionId}
 PATCH /v1/subscriptions/{subscriptionId}
 POST  /v1/subscriptions/{subscriptionId}/cancel
 POST  /v1/subscriptions/{subscriptionId}/charge-proposal
+POST  /v1/subscriptions/charge-proposals/due-scan
 ```
 
 订阅用于管理 ChatGPT Plus、Claude Pro 等周期性服务费用：
@@ -241,7 +242,13 @@ POST  /v1/subscriptions/{subscriptionId}/charge-proposal
 - 自然月/年保留最初扣款日作为 `billingAnchorDay`；31 日遇短月取月末，后续月份恢复锚点，不永久漂移到 28 日。
 - 创建时可提供 `duration` 或 `endDate`，二者互斥；不提供表示持续订阅。
 - PATCH 将 nullable `duration`/`endDate` 视为一组排期替换字段：二者都非空时冲突；`duration` 非空时按 `startDate` 计算 `endDate`；仅 `endDate` 非空时移除 `duration`；两者都为 `null` 时清除有限期限。
+- 创建和 PATCH 都以修改后的完整 subscription 做付款校验：`paymentAccountId` 必须引用未归档账户，且账户 `supportedCurrencies` 必须包含 `amount.currency`；校验失败时不保留部分修改。
 - subscription 计划本身不写支出。`charge-proposal` 只创建 `pending_review` expense，确认 atomic group 后才影响账户余额并推进 `nextChargeDate`；拒绝后允许重新生成同一期候选。
+- 单条 `charge-proposal` 在真正生成候选前再次校验付款账户和币种。若账户后来被归档或支持币种发生漂移，后端拒绝生成，不换算原金额、不改写计划币种。
+- `due-scan` 请求体只允许 `throughDate`（必填 ISO date）和 `limit`（默认 100，范围 1–200）；未知字段返回 400。它只扫描 `trial|active` 且 `nextChargeDate <= throughDate` 的计划，并按 `(nextChargeDate, id)` 稳定排序。
+- `limit` 只限制本次新建候选数量，不限制检查或报告 skip。已有 pending 的项目以 `already_pending` 跳过；付款账户缺失/已归档以 `payment_account_unavailable` 跳过；账户不支持订阅币种以 `payment_currency_unsupported` 跳过。skip 不阻断其他订阅。
+- `due-scan` 返回 `createdCount`、`alreadyPendingCount`、`blockedCount`、`remainingEligibleCount`、`hasMore`、`created[]`、`skipped[]`。`remainingEligibleCount` 只统计因达到 limit 而尚未创建、除此之外可创建的项目；`hasMore` 等价于该值大于 0。
+- 一次 `due-scan` 在同一次账本 read-modify-write 中创建全部返回候选、更新 pending 指针并保存幂等响应；任一非预期不变量错误使整批失败。它是显式调用命令，不是后台 timer，不会自动确认、扣款或推进日期。
 - 取消不会删除历史 movement，只停止未来计划扣款。
 - 所有写操作必须提供 `Idempotency-Key`。
 
@@ -264,6 +271,8 @@ POST /v1/ai/atomic-groups/{atomicGroupId}/edit
 - approve 前必须校验。
 - 修改已有记录必须返回 old → new diff。
 - full ledger context 只用于生成候选，不授权 AI 写账。
+- `movements` 中按 atomic group 持久化的 standalone `pending_review` 候选会动态投影到 pending AI Review；投影 ID 为 `proposal_movement_{movementId}`，不会在 `aiProposals` 中再保存一份副本。
+- 该投影支持查询、确认和拒绝；standalone 候选不可原地编辑，编辑请求返回冲突，调用方应拒绝后重新生成。确认或拒绝后它从 pending 列表和 pending count 中消失。
 
 ## 9. Quotes / FX / Historical Prices
 

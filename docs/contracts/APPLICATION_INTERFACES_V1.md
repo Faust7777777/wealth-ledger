@@ -183,6 +183,7 @@ SubscriptionService {
   updateSubscription(subscriptionId: ID, patch: UpdateSubscriptionPatch): Result<Subscription>;
   cancelSubscription(subscriptionId: ID): Result<Subscription>;
   createChargeProposal(subscriptionId: ID): Result<AiAtomicGroup>;
+  scanDueChargeProposals(input: SubscriptionDueScanInput): Result<SubscriptionDueScanResult>;
 }
 
 CreateSubscriptionInput {
@@ -218,14 +219,44 @@ UpdateSubscriptionPatch {
   status?: "trial" | "active" | "paused";
   note?: string | null;
 }
+
+SubscriptionDueScanInput {
+  throughDate: ISODate;
+  limit?: number;
+}
+
+SubscriptionDueScanSkipReason =
+  | "already_pending"
+  | "payment_account_unavailable"
+  | "payment_currency_unsupported";
+
+SubscriptionDueScanResult {
+  throughDate: ISODate;
+  createdCount: number;
+  alreadyPendingCount: number;
+  blockedCount: number;
+  remainingEligibleCount: number;
+  hasMore: boolean;
+  created: (AiAtomicGroup & {
+    subscriptionId: ID;
+    scheduledChargeDate: ISODate;
+  })[];
+  skipped: {
+    subscriptionId: ID;
+    scheduledChargeDate: ISODate;
+    reason: SubscriptionDueScanSkipReason;
+  }[];
+}
 ```
 
 约束：
 
 - 订阅计划本身不是已发生的 Movement，不得在创建或编辑计划时扣款。
 - `listUpcoming` 默认窗口为 30 天，`days` 只接受 1–365。
-- `amount` 保留原币种；`duration` 与 `endDate` 最多一个为非空值。
+- `amount` 保留原币种；`duration` 与 `endDate` 最多一个为非空值。创建/PATCH 后的完整计划必须引用未归档且支持该币种的付款账户，否则原计划保持不变。
 - `createChargeProposal` 只生成 `pending_review` 支出候选；同一计费日期不得重复生成候选。
+- `scanDueChargeProposals` 的 `throughDate` 必填；limit 默认 100、范围 1–200。它按 `(nextChargeDate,id)` 稳定扫描 active/trial 到期项，limit 只限制 created，已 pending 和付款能力阻塞按 item skip。
+- 付款账户后来归档或移除支持币种时，单条和批量生成必须重新校验；不得自动换汇、修改订阅币种或阻断批次中的其他有效计划。
 - 候选确认后才写正式流水、影响余额并推进 `nextChargeDate`；拒绝后保留原计费日期。
 - 存在待确认扣费候选时取消订阅必须返回冲突；取消不删除历史扣费记录。
 - 该服务不连接支付平台，不自动续费或代扣。
@@ -268,6 +299,8 @@ AiCsvInput {
 - full ledger context 只用于生成 proposal。
 - 修改已有记录必须包含 old → new diff。
 - approve 前必须重新校验。
+- `listPending` / `getProposal` 同时返回从 standalone `pending_review` movement group 动态生成的只读 proposal；其 ID 为 `proposal_movement_{movementId}`，不要求在 `aiProposals` 中重复保存。
+- 这类投影支持 approve/reject；edit 返回冲突，调用方应 reject 后通过原业务命令重新生成。处理后它不再出现在 pending 列表或 `aiPendingCount`。
 
 ## 7. QuoteService
 

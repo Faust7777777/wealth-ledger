@@ -23,8 +23,10 @@ EXAMPLES = CONTRACTS / "examples"
 MOCK_SERVER = ROOT / "tools" / "mock_api_server.py"
 DEV_SERVER = ROOT / "server" / "dev_server.py"
 RUST_SERVER = ROOT / "server-rs" / "src" / "main.rs"
+RUST_LOCAL_LEDGER = ROOT / "server-rs" / "src" / "local_ledger.rs"
 RUST_MANIFEST = ROOT / "server-rs" / "Cargo.toml"
 SERVER_SMOKE = ROOT / "tools" / "server_smoke.py"
+LOCAL_LEDGER_SMOKE = ROOT / "tools" / "local_ledger_smoke.py"
 FRONTEND_LOCAL_SERVER_SMOKE = ROOT / "tools" / "frontend_local_server_smoke.ps1"
 LOCAL_SERVER_SUBSCRIPTION_TEST = (
     ROOT / "test" / "local_server_subscription_integration_test.dart"
@@ -320,9 +322,7 @@ def check_rust_server() -> None:
     if "dev_access_token_not_for_production" in text:
         fail("Rust server must not use the old fixed dev access token")
 
-    local_ledger_text = (ROOT / "server-rs" / "src" / "local_ledger.rs").read_text(
-        encoding="utf-8"
-    )
+    local_ledger_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
     ledger_lock_snippets = [
         "LEDGER_WRITE_LOCKS",
         "with_ledger_write_lock",
@@ -364,6 +364,248 @@ def check_rust_server() -> None:
             fail(f"Rust server does not explicitly list forbidden endpoint {full_endpoint}")
 
     ok("Rust server safety checks passed")
+
+
+def check_subscription_due_scan(doc: dict) -> None:
+    path = "/subscriptions/charge-proposals/due-scan"
+    path_item = doc["paths"].get(path)
+    if not isinstance(path_item, dict):
+        fail(f"OpenAPI must document subscription due scan path {path}")
+
+    documented_methods = HTTP_METHODS.intersection(
+        method.upper() for method in path_item if isinstance(method, str)
+    )
+    if documented_methods != {"POST"}:
+        fail("Subscription due scan must be documented as POST only")
+    operation = path_item.get("post")
+    if not isinstance(operation, dict):
+        fail("Subscription due scan POST operation is missing")
+
+    request_body = operation.get("requestBody", {})
+    if request_body.get("required") is not True:
+        fail("Subscription due scan request body must be required")
+    request_ref = (
+        request_body.get("content", {})
+        .get("application/json", {})
+        .get("schema", {})
+        .get("$ref")
+    )
+    if request_ref != "#/components/schemas/SubscriptionDueScanRequest":
+        fail("Subscription due scan must use SubscriptionDueScanRequest")
+
+    schemas = doc["components"]["schemas"]
+    request_schema = schemas.get("SubscriptionDueScanRequest", {})
+    request_properties = request_schema.get("properties", {})
+    if request_schema.get("type") != "object":
+        fail("SubscriptionDueScanRequest must be an object")
+    if request_schema.get("additionalProperties") is not False:
+        fail("SubscriptionDueScanRequest must reject unknown fields")
+    if set(request_schema.get("required", [])) != {"throughDate"}:
+        fail("SubscriptionDueScanRequest must require only throughDate")
+    if set(request_properties) != {"throughDate", "limit"}:
+        fail("SubscriptionDueScanRequest fields must be throughDate and limit")
+    if request_properties["throughDate"].get("$ref") != "#/components/schemas/ISODate":
+        fail("Subscription due scan throughDate must use ISODate")
+    limit_schema = request_properties["limit"]
+    expected_limit = {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 200,
+        "default": 100,
+    }
+    for key, expected in expected_limit.items():
+        if limit_schema.get(key) != expected:
+            fail(f"Subscription due scan limit must document {key}={expected}")
+
+    response_ref = (
+        operation.get("responses", {})
+        .get("200", {})
+        .get("content", {})
+        .get("application/json", {})
+        .get("schema", {})
+        .get("$ref")
+    )
+    if response_ref != "#/components/schemas/SubscriptionDueScanResponse":
+        fail("Subscription due scan 200 response must use SubscriptionDueScanResponse")
+    response_schema = schemas.get("SubscriptionDueScanResponse", {})
+    if set(response_schema.get("required", [])) != {"ok", "data"}:
+        fail("SubscriptionDueScanResponse must require ok and data")
+    response_properties = response_schema.get("properties", {})
+    if set(response_properties) != {"ok", "data"}:
+        fail("SubscriptionDueScanResponse must expose only ok and data")
+    if response_properties.get("ok", {}).get("const") is not True:
+        fail("SubscriptionDueScanResponse.ok must be true")
+    if (
+        response_properties.get("data", {}).get("$ref")
+        != "#/components/schemas/SubscriptionDueScanResult"
+    ):
+        fail("SubscriptionDueScanResponse.data must use SubscriptionDueScanResult")
+
+    result_schema = schemas.get("SubscriptionDueScanResult", {})
+    result_fields = {
+        "throughDate",
+        "createdCount",
+        "alreadyPendingCount",
+        "blockedCount",
+        "remainingEligibleCount",
+        "hasMore",
+        "created",
+        "skipped",
+    }
+    if result_schema.get("type") != "object":
+        fail("SubscriptionDueScanResult must be an object")
+    if result_schema.get("additionalProperties") is not False:
+        fail("SubscriptionDueScanResult must reject undocumented response fields")
+    if set(result_schema.get("required", [])) != result_fields:
+        fail("SubscriptionDueScanResult must require all eight response fields")
+    result_properties = result_schema.get("properties", {})
+    if set(result_properties) != result_fields:
+        fail("SubscriptionDueScanResult must expose exactly eight response fields")
+    if result_properties["throughDate"].get("$ref") != "#/components/schemas/ISODate":
+        fail("SubscriptionDueScanResult.throughDate must use ISODate")
+    for field in (
+        "createdCount",
+        "alreadyPendingCount",
+        "blockedCount",
+        "remainingEligibleCount",
+    ):
+        if result_properties[field].get("type") != "integer":
+            fail(f"SubscriptionDueScanResult.{field} must be an integer")
+        if result_properties[field].get("minimum") != 0:
+            fail(f"SubscriptionDueScanResult.{field} must be non-negative")
+    if result_properties["hasMore"].get("type") != "boolean":
+        fail("SubscriptionDueScanResult.hasMore must be boolean")
+    if result_properties["created"].get("type") != "array":
+        fail("SubscriptionDueScanResult.created must be an array")
+    if (
+        result_properties["created"].get("items", {}).get("$ref")
+        != "#/components/schemas/SubscriptionDueScanCreated"
+    ):
+        fail("SubscriptionDueScanResult.created items must use SubscriptionDueScanCreated")
+    if result_properties["skipped"].get("type") != "array":
+        fail("SubscriptionDueScanResult.skipped must be an array")
+    if (
+        result_properties["skipped"].get("items", {}).get("$ref")
+        != "#/components/schemas/SubscriptionDueScanSkip"
+    ):
+        fail("SubscriptionDueScanResult.skipped items must use SubscriptionDueScanSkip")
+
+    created_schema = schemas.get("SubscriptionDueScanCreated", {})
+    created_all_of = created_schema.get("allOf", [])
+    if not any(
+        isinstance(part, dict)
+        and part.get("$ref") == "#/components/schemas/AiAtomicGroup"
+        for part in created_all_of
+    ):
+        fail("SubscriptionDueScanCreated must extend AiAtomicGroup")
+    created_extension = next(
+        (
+            part
+            for part in created_all_of
+            if isinstance(part, dict) and part.get("type") == "object"
+        ),
+        {},
+    )
+    created_fields = {"subscriptionId", "scheduledChargeDate"}
+    if set(created_extension.get("required", [])) != created_fields:
+        fail("SubscriptionDueScanCreated must require subscriptionId and scheduledChargeDate")
+    created_properties = created_extension.get("properties", {})
+    if set(created_properties) != created_fields:
+        fail("SubscriptionDueScanCreated must document subscriptionId and scheduledChargeDate")
+    if created_properties["subscriptionId"].get("$ref") != "#/components/schemas/ID":
+        fail("SubscriptionDueScanCreated.subscriptionId must use ID")
+    if (
+        created_properties["scheduledChargeDate"].get("$ref")
+        != "#/components/schemas/ISODate"
+    ):
+        fail("SubscriptionDueScanCreated.scheduledChargeDate must use ISODate")
+
+    skip_reason = schemas.get("SubscriptionDueScanSkipReason", {})
+    expected_reasons = {
+        "already_pending",
+        "payment_account_unavailable",
+        "payment_currency_unsupported",
+    }
+    if skip_reason.get("type") != "string" or set(skip_reason.get("enum", [])) != expected_reasons:
+        fail("SubscriptionDueScanSkipReason must document all three stable skip reasons")
+    skip_schema = schemas.get("SubscriptionDueScanSkip", {})
+    skip_fields = {"subscriptionId", "scheduledChargeDate", "reason"}
+    if skip_schema.get("type") != "object":
+        fail("SubscriptionDueScanSkip must be an object")
+    if skip_schema.get("additionalProperties") is not False:
+        fail("SubscriptionDueScanSkip must reject undocumented item fields")
+    if set(skip_schema.get("required", [])) != skip_fields:
+        fail("SubscriptionDueScanSkip must require subscriptionId, scheduledChargeDate, and reason")
+    skip_properties = skip_schema.get("properties", {})
+    if set(skip_properties) != skip_fields:
+        fail("SubscriptionDueScanSkip must expose exactly its three item fields")
+    expected_skip_refs = {
+        "subscriptionId": "#/components/schemas/ID",
+        "scheduledChargeDate": "#/components/schemas/ISODate",
+        "reason": "#/components/schemas/SubscriptionDueScanSkipReason",
+    }
+    for field, expected_ref in expected_skip_refs.items():
+        if skip_properties[field].get("$ref") != expected_ref:
+            fail(f"SubscriptionDueScanSkip.{field} must use {expected_ref.rsplit('/', 1)[-1]}")
+
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    rust_route_snippets = [
+        '"/v1/subscriptions/charge-proposals/due-scan"',
+        "post(create_due_subscription_charge_proposals)",
+        "async fn create_due_subscription_charge_proposals(",
+        'let operation = "POST /v1/subscriptions/charge-proposals/due-scan";',
+        "local_ledger::create_due_subscription_charge_proposals(",
+        'local_ledger_error(error, "invalid_subscription_due_scan")',
+    ]
+    missing = [snippet for snippet in rust_route_snippets if snippet not in rust_text]
+    if missing:
+        fail("Rust subscription due scan route/handler is incomplete: " + ", ".join(missing))
+
+    local_ledger_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    implementation_snippets = [
+        "pub fn create_due_subscription_charge_proposals<F>(",
+        "parse_subscription_due_scan_input(&input)?",
+        "idempotent_ledger_write(path, idempotency, 200",
+        '"throughDate" | "limit"',
+        "Date::parse(value, &Iso8601::DATE).is_ok()",
+        "None => Some(100_usize)",
+        "Some(value @ 1..=200) => Some(value)",
+        'Some("trial" | "active")',
+        "date <= through_date.as_str()",
+        "left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))",
+        "created.len() >= limit",
+        "create_subscription_charge_proposal_in_document(",
+        '"throughDate": through_date',
+        '"createdCount": created.len()',
+        '"alreadyPendingCount": already_pending_count',
+        '"blockedCount": blocked_count',
+        '"remainingEligibleCount": remaining_eligible_count',
+        '"hasMore": remaining_eligible_count > 0',
+        '"created": created',
+        '"skipped": skipped',
+        '"already_pending"',
+        '"payment_account_unavailable"',
+        '"payment_currency_unsupported"',
+    ]
+    missing = [
+        snippet for snippet in implementation_snippets if snippet not in local_ledger_text
+    ]
+    if missing:
+        fail("Rust subscription due scan implementation is incomplete: " + ", ".join(missing))
+
+    if not LOCAL_LEDGER_SMOKE.exists():
+        fail(f"Missing real local-ledger smoke: {LOCAL_LEDGER_SMOKE}")
+    smoke_text = LOCAL_LEDGER_SMOKE.read_text(encoding="utf-8")
+    smoke_snippets = [
+        "def create_and_confirm_due_subscription_charge(",
+        '"/v1/subscriptions/charge-proposals/due-scan"',
+        "subscription_result = create_and_confirm_due_subscription_charge(",
+    ]
+    missing = [snippet for snippet in smoke_snippets if snippet not in smoke_text]
+    if missing:
+        fail("Local-ledger smoke must exercise subscription due scan: " + ", ".join(missing))
+
+    ok("Subscription due-scan contract and implementation checks passed")
 
 
 def check_server_smoke() -> None:
@@ -862,6 +1104,7 @@ def main() -> None:
             fail(f"{method.upper()} {path} must document invalid cursor responses")
     ok("Critical AI/DCA invariants are represented")
 
+    check_subscription_due_scan(doc)
     check_examples()
     check_mock_server()
     check_dev_server()

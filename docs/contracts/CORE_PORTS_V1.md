@@ -79,6 +79,7 @@ SubscriptionUseCases {
   updateSubscription(subscriptionId: ID, patch: UpdateSubscriptionPatch): Subscription;
   cancelSubscription(subscriptionId: ID): Subscription;
   createChargeProposal(subscriptionId: ID): AiAtomicGroup;
+  scanDueChargeProposals(input: SubscriptionDueScanInput): SubscriptionDueScanResult;
 }
 ```
 
@@ -86,6 +87,7 @@ SubscriptionUseCases {
 
 - 创建、编辑、暂停或取消计划只改变订阅资源，不直接写 confirmed movement。
 - `createChargeProposal` 只创建待确认候选，并记录该订阅当前计费日期的 pending 引用。
+- `scanDueChargeProposals` 按 `(nextChargeDate,id)` 稳定扫描到期计划；limit 只限制创建数量，逐项付款阻塞以结构化 skip 返回。
 - 候选确认与拒绝复用 atomic-group 事务边界，不另建绕过复核的扣款路径。
 
 ## 3. Store ports
@@ -137,9 +139,10 @@ SubscriptionStorePort {
 
 - subscription 保存未来周期计划与 pending/last charge 引用，不等同于 confirmed movement。
 - 同一订阅、同一计费日期最多有一个待确认扣费候选。
-- 创建候选时，proposal 写入与订阅 pending 引用必须处于同一事务边界。
+- 创建候选时，pending movement/entries 写入与订阅 pending 引用必须处于同一事务边界；无需在 proposal store 再保存副本。
+- pending 指针必须引用状态为 `pending_review`、subscription ID 和计费日期均匹配的 movement；反向孤儿引用必须拒绝。
 - 确认扣费时，movement 写入、pending 清除、last charge 更新和 `nextChargeDate` 推进必须处于同一事务边界。
-- 拒绝候选只清除 pending 引用，不推进计费日期。
+- 拒绝候选把 movement 标记为 `cancelled` 并清除 pending 引用，不推进计费日期；历史候选保留用于追溯。
 
 ### ProposalStorePort
 
@@ -156,6 +159,7 @@ ProposalStorePort {
 
 - proposal store 与 confirmed ledger 分离。
 - approve 前必须重新 validation。
+- `listPending` / `getProposal` 可以把 standalone pending movement group 动态投影为只读 proposal；该投影不经 `saveProposal` 持久化，避免同一 movement 双份真相。
 
 ### QuoteStorePort
 
@@ -356,6 +360,22 @@ createSubscriptionChargeProposal(subscriptionId: ID): AiAtomicGroup
 - 已存在 pending 扣费候选时返回冲突，不重复创建。
 - 确认前不影响余额、流水、净值或快照；确认后才推进计划日期。
 - 不调用支付平台，不执行自动续费或真实代扣。
+
+### Scan due subscription charge proposals
+
+```ts
+scanDueChargeProposals(input: SubscriptionDueScanInput): SubscriptionDueScanResult
+```
+
+规则：
+
+- `throughDate` 是必填本地 ISO 日历日；limit 默认 100，范围 1–200，未知字段必须拒绝。
+- 只扫描 `trial|active` 且 `nextChargeDate <= throughDate` 的计划，按 `(nextChargeDate,id)` 稳定排序。
+- 已 pending、付款账户不可用、付款币种不受支持分别返回 `already_pending`、`payment_account_unavailable`、`payment_currency_unsupported`；单项 skip 不终止批次。
+- 账户或支持币种在计划创建后发生漂移时，不自动换汇或修改计划；单条和批量生成都必须重新校验付款能力。
+- limit 只约束新建候选数；`remainingEligibleCount` 只统计因 limit 未创建的可创建项目，`hasMore` 与其是否大于零一致。
+- 扫描与所有候选写入必须共用一次事务和一次幂等结果提交；任一非预期不变量错误整批回滚。
+- 只创建待复核 movement，不确认、不扣款、不推进日期，也不启动后台 timer。
 
 ## 7. Data source mode
 

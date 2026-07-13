@@ -605,6 +605,49 @@ paths:
               schema:
                 $ref: "#/components/schemas/SubscriptionListResponse"
 
+  /subscriptions/charge-proposals/due-scan:
+    post:
+      tags: [Subscriptions]
+      summary: Generate bounded pending charge proposals for subscriptions due through a date.
+      description: >-
+        Scans trial and active subscriptions in stable nextChargeDate/id order.
+        The limit bounds newly created proposals, while already-pending and
+        payment-blocked items are reported as skips. No balance is changed and
+        no schedule is advanced until each returned atomic group is confirmed.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscriptionDueScanRequest"
+      responses:
+        "200":
+          description: Due scan completed and its pending candidates were persisted atomically.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionDueScanResponse"
+        "400":
+          description: Invalid throughDate, limit, or unsupported request field.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The Idempotency-Key was reused with a different request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "501":
+          description: No real local ledger is mounted for this command.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
   /subscriptions/{subscriptionId}:
     parameters:
       - name: subscriptionId
@@ -2182,6 +2225,10 @@ components:
     CreateSubscriptionRequest:
       type: object
       required: [displayName, provider, amount, paymentAccountId, billingCycle, startDate]
+      description: >-
+        duration and endDate are mutually exclusive. paymentAccountId must
+        reference a non-archived account whose supportedCurrencies contains
+        amount.currency.
       properties:
         displayName:
           type: string
@@ -2216,11 +2263,15 @@ components:
           default: active
         note:
           type: string
-      description: duration and endDate are mutually exclusive.
     UpdateSubscriptionRequest:
       type: object
       minProperties: 1
-      description: Nullable duration and endDate form one schedule replacement group. Two non-null values conflict; non-null duration computes endDate from startDate; only non-null endDate removes duration; two null values clear the finite schedule.
+      description: >-
+        Nullable duration and endDate form one schedule replacement group. Two
+        non-null values conflict; non-null duration computes endDate from
+        startDate; only non-null endDate removes duration; two null values clear
+        the finite schedule. The complete patched subscription is rejected
+        unless its payment account is non-archived and supports amount.currency.
       properties:
         displayName:
           type: string
@@ -2274,6 +2325,98 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Subscription"
+
+    SubscriptionDueScanRequest:
+      type: object
+      additionalProperties: false
+      required: [throughDate]
+      properties:
+        throughDate:
+          $ref: "#/components/schemas/ISODate"
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 100
+          description: Maximum number of newly created proposals, not the number of inspected or skipped subscriptions.
+    SubscriptionDueScanSkipReason:
+      type: string
+      enum:
+        - already_pending
+        - payment_account_unavailable
+        - payment_currency_unsupported
+    SubscriptionDueScanSkip:
+      type: object
+      additionalProperties: false
+      required: [subscriptionId, scheduledChargeDate, reason]
+      properties:
+        subscriptionId:
+          $ref: "#/components/schemas/ID"
+        scheduledChargeDate:
+          $ref: "#/components/schemas/ISODate"
+        reason:
+          $ref: "#/components/schemas/SubscriptionDueScanSkipReason"
+    SubscriptionDueScanCreated:
+      allOf:
+        - $ref: "#/components/schemas/AiAtomicGroup"
+        - type: object
+          required: [subscriptionId, scheduledChargeDate]
+          properties:
+            subscriptionId:
+              $ref: "#/components/schemas/ID"
+            scheduledChargeDate:
+              $ref: "#/components/schemas/ISODate"
+    SubscriptionDueScanResult:
+      type: object
+      additionalProperties: false
+      required:
+        - throughDate
+        - createdCount
+        - alreadyPendingCount
+        - blockedCount
+        - remainingEligibleCount
+        - hasMore
+        - created
+        - skipped
+      properties:
+        throughDate:
+          $ref: "#/components/schemas/ISODate"
+        createdCount:
+          type: integer
+          minimum: 0
+          description: Equal to the length of created.
+        alreadyPendingCount:
+          type: integer
+          minimum: 0
+          description: Count of skipped items whose reason is already_pending.
+        blockedCount:
+          type: integer
+          minimum: 0
+          description: Count of skipped items whose reason is payment_account_unavailable or payment_currency_unsupported.
+        remainingEligibleCount:
+          type: integer
+          minimum: 0
+          description: Otherwise creatable subscriptions left uncreated only because limit was reached.
+        hasMore:
+          type: boolean
+          description: True exactly when remainingEligibleCount is greater than zero.
+        created:
+          type: array
+          items:
+            $ref: "#/components/schemas/SubscriptionDueScanCreated"
+        skipped:
+          type: array
+          description: Already-pending and payment-blocked candidates in stable scan order.
+          items:
+            $ref: "#/components/schemas/SubscriptionDueScanSkip"
+    SubscriptionDueScanResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/SubscriptionDueScanResult"
 
     EvidenceRef:
       type: object
@@ -2382,6 +2525,10 @@ components:
           enum: [pending, approved, rejected, edited]
         validation:
           $ref: "#/components/schemas/AiValidationResult"
+        subscriptionId:
+          $ref: "#/components/schemas/ID"
+        scheduledChargeDate:
+          $ref: "#/components/schemas/ISODate"
     AiProposal:
       type: object
       required: [id, status, source, atomicGroups, warnings, createdAt]

@@ -214,6 +214,8 @@ Movement {
   amountBreakdown?: TransactionAmountBreakdown;
   settlement?: SettlementInfo;
   transferMeta?: TransferMeta;
+  subscriptionId?: ID;
+  scheduledChargeDate?: ISODate;
   source: DataSourceInfo;
   createdAt: ISODateTime;
   updatedAt: ISODateTime;
@@ -264,6 +266,7 @@ MovementEntry {
 - `atomicGroupId` 是确认、拒绝、回滚的最小单位。
 - 多腿交易必须整组接受或整组拒绝。
 - `pending_review` / `draft` 不影响正式余额和净值。
+- subscription 扣费候选必须同时带 `subscriptionId` 与 `scheduledChargeDate`，并与 subscription 上的 pending 指针双向一致。
 - 已确认记录原则上不原地改写；更正优先通过 `correction` 事件表达。
 
 ## 6. Transfer / 在途 / 折损
@@ -428,17 +431,51 @@ Subscription {
   createdAt: ISODateTime;
   updatedAt: ISODateTime;
 }
+
+SubscriptionDueScanInput {
+  throughDate: ISODate;
+  limit?: number; // default 100, range 1..200
+}
+
+SubscriptionDueScanSkipReason =
+  | "already_pending"
+  | "payment_account_unavailable"
+  | "payment_currency_unsupported";
+
+SubscriptionDueScanSkip {
+  subscriptionId: ID;
+  scheduledChargeDate: ISODate;
+  reason: SubscriptionDueScanSkipReason;
+}
+
+SubscriptionDueScanResult {
+  throughDate: ISODate;
+  createdCount: number;
+  alreadyPendingCount: number;
+  blockedCount: number;
+  remainingEligibleCount: number;
+  hasMore: boolean;
+  created: (AiAtomicGroup & {
+    subscriptionId: ID;
+    scheduledChargeDate: ISODate;
+  })[];
+  skipped: SubscriptionDueScanSkip[];
+}
 ```
 
 规则：
 
 - `amount` 保留订阅原币种（如 USD），不得在计划层静默换算为本位币。
+- `paymentAccountId` 必须引用未归档账户，且该账户必须显式支持 `amount.currency`；创建和 PATCH 以修改后的完整对象校验，失败时原对象保持不变。
+- 账户后续被归档或移除支持币种属于付款能力漂移，不会反向改写既有 subscription。生成候选时必须重新校验；单条生成返回错误，批量扫描分别报告 `payment_account_unavailable` 或 `payment_currency_unsupported`。
 - `duration` 与 `endDate` 二选一；固定终止日期优先于 `autoRenew`，到期后必须显式延长。
 - 月度和年度周期以 `billingAnchorDay` 为锚点；短月份可落在月末，后续月份恢复原锚点。
 - 到期提醒只生成 `pending_review` 支出候选；确认前不影响账户余额。
 - 同一订阅、同一计费日期最多存在一个待确认扣费候选。
+- `pendingChargeMovementId` 与 `pendingChargeDate` 必须成对出现，并引用存在的 `pending_review` movement；movement 的 `subscriptionId`、`scheduledChargeDate` 必须反向匹配。孤立的 pending subscription movement 或重复 pending 键均为无效账本。
 - 候选确认后才推进 `nextChargeDate`；拒绝后保持原计费日期，可重新生成候选。
 - 取消保留历史扣费，但清空未来计费日期；存在待确认扣费时必须先处理候选。
+- due scan 只选择 `trial|active` 且 `nextChargeDate <= throughDate` 的计划，按 `(nextChargeDate,id)` 排序。limit 只限制 `created`；`remainingEligibleCount` 不包含已 pending 或付款能力受阻的项目，`hasMore = remainingEligibleCount > 0`。
 
 ## 10. Quote / FXRate
 

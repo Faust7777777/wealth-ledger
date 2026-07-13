@@ -13,6 +13,7 @@
 5. 修改已有记录必须显示 old → new diff。
 6. 修改 confirmed 记录时，默认生成更正事件；除非用户显式选择“修改原记录”。
 7. confidence 不作为盲签依据；证据、diff、警告必须可见。
+8. 已持久化在 `movements` 的 standalone `pending_review` 候选只做读取投影，不得为了进入 AI Review 再复制成 `aiProposals` 记录。
 
 ## 1. 顶层结构
 
@@ -84,6 +85,8 @@ AiAtomicGroup {
   warnings: AiWarning[];
   status: AiAtomicGroupStatus;
   validation: AiValidationResult;
+  subscriptionId?: ID;
+  scheduledChargeDate?: ISODate;
 }
 
 AiOperation =
@@ -115,6 +118,7 @@ AiAtomicGroupStatus =
 - `correction`：对 confirmed 记录生成反向/更正事件，优先于原地改写。
 - `merge`：用于对手方归并，例如“瑞幸”与“瑞幸咖啡”。
 - `classify`：用于分类/标签建议。
+- subscription 扣费候选的 group 必须携带 `subscriptionId` 与 `scheduledChargeDate`，便于调用方定位计划和计费期。
 
 ## 4. Proposed Entity
 
@@ -230,3 +234,30 @@ DcaExecutedProposal {
 - pending proposal / draft 可以持久化，以便刷新或重启后继续复核。
 - 用户确认前不写 confirmed/effective ledger，不影响余额、持仓、净值或快照。
 - 用户确认 atomic group 后才生成正式 Movement。
+
+## 9. Standalone pending movement 投影
+
+订阅扣费、DCA 记录或手工候选可以直接以 `Movement.status = "pending_review"` 持久化，而不属于 AI 模型生成的 `aiProposals`。AI Review 读取层必须让这些候选在刷新或服务重启后仍可发现。
+
+```ts
+StandalonePendingProjection {
+  id: `proposal_movement_${movementId}`;
+  status: "pending";
+  source: {
+    kind: "manual_import";
+    evidenceRefs: EvidenceRef[];
+  };
+  atomicGroups: AiAtomicGroup[];
+  warnings: AiWarning[];
+  createdAt: ISODateTime;
+}
+```
+
+规则：
+
+- 读取 `movements` 中的 `pending_review` 项，按 `atomicGroupId` 分组；组内 movement 按 ID 稳定排序，再动态构造 proposal。
+- synthetic proposal 不是新的磁盘实体，不写入 `aiProposals`，也不产生第二份 movement。
+- `GET /ai/proposals/pending`、`GET /ai/proposals/{proposalId}` 与 overview `aiPendingCount` 都包含该投影。
+- approve/reject 直接消费底层 movement atomic group；处理完成后投影自动从 pending 读取结果消失。
+- standalone 投影不可原地 edit；编辑请求返回冲突，用户应拒绝后从订阅、DCA 或手工录入命令重新生成。
+- subscription 投影使用 `subscription_charge_requires_confirmation` warning；确认前不扣款、不推进 `nextChargeDate`。

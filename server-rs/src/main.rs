@@ -1065,6 +1065,10 @@ fn app_with_state(state: AppState) -> Router {
         )
         .route("/v1/subscriptions/upcoming", get(upcoming_subscriptions))
         .route(
+            "/v1/subscriptions/charge-proposals/due-scan",
+            post(create_due_subscription_charge_proposals),
+        )
+        .route(
             "/v1/subscriptions/{subscription_id}",
             get(subscription_detail).patch(update_subscription),
         )
@@ -2197,6 +2201,32 @@ async fn create_subscription_charge_proposal(
     ) {
         Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_subscription_charge_proposal"),
+    }
+}
+
+async fn create_due_subscription_charge_proposals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = "POST /v1/subscriptions/charge-proposals/due-scan";
+    let idempotency = match idempotency_request(&headers, operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_due_subscription_charge_proposals(
+        path,
+        input,
+        &now,
+        &idempotency,
+        || (next_local_movement_id(), next_local_atomic_group_id()),
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_subscription_due_scan"),
     }
 }
 
@@ -4770,6 +4800,36 @@ mod tests {
         (status, headers, body)
     }
 
+    async fn create_test_subscription(
+        router: Router,
+        account_id: &str,
+        display_name: &str,
+        next_charge_date: &str,
+        status: &str,
+    ) -> String {
+        let (status_code, body) = request_json_body_from(
+            router,
+            Method::POST,
+            "/v1/subscriptions",
+            json!({
+                "displayName": display_name,
+                "provider": "Integration provider",
+                "amount": {"amount": "20.00", "currency": "USD"},
+                "paymentAccountId": account_id,
+                "billingCycle": {"unit": "month", "interval": 1},
+                "startDate": next_charge_date,
+                "nextChargeDate": next_charge_date,
+                "status": status
+            }),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::CREATED, "{body}");
+        body["data"]["id"]
+            .as_str()
+            .expect("subscription id")
+            .to_string()
+    }
+
     async fn request_json_with_bearer_from(
         router: Router,
         method: Method,
@@ -5756,6 +5816,7 @@ mod tests {
             (Method::POST, "/v1/dca/reminders/missing/skip"),
             (Method::POST, "/v1/dca/reminders/missing/snooze"),
             (Method::POST, "/v1/subscriptions"),
+            (Method::POST, "/v1/subscriptions/charge-proposals/due-scan"),
             (Method::PATCH, "/v1/subscriptions/missing"),
             (Method::POST, "/v1/subscriptions/missing/cancel"),
             (Method::POST, "/v1/subscriptions/missing/charge-proposal"),
@@ -8412,6 +8473,559 @@ mod tests {
                 .iter()
                 .any(|change| change["entityType"] == "subscription")
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn standalone_subscription_charge_is_discoverable_in_ai_review_after_restart() {
+        let path = unique_test_ledger_path("subscription_ai_review_discovery");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+        let (_, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "Review USD card",
+                "accountType": "virtual_card",
+                "defaultCurrency": "USD",
+                "supportedCurrencies": ["USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "USD", "amount": "100.00"}]
+            }),
+        )
+        .await;
+        let account_id = account_body["data"]["id"].as_str().expect("account id");
+        let subscription_id = create_test_subscription(
+            router.clone(),
+            account_id,
+            "Discoverable subscription",
+            "2026-01-31",
+            "active",
+        )
+        .await;
+        let (proposal_status, proposal_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/subscriptions/{subscription_id}/charge-proposal"),
+        )
+        .await;
+        assert_eq!(proposal_status, StatusCode::CREATED, "{proposal_body}");
+        let group_id = proposal_body["data"]["id"]
+            .as_str()
+            .expect("atomic group id")
+            .to_string();
+
+        let restarted_router = app_with_state(AppState::local(path.clone()));
+        let (pending_status, pending_body) = request_json_from(
+            restarted_router.clone(),
+            Method::GET,
+            "/v1/ai/proposals/pending",
+        )
+        .await;
+        assert_eq!(pending_status, StatusCode::OK);
+        let proposals = pending_body["data"].as_array().expect("pending proposals");
+        let proposal = proposals
+            .iter()
+            .find(|proposal| {
+                proposal["atomicGroups"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|group| group["id"] == group_id)
+            })
+            .expect("subscription proposal should remain discoverable after restart");
+        let proposal_id = proposal["id"].as_str().expect("synthetic proposal id");
+
+        let (detail_status, detail_body) = request_json_from(
+            restarted_router.clone(),
+            Method::GET,
+            &format!("/v1/ai/proposals/{proposal_id}"),
+        )
+        .await;
+        assert_eq!(detail_status, StatusCode::OK, "{detail_body}");
+        assert_eq!(detail_body["data"], *proposal);
+
+        let (edit_status, edit_body) = request_json_body_from(
+            restarted_router.clone(),
+            Method::POST,
+            &format!("/v1/ai/atomic-groups/{group_id}/edit"),
+            json!({
+                "type": "expense",
+                "occurredAt": "2026-01-31T00:00:00Z",
+                "title": "Must reject and regenerate",
+                "entries": []
+            }),
+        )
+        .await;
+        assert_eq!(edit_status, StatusCode::CONFLICT, "{edit_body}");
+
+        let (reject_status, _) = request_json_from(
+            restarted_router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{group_id}/reject"),
+        )
+        .await;
+        assert_eq!(reject_status, StatusCode::NO_CONTENT);
+        let (_, after_reject) = request_json_from(
+            restarted_router.clone(),
+            Method::GET,
+            "/v1/ai/proposals/pending",
+        )
+        .await;
+        assert!(
+            after_reject["data"]
+                .as_array()
+                .expect("pending proposals")
+                .iter()
+                .all(|proposal| {
+                    proposal["atomicGroups"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .all(|group| group["id"] != group_id)
+                })
+        );
+        let (_, overview) =
+            request_json_from(restarted_router, Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview["data"]["pendingSummary"]["aiPendingCount"], 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn subscription_due_scan_is_bounded_idempotent_and_never_auto_confirms() {
+        let (unmounted_status, _) = request_json_body_from(
+            app(),
+            Method::POST,
+            "/v1/subscriptions/charge-proposals/due-scan",
+            json!({"throughDate": "2026-07-13"}),
+        )
+        .await;
+        assert_eq!(unmounted_status, StatusCode::NOT_IMPLEMENTED);
+
+        let path = unique_test_ledger_path("subscription_due_scan");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (_, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "Primary USD card",
+                "accountType": "virtual_card",
+                "defaultCurrency": "USD",
+                "supportedCurrencies": ["USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "USD", "amount": "100.00"}]
+            }),
+        )
+        .await;
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("primary account id")
+            .to_string();
+        let (_, blocked_account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "Archived USD card",
+                "accountType": "virtual_card",
+                "defaultCurrency": "USD",
+                "supportedCurrencies": ["USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "USD", "amount": "50.00"}]
+            }),
+        )
+        .await;
+        let blocked_account_id = blocked_account_body["data"]["id"]
+            .as_str()
+            .expect("blocked account id")
+            .to_string();
+        let (_, currency_account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "Multi-currency card",
+                "accountType": "virtual_card",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY", "USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "CNY", "amount": "100.00"}]
+            }),
+        )
+        .await;
+        let currency_account_id = currency_account_body["data"]["id"]
+            .as_str()
+            .expect("currency account id")
+            .to_string();
+
+        let blocked_id = create_test_subscription(
+            router.clone(),
+            &blocked_account_id,
+            "Blocked due",
+            "2026-01-10",
+            "active",
+        )
+        .await;
+        let pending_id = create_test_subscription(
+            router.clone(),
+            &account_id,
+            "Already pending",
+            "2026-01-15",
+            "active",
+        )
+        .await;
+        let currency_blocked_id = create_test_subscription(
+            router.clone(),
+            &currency_account_id,
+            "Unsupported currency",
+            "2026-01-20",
+            "active",
+        )
+        .await;
+        let first_due_id = create_test_subscription(
+            router.clone(),
+            &account_id,
+            "First due",
+            "2026-01-31",
+            "active",
+        )
+        .await;
+        let second_due_id = create_test_subscription(
+            router.clone(),
+            &account_id,
+            "Second due",
+            "2026-01-31",
+            "trial",
+        )
+        .await;
+        let paused_id = create_test_subscription(
+            router.clone(),
+            &account_id,
+            "Paused due",
+            "2026-01-05",
+            "paused",
+        )
+        .await;
+        let future_id = create_test_subscription(
+            router.clone(),
+            &account_id,
+            "Future charge",
+            "2026-08-01",
+            "active",
+        )
+        .await;
+
+        let (archive_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/accounts/{blocked_account_id}/archive"),
+        )
+        .await;
+        assert_eq!(archive_status, StatusCode::OK);
+        let (pending_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/subscriptions/{pending_id}/charge-proposal"),
+        )
+        .await;
+        assert_eq!(pending_status, StatusCode::CREATED);
+        let (currency_patch_status, currency_patch_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/accounts/{currency_account_id}"),
+            json!({"supportedCurrencies": ["CNY"]}),
+        )
+        .await;
+        assert_eq!(
+            currency_patch_status,
+            StatusCode::OK,
+            "{currency_patch_body}"
+        );
+        let (blocked_single_status, blocked_single_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/subscriptions/{currency_blocked_id}/charge-proposal"),
+        )
+        .await;
+        assert_eq!(
+            blocked_single_status,
+            StatusCode::BAD_REQUEST,
+            "{blocked_single_body}"
+        );
+        let mut reordered = local_ledger::read_document(&path).expect("ledger should be readable");
+        reordered["subscriptions"]
+            .as_array_mut()
+            .expect("subscriptions should be an array")
+            .reverse();
+        local_ledger::write_document(&path, &reordered).expect("reordered ledger should persist");
+
+        for invalid in [
+            json!([]),
+            json!({}),
+            json!({"throughDate": "not-a-date"}),
+            json!({"throughDate": "2026-07-13", "limit": 0}),
+            json!({"throughDate": "2026-07-13", "limit": 201}),
+            json!({"throughDate": "2026-07-13", "limit": 1.5}),
+            json!({"throughDate": "2026-07-13", "unexpected": true}),
+        ] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/subscriptions/charge-proposals/due-scan",
+                invalid,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["code"], "invalid_subscription_due_scan");
+        }
+
+        let first_key = "subscription-due-scan-replay";
+        let first_input = json!({"throughDate": "2026-07-13", "limit": 1});
+        let (first_status, first_headers, first_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            "/v1/subscriptions/charge-proposals/due-scan",
+            first_input.clone(),
+            Some(first_key),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK, "{first_body}");
+        assert_eq!(first_body["data"]["createdCount"], 1);
+        assert_eq!(first_body["data"]["alreadyPendingCount"], 1);
+        assert_eq!(first_body["data"]["blockedCount"], 2);
+        assert_eq!(first_body["data"]["remainingEligibleCount"], 1);
+        assert_eq!(first_body["data"]["hasMore"], true);
+        assert_eq!(
+            first_body["data"]["created"][0]["subscriptionId"],
+            first_due_id
+        );
+        assert_eq!(
+            first_body["data"]["skipped"],
+            json!([
+                {
+                    "subscriptionId": blocked_id,
+                    "scheduledChargeDate": "2026-01-10",
+                    "reason": "payment_account_unavailable"
+                },
+                {
+                    "subscriptionId": pending_id,
+                    "scheduledChargeDate": "2026-01-15",
+                    "reason": "already_pending"
+                },
+                {
+                    "subscriptionId": currency_blocked_id,
+                    "scheduledChargeDate": "2026-01-20",
+                    "reason": "payment_currency_unsupported"
+                }
+            ])
+        );
+        assert!(first_headers.get("idempotency-replayed").is_none());
+
+        let restarted_router = app_with_state(AppState::local(path.clone()));
+        let (replay_status, replay_headers, replay_body) = request_json_body_with_idempotency_from(
+            restarted_router.clone(),
+            Method::POST,
+            "/v1/subscriptions/charge-proposals/due-scan",
+            first_input,
+            Some(first_key),
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::OK);
+        assert_eq!(replay_body, first_body);
+        assert_eq!(
+            replay_headers
+                .get("idempotency-replayed")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+
+        let (reuse_status, _, reuse_body) = request_json_body_with_idempotency_from(
+            restarted_router.clone(),
+            Method::POST,
+            "/v1/subscriptions/charge-proposals/due-scan",
+            json!({"throughDate": "2026-07-13", "limit": 2}),
+            Some(first_key),
+        )
+        .await;
+        assert_eq!(reuse_status, StatusCode::CONFLICT);
+        assert_eq!(reuse_body["error"]["code"], "idempotency_key_reused");
+
+        let (second_status, second_body) = request_json_body_from(
+            restarted_router.clone(),
+            Method::POST,
+            "/v1/subscriptions/charge-proposals/due-scan",
+            json!({"throughDate": "2026-07-13", "limit": 200}),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::OK, "{second_body}");
+        assert_eq!(second_body["data"]["createdCount"], 1);
+        assert_eq!(second_body["data"]["alreadyPendingCount"], 2);
+        assert_eq!(second_body["data"]["blockedCount"], 2);
+        assert_eq!(second_body["data"]["remainingEligibleCount"], 0);
+        assert_eq!(second_body["data"]["hasMore"], false);
+        assert_eq!(
+            second_body["data"]["created"][0]["subscriptionId"],
+            second_due_id
+        );
+
+        let (_, account_before_confirm) = request_json_from(
+            restarted_router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(account_before_confirm["data"]["value"]["amount"], "100.00");
+        for subscription_id in [
+            blocked_id.clone(),
+            currency_blocked_id.clone(),
+            paused_id,
+            future_id,
+            first_due_id.clone(),
+            second_due_id.clone(),
+        ] {
+            let (_, detail) = request_json_from(
+                restarted_router.clone(),
+                Method::GET,
+                &format!("/v1/subscriptions/{subscription_id}"),
+            )
+            .await;
+            assert_eq!(detail["data"]["lastChargeDate"], Value::Null);
+        }
+
+        let group_id = second_body["data"]["created"][0]["id"]
+            .as_str()
+            .expect("created group id");
+        let (confirm_status, confirm_body) = request_json_from(
+            restarted_router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+        assert_eq!(confirm_body["data"]["ledgerWrite"], true);
+        let (_, account_after_confirm) = request_json_from(
+            restarted_router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(account_after_confirm["data"]["value"]["amount"], "80.00");
+        let (_, confirmed_subscription) = request_json_from(
+            restarted_router,
+            Method::GET,
+            &format!("/v1/subscriptions/{second_due_id}"),
+        )
+        .await;
+        assert_eq!(
+            confirmed_subscription["data"]["lastChargeDate"],
+            "2026-01-31"
+        );
+        assert_eq!(
+            confirmed_subscription["data"]["nextChargeDate"],
+            "2026-02-28"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn subscriptions_reject_unsupported_payment_currency_on_create_and_patch() {
+        let path = unique_test_ledger_path("subscription_payment_currency_validation");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (_, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "CNY-only card",
+                "accountType": "virtual_card",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "CNY", "amount": "500.00"}]
+            }),
+        )
+        .await;
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id")
+            .to_string();
+
+        let (invalid_create_status, invalid_create_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/subscriptions",
+            json!({
+                "displayName": "GPT Plus",
+                "provider": "OpenAI",
+                "amount": {"amount": "20.00", "currency": "USD"},
+                "paymentAccountId": account_id,
+                "billingCycle": {"unit": "month", "interval": 1},
+                "startDate": "2026-07-13"
+            }),
+        )
+        .await;
+        assert_eq!(
+            invalid_create_status,
+            StatusCode::BAD_REQUEST,
+            "{invalid_create_body}"
+        );
+        assert_eq!(
+            invalid_create_body["error"]["code"],
+            "invalid_subscription_input"
+        );
+
+        let (_, create_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/subscriptions",
+            json!({
+                "displayName": "国内会员",
+                "provider": "Example",
+                "amount": {"amount": "88.00", "currency": "CNY"},
+                "paymentAccountId": account_id,
+                "billingCycle": {"unit": "month", "interval": 1},
+                "startDate": "2026-07-13"
+            }),
+        )
+        .await;
+        let subscription_id = create_body["data"]["id"]
+            .as_str()
+            .expect("subscription id")
+            .to_string();
+
+        let (patch_status, patch_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/subscriptions/{subscription_id}"),
+            json!({"amount": {"amount": "20.00", "currency": "USD"}}),
+        )
+        .await;
+        assert_eq!(patch_status, StatusCode::BAD_REQUEST, "{patch_body}");
+        assert_eq!(patch_body["error"]["code"], "invalid_subscription_patch");
+
+        let (detail_status, detail_body) = request_json_from(
+            router,
+            Method::GET,
+            &format!("/v1/subscriptions/{subscription_id}"),
+        )
+        .await;
+        assert_eq!(detail_status, StatusCode::OK);
+        assert_eq!(detail_body["data"]["amount"]["amount"], "88.00");
+        assert_eq!(detail_body["data"]["amount"]["currency"], "CNY");
+
         let _ = std::fs::remove_file(path);
     }
 

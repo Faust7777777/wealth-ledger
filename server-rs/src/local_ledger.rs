@@ -1682,15 +1682,20 @@ pub fn update_subscription(
     idempotency: &IdempotencyRequest,
 ) -> Result<IdempotentResponse, LedgerError> {
     idempotent_ledger_write(path, idempotency, 200, |document| {
-        validate_subscription_payment_account_patch(document, &patch)?;
-        let updated = {
-            let subscription =
-                find_subscription_mut(document, subscription_id).ok_or_else(|| {
-                    LedgerError::NotFound(format!("subscription does not exist: {subscription_id}"))
-                })?;
-            apply_subscription_patch(subscription, &patch, now)?;
-            subscription.clone()
-        };
+        let subscription_index = document["subscriptions"]
+            .as_array()
+            .expect("validated local ledger subscriptions should be an array")
+            .iter()
+            .position(|subscription| {
+                subscription.get("id").and_then(Value::as_str) == Some(subscription_id)
+            })
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("subscription does not exist: {subscription_id}"))
+            })?;
+        let mut updated = document["subscriptions"][subscription_index].clone();
+        apply_subscription_patch(&mut updated, &patch, now)?;
+        validate_subscription_payment(document, &updated)?;
+        document["subscriptions"][subscription_index] = updated.clone();
         append_sync_change(
             document,
             "subscription",
@@ -1768,129 +1773,310 @@ pub fn create_subscription_charge_proposal(
     idempotency: &IdempotencyRequest,
 ) -> Result<IdempotentResponse, LedgerError> {
     idempotent_ledger_write(path, idempotency, 201, |document| {
-        let subscription = document["subscriptions"]
-            .as_array()
-            .expect("validated local ledger subscriptions should be an array")
-            .iter()
-            .find(|item| item.get("id").and_then(Value::as_str) == Some(subscription_id))
-            .cloned()
-            .ok_or_else(|| {
-                LedgerError::NotFound(format!("subscription does not exist: {subscription_id}"))
-            })?;
-        if !matches!(
-            subscription.get("status").and_then(Value::as_str),
-            Some("trial" | "active")
-        ) {
-            return Err(LedgerError::Conflict(
-                "subscription must be trial or active to generate a charge".to_string(),
-            ));
-        }
-        if subscription
-            .get("pendingChargeMovementId")
-            .and_then(Value::as_str)
-            .is_some()
-        {
-            return Err(LedgerError::Conflict(
-                "subscription already has a pending charge proposal".to_string(),
-            ));
-        }
-        let charge_date = subscription
-            .get("nextChargeDate")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                LedgerError::Conflict("subscription has no next charge date".to_string())
-            })?;
-        let payment_account_id = subscription
-            .get("paymentAccountId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                LedgerError::InvalidInput(vec![
-                    "subscription.paymentAccountId is missing".to_string(),
-                ])
-            })?;
-        if !active_account_exists(document, payment_account_id) {
-            return Err(LedgerError::NotFound(format!(
-                "subscription payment account does not exist or is archived: {payment_account_id}"
-            )));
-        }
-        let amount = subscription
-            .get("amount")
-            .and_then(|money| money.get("amount"))
-            .and_then(Value::as_str)
-            .expect("validated subscription amount should exist");
-        let currency = subscription
-            .get("amount")
-            .and_then(|money| money.get("currency"))
-            .and_then(Value::as_str)
-            .expect("validated subscription currency should exist");
-        let display_name = subscription
-            .get("displayName")
-            .and_then(Value::as_str)
-            .expect("validated subscription displayName should exist");
-        let provider = subscription
-            .get("provider")
-            .and_then(Value::as_str)
-            .expect("validated subscription provider should exist");
-        let mut movement = movement_from_create_input(
+        create_subscription_charge_proposal_in_document(
             document,
-            &json!({
-                "type": "expense",
-                "occurredAt": format!("{charge_date}T00:00:00Z"),
-                "title": format!("{display_name} 订阅扣款"),
-                "description": format!("{provider} 订阅的待确认计划扣款；确认前不影响正式账本。"),
-                "entries": [{
-                    "accountId": payment_account_id,
-                    "amount": amount,
-                    "currency": currency,
-                    "direction": "out",
-                    "role": "source"
-                }],
-                "tags": ["subscription"]
-            }),
+            subscription_id,
             movement_id,
             atomic_group_id,
             now,
-        )?;
-        movement["status"] = json!("pending_review");
-        movement["subscriptionId"] = json!(subscription_id);
-        movement["scheduledChargeDate"] = json!(charge_date);
-        movement["source"] = json!({
-            "kind": "system",
-            "sourceId": subscription_id,
-            "createdBy": "system"
+        )
+    })
+}
+
+pub fn create_due_subscription_charge_proposals<F>(
+    path: &Path,
+    input: Value,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+    mut next_ids: F,
+) -> Result<IdempotentResponse, LedgerError>
+where
+    F: FnMut() -> (String, String),
+{
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let (through_date, limit) = parse_subscription_due_scan_input(&input)?;
+        let mut candidates = document["subscriptions"]
+            .as_array()
+            .expect("validated local ledger subscriptions should be an array")
+            .iter()
+            .filter(|subscription| {
+                matches!(
+                    subscription.get("status").and_then(Value::as_str),
+                    Some("trial" | "active")
+                ) && subscription
+                    .get("nextChargeDate")
+                    .and_then(Value::as_str)
+                    .is_some_and(|date| date <= through_date.as_str())
+            })
+            .map(|subscription| {
+                (
+                    subscription
+                        .get("nextChargeDate")
+                        .and_then(Value::as_str)
+                        .expect("eligible subscription nextChargeDate should exist")
+                        .to_string(),
+                    subscription
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .expect("validated subscription id should exist")
+                        .to_string(),
+                    subscription.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
         });
 
-        document["movements"]
-            .as_array_mut()
-            .expect("validated local ledger movements should be an array")
-            .push(movement.clone());
-        if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
-            let movement_entries = document["movementEntries"]
-                .as_array_mut()
-                .expect("validated local ledger movementEntries should be an array");
-            for entry in entries {
-                let mut indexed_entry = entry.clone();
-                indexed_entry["movementId"] = json!(movement_id);
-                indexed_entry["atomicGroupId"] = json!(atomic_group_id);
-                movement_entries.push(indexed_entry);
-            }
-        }
-        let subscription_mut = find_subscription_mut(document, subscription_id)
-            .expect("subscription should still exist");
-        subscription_mut["pendingChargeMovementId"] = json!(movement_id);
-        subscription_mut["pendingChargeDate"] = json!(charge_date);
-        subscription_mut["updatedAt"] = json!(now);
+        let mut created = Vec::new();
+        let mut skipped = Vec::new();
+        let mut already_pending_count = 0_usize;
+        let mut blocked_count = 0_usize;
+        let mut remaining_eligible_count = 0_usize;
 
-        let mut group = atomic_group_from_movement(&movement, "pending");
-        group["subscriptionId"] = json!(subscription_id);
-        group["scheduledChargeDate"] = json!(charge_date);
-        group["warnings"] = json!([{
-            "code": "subscription_charge_requires_confirmation",
-            "message": "该订阅扣款只是候选；用户确认后才写入正式账本。",
-            "severity": "info"
-        }]);
-        Ok(group)
+        for (charge_date, subscription_id, subscription) in candidates {
+            if subscription
+                .get("pendingChargeMovementId")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                already_pending_count += 1;
+                skipped.push(subscription_due_scan_skip(
+                    &subscription_id,
+                    &charge_date,
+                    "already_pending",
+                ));
+                continue;
+            }
+
+            let payment_account_id = subscription
+                .get("paymentAccountId")
+                .and_then(Value::as_str)
+                .expect("validated subscription paymentAccountId should exist");
+            let currency = subscription
+                .get("amount")
+                .and_then(|money| money.get("currency"))
+                .and_then(Value::as_str)
+                .expect("validated subscription currency should exist");
+            if let Some(issue) = subscription_payment_issue(document, payment_account_id, currency)
+            {
+                blocked_count += 1;
+                let reason = match issue {
+                    SubscriptionPaymentIssue::AccountUnavailable => "payment_account_unavailable",
+                    SubscriptionPaymentIssue::CurrencyUnsupported => "payment_currency_unsupported",
+                };
+                skipped.push(subscription_due_scan_skip(
+                    &subscription_id,
+                    &charge_date,
+                    reason,
+                ));
+                continue;
+            }
+
+            if created.len() >= limit {
+                remaining_eligible_count += 1;
+                continue;
+            }
+
+            let (movement_id, atomic_group_id) = next_ids();
+            created.push(create_subscription_charge_proposal_in_document(
+                document,
+                &subscription_id,
+                &movement_id,
+                &atomic_group_id,
+                now,
+            )?);
+        }
+
+        Ok(json!({
+            "throughDate": through_date,
+            "createdCount": created.len(),
+            "alreadyPendingCount": already_pending_count,
+            "blockedCount": blocked_count,
+            "remainingEligibleCount": remaining_eligible_count,
+            "hasMore": remaining_eligible_count > 0,
+            "created": created,
+            "skipped": skipped
+        }))
     })
+}
+
+fn parse_subscription_due_scan_input(input: &Value) -> Result<(String, usize), LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "subscription due scan input must be a JSON object".to_string(),
+        ]));
+    };
+    let mut errors = Vec::new();
+    let mut unknown = object
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "throughDate" | "limit"))
+        .cloned()
+        .collect::<Vec<_>>();
+    unknown.sort_unstable();
+    if !unknown.is_empty() {
+        errors.push(format!(
+            "unsupported subscription due scan fields: {}",
+            unknown.join(", ")
+        ));
+    }
+    let through_date = match object.get("throughDate").and_then(Value::as_str) {
+        Some(value) if Date::parse(value, &Iso8601::DATE).is_ok() => Some(value.to_string()),
+        _ => {
+            errors.push("throughDate must be an ISO date".to_string());
+            None
+        }
+    };
+    let limit = match object.get("limit") {
+        None => Some(100_usize),
+        Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
+            Some(value @ 1..=200) => Some(value),
+            _ => {
+                errors.push("limit must be an integer from 1 to 200".to_string());
+                None
+            }
+        },
+    };
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+    Ok((
+        through_date.expect("validated throughDate should exist"),
+        limit.expect("validated limit should exist"),
+    ))
+}
+
+fn subscription_due_scan_skip(
+    subscription_id: &str,
+    scheduled_charge_date: &str,
+    reason: &str,
+) -> Value {
+    json!({
+        "subscriptionId": subscription_id,
+        "scheduledChargeDate": scheduled_charge_date,
+        "reason": reason
+    })
+}
+
+fn create_subscription_charge_proposal_in_document(
+    document: &mut Value,
+    subscription_id: &str,
+    movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let subscription = document["subscriptions"]
+        .as_array()
+        .expect("validated local ledger subscriptions should be an array")
+        .iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(subscription_id))
+        .cloned()
+        .ok_or_else(|| {
+            LedgerError::NotFound(format!("subscription does not exist: {subscription_id}"))
+        })?;
+    if !matches!(
+        subscription.get("status").and_then(Value::as_str),
+        Some("trial" | "active")
+    ) {
+        return Err(LedgerError::Conflict(
+            "subscription must be trial or active to generate a charge".to_string(),
+        ));
+    }
+    if subscription
+        .get("pendingChargeMovementId")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return Err(LedgerError::Conflict(
+            "subscription already has a pending charge proposal".to_string(),
+        ));
+    }
+    let charge_date = subscription
+        .get("nextChargeDate")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::Conflict("subscription has no next charge date".to_string()))?;
+    validate_subscription_payment(document, &subscription)?;
+    let payment_account_id = subscription
+        .get("paymentAccountId")
+        .and_then(Value::as_str)
+        .expect("validated subscription paymentAccountId should exist");
+    let amount = subscription
+        .get("amount")
+        .and_then(|money| money.get("amount"))
+        .and_then(Value::as_str)
+        .expect("validated subscription amount should exist");
+    let currency = subscription
+        .get("amount")
+        .and_then(|money| money.get("currency"))
+        .and_then(Value::as_str)
+        .expect("validated subscription currency should exist");
+    let display_name = subscription
+        .get("displayName")
+        .and_then(Value::as_str)
+        .expect("validated subscription displayName should exist");
+    let provider = subscription
+        .get("provider")
+        .and_then(Value::as_str)
+        .expect("validated subscription provider should exist");
+    let mut movement = movement_from_create_input(
+        document,
+        &json!({
+            "type": "expense",
+            "occurredAt": format!("{charge_date}T00:00:00Z"),
+            "title": format!("{display_name} 订阅扣款"),
+            "description": format!("{provider} 订阅的待确认计划扣款；确认前不影响正式账本。"),
+            "entries": [{
+                "accountId": payment_account_id,
+                "amount": amount,
+                "currency": currency,
+                "direction": "out",
+                "role": "source"
+            }],
+            "tags": ["subscription"]
+        }),
+        movement_id,
+        atomic_group_id,
+        now,
+    )?;
+    movement["status"] = json!("pending_review");
+    movement["subscriptionId"] = json!(subscription_id);
+    movement["scheduledChargeDate"] = json!(charge_date);
+    movement["source"] = json!({
+        "kind": "system",
+        "sourceId": subscription_id,
+        "createdBy": "system"
+    });
+
+    document["movements"]
+        .as_array_mut()
+        .expect("validated local ledger movements should be an array")
+        .push(movement.clone());
+    if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
+        let movement_entries = document["movementEntries"]
+            .as_array_mut()
+            .expect("validated local ledger movementEntries should be an array");
+        for entry in entries {
+            let mut indexed_entry = entry.clone();
+            indexed_entry["movementId"] = json!(movement_id);
+            indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+            movement_entries.push(indexed_entry);
+        }
+    }
+    let subscription_mut =
+        find_subscription_mut(document, subscription_id).expect("subscription should still exist");
+    subscription_mut["pendingChargeMovementId"] = json!(movement_id);
+    subscription_mut["pendingChargeDate"] = json!(charge_date);
+    subscription_mut["updatedAt"] = json!(now);
+
+    let mut group = atomic_group_from_movement(&movement, "pending");
+    group["subscriptionId"] = json!(subscription_id);
+    group["scheduledChargeDate"] = json!(charge_date);
+    group["warnings"] = json!([{
+        "code": "subscription_charge_requires_confirmation",
+        "message": "该订阅扣款只是候选；用户确认后才写入正式账本。",
+        "severity": "info"
+    }]);
+    Ok(group)
 }
 
 pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
@@ -2253,6 +2439,12 @@ pub fn edit_ai_atomic_group(
     idempotency: &IdempotencyRequest,
 ) -> Result<IdempotentResponse, LedgerError> {
     idempotent_ledger_write(path, idempotency, 200, |document| {
+        if standalone_pending_movement_for_group(document, atomic_group_id).is_some() {
+            return Err(LedgerError::Conflict(
+                "standalone ledger candidates cannot be edited; reject and regenerate the candidate"
+                    .to_string(),
+            ));
+        }
         let source_id =
             find_ai_proposal_id_for_group(document, atomic_group_id).ok_or_else(|| {
                 LedgerError::NotFound(format!("AI atomic group does not exist: {atomic_group_id}"))
@@ -2290,24 +2482,17 @@ pub fn edit_ai_atomic_group(
 
 pub fn list_pending_ai_proposals(path: &Path) -> io::Result<Value> {
     let document = load_or_initialize(path)?;
-    Ok(json!(
-        document["aiProposals"]
-            .as_array()
-            .expect("validated local ledger aiProposals should be an array")
-            .iter()
-            .filter(|proposal| is_pending_ai_proposal(proposal))
-            .cloned()
-            .collect::<Vec<_>>()
-    ))
+    Ok(json!(pending_ai_proposals_for_document(&document)))
 }
 
 fn pending_ai_proposal_count(document: &Value) -> usize {
-    document["aiProposals"]
+    let stored = document["aiProposals"]
         .as_array()
         .expect("validated local ledger aiProposals should be an array")
         .iter()
         .filter(|proposal| is_pending_ai_proposal(proposal))
-        .count()
+        .count();
+    stored + standalone_pending_movement_groups(document).len()
 }
 
 fn is_pending_ai_proposal(proposal: &Value) -> bool {
@@ -2319,12 +2504,192 @@ fn is_pending_ai_proposal(proposal: &Value) -> bool {
 
 pub fn get_ai_proposal(path: &Path, proposal_id: &str) -> io::Result<Option<Value>> {
     let document = load_or_initialize(path)?;
-    Ok(document["aiProposals"]
+    let stored = document["aiProposals"]
         .as_array()
         .expect("validated local ledger aiProposals should be an array")
         .iter()
         .find(|proposal| proposal.get("id").and_then(Value::as_str) == Some(proposal_id))
-        .cloned())
+        .cloned();
+    if stored.is_some() {
+        return Ok(stored);
+    }
+    Ok(standalone_pending_movement_groups(&document)
+        .into_iter()
+        .map(|movements| standalone_pending_movement_group_proposal(&movements))
+        .find(|proposal| proposal.get("id").and_then(Value::as_str) == Some(proposal_id)))
+}
+
+fn pending_ai_proposals_for_document(document: &Value) -> Vec<Value> {
+    let mut proposals = document["aiProposals"]
+        .as_array()
+        .expect("validated local ledger aiProposals should be an array")
+        .iter()
+        .filter(|proposal| is_pending_ai_proposal(proposal))
+        .cloned()
+        .collect::<Vec<_>>();
+    proposals.extend(
+        standalone_pending_movement_groups(document)
+            .into_iter()
+            .map(|movements| standalone_pending_movement_group_proposal(&movements)),
+    );
+    proposals.sort_by(|left, right| {
+        let left_key = (
+            left.get("createdAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            left.get("id").and_then(Value::as_str).unwrap_or_default(),
+        );
+        let right_key = (
+            right
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            right.get("id").and_then(Value::as_str).unwrap_or_default(),
+        );
+        left_key.cmp(&right_key)
+    });
+    proposals
+}
+
+fn standalone_pending_movements(document: &Value) -> impl Iterator<Item = &Value> {
+    document["movements"]
+        .as_array()
+        .expect("validated local ledger movements should be an array")
+        .iter()
+        .filter(|movement| movement.get("status").and_then(Value::as_str) == Some("pending_review"))
+}
+
+fn standalone_pending_movement_groups(document: &Value) -> Vec<Vec<&Value>> {
+    let mut groups = BTreeMap::<String, Vec<&Value>>::new();
+    for movement in standalone_pending_movements(document) {
+        let Some(atomic_group_id) = movement.get("atomicGroupId").and_then(Value::as_str) else {
+            continue;
+        };
+        groups
+            .entry(atomic_group_id.to_string())
+            .or_default()
+            .push(movement);
+    }
+    for movements in groups.values_mut() {
+        movements.sort_unstable_by_key(|movement| {
+            movement
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        });
+    }
+    groups.into_values().collect()
+}
+
+fn standalone_pending_movement_for_group<'a>(
+    document: &'a Value,
+    atomic_group_id: &str,
+) -> Option<&'a Value> {
+    standalone_pending_movements(document).find(|movement| {
+        movement.get("atomicGroupId").and_then(Value::as_str) == Some(atomic_group_id)
+    })
+}
+
+fn standalone_pending_movement_group_proposal(movements: &[&Value]) -> Value {
+    let movement = movements
+        .first()
+        .copied()
+        .expect("standalone pending movement group should not be empty");
+    let movement_id = movement
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("validated pending movement id should be a string");
+    let title = movement
+        .get("title")
+        .and_then(Value::as_str)
+        .expect("validated pending movement title should be a string");
+    let created_at = movements
+        .iter()
+        .filter_map(|movement| {
+            movement
+                .get("createdAt")
+                .or_else(|| movement.get("recordedAt"))
+                .and_then(Value::as_str)
+        })
+        .min()
+        .expect("validated pending movement timestamp should be a string");
+    let is_subscription = movements.iter().any(|movement| {
+        movement
+            .get("subscriptionId")
+            .and_then(Value::as_str)
+            .is_some()
+    });
+    let is_dca = movements.iter().any(|movement| {
+        movement
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some("dca")))
+    });
+    let (source_label, warnings) = if is_subscription {
+        (
+            "订阅计划",
+            json!([{
+                "code": "subscription_charge_requires_confirmation",
+                "message": "该订阅扣费只是候选；用户确认后才写入正式账本。",
+                "severity": "info"
+            }]),
+        )
+    } else if is_dca {
+        (
+            "定投提醒",
+            json!([{
+                "code": "record_only_no_order",
+                "message": "该候选只记录用户已执行的定投，不连接券商、不下单、不转账。",
+                "severity": "info"
+            }]),
+        )
+    } else {
+        (
+            "手动记录",
+            json!([{
+                "code": "manual_candidate_requires_confirmation",
+                "message": "该记录仍是候选；用户确认后才写入正式账本。",
+                "severity": "info"
+            }]),
+        )
+    };
+    let mut group = atomic_group_from_movement(movement, "pending");
+    group["proposedMovements"] = json!(
+        movements
+            .iter()
+            .map(|movement| project_movement_for_api(movement))
+            .collect::<Vec<_>>()
+    );
+    group["warnings"] = warnings.clone();
+    if let Some(subscription_id) = movement.get("subscriptionId").and_then(Value::as_str) {
+        group["subscriptionId"] = json!(subscription_id);
+    }
+    if let Some(charge_date) = movement.get("scheduledChargeDate").and_then(Value::as_str) {
+        group["scheduledChargeDate"] = json!(charge_date);
+    }
+    let evidence_refs = movements
+        .iter()
+        .filter_map(|movement| movement.get("id").and_then(Value::as_str))
+        .map(|movement_id| {
+            json!({
+                "id": format!("evidence_movement_{movement_id}"),
+                "type": "text",
+                "label": source_label
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "id": format!("proposal_movement_{movement_id}"),
+        "status": "pending",
+        "source": {
+            "kind": "manual_import",
+            "evidenceRefs": evidence_refs
+        },
+        "summary": title,
+        "atomicGroups": [group],
+        "warnings": warnings,
+        "createdAt": created_at
+    })
 }
 
 pub fn ensure_real_and_fixture_paths_separate(
@@ -2404,6 +2769,7 @@ pub fn validate_document(document: &Value) -> Result<(), Vec<String>> {
     validate_subscriptions(
         object.get("subscriptions"),
         object.get("accounts"),
+        object.get("movements"),
         &mut errors,
     );
 
@@ -2542,6 +2908,7 @@ fn validate_accounts(accounts: Option<&Value>, errors: &mut Vec<String>) {
 fn validate_subscriptions(
     subscriptions: Option<&Value>,
     accounts: Option<&Value>,
+    movements: Option<&Value>,
     errors: &mut Vec<String>,
 ) {
     let Some(subscriptions) = subscriptions.and_then(Value::as_array) else {
@@ -2556,7 +2923,20 @@ fn validate_subscriptions(
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
+    let movement_by_id = movements
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|movement| {
+                    Some((movement.get("id")?.as_str()?.to_string(), movement.clone()))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let mut ids = BTreeSet::new();
+    let mut pending_keys = BTreeSet::new();
+    let mut pending_links = BTreeMap::new();
 
     for (index, subscription) in subscriptions.iter().enumerate() {
         let path = format!("subscriptions[{index}]");
@@ -2663,10 +3043,26 @@ fn validate_subscriptions(
                 "{path}.reminderDaysBefore must be an integer from 0 to 365"
             ));
         }
-        let pending_movement = object
-            .get("pendingChargeMovementId")
-            .and_then(Value::as_str);
-        let pending_date = object.get("pendingChargeDate").and_then(Value::as_str);
+        let pending_movement = match object.get("pendingChargeMovementId") {
+            None => None,
+            Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+            Some(_) => {
+                errors.push(format!(
+                    "{path}.pendingChargeMovementId must be a non-empty string"
+                ));
+                None
+            }
+        };
+        let pending_date = match object.get("pendingChargeDate") {
+            None => None,
+            Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+            Some(_) => {
+                errors.push(format!(
+                    "{path}.pendingChargeDate must be a non-empty string"
+                ));
+                None
+            }
+        };
         if pending_movement.is_some() != pending_date.is_some() {
             errors.push(format!(
                 "{path}.pendingChargeMovementId and pendingChargeDate must appear together"
@@ -2676,6 +3072,105 @@ fn validate_subscriptions(
             && Date::parse(date, &Iso8601::DATE).is_err()
         {
             errors.push(format!("{path}.pendingChargeDate must be an ISO date"));
+        }
+        if let (Some(subscription_id), Some(movement_id), Some(charge_date)) = (
+            object.get("id").and_then(Value::as_str),
+            pending_movement,
+            pending_date,
+        ) {
+            if !pending_keys.insert((subscription_id.to_string(), charge_date.to_string())) {
+                errors.push(format!(
+                    "duplicate pending subscription charge for {subscription_id} on {charge_date}"
+                ));
+            }
+            pending_links.insert(
+                subscription_id.to_string(),
+                (movement_id.to_string(), charge_date.to_string()),
+            );
+            match movement_by_id.get(movement_id) {
+                Some(movement) => {
+                    if movement.get("status").and_then(Value::as_str) != Some("pending_review") {
+                        errors.push(format!(
+                            "{path}.pendingChargeMovementId must reference a pending_review movement"
+                        ));
+                    }
+                    if movement.get("subscriptionId").and_then(Value::as_str)
+                        != Some(subscription_id)
+                    {
+                        errors.push(format!(
+                            "{path}.pendingChargeMovementId must reference the same subscription"
+                        ));
+                    }
+                    if movement.get("scheduledChargeDate").and_then(Value::as_str)
+                        != Some(charge_date)
+                    {
+                        errors.push(format!(
+                            "{path}.pendingChargeDate must match movement.scheduledChargeDate"
+                        ));
+                    }
+                }
+                None => errors.push(format!(
+                    "{path}.pendingChargeMovementId must reference an existing movement"
+                )),
+            }
+        }
+    }
+
+    if let Some(movements) = movements.and_then(Value::as_array) {
+        for (index, movement) in movements.iter().enumerate() {
+            if movement.get("status").and_then(Value::as_str) != Some("pending_review") {
+                continue;
+            }
+            let Some(subscription_id_value) = movement.get("subscriptionId") else {
+                continue;
+            };
+            let Some(subscription_id) = subscription_id_value
+                .as_str()
+                .filter(|subscription_id| !subscription_id.is_empty())
+            else {
+                errors.push(format!(
+                    "movements[{index}].subscriptionId must be a non-empty string"
+                ));
+                continue;
+            };
+            let movement_id = movement
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|movement_id| !movement_id.is_empty());
+            if movement_id.is_none() {
+                errors.push(format!(
+                    "movements[{index}].id must be a non-empty string for a pending subscription charge"
+                ));
+            }
+            if movement
+                .get("atomicGroupId")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                errors.push(format!(
+                    "movements[{index}].atomicGroupId must be a non-empty string for a pending subscription charge"
+                ));
+            }
+            let charge_date = movement
+                .get("scheduledChargeDate")
+                .and_then(Value::as_str)
+                .filter(|charge_date| !charge_date.is_empty());
+            if charge_date.is_none() {
+                errors.push(format!(
+                    "movements[{index}].scheduledChargeDate must be a non-empty ISO date"
+                ));
+            } else if charge_date.is_some_and(|date| Date::parse(date, &Iso8601::DATE).is_err()) {
+                errors.push(format!(
+                    "movements[{index}].scheduledChargeDate must be an ISO date"
+                ));
+            }
+            match (movement_id, charge_date, pending_links.get(subscription_id)) {
+                (Some(movement_id), Some(charge_date), Some((linked_id, linked_date)))
+                    if linked_id == movement_id && linked_date == charge_date => {}
+                _ => errors.push(format!(
+                    "movements[{index}] pending subscription charge must match the subscription pending pointer"
+                )),
+            }
         }
     }
 }
@@ -5846,10 +6341,22 @@ fn subscription_from_create_input(
     };
     let note = optional_string(object, "note", &mut errors);
 
-    if let Some(account_id) = payment_account_id.as_deref()
-        && !active_account_exists(document, account_id)
-    {
-        errors.push("paymentAccountId does not exist or is archived".to_string());
+    if let (Some(account_id), Some(currency)) = (
+        payment_account_id.as_deref(),
+        amount
+            .as_ref()
+            .and_then(|money| money.get("currency"))
+            .and_then(Value::as_str),
+    ) {
+        match subscription_payment_issue(document, account_id, currency) {
+            Some(SubscriptionPaymentIssue::AccountUnavailable) => {
+                errors.push("paymentAccountId does not exist or is archived".to_string());
+            }
+            Some(SubscriptionPaymentIssue::CurrencyUnsupported) => {
+                errors.push("amount.currency must be supported by the payment account".to_string());
+            }
+            None => {}
+        }
     }
     if let (Some(start), Some(next)) = (start_date, next_charge_date)
         && next < start
@@ -5905,28 +6412,38 @@ fn subscription_from_create_input(
     Ok(subscription)
 }
 
-fn validate_subscription_payment_account_patch(
+fn validate_subscription_payment(
     document: &Value,
-    patch: &Value,
+    subscription: &Value,
 ) -> Result<(), LedgerError> {
-    let Some(object) = patch.as_object() else {
-        return Err(LedgerError::InvalidInput(vec![
-            "subscription patch must be a JSON object".to_string(),
-        ]));
-    };
-    if let Some(value) = object.get("paymentAccountId") {
-        let Some(account_id) = value.as_str().filter(|value| !value.is_empty()) else {
-            return Err(LedgerError::InvalidInput(vec![
+    let account_id = subscription
+        .get("paymentAccountId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
                 "paymentAccountId must be a non-empty string".to_string(),
-            ]));
-        };
-        if !active_account_exists(document, account_id) {
-            return Err(LedgerError::InvalidInput(vec![
-                "paymentAccountId does not exist or is archived".to_string(),
-            ]));
+            ])
+        })?;
+    let currency = subscription
+        .get("amount")
+        .and_then(|money| money.get("currency"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "amount.currency must be a non-empty string".to_string(),
+            ])
+        })?;
+    match subscription_payment_issue(document, account_id, currency) {
+        Some(SubscriptionPaymentIssue::AccountUnavailable) => Err(LedgerError::InvalidInput(vec![
+            "paymentAccountId does not exist or is archived".to_string(),
+        ])),
+        Some(SubscriptionPaymentIssue::CurrencyUnsupported) => {
+            Err(LedgerError::InvalidInput(vec![
+                "amount.currency must be supported by the payment account".to_string(),
+            ]))
         }
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn apply_subscription_patch(
@@ -6077,7 +6594,12 @@ fn apply_subscription_patch(
     let fake_accounts = json!([{ "id": payment_id }]);
     let candidate_array = json!([candidate.clone()]);
     let mut errors = Vec::new();
-    validate_subscriptions(Some(&candidate_array), Some(&fake_accounts), &mut errors);
+    validate_subscriptions(
+        Some(&candidate_array),
+        Some(&fake_accounts),
+        None,
+        &mut errors,
+    );
     if let (Some(next), Some(end)) = (
         candidate
             .get("nextChargeDate")
@@ -6638,14 +7160,39 @@ fn normalized_required_money(
 }
 
 fn active_account_exists(document: &Value, account_id: &str) -> bool {
+    active_account(document, account_id).is_some()
+}
+
+fn active_account<'a>(document: &'a Value, account_id: &str) -> Option<&'a Value> {
     document["accounts"]
         .as_array()
         .expect("validated local ledger accounts should be an array")
         .iter()
-        .any(|account| {
+        .find(|account| {
             account.get("id").and_then(Value::as_str) == Some(account_id)
                 && account.get("status").and_then(Value::as_str) != Some("archived")
         })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriptionPaymentIssue {
+    AccountUnavailable,
+    CurrencyUnsupported,
+}
+
+fn subscription_payment_issue(
+    document: &Value,
+    account_id: &str,
+    currency: &str,
+) -> Option<SubscriptionPaymentIssue> {
+    let Some(account) = active_account(document, account_id) else {
+        return Some(SubscriptionPaymentIssue::AccountUnavailable);
+    };
+    let supports_currency = account
+        .get("supportedCurrencies")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(currency)));
+    (!supports_currency).then_some(SubscriptionPaymentIssue::CurrencyUnsupported)
 }
 
 fn apply_movement_entries(
@@ -8415,6 +8962,239 @@ mod tests {
         assert_eq!(document["movements"], json!([]));
         assert_eq!(document["subscriptions"], json!([]));
         assert_eq!(document["aiProposals"], json!([]));
+    }
+
+    #[test]
+    fn validate_document_rejects_broken_subscription_pending_links() {
+        let now = "2026-07-13T00:00:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        let account = account_from_create_input(
+            &json!({
+                "displayName": "USD card",
+                "accountType": "virtual_card",
+                "defaultCurrency": "USD",
+                "supportedCurrencies": ["USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "USD", "amount": "100.00"}]
+            }),
+            "acct_subscription",
+            now,
+        )
+        .expect("account fixture should be valid");
+        document["accounts"] = json!([account]);
+        let mut subscription = subscription_from_create_input(
+            &document,
+            &json!({
+                "displayName": "GPT Plus",
+                "provider": "OpenAI",
+                "amount": {"amount": "20.00", "currency": "USD"},
+                "paymentAccountId": "acct_subscription",
+                "billingCycle": {"unit": "month", "interval": 1},
+                "startDate": "2026-07-13"
+            }),
+            "subscription_1",
+            now,
+        )
+        .expect("subscription fixture should be valid");
+        subscription["pendingChargeMovementId"] = json!("movement_subscription_1");
+        subscription["pendingChargeDate"] = json!("2026-07-13");
+        document["subscriptions"] = json!([subscription]);
+        document["movements"] = json!([{
+            "id": "movement_subscription_1",
+            "atomicGroupId": "group_subscription_1",
+            "status": "pending_review",
+            "subscriptionId": "subscription_1",
+            "scheduledChargeDate": "2026-07-13"
+        }]);
+        validate_document(&document).expect("matching pending link should validate");
+
+        let mut missing = document.clone();
+        missing["movements"] = json!([]);
+        let errors = validate_document(&missing).expect_err("missing movement must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must reference an existing movement"))
+        );
+
+        let mut wrong_status = document.clone();
+        wrong_status["movements"][0]["status"] = json!("confirmed");
+        let errors = validate_document(&wrong_status).expect_err("wrong status must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must reference a pending_review movement"))
+        );
+
+        let mut wrong_subscription = document.clone();
+        wrong_subscription["movements"][0]["subscriptionId"] = json!("subscription_other");
+        let errors =
+            validate_document(&wrong_subscription).expect_err("wrong subscription must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must reference the same subscription"))
+        );
+
+        let mut wrong_date = document.clone();
+        wrong_date["movements"][0]["scheduledChargeDate"] = json!("2026-07-14");
+        let errors = validate_document(&wrong_date).expect_err("wrong charge date must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must match movement.scheduledChargeDate"))
+        );
+
+        let mut wrong_pointer_types = document.clone();
+        wrong_pointer_types["subscriptions"][0]["pendingChargeMovementId"] = json!(123);
+        wrong_pointer_types["subscriptions"][0]["pendingChargeDate"] = json!(false);
+        let errors = validate_document(&wrong_pointer_types)
+            .expect_err("non-string pending pointers must fail");
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("pendingChargeMovementId must be a non-empty string")
+            })
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("pendingChargeDate must be a non-empty string"))
+        );
+
+        let mut wrong_movement_types = document.clone();
+        wrong_movement_types["movements"][0]["subscriptionId"] = json!(123);
+        let errors = validate_document(&wrong_movement_types)
+            .expect_err("non-string movement subscriptionId must fail");
+        assert!(errors.iter().any(|error| {
+            error.contains("movements[0].subscriptionId must be a non-empty string")
+        }));
+
+        let mut missing_group = document.clone();
+        missing_group["movements"][0]["atomicGroupId"] = Value::Null;
+        let errors = validate_document(&missing_group).expect_err("missing atomic group must fail");
+        assert!(errors.iter().any(|error| {
+            error.contains("movements[0].atomicGroupId must be a non-empty string")
+        }));
+
+        let mut orphan = document;
+        orphan["subscriptions"][0]
+            .as_object_mut()
+            .expect("subscription should be an object")
+            .remove("pendingChargeMovementId");
+        orphan["subscriptions"][0]
+            .as_object_mut()
+            .expect("subscription should be an object")
+            .remove("pendingChargeDate");
+        let errors = validate_document(&orphan).expect_err("orphan movement must fail");
+        assert!(errors.iter().any(|error| {
+            error
+                .contains("pending subscription charge must match the subscription pending pointer")
+        }));
+    }
+
+    #[test]
+    fn subscription_due_scan_input_defaults_and_rejects_out_of_range_limits() {
+        assert_eq!(
+            parse_subscription_due_scan_input(&json!({"throughDate": "2026-07-13"}))
+                .expect("default limit should parse"),
+            ("2026-07-13".to_string(), 100)
+        );
+        assert!(
+            parse_subscription_due_scan_input(&json!({"throughDate": "2026-07-13", "limit": 200}))
+                .is_ok()
+        );
+        for invalid in [
+            json!({"throughDate": "2026-07-13", "limit": null}),
+            json!({"throughDate": "2026-07-13", "limit": -1}),
+            json!({"throughDate": "2026-07-13", "limit": 201}),
+        ] {
+            assert!(parse_subscription_due_scan_input(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn standalone_pending_ai_projection_groups_movements_by_atomic_group() {
+        let now = "2026-07-13T00:00:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        let account = account_from_create_input(
+            &json!({
+                "displayName": "Review account",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "CNY", "amount": "100.00"}]
+            }),
+            "acct_review",
+            now,
+        )
+        .expect("account fixture should be valid");
+        document["accounts"] = json!([account]);
+
+        let mut movement_b = movement_from_create_input(
+            &document,
+            &json!({
+                "type": "expense",
+                "occurredAt": now,
+                "title": "Second movement",
+                "entries": [{
+                    "accountId": "acct_review",
+                    "amount": "2.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }]
+            }),
+            "movement_b",
+            "group_shared",
+            now,
+        )
+        .expect("movement fixture should be valid");
+        movement_b["status"] = json!("pending_review");
+        let mut movement_a = movement_from_create_input(
+            &document,
+            &json!({
+                "type": "expense",
+                "occurredAt": now,
+                "title": "First movement",
+                "entries": [{
+                    "accountId": "acct_review",
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }]
+            }),
+            "movement_a",
+            "group_shared",
+            now,
+        )
+        .expect("movement fixture should be valid");
+        movement_a["status"] = json!("pending_review");
+        document["movements"] = json!([movement_b, movement_a]);
+
+        let proposals = pending_ai_proposals_for_document(&document);
+        assert_eq!(pending_ai_proposal_count(&document), 1);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0]["id"], "proposal_movement_movement_a");
+        assert_eq!(proposals[0]["atomicGroups"][0]["id"], "group_shared");
+        assert_eq!(
+            proposals[0]["atomicGroups"][0]["proposedMovements"]
+                .as_array()
+                .expect("proposed movements should be an array")
+                .len(),
+            2
+        );
+        assert_eq!(
+            proposals[0]["atomicGroups"][0]["proposedMovements"][0]["id"],
+            "movement_a"
+        );
+        assert_eq!(
+            proposals[0]["atomicGroups"][0]["proposedMovements"][1]["id"],
+            "movement_b"
+        );
     }
 
     #[test]

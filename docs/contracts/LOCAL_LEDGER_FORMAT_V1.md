@@ -81,7 +81,7 @@ DataSourceMode =
 
 - API 响应可以是投影/聚合结果；磁盘格式不是 HTTP 响应格式。
 - `movements` 是业务事件；`movementEntries` 是分录明细。
-- `aiProposals` 只保存候选与复核状态；确认前不得影响正式余额、净值、持仓。
+- `aiProposals` 保存 AI 原生候选与复核状态；standalone `pending_review` movement 不得为了 AI Review 可见性再复制到该数组。读取层按 `atomicGroupId` 动态投影这类候选，确认前不得影响正式余额、净值、持仓。
 - `syncChanges` 是本地/远端同步变更日志，不等于业务流水。
 - 空日志对外使用 genesis cursor `local_cursor_0000`，磁盘上的 `syncState.cursor` 仍为 `null`。
 - `syncState.nextChangeSequence` 是持久化提示值；生成新 ID 时必须同时扫描已有最大 `local_change_N`，不得因字段回退而复用 change ID。
@@ -116,7 +116,20 @@ DataSourceMode =
 - `status`：`trial|active|paused|cancelled|expired`。
 - `pendingChargeMovementId` 与 `pendingChargeDate` 必须成对出现。
 
-生成扣款候选时只新增 `pending_review` movement。确认 atomic group 后，订阅才记录 `lastChargeMovementId/lastChargeDate` 并推进下次日期；拒绝候选则清除 pending 引用但保留原计划日期。
+创建或更新 subscription 时，付款账户必须存在、未归档，且 `supportedCurrencies` 包含 `amount.currency`。账户后续归档或支持币种变更不自动改写旧计划；每次生成候选都重新检查，避免在币种能力漂移后静默换汇或写入不可执行候选。
+
+生成扣款候选时新增 `pending_review` movement 及其 entries，并在同一 document 中写入 subscription 的 pending 指针；不额外持久化 `aiProposals` 副本。确认 atomic group 后，订阅才记录 `lastChargeMovementId/lastChargeDate` 并推进下次日期；拒绝候选则把 movement 标记为 `cancelled`、清除 pending 引用并保留原计划日期，历史候选及 entries 仍留在账本中用于追溯。
+
+磁盘校验必须维持双向不变量：
+
+- `pendingChargeMovementId` 与 `pendingChargeDate` 同时存在或同时缺失。
+- pending ID 必须引用存在且状态为 `pending_review` 的 movement。
+- movement 的 `subscriptionId` 与 subscription ID 一致，`scheduledChargeDate` 与 `pendingChargeDate` 一致。
+- 每个 subscription/计费日期最多一个 pending 候选；带 `subscriptionId` 的 pending movement 不得成为没有 subscription pending 指针的孤儿。
+
+`POST /v1/subscriptions/charge-proposals/due-scan` 在一次账本锁定/read-modify-write 中完成稳定排序、逐项 skip、全部候选创建、pending 指针更新和幂等记录保存，并只提交一次。limit 仅限制创建数量；已 pending 或付款能力漂移的项目仍进入 `skipped[]`，不会阻断其他项目。该命令不改变 `ledgerVersion`，也不是后台自动扣款任务。
+
+AI pending 读取层把 standalone pending movements 按 `atomicGroupId` 分组，动态生成 `proposal_movement_{movementId}` 形式的 proposal 投影；列表、详情和 overview pending count 都包含该投影。确认/拒绝仍直接消费原 movement atomic group；投影不可编辑，处理完成后自然消失。
 
 ## 4. 写入原则
 

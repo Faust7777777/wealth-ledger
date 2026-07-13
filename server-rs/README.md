@@ -157,9 +157,9 @@ the JSON ledger when no `?scenario=` query is present:
   `GET /v1/subscriptions/upcoming`,
   `GET/PATCH /v1/subscriptions/{subscription_id}`,
   `POST /v1/subscriptions/{subscription_id}/cancel`, and
-  `POST /v1/subscriptions/{subscription_id}/charge-proposal`; plans never
-  charge an external payment provider, and only confirmed proposals affect
-  balances
+  `POST /v1/subscriptions/{subscription_id}/charge-proposal`, plus the bounded
+  `POST /v1/subscriptions/charge-proposals/due-scan`; plans never charge an
+  external payment provider, and only confirmed proposals affect balances
 - AI proposal review: text/image/CSV import proposals, edit, approve/reject
 - snapshots: latest/list/manual baseline
 - instruments and cached market data: instrument create/update plus quote/FX
@@ -190,6 +190,24 @@ DCA "record executed" in real-local mode may persist a pending proposal/draft so
 the review flow survives refresh/restart. It still does not place orders,
 execute transfers, or affect the confirmed/effective ledger until the user
 confirms the atomic group.
+
+Subscription due-scan is also a real-local-only, explicit command endpoint. It
+is not a background timer: a client or scheduler must call it with a local
+calendar date and an idempotency key. Without `--ledger-path` it returns `501`
+instead of pretending that candidates were persisted. For example:
+
+```powershell
+$headers = @{ 'Idempotency-Key' = 'subscription-scan-2026-07-13' }
+$body = @{ throughDate = '2026-07-13'; limit = 100 } | ConvertTo-Json
+Invoke-RestMethod -Method Post `
+  -Uri 'http://127.0.0.1:8791/v1/subscriptions/charge-proposals/due-scan' `
+  -Headers $headers -ContentType 'application/json' -Body $body
+```
+
+The scan creates `pending_review` charge candidates only. It does not deduct an
+account balance, advance `lastChargeDate`/`nextChargeDate`, call a payment
+provider, or auto-confirm anything. Each candidate remains visible in AI review
+until the user confirms or rejects its atomic group.
 
 The Rust dev server also accepts two temporary compatibility aliases for early
 frontend integration:
@@ -234,10 +252,14 @@ python tools\local_ledger_smoke.py
 ```
 
 It verifies persistent account-create replay, account update, manual movement
-confirmation, DCA record-executed confirmation, a foreign-currency subscription
-charge proposal and confirmation, CSV/image proposal creation, AI approval,
-snapshot creation, derived overview/allocation values, forbidden broker
-endpoints, and on-disk persistence.
+confirmation, DCA record-executed confirmation, and a real-local subscription
+due-scan over multiple foreign-currency plans. The subscription checks cover
+same-key replay, different-body conflict, unchanged balance/schedule before
+confirmation, AI-review discovery, confirmed deduction/date advancement, and
+the invariant that the projected candidate is not duplicated in `aiProposals`.
+The smoke also covers CSV/image proposal creation, AI approval, snapshot
+creation, derived overview/allocation values, forbidden broker endpoints, and
+on-disk persistence.
 
 ## Checks
 

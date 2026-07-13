@@ -38,6 +38,7 @@ def request_json(
     body: dict[str, Any] | None = None,
     expected_status: int = 200,
     idempotency_key: str | None = None,
+    expected_headers: dict[str, str | None] | None = None,
 ) -> dict[str, Any]:
     data = None if body is None else json.dumps(body).encode("utf-8")
     headers = {"Content-Type": "application/json"}
@@ -52,13 +53,21 @@ def request_json(
     try:
         with urllib.request.urlopen(request, timeout=3) as response:
             status = response.status
+            response_headers = response.headers
             payload = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         status = exc.code
+        response_headers = exc.headers
         payload = exc.read().decode("utf-8")
 
     if status != expected_status:
         raise AssertionError(f"{method} {path}: expected {expected_status}, got {status}: {payload}")
+    for name, expected in (expected_headers or {}).items():
+        actual = response_headers.get(name)
+        if actual != expected:
+            raise AssertionError(
+                f"{method} {path}: expected header {name}={expected!r}, got {actual!r}"
+            )
     if not payload:
         return {}
     return json.loads(payload)
@@ -310,42 +319,142 @@ def create_image_proposal_without_writing(base: str) -> None:
     assert proposal["status"] == "pending"
 
 
-def create_and_confirm_subscription_charge(base: str, account_id: str) -> dict[str, Any]:
-    subscription = unwrap_data(
+def create_subscription(
+    base: str,
+    account_id: str,
+    *,
+    display_name: str,
+    provider: str,
+    plan_name: str,
+    start_date: str,
+) -> dict[str, Any]:
+    return unwrap_data(
         request_json(
             base,
             "/v1/subscriptions",
             method="POST",
             expected_status=201,
             body={
-                "displayName": "ChatGPT Plus smoke",
-                "provider": "OpenAI",
-                "planName": "Plus",
+                "displayName": display_name,
+                "provider": provider,
+                "planName": plan_name,
                 "amount": {"amount": "20.00", "currency": "USD"},
                 "paymentAccountId": account_id,
                 "billingCycle": {"unit": "month", "interval": 1},
-                "startDate": "2026-01-31",
+                "startDate": start_date,
                 "duration": {"unit": "month", "count": 3},
                 "autoRenew": False,
                 "reminderDaysBefore": 3,
             },
         )
     )
-    assert subscription["nextChargeDate"] == "2026-01-31"
 
-    upcoming = unwrap_data(request_json(base, "/v1/subscriptions/upcoming?days=365"))
-    assert subscription["id"] in {item["id"] for item in upcoming}
 
-    group = unwrap_data(
+def create_and_confirm_due_subscription_charge(
+    base: str, account_id: str, ledger_path: Path
+) -> dict[str, Any]:
+    due = create_subscription(
+        base,
+        account_id,
+        display_name="ChatGPT Plus due-scan smoke",
+        provider="OpenAI",
+        plan_name="Plus",
+        start_date="2026-01-31",
+    )
+    future = create_subscription(
+        base,
+        account_id,
+        display_name="Claude Pro future smoke",
+        provider="Anthropic",
+        plan_name="Pro",
+        start_date="2026-08-31",
+    )
+    assert due["nextChargeDate"] == "2026-01-31"
+    assert future["nextChargeDate"] == "2026-08-31"
+
+    before = unwrap_data(request_json(base, f"/v1/accounts/{account_id}"))
+    due_before = unwrap_data(request_json(base, f"/v1/subscriptions/{due['id']}"))
+    future_before = unwrap_data(request_json(base, f"/v1/subscriptions/{future['id']}"))
+    assert before["cashBalances"][0]["amount"] == "100.00"
+    assert due_before.get("lastChargeDate") is None
+    assert future_before.get("lastChargeDate") is None
+
+    scan_path = "/v1/subscriptions/charge-proposals/due-scan"
+    scan_key = "smoke-subscription-due-scan-replay"
+    scan_body = {"throughDate": "2026-07-13", "limit": 1}
+    scan = unwrap_data(
         request_json(
             base,
-            f"/v1/subscriptions/{subscription['id']}/charge-proposal",
+            scan_path,
             method="POST",
-            expected_status=201,
+            body=scan_body,
+            idempotency_key=scan_key,
+            expected_headers={"Idempotency-Replayed": None},
         )
     )
-    before = unwrap_data(request_json(base, f"/v1/accounts/{account_id}"))
-    assert before["cashBalances"][0]["amount"] == "100.00"
+    assert scan["throughDate"] == "2026-07-13"
+    assert scan["createdCount"] == 1
+    assert scan["alreadyPendingCount"] == 0
+    assert scan["blockedCount"] == 0
+    assert scan["remainingEligibleCount"] == 0
+    assert scan["hasMore"] is False
+    assert scan["skipped"] == []
+    group = scan["created"][0]
+    assert group["subscriptionId"] == due["id"]
+    assert group["scheduledChargeDate"] == "2026-01-31"
+    assert len(group["proposedMovements"]) == 1
+    movement_id = group["proposedMovements"][0]["id"]
+
+    replay = unwrap_data(
+        request_json(
+            base,
+            scan_path,
+            method="POST",
+            body=scan_body,
+            idempotency_key=scan_key,
+            expected_headers={"Idempotency-Replayed": "true"},
+        )
+    )
+    assert replay == scan
+
+    reused = request_json(
+        base,
+        scan_path,
+        method="POST",
+        body={"throughDate": "2026-07-13", "limit": 2},
+        idempotency_key=scan_key,
+        expected_status=409,
+    )
+    assert reused["ok"] is False
+    assert reused["error"]["code"] == "idempotency_key_reused"
+
+    after_scan = unwrap_data(request_json(base, f"/v1/accounts/{account_id}"))
+    due_after_scan = unwrap_data(request_json(base, f"/v1/subscriptions/{due['id']}"))
+    future_after_scan = unwrap_data(request_json(base, f"/v1/subscriptions/{future['id']}"))
+    assert after_scan["cashBalances"][0]["amount"] == "100.00"
+    assert due_after_scan.get("lastChargeDate") is None
+    assert due_after_scan["nextChargeDate"] == "2026-01-31"
+    assert future_after_scan.get("lastChargeDate") is None
+    assert future_after_scan["nextChargeDate"] == "2026-08-31"
+
+    pending = unwrap_data(request_json(base, "/v1/ai/proposals/pending"))
+    synthetic = next(
+        proposal
+        for proposal in pending
+        if any(item["id"] == group["id"] for item in proposal["atomicGroups"])
+    )
+    assert synthetic["id"] == f"proposal_movement_{movement_id}"
+    synthetic_detail = unwrap_data(
+        request_json(base, f"/v1/ai/proposals/{synthetic['id']}")
+    )
+    assert synthetic_detail == synthetic
+
+    persisted_pending = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert sum(item["id"] == movement_id for item in persisted_pending["movements"]) == 1
+    assert all(
+        movement_id not in json.dumps(proposal, sort_keys=True)
+        for proposal in persisted_pending["aiProposals"]
+    )
 
     confirmed = unwrap_data(
         request_json(base, f"/v1/atomic-groups/{group['id']}/confirm", method="POST")
@@ -354,10 +463,17 @@ def create_and_confirm_subscription_charge(base: str, account_id: str) -> dict[s
     after = unwrap_data(request_json(base, f"/v1/accounts/{account_id}"))
     assert after["cashBalances"][0]["amount"] == "80.00"
 
-    refreshed = unwrap_data(request_json(base, f"/v1/subscriptions/{subscription['id']}"))
+    refreshed = unwrap_data(request_json(base, f"/v1/subscriptions/{due['id']}"))
+    assert refreshed["lastChargeDate"] == "2026-01-31"
     assert refreshed["nextChargeDate"] == "2026-02-28"
     assert refreshed.get("pendingChargeMovementId") is None
-    return refreshed
+    pending_after = unwrap_data(request_json(base, "/v1/ai/proposals/pending"))
+    assert synthetic["id"] not in {item["id"] for item in pending_after}
+    return {
+        "confirmed": refreshed,
+        "future": future_after_scan,
+        "movementId": movement_id,
+    }
 
 
 def run_smoke(base: str, ledger_path: Path) -> None:
@@ -463,8 +579,10 @@ def run_smoke(base: str, ledger_path: Path) -> None:
         account_type="virtual_card",
         currency="USD",
     )
-    subscription = create_and_confirm_subscription_charge(base, subscription_account["id"])
-    assert subscription["lastChargeDate"] == "2026-01-31"
+    subscription_result = create_and_confirm_due_subscription_charge(
+        base, subscription_account["id"], ledger_path
+    )
+    assert subscription_result["confirmed"]["lastChargeDate"] == "2026-01-31"
 
     movements = unwrap_data(request_json(base, "/v1/movements"))
     confirmed_ids = {item["id"] for item in movements if item["status"] == "confirmed"}
@@ -524,11 +642,15 @@ def run_smoke(base: str, ledger_path: Path) -> None:
 
     persisted = json.loads(ledger_path.read_text(encoding="utf-8"))
     assert len(persisted["accounts"]) == 3
-    assert len(persisted["subscriptions"]) == 1
+    assert len(persisted["subscriptions"]) == 2
     assert len(persisted["snapshots"]) == 1
     assert persisted["syncState"]["pendingChangeIds"] == []
     assert len(persisted["syncChanges"]) >= len(final_sync["changes"])
     assert any(item["source"]["kind"] == "ai_proposal" for item in persisted["movements"])
+    assert all(
+        subscription_result["movementId"] not in json.dumps(proposal, sort_keys=True)
+        for proposal in persisted["aiProposals"]
+    )
     assert len(persisted["idempotencyState"]["records"]) >= 1
     assert account_retry_key not in ledger_path.read_text(encoding="utf-8")
 
