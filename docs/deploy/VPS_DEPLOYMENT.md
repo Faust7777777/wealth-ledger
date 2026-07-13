@@ -156,9 +156,12 @@ Windows:
 
 ```powershell
 pwsh -NoProfile -File tools\package_remote_windows.ps1 `
-  -ApiBase https://api.example.com `
   -OutputDir C:\tmp\finwealth-server-client
 ```
+
+This produces a universal client that asks for the HTTPS API origin on first
+launch. Add `-ApiBase https://api.example.com` only when a fixed-origin package
+is preferred.
 
 Keep the zip with its `.sha256` sidecar. Extract it and run
 `Start-Finwealth.cmd`; the launcher validates package hashes and the public
@@ -174,8 +177,12 @@ flutter run -d windows --dart-define=DATA_SOURCE=api_remote --dart-define=API_BA
 Android:
 
 ```powershell
-flutter run -d <device-id> --dart-define=DATA_SOURCE=api_remote --dart-define=API_BASE=https://api.example.com
+pwsh -NoProfile -File tools\package_remote_android.ps1 `
+  -OutputDir C:\tmp\finwealth-android-client
 ```
+
+The resulting self-use APK is debug-signed and includes SHA-256/provenance
+sidecars. On first launch, enter the same HTTPS server origin used by Windows.
 
 Login in Settings with the username/password configured above. The client stores
 tokens with Windows DPAPI / Android Keystore.

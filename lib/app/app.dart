@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/env.dart';
 import '../data/providers.dart';
+import '../features/remote_server_setup_page.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_theme.dart';
 import 'router.dart';
@@ -77,6 +78,18 @@ class _WealthLedgerAppState extends ConsumerState<WealthLedgerApp> {
 
   @override
   Widget build(BuildContext context) {
+    final mode = ref.watch(themeModeProvider);
+    final env = ref.watch(effectiveAppEnvironmentProvider);
+    if (!env.hasConfiguredRemoteApi) {
+      return MaterialApp(
+        title: 'Wealth Ledger',
+        debugShowCheckedModeBanner: false,
+        theme: buildLightTheme(),
+        darkTheme: buildDarkTheme(),
+        themeMode: mode,
+        home: const RemoteServerSetupPage(),
+      );
+    }
     if (!_startupRefreshScheduled) {
       _startupRefreshScheduled = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -84,8 +97,6 @@ class _WealthLedgerAppState extends ConsumerState<WealthLedgerApp> {
       });
     }
 
-    final mode = ref.watch(themeModeProvider);
-    final env = ref.watch(appEnvironmentProvider);
     _configureScheduledQuoteRefresh(env);
     final banner = env.devBannerLabel;
 

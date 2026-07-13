@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:finwealth/core/env.dart';
+import 'package:finwealth/core/api_endpoint_store.dart';
 import 'package:finwealth/data/api_mock_repositories.dart';
 import 'package:finwealth/data/auth_repositories.dart';
 import 'package:finwealth/data/providers.dart';
@@ -26,6 +27,7 @@ void main() {
             apiBaseUrl: 'https://api.example.com',
           ),
         ),
+        apiEndpointStoreProvider.overrideWithValue(MemoryApiEndpointStore()),
       ],
     );
     addTearDown(container.dispose);

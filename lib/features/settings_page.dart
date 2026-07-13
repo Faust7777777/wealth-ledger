@@ -7,6 +7,7 @@ import 'package:go_router/go_router.dart';
 import '../core/env.dart';
 import '../data/auth_store.dart';
 import '../data/providers.dart';
+import 'remote_server_setup_page.dart';
 import '../theme/app_dimens.dart';
 
 String _modeLabel(DataSourceMode m) => switch (m) {
@@ -23,7 +24,7 @@ class SettingsPage extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final mode = ref.watch(themeModeProvider);
-    final env = ref.watch(appEnvironmentProvider);
+    final env = ref.watch(effectiveAppEnvironmentProvider);
     return Scaffold(
       appBar: AppBar(title: const Text('设置')),
       body: ListView(
@@ -52,6 +53,15 @@ class SettingsPage extends ConsumerWidget {
                 ? null
                 : Chip(label: Text(env.devBannerLabel!)),
           ),
+          if (env.dataSourceMode == DataSourceMode.apiRemote)
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.cloud_outlined),
+              title: const Text('服务器'),
+              subtitle: Text(env.apiBaseUrl),
+              trailing: const Icon(Icons.edit_outlined),
+              onTap: () => showRemoteServerDialog(context, ref),
+            ),
           if (env.isApiBacked) ...[
             const Divider(),
             const _LocalServerAuthSection(),

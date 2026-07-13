@@ -55,6 +55,9 @@ REMOTE_PACKAGE_SCRIPT = ROOT / "tools" / "package_remote_windows.ps1"
 REMOTE_WINDOWS_LAUNCHER = ROOT / "tools" / "windows_remote_launcher.ps1"
 REMOTE_WINDOWS_LAUNCHER_CMD = ROOT / "tools" / "windows_remote_launcher.cmd"
 REMOTE_WINDOWS_PACKAGE_DOC = ROOT / "docs" / "deploy" / "WINDOWS_SERVER_CLIENT_PACKAGE.md"
+REMOTE_ANDROID_PACKAGE_SCRIPT = ROOT / "tools" / "package_remote_android.ps1"
+REMOTE_ANDROID_PACKAGE_DOC = ROOT / "docs" / "deploy" / "ANDROID_SERVER_CLIENT_PACKAGE.md"
+ANDROID_MANIFEST = ROOT / "android" / "app" / "src" / "main" / "AndroidManifest.xml"
 SERVER_MODE_ALGORITHMS = CONTRACTS / "SERVER_MODE_ALGORITHMS_V1.md"
 PACKAGE_WORKFLOW = ROOT / ".github" / "workflows" / "package.yml"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -1133,6 +1136,9 @@ def check_release_packaging() -> None:
         REMOTE_WINDOWS_LAUNCHER,
         REMOTE_WINDOWS_LAUNCHER_CMD,
         REMOTE_WINDOWS_PACKAGE_DOC,
+        REMOTE_ANDROID_PACKAGE_SCRIPT,
+        REMOTE_ANDROID_PACKAGE_DOC,
+        ANDROID_MANIFEST,
         SERVER_MODE_ALGORITHMS,
         PACKAGE_WORKFLOW,
         CI_WORKFLOW,
@@ -1202,6 +1208,8 @@ def check_release_packaging() -> None:
     remote_package_text = REMOTE_PACKAGE_SCRIPT.read_text(encoding="utf-8")
     remote_package_snippets = [
         "--dart-define=DATA_SOURCE=api_remote",
+        "endpointMode",
+        "remote_server_setup_test.dart",
         "$parsedApiBase.Scheme -ceq \"https\"",
         "sourceCommit",
         "sourceDirty",
@@ -1220,6 +1228,7 @@ def check_release_packaging() -> None:
     remote_launcher_snippets = [
         "packageFormat -ne 3",
         "dataSource -cne \"api_remote\"",
+        "endpointMode",
         "Test-HttpsApiBase",
         "Get-FileHash",
         "/v1/health",
@@ -1230,6 +1239,30 @@ def check_release_packaging() -> None:
     ]
     if missing:
         fail("Windows remote launcher missing safety behavior: " + ", ".join(missing))
+
+    remote_android_text = REMOTE_ANDROID_PACKAGE_SCRIPT.read_text(encoding="utf-8")
+    remote_android_snippets = [
+        "--dart-define=DATA_SOURCE=api_remote",
+        "endpointMode",
+        "remote_server_setup_test.dart",
+        "debug-self-use",
+        "apkSha256",
+        "manifest.json",
+    ]
+    missing = [
+        snippet for snippet in remote_android_snippets if snippet not in remote_android_text
+    ]
+    if missing:
+        fail("Android remote package script missing safeguards: " + ", ".join(missing))
+
+    android_manifest_text = ANDROID_MANIFEST.read_text(encoding="utf-8")
+    for snippet in (
+        "android.permission.INTERNET",
+        'android:usesCleartextTraffic="false"',
+        'android:allowBackup="false"',
+    ):
+        if snippet not in android_manifest_text:
+            fail(f"Android server client manifest missing security setting: {snippet}")
 
     package_integrity_smoke_text = PACKAGE_INTEGRITY_SMOKE.read_text(encoding="utf-8")
     package_integrity_smoke_snippets = [
@@ -1267,6 +1300,9 @@ def check_release_packaging() -> None:
         "remote_api_base",
         "package_remote_windows.ps1",
         "finwealth-windows-server-client-x64",
+        "include_android_server_client",
+        "package_remote_android.ps1",
+        "android-server-client-debug",
     ]
     missing = [
         snippet for snippet in required_workflow_snippets if snippet not in workflow_text

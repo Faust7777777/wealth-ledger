@@ -3,6 +3,7 @@
 import 'package:flutter/material.dart' show ThemeMode;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../core/api_endpoint_store.dart';
 import '../core/env.dart';
 import 'api_mock_repositories.dart';
 import 'auth_repositories.dart';
@@ -13,11 +14,45 @@ import 'real_local_repositories.dart';
 import 'repositories.dart';
 import 'view_models.dart';
 
+final apiEndpointStoreProvider = Provider<ApiEndpointStore>(
+  (ref) => PlatformApiEndpointStore(),
+);
+
+class RemoteApiEndpointController extends AsyncNotifier<String?> {
+  @override
+  Future<String?> build() => ref.watch(apiEndpointStoreProvider).read();
+
+  Future<String> configure(String input) async {
+    final normalized = normalizeHttpsApiOrigin(input);
+    await ref.read(apiEndpointStoreProvider).write(normalized);
+    state = AsyncData(normalized);
+    return normalized;
+  }
+
+  Future<void> clear() async {
+    state = const AsyncLoading<String?>();
+    await ref.read(apiEndpointStoreProvider).clear();
+    state = const AsyncData(null);
+  }
+}
+
+final remoteApiEndpointProvider =
+    AsyncNotifierProvider<RemoteApiEndpointController, String?>(
+      RemoteApiEndpointController.new,
+    );
+
+final effectiveAppEnvironmentProvider = Provider<AppEnvironment>((ref) {
+  final base = ref.watch(appEnvironmentProvider);
+  if (base.dataSourceMode != DataSourceMode.apiRemote) return base;
+  final saved = ref.watch(remoteApiEndpointProvider).value;
+  return saved == null ? base : base.copyWith(apiBaseUrl: saved);
+});
+
 DataSourceMode _mode(Ref ref) =>
-    ref.watch(appEnvironmentProvider).dataSourceMode;
+    ref.watch(effectiveAppEnvironmentProvider).dataSourceMode;
 
 final devApiClientProvider = Provider<DevApiClient>((ref) {
-  final env = ref.watch(appEnvironmentProvider);
+  final env = ref.watch(effectiveAppEnvironmentProvider);
   return DevApiClient(
     env.apiBaseUrl,
     scenario: env.apiScenario,
@@ -30,7 +65,7 @@ final authTokenStoreProvider = Provider<AuthTokenStore>(
 );
 
 final authRepositoryProvider = Provider<AuthRepository>((ref) {
-  if (!ref.watch(appEnvironmentProvider).isApiBacked) {
+  if (!ref.watch(effectiveAppEnvironmentProvider).isApiBacked) {
     return const UnsupportedAuthRepository();
   }
   return LocalServerAuthRepository(ref.watch(devApiClientProvider));

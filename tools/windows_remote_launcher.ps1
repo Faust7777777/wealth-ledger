@@ -27,13 +27,18 @@ function Test-HttpsApiBase {
 function Assert-PackageIntegrity {
   $manifest = Get-Content -Raw -LiteralPath $PackageManifestPath | ConvertFrom-Json
   $build = Get-Content -Raw -LiteralPath $BuildConfigPath | ConvertFrom-Json
+  $endpointIsValid = switch ([string]$manifest.endpointMode) {
+    "fixed" { Test-HttpsApiBase ([string]$manifest.apiBase) }
+    "runtime" { [string]::IsNullOrEmpty([string]$manifest.apiBase) }
+    default { $false }
+  }
   if (
     $manifest.packageFormat -ne 3 -or
     [string]$manifest.clientVersion -eq "" -or
     [string]$manifest.sourceCommit -notmatch '^[0-9a-fA-F]{40}$' -or
     $manifest.sourceDirty -isnot [bool] -or
     $manifest.dataSource -cne "api_remote" -or
-    !(Test-HttpsApiBase ([string]$manifest.apiBase)) -or
+    !$endpointIsValid -or
     $manifest.client -cne "finwealth.exe" -or
     [string]$manifest.clientSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
     $manifest.launcherPowerShell -cne "Start-Finwealth.ps1" -or
@@ -48,6 +53,7 @@ function Assert-PackageIntegrity {
   if (
     $build.buildFormat -ne 3 -or
     $build.dataSource -cne "api_remote" -or
+    $build.endpointMode -cne $manifest.endpointMode -or
     $build.apiBase -cne $manifest.apiBase -or
     $build.serverBundled -ne $false -or
     $build.clientVersion -cne $manifest.clientVersion -or
@@ -88,13 +94,15 @@ if ($PackageIntegrityOnly) {
   return
 }
 
-try {
-  $health = Invoke-RestMethod -Uri "$($manifest.apiBase)/v1/health" -Method Get -TimeoutSec 10
-  if ($health.ok -ne $true -or $health.data.status -cne "ok") {
-    throw "Health response is not healthy."
+if ($manifest.endpointMode -ceq "fixed") {
+  try {
+    $health = Invoke-RestMethod -Uri "$($manifest.apiBase)/v1/health" -Method Get -TimeoutSec 10
+    if ($health.ok -ne $true -or $health.data.status -cne "ok") {
+      throw "Health response is not healthy."
+    }
+  } catch {
+    throw "Cannot reach the configured Finwealth server at $($manifest.apiBase): $($_.Exception.Message)"
   }
-} catch {
-  throw "Cannot reach the configured Finwealth server at $($manifest.apiBase): $($_.Exception.Message)"
 }
 
 if ($CheckOnly) {
@@ -102,6 +110,10 @@ if ($CheckOnly) {
   return
 }
 
-Write-Host "Starting Finwealth against $($manifest.apiBase)"
+if ($manifest.endpointMode -ceq "fixed") {
+  Write-Host "Starting Finwealth against $($manifest.apiBase)"
+} else {
+  Write-Host "Starting Finwealth; configure the HTTPS server in the app."
+}
 $client = Start-Process -FilePath $ClientExe -WorkingDirectory $InstallDir -PassThru
 Wait-Process -Id $client.Id

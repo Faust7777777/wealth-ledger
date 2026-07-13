@@ -9,10 +9,15 @@ on:
         default: false
         type: boolean
       remote_api_base:
-        description: Optional HTTPS API origin for a Windows server-client package (for example https://api.example.com)
+        description: Optional fixed HTTPS API origin; leave empty for a universal runtime-configured client
         required: false
         default: ''
         type: string
+      include_android_server_client:
+        description: Build the writable Android server client (debug-signed for private self-use)
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: package-${{ github.ref }}
@@ -102,7 +107,7 @@ jobs:
 
       - name: Check Windows server-client readiness
         shell: pwsh
-        run: ./tools/package_remote_windows.ps1 -ApiBase https://api.example.com -CheckReadinessOnly
+        run: ./tools/package_remote_windows.ps1 -CheckReadinessOnly
 
   package-windows:
     name: Package Windows
@@ -180,7 +185,6 @@ jobs:
   package-windows-remote:
     name: Package Windows server client
     needs: verify-windows-source
-    if: ${{ inputs.remote_api_base != '' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -207,4 +211,43 @@ jobs:
           path: |
             dist/*-windows-server-client-x64.zip
             dist/*-windows-server-client-x64.zip.sha256
+          if-no-files-found: error
+
+  package-android-remote:
+    name: Package Android server client
+    needs: verify-windows-source
+    if: ${{ inputs.include_android_server_client }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Build Android server client
+        shell: pwsh
+        env:
+          FINWEALTH_REMOTE_API_BASE: ${{ inputs.remote_api_base }}
+        run: ./tools/package_remote_android.ps1 -ApiBase $env:FINWEALTH_REMOTE_API_BASE -OutputDir dist
+
+      - name: Upload Android server-client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finwealth-android-server-client-debug
+          path: |
+            dist/*-android-server-client-debug.apk
+            dist/*-android-server-client-debug.apk.sha256
+            dist/*-android-server-client-debug.apk.manifest.json
           if-no-files-found: error

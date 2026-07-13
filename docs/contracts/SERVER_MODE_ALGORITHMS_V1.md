@@ -8,6 +8,8 @@
 - VPS 上的 `ledger.json` 是在线模式唯一业务事实源。
 - Windows 客户端以 `DATA_SOURCE=api_remote` 连接同一个 HTTPS API；客户端不维护
   第二份可写账本，因此在线共享使用不依赖离线 sync merge。
+- Windows/Android 通用客户端首次启动校验并保存 HTTPS origin；切换 origin 时先清除
+  旧服务器 token，防止跨主机凭证复用。地址配置本身不含秘密。
 - Rust 服务只监听 loopback，由 Caddy/Nginx 终止 TLS。Host 必须在显式允许列表中。
 - 一个 ledger 同时只允许一个 Rust 进程持有 OS 文件锁，不支持 active-active 或共享盘多写。
 

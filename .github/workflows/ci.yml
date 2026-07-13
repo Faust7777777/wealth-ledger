@@ -121,7 +121,7 @@ jobs:
 
       - name: Check Windows server client readiness
         shell: pwsh
-        run: ./tools/package_remote_windows.ps1 -ApiBase https://api.example.com -CheckReadinessOnly
+        run: ./tools/package_remote_windows.ps1 -CheckReadinessOnly
 
       - name: Build paired Windows self-use package
         shell: pwsh
@@ -129,7 +129,7 @@ jobs:
 
       - name: Build Windows server client package
         shell: pwsh
-        run: ./tools/package_remote_windows.ps1 -ApiBase https://api.example.com -OutputDir tmp/package-remote-ci
+        run: ./tools/package_remote_windows.ps1 -OutputDir tmp/package-remote-ci
 
   flutter-android:
     name: Flutter Android
@@ -153,4 +153,4 @@ jobs:
         run: flutter pub get
 
       - name: Build Android debug APK
-        run: flutter build apk --debug
+        run: flutter build apk --debug --dart-define=DATA_SOURCE=api_remote --dart-define=API_BASE=

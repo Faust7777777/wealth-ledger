@@ -18,11 +18,19 @@ class AppEnvironment {
   final String apiBaseUrl;
   final String apiScenario; // 仅 dev 联调：空=服务器默认(空态)；可设 'degraded'
 
+  AppEnvironment copyWith({String? apiBaseUrl}) => AppEnvironment(
+    dataSourceMode: dataSourceMode,
+    apiBaseUrl: apiBaseUrl ?? this.apiBaseUrl,
+    apiScenario: apiScenario,
+  );
+
   bool get isDemo => dataSourceMode == DataSourceMode.debugFixture;
   bool get isLocalServer => dataSourceMode == DataSourceMode.localServer;
   bool get isApiBacked =>
       dataSourceMode == DataSourceMode.localServer ||
       dataSourceMode == DataSourceMode.apiRemote;
+  bool get hasConfiguredRemoteApi =>
+      dataSourceMode != DataSourceMode.apiRemote || apiBaseUrl.isNotEmpty;
 
   /// 非生产数据来源角标：DEMO(fixture) / DEV(本地 Rust 服务)；real_local / api_remote 为 null。
   String? get devBannerLabel => switch (dataSourceMode) {

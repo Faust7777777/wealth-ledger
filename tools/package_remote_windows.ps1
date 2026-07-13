@@ -1,6 +1,5 @@
 param(
-  [Parameter(Mandatory = $true)]
-  [string]$ApiBase,
+  [string]$ApiBase = "",
   [string]$OutputDir = "dist",
   [switch]$SkipBuild,
   [switch]$AllowDirtySource,
@@ -10,19 +9,23 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$parsedApiBase = $null
-$apiBaseIsValid = ![string]::IsNullOrWhiteSpace($ApiBase) -and
-  [System.Uri]::TryCreate($ApiBase, [System.UriKind]::Absolute, [ref]$parsedApiBase) -and
-  $parsedApiBase.Scheme -ceq "https" -and
-  ![string]::IsNullOrWhiteSpace($parsedApiBase.Host) -and
-  [string]::IsNullOrEmpty($parsedApiBase.UserInfo) -and
-  $parsedApiBase.AbsolutePath -ceq "/" -and
-  [string]::IsNullOrEmpty($parsedApiBase.Query) -and
-  [string]::IsNullOrEmpty($parsedApiBase.Fragment)
-if (!$apiBaseIsValid) {
-  throw "-ApiBase must be an HTTPS origin without credentials, path, query, or fragment, for example https://api.example.com."
+$EndpointMode = if ([string]::IsNullOrWhiteSpace($ApiBase)) { "runtime" } else { "fixed" }
+if ($EndpointMode -eq "fixed") {
+  $parsedApiBase = $null
+  $apiBaseIsValid = [System.Uri]::TryCreate($ApiBase, [System.UriKind]::Absolute, [ref]$parsedApiBase) -and
+    $parsedApiBase.Scheme -ceq "https" -and
+    ![string]::IsNullOrWhiteSpace($parsedApiBase.Host) -and
+    [string]::IsNullOrEmpty($parsedApiBase.UserInfo) -and
+    $parsedApiBase.AbsolutePath -ceq "/" -and
+    [string]::IsNullOrEmpty($parsedApiBase.Query) -and
+    [string]::IsNullOrEmpty($parsedApiBase.Fragment)
+  if (!$apiBaseIsValid) {
+    throw "-ApiBase must be an HTTPS origin without credentials, path, query, or fragment, for example https://api.example.com."
+  }
+  $ApiBase = $parsedApiBase.GetLeftPart([System.UriPartial]::Authority)
+} else {
+  $ApiBase = ""
 }
-$ApiBase = $parsedApiBase.GetLeftPart([System.UriPartial]::Authority)
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $git = Get-Command git -ErrorAction Stop
@@ -42,12 +45,15 @@ if (!(Test-Path -LiteralPath $flutterExe -PathType Leaf)) {
   throw "flutter not found. Install Flutter or add it to PATH."
 }
 
-& $flutterExe test test\auth_client_test.dart test\api_remote_mode_test.dart
+& $flutterExe test `
+  test\auth_client_test.dart `
+  test\api_remote_mode_test.dart `
+  test\remote_server_setup_test.dart
 if ($LASTEXITCODE -ne 0) {
   throw "Remote auth/data-source readiness tests failed."
 }
 if ($CheckReadinessOnly) {
-  Write-Host "Windows remote client readiness passed for $ApiBase."
+  Write-Host "Windows remote client readiness passed (endpoint mode: $EndpointMode)."
   return
 }
 
@@ -67,6 +73,7 @@ if (!$SkipBuild) {
   $buildConfig = [ordered]@{
     buildFormat = 3
     dataSource = "api_remote"
+    endpointMode = $EndpointMode
     apiBase = $ApiBase
     serverBundled = $false
     clientVersion = $versionLine
@@ -81,6 +88,7 @@ $buildConfig = Get-Content -Raw -LiteralPath $buildConfigPath | ConvertFrom-Json
 if (
   $buildConfig.buildFormat -ne 3 -or
   $buildConfig.dataSource -cne "api_remote" -or
+  $buildConfig.endpointMode -cne $EndpointMode -or
   $buildConfig.apiBase -cne $ApiBase -or
   $buildConfig.serverBundled -ne $false -or
   $buildConfig.clientVersion -cne $versionLine -or
@@ -120,6 +128,7 @@ try {
     sourceCommit = $sourceCommit
     sourceDirty = $sourceDirty
     dataSource = "api_remote"
+    endpointMode = $EndpointMode
     apiBase = $ApiBase
     client = "finwealth.exe"
     clientSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $client).Hash.ToLowerInvariant()
