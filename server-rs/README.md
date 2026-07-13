@@ -62,6 +62,11 @@ cargo run --manifest-path server-rs/Cargo.toml -- --port 8791 --ledger-path .\tm
 - no AI direct ledger writes
 - no coupon planning
 
+For VPS deployment, `--check-production-config` validates the environment
+without starting the listener or printing secrets. It requires auth, an Argon2
+hash, loopback binding, a public Host allow-list, disabled scenario data, and a
+known quote-provider setting.
+
 ## Internal boundary
 
 `DevLedgerCore` owns deterministic empty/degraded data when no ledger path is
@@ -147,6 +152,10 @@ tmp\ledger.json.lock  # permanent process-lease sidecar; never infer ownership f
 
 The sibling auth state backs login/refresh/logout and device list/revoke routes;
 it is not part of portfolio or movement derivation.
+
+Auth token issue/rotation/revocation is fail-closed on persistence errors. Auth
+state uses a synced temporary file and atomic rename; a corrupt existing auth
+state prevents startup instead of silently resetting all devices.
 
 ## Exclusive local-ledger lease
 

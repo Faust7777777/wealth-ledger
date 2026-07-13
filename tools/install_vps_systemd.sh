@@ -64,5 +64,17 @@ EOF
   exit 0
 fi
 
+echo "Validating production configuration..."
+systemd-run \
+  --wait \
+  --pipe \
+  --quiet \
+  --collect \
+  --unit="finwealth-config-check-$$" \
+  --property="User=$APP_USER" \
+  --property="Group=$APP_USER" \
+  --property="EnvironmentFile=$ENV_FILE" \
+  "$APP_DIR/$BIN_NAME" --check-production-config
+
 systemctl enable --now "$SERVICE_NAME"
 systemctl status "$SERVICE_NAME" --no-pager

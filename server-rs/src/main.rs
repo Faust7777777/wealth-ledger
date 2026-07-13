@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     env, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     process,
@@ -158,10 +158,12 @@ struct AuthDevice {
     last_seen_at: String,
 }
 
+#[derive(Debug)]
 enum AuthError {
     Request(Vec<String>),
     Credentials,
     RefreshToken,
+    Storage,
 }
 
 struct AuthTokens {
@@ -185,13 +187,13 @@ impl AuthStore {
             .or(default_state_path);
         let state = state_path
             .as_ref()
-            .and_then(|path| match read_auth_state(path) {
-                Ok(state) => Some(state),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    eprintln!("failed to read auth state: {error}");
-                    None
-                }
+            .map(|path| match read_auth_state(path) {
+                Ok(state) => state,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => AuthState::default(),
+                Err(error) => panic!(
+                    "failed to read auth state {}; refusing to start: {error}",
+                    path.display()
+                ),
             })
             .unwrap_or_default();
         let config = AuthConfig {
@@ -227,7 +229,14 @@ impl AuthStore {
     ) -> Self {
         let state = state_path
             .as_ref()
-            .and_then(|path| read_auth_state(path).ok())
+            .map(|path| match read_auth_state(path) {
+                Ok(state) => state,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => AuthState::default(),
+                Err(error) => panic!(
+                    "failed to read auth state {}; refusing to start: {error}",
+                    path.display()
+                ),
+            })
             .unwrap_or_default();
         Self {
             inner: Arc::new(Mutex::new(state)),
@@ -262,7 +271,7 @@ impl AuthStore {
             return Err(AuthError::Credentials);
         }
 
-        Ok(self.issue_tokens(&device_name, None, now))
+        self.issue_tokens(&device_name, None, now)
     }
 
     fn refresh(&self, input: Value, now: &str) -> Result<AuthTokens, AuthError> {
@@ -288,14 +297,16 @@ impl AuthStore {
             return Err(AuthError::RefreshToken);
         };
         if token_expired(&device.refresh_expires_at) {
-            state.devices.remove(&device_id);
-            self.persist_state(&state);
+            let mut updated = state.clone();
+            updated.devices.remove(&device_id);
+            self.persist_state(&updated)?;
+            *state = updated;
             return Err(AuthError::RefreshToken);
         }
         let device_name = device.name;
         drop(state);
 
-        Ok(self.issue_tokens(&device_name, Some(device_id), now))
+        self.issue_tokens(&device_name, Some(device_id), now)
     }
 
     fn devices(&self) -> Value {
@@ -316,28 +327,37 @@ impl AuthStore {
         )
     }
 
-    fn revoke_device(&self, device_id: &str) {
+    fn revoke_device(&self, device_id: &str) -> Result<(), AuthError> {
         let mut state = self.inner.lock().expect("auth store mutex should lock");
-        state.devices.remove(device_id);
-        self.persist_state(&state);
+        let mut updated = state.clone();
+        updated.devices.remove(device_id);
+        self.persist_state(&updated)?;
+        *state = updated;
+        Ok(())
     }
 
-    fn revoke_refresh_token(&self, refresh_token: &str) {
+    fn revoke_refresh_token(&self, refresh_token: &str) -> Result<(), AuthError> {
         let refresh_hash = token_hash(refresh_token);
         let mut state = self.inner.lock().expect("auth store mutex should lock");
-        state
+        let mut updated = state.clone();
+        updated
             .devices
             .retain(|_, device| !token_hash_eq(&device.refresh_token_hash, &refresh_hash));
-        self.persist_state(&state);
+        self.persist_state(&updated)?;
+        *state = updated;
+        Ok(())
     }
 
-    fn revoke_access_token(&self, access_token: &str) {
+    fn revoke_access_token(&self, access_token: &str) -> Result<(), AuthError> {
         let access_hash = token_hash(access_token);
         let mut state = self.inner.lock().expect("auth store mutex should lock");
-        state
+        let mut updated = state.clone();
+        updated
             .devices
             .retain(|_, device| !token_hash_eq(&device.access_token_hash, &access_hash));
-        self.persist_state(&state);
+        self.persist_state(&updated)?;
+        *state = updated;
+        Ok(())
     }
 
     fn should_require_auth(&self) -> bool {
@@ -357,7 +377,9 @@ impl AuthStore {
             }
             device.last_seen_at = current_timestamp();
             let device_id = device.id.clone();
-            self.persist_state(&state);
+            if let Err(error) = self.persist_state(&state) {
+                eprintln!("failed to persist auth last-seen metadata: {error:?}");
+            }
             return Some(device_id);
         }
         None
@@ -388,7 +410,7 @@ impl AuthStore {
         device_name: &str,
         existing_device_id: Option<String>,
         now: &str,
-    ) -> AuthTokens {
+    ) -> Result<AuthTokens, AuthError> {
         let dev_mode = self.config.username.is_none();
         let access_token = random_token(if dev_mode {
             "dev_access_"
@@ -414,7 +436,8 @@ impl AuthStore {
             .get(&device_id)
             .map(|device| device.created_at.clone())
             .unwrap_or_else(|| now.to_string());
-        state.devices.insert(
+        let mut updated = state.clone();
+        updated.devices.insert(
             device_id.clone(),
             AuthDevice {
                 id: device_id.clone(),
@@ -427,24 +450,23 @@ impl AuthStore {
                 last_seen_at: now.to_string(),
             },
         );
-        self.persist_state(&state);
+        self.persist_state(&updated)?;
+        *state = updated;
 
-        AuthTokens {
+        Ok(AuthTokens {
             access_token,
             refresh_token,
             expires_at,
             refresh_expires_at,
             device_id,
-        }
+        })
     }
 
-    fn persist_state(&self, state: &AuthState) {
+    fn persist_state(&self, state: &AuthState) -> Result<(), AuthError> {
         let Some(path) = self.config.state_path.as_ref() else {
-            return;
+            return Ok(());
         };
-        if let Err(error) = write_auth_state(path, state) {
-            eprintln!("failed to persist auth state: {error}");
-        }
+        write_auth_state(path, state).map_err(|_| AuthError::Storage)
     }
 }
 
@@ -831,6 +853,19 @@ async fn main() {
         print_password_hash_from_stdin();
         return;
     }
+    if should_check_production_config(env::args()) {
+        check_production_config_from_env().unwrap_or_else(|errors| {
+            eprintln!("invalid Finwealth production configuration:");
+            for error in errors {
+                eprintln!("- {error}");
+            }
+            process::exit(2);
+        });
+        println!(
+            "production configuration validated: loopback bind, required auth, and public Host allow-list"
+        );
+        return;
+    }
     if let Some(command) = read_ledger_command_from(env::args()) {
         run_ledger_command(command).expect("ledger command failed");
         return;
@@ -877,6 +912,77 @@ async fn main() {
     axum::serve(listener, app_with_state(state))
         .await
         .expect("serve finwealth rust server");
+}
+
+fn should_check_production_config<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    args.into_iter()
+        .map(Into::into)
+        .skip(1)
+        .any(|arg| arg == "--check-production-config")
+}
+
+fn check_production_config_from_env() -> Result<(), Vec<String>> {
+    let config = AuthConfig {
+        username: env::var("FINWEALTH_AUTH_USERNAME").ok(),
+        password_hash: env::var("FINWEALTH_AUTH_PASSWORD_HASH").ok(),
+        dev_plain_password: env::var("FINWEALTH_AUTH_PASSWORD").ok(),
+        require_auth: env_flag("FINWEALTH_REQUIRE_AUTH"),
+        state_path: None,
+    };
+    let addr = env::var("FINWEALTH_RS_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8790".to_string())
+        .parse::<SocketAddr>()
+        .map_err(|_| vec!["FINWEALTH_RS_ADDR must be a valid socket address".to_string()])?;
+    let quote_provider = env::var("FINWEALTH_QUOTE_PROVIDER").ok();
+    let errors = production_config_errors(
+        &config,
+        addr,
+        &allowed_hosts_from_env(),
+        env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
+        quote_provider.as_deref(),
+    );
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn production_config_errors(
+    config: &AuthConfig,
+    addr: SocketAddr,
+    allowed_hosts: &[String],
+    allow_ledger_scenario: bool,
+    quote_provider: Option<&str>,
+) -> Vec<String> {
+    let mut errors = validate_auth_config(config).err().unwrap_or_default();
+    if !config.require_auth {
+        errors.push("FINWEALTH_REQUIRE_AUTH must be true for server deployment".to_string());
+    }
+    if !addr.ip().is_loopback() {
+        errors.push("FINWEALTH_RS_ADDR must bind to a loopback address".to_string());
+    }
+    if !allowed_hosts
+        .iter()
+        .any(|host| !matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1"))
+    {
+        errors
+            .push("FINWEALTH_ALLOWED_HOSTS must include the public reverse-proxy host".to_string());
+    }
+    if allow_ledger_scenario {
+        errors.push("FINWEALTH_ALLOW_LEDGER_SCENARIO must be disabled in production".to_string());
+    }
+    if !matches!(
+        quote_provider.map(str::trim),
+        None | Some("") | Some("none") | Some("yahoo")
+    ) {
+        errors.push("FINWEALTH_QUOTE_PROVIDER must be none or yahoo".to_string());
+    }
+    errors
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1368,25 +1474,31 @@ async fn auth_logout(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Option<JsonExtractor<Value>>,
-) -> StatusCode {
+) -> Response {
     if let Some(refresh_token) = body
         .as_ref()
         .and_then(|JsonExtractor(value)| value.get("refreshToken").and_then(Value::as_str))
     {
-        state.auth.revoke_refresh_token(refresh_token);
-    } else if let Some(token) = bearer_token(&headers) {
-        state.auth.revoke_access_token(&token);
+        if let Err(error) = state.auth.revoke_refresh_token(refresh_token) {
+            return auth_error_response(error);
+        }
+    } else if let Some(token) = bearer_token(&headers)
+        && let Err(error) = state.auth.revoke_access_token(&token)
+    {
+        return auth_error_response(error);
     }
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn auth_devices(State(state): State<AppState>) -> Json<Value> {
     envelope(state.auth.devices())
 }
 
-async fn revoke_device(State(state): State<AppState>, Path(device_id): Path<String>) -> StatusCode {
-    state.auth.revoke_device(&device_id);
-    StatusCode::NO_CONTENT
+async fn revoke_device(State(state): State<AppState>, Path(device_id): Path<String>) -> Response {
+    match state.auth.revoke_device(&device_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => auth_error_response(error),
+    }
 }
 
 async fn portfolio_overview(
@@ -3874,6 +3986,19 @@ fn auth_error_response(error: AuthError) -> Response {
             "invalid_credentials",
             "Username, password, or refresh token is invalid.",
         ),
+        AuthError::Storage => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "ok": false,
+                "error": {
+                    "code": "auth_state_io_error",
+                    "message": "Authentication state could not be persisted.",
+                    "severity": "error",
+                    "retryable": false
+                }
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -3995,8 +4120,34 @@ fn write_auth_state(path: &FsPath, state: &AuthState) -> io::Result<()> {
     let tmp_path = path.with_extension("auth.json.tmp");
     let bytes =
         serde_json::to_vec_pretty(&auth_state_to_json(state)).map_err(invalid_auth_state_data)?;
-    fs::write(&tmp_path, bytes)?;
-    fs::rename(tmp_path, path)?;
+    let mut temporary = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp_path)?;
+    temporary.write_all(&bytes)?;
+    temporary.sync_all()?;
+    drop(temporary);
+    fs::rename(&tmp_path, path)?;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    sync_auth_parent_directory(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_auth_parent_directory(path: &FsPath) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::OpenOptions::new().read(true).open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_auth_parent_directory(_path: &FsPath) -> io::Result<()> {
     Ok(())
 }
 
@@ -5073,6 +5224,45 @@ mod tests {
     }
 
     #[test]
+    fn production_config_requires_loopback_auth_and_public_host() {
+        let secure = AuthConfig {
+            username: Some("wu".to_string()),
+            password_hash: Some(hash_password_for_test("correct horse")),
+            dev_plain_password: None,
+            require_auth: true,
+            state_path: None,
+        };
+        let valid = production_config_errors(
+            &secure,
+            "127.0.0.1:8790".parse().expect("test address"),
+            &["127.0.0.1".to_string(), "api.example.com".to_string()],
+            false,
+            Some("none"),
+        );
+        assert!(valid.is_empty(), "{valid:?}");
+
+        let open = AuthConfig {
+            username: None,
+            password_hash: None,
+            dev_plain_password: None,
+            require_auth: false,
+            state_path: None,
+        };
+        let errors = production_config_errors(
+            &open,
+            "0.0.0.0:8790".parse().expect("test address"),
+            &["127.0.0.1".to_string(), "localhost".to_string()],
+            true,
+            Some("typo"),
+        );
+        assert!(errors.iter().any(|error| error.contains("REQUIRE_AUTH")));
+        assert!(errors.iter().any(|error| error.contains("loopback")));
+        assert!(errors.iter().any(|error| error.contains("ALLOWED_HOSTS")));
+        assert!(errors.iter().any(|error| error.contains("LEDGER_SCENARIO")));
+        assert!(errors.iter().any(|error| error.contains("QUOTE_PROVIDER")));
+    }
+
+    #[test]
     fn auth_config_accepts_hash_only_require_auth_and_open_dev_mode() {
         let require_auth = AuthConfig {
             username: Some("wu".to_string()),
@@ -5527,6 +5717,70 @@ mod tests {
         .await;
         assert_eq!(revoked_status, StatusCode::UNAUTHORIZED);
         assert_eq!(revoked_body["error"]["code"], "invalid_credentials");
+
+        let _ = std::fs::remove_file(auth_path);
+    }
+
+    #[test]
+    fn auth_login_fails_closed_when_device_state_cannot_be_persisted() {
+        let parent_file = unique_test_ledger_path("auth_unwritable_parent");
+        std::fs::create_dir_all(
+            parent_file
+                .parent()
+                .expect("test parent file should have a parent"),
+        )
+        .expect("test directory should be created");
+        std::fs::write(&parent_file, "not a directory")
+            .expect("test parent file should be created");
+        let state_path = parent_file.join("ledger.auth.json");
+        let auth = AuthStore::configured_with_state_path(
+            "wu",
+            hash_password_for_test("correct horse"),
+            true,
+            Some(state_path),
+        );
+
+        let result = auth.login(
+            json!({
+                "username": "wu",
+                "password": "correct horse",
+                "deviceName": "Windows"
+            }),
+            "2026-07-14T00:00:00Z",
+        );
+        assert!(matches!(result, Err(AuthError::Storage)));
+        assert!(
+            auth.inner
+                .lock()
+                .expect("auth state should lock")
+                .devices
+                .is_empty(),
+            "failed persistence must not leave a live in-memory session"
+        );
+
+        let _ = std::fs::remove_file(parent_file);
+    }
+
+    #[test]
+    fn corrupt_auth_state_refuses_store_startup() {
+        let auth_path = unique_test_ledger_path("auth_corrupt_startup");
+        std::fs::create_dir_all(
+            auth_path
+                .parent()
+                .expect("test auth path should have a parent"),
+        )
+        .expect("test directory should be created");
+        std::fs::write(&auth_path, "{not-json").expect("corrupt auth test state should be written");
+
+        let result = std::panic::catch_unwind(|| {
+            AuthStore::configured_with_state_path(
+                "wu",
+                hash_password_for_test("correct horse"),
+                true,
+                Some(auth_path.clone()),
+            )
+        });
+        assert!(result.is_err(), "corrupt auth state must fail closed");
 
         let _ = std::fs::remove_file(auth_path);
     }

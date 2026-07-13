@@ -56,7 +56,7 @@ class _WealthLedgerAppState extends ConsumerState<WealthLedgerApp> {
   }
 
   void _configureScheduledQuoteRefresh(AppEnvironment env) {
-    final shouldRun = env.isLocalServer;
+    final shouldRun = env.isApiBacked;
     if (!shouldRun) {
       _scheduledQuoteRefreshTimer?.cancel();
       _scheduledQuoteRefreshTimer = null;

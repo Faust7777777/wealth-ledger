@@ -30,7 +30,7 @@ final authTokenStoreProvider = Provider<AuthTokenStore>(
 );
 
 final authRepositoryProvider = Provider<AuthRepository>((ref) {
-  if (_mode(ref) != DataSourceMode.localServer) {
+  if (!ref.watch(appEnvironmentProvider).isApiBacked) {
     return const UnsupportedAuthRepository();
   }
   return LocalServerAuthRepository(ref.watch(devApiClientProvider));
@@ -137,8 +137,8 @@ T _pick<T>(
   required T Function() api,
 }) => switch (_mode(ref)) {
   DataSourceMode.debugFixture => fixture(),
-  DataSourceMode.localServer => api(),
-  _ => real(),
+  DataSourceMode.localServer || DataSourceMode.apiRemote => api(),
+  DataSourceMode.realLocal => real(),
 };
 
 // —— 仓库 provider（按 mode 选实现：real_local / debug_fixture / local_server）——

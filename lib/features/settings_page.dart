@@ -14,7 +14,7 @@ String _modeLabel(DataSourceMode m) => switch (m) {
   DataSourceMode.debugFixture => 'DEMO 演示数据（隔离；不写真实账本、不同步）',
   DataSourceMode.localServer =>
     '本地 Rust 服务（dev/local server；可连 --ledger-path 真实账本）',
-  DataSourceMode.apiRemote => '远端 API（未接入）',
+  DataSourceMode.apiRemote => '远端 Finwealth 服务（HTTPS）',
 };
 
 class SettingsPage extends ConsumerWidget {
@@ -52,7 +52,7 @@ class SettingsPage extends ConsumerWidget {
                 ? null
                 : Chip(label: Text(env.devBannerLabel!)),
           ),
-          if (env.isLocalServer) ...[
+          if (env.isApiBacked) ...[
             const Divider(),
             const _LocalServerAuthSection(),
           ],
@@ -82,8 +82,7 @@ class SettingsPage extends ConsumerWidget {
             contentPadding: EdgeInsets.zero,
             title: Text('关于'),
             subtitle: Text(
-              'Wealth Ledger · 前端骨架\n'
-              '本地账本 / 同步 / 行情 / AI 由后端线实现（开发中）',
+              'Wealth Ledger · 私有账本\nWindows / Android · Rust 服务端',
             ),
           ),
         ],
@@ -124,7 +123,7 @@ class _LocalServerAuthSectionState
       children: [
         Padding(
           padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
-          child: Text('本地服务登录', style: Theme.of(context).textTheme.titleMedium),
+          child: Text('服务登录', style: Theme.of(context).textTheme.titleMedium),
         ),
         auth.when(
           loading: () => const LinearProgressIndicator(),

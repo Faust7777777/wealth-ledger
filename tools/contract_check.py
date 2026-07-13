@@ -38,6 +38,8 @@ LOCAL_SERVER_SUBSCRIPTION_TEST = (
 PYTHON_REQUIREMENTS = ROOT / "tools" / "requirements.txt"
 DEPLOY_ENV_EXAMPLE = ROOT / "deploy" / "finwealth-server.env.example"
 SYSTEMD_SERVICE = ROOT / "deploy" / "systemd" / "finwealth-server.service"
+VPS_INSTALL = ROOT / "tools" / "install_vps_systemd.sh"
+VPS_READINESS = ROOT / "tools" / "check_vps_readiness.sh"
 VPS_BACKUP = ROOT / "tools" / "backup_vps_ledger.sh"
 VPS_RESTORE = ROOT / "tools" / "restore_vps_ledger.sh"
 VPS_BACKUP_RESTORE_SMOKE = ROOT / "tools" / "vps_backup_restore_smoke.sh"
@@ -49,6 +51,11 @@ PACKAGE_INTEGRITY_SMOKE = ROOT / "tools" / "package_integrity_smoke.ps1"
 WINDOWS_LAUNCHER = ROOT / "tools" / "windows_self_use_launcher.ps1"
 WINDOWS_LAUNCHER_CMD = ROOT / "tools" / "windows_self_use_launcher.cmd"
 WINDOWS_PACKAGE_DOC = ROOT / "docs" / "deploy" / "WINDOWS_SELF_USE_PACKAGE.md"
+REMOTE_PACKAGE_SCRIPT = ROOT / "tools" / "package_remote_windows.ps1"
+REMOTE_WINDOWS_LAUNCHER = ROOT / "tools" / "windows_remote_launcher.ps1"
+REMOTE_WINDOWS_LAUNCHER_CMD = ROOT / "tools" / "windows_remote_launcher.cmd"
+REMOTE_WINDOWS_PACKAGE_DOC = ROOT / "docs" / "deploy" / "WINDOWS_SERVER_CLIENT_PACKAGE.md"
+SERVER_MODE_ALGORITHMS = CONTRACTS / "SERVER_MODE_ALGORITHMS_V1.md"
 PACKAGE_WORKFLOW = ROOT / ".github" / "workflows" / "package.yml"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 GITIGNORE = ROOT / ".gitignore"
@@ -969,6 +976,8 @@ def check_deploy_security_defaults() -> None:
         fail(f"Missing deploy env example: {DEPLOY_ENV_EXAMPLE}")
     for required in (
         SYSTEMD_SERVICE,
+        VPS_INSTALL,
+        VPS_READINESS,
         VPS_BACKUP,
         VPS_RESTORE,
         VPS_BACKUP_RESTORE_SMOKE,
@@ -982,6 +991,23 @@ def check_deploy_security_defaults() -> None:
     env_text = DEPLOY_ENV_EXAMPLE.read_text(encoding="utf-8")
     if "FINWEALTH_QUOTE_PROVIDER=none" not in env_text:
         fail("Deploy env example must default FINWEALTH_QUOTE_PROVIDER to none")
+
+    install_text = VPS_INSTALL.read_text(encoding="utf-8")
+    if "--check-production-config" not in install_text or "EnvironmentFile" not in install_text:
+        fail("VPS installer must validate production configuration through systemd")
+
+    readiness_text = VPS_READINESS.read_text(encoding="utf-8")
+    readiness_snippets = [
+        "--check-production-config",
+        "--validate-ledger",
+        "--validate-auth-state",
+        "systemctl is-active",
+        "127.0.0.1:8790/v1/health",
+        "--public-base-url",
+    ]
+    missing = [snippet for snippet in readiness_snippets if snippet not in readiness_text]
+    if missing:
+        fail("VPS readiness check missing production gates: " + ", ".join(missing))
 
     service_text = SYSTEMD_SERVICE.read_text(encoding="utf-8")
     required_snippets = [
@@ -1103,6 +1129,11 @@ def check_release_packaging() -> None:
         WINDOWS_LAUNCHER,
         WINDOWS_LAUNCHER_CMD,
         WINDOWS_PACKAGE_DOC,
+        REMOTE_PACKAGE_SCRIPT,
+        REMOTE_WINDOWS_LAUNCHER,
+        REMOTE_WINDOWS_LAUNCHER_CMD,
+        REMOTE_WINDOWS_PACKAGE_DOC,
+        SERVER_MODE_ALGORITHMS,
         PACKAGE_WORKFLOW,
         CI_WORKFLOW,
     ):
@@ -1168,6 +1199,38 @@ def check_release_packaging() -> None:
     if missing:
         fail("Windows self-use launcher missing safety behavior: " + ", ".join(missing))
 
+    remote_package_text = REMOTE_PACKAGE_SCRIPT.read_text(encoding="utf-8")
+    remote_package_snippets = [
+        "--dart-define=DATA_SOURCE=api_remote",
+        "$parsedApiBase.Scheme -ceq \"https\"",
+        "sourceCommit",
+        "sourceDirty",
+        "serverBundled = $false",
+        "packageFormat = 3",
+        "PackageIntegrityOnly",
+        "windows-server-client-x64",
+    ]
+    missing = [
+        snippet for snippet in remote_package_snippets if snippet not in remote_package_text
+    ]
+    if missing:
+        fail("Windows remote package script missing safeguards: " + ", ".join(missing))
+
+    remote_launcher_text = REMOTE_WINDOWS_LAUNCHER.read_text(encoding="utf-8")
+    remote_launcher_snippets = [
+        "packageFormat -ne 3",
+        "dataSource -cne \"api_remote\"",
+        "Test-HttpsApiBase",
+        "Get-FileHash",
+        "/v1/health",
+        "Start-Process",
+    ]
+    missing = [
+        snippet for snippet in remote_launcher_snippets if snippet not in remote_launcher_text
+    ]
+    if missing:
+        fail("Windows remote launcher missing safety behavior: " + ", ".join(missing))
+
     package_integrity_smoke_text = PACKAGE_INTEGRITY_SMOKE.read_text(encoding="utf-8")
     package_integrity_smoke_snippets = [
         "PackageIntegrityOnly",
@@ -1201,6 +1264,9 @@ def check_release_packaging() -> None:
         "include_android_readonly_preview",
         "AndroidReadOnlyPreview",
         "android-readonly-preview-debug",
+        "remote_api_base",
+        "package_remote_windows.ps1",
+        "finwealth-windows-server-client-x64",
     ]
     missing = [
         snippet for snippet in required_workflow_snippets if snippet not in workflow_text

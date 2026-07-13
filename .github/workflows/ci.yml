@@ -37,7 +37,7 @@ jobs:
         run: python tools/contract_check.py
 
       - name: Check shell scripts
-        run: bash -n tools/install_vps_systemd.sh tools/backup_vps_ledger.sh tools/restore_vps_ledger.sh tools/vps_backup_restore_smoke.sh
+        run: bash -n tools/install_vps_systemd.sh tools/check_vps_readiness.sh tools/backup_vps_ledger.sh tools/restore_vps_ledger.sh tools/vps_backup_restore_smoke.sh
 
       - name: Run VPS backup and restore smoke
         run: bash tools/vps_backup_restore_smoke.sh
@@ -119,9 +119,17 @@ jobs:
         shell: pwsh
         run: ./tools/package_release.ps1 -WindowsOnly -CheckReadinessOnly
 
+      - name: Check Windows server client readiness
+        shell: pwsh
+        run: ./tools/package_remote_windows.ps1 -ApiBase https://api.example.com -CheckReadinessOnly
+
       - name: Build paired Windows self-use package
         shell: pwsh
         run: ./tools/package_release.ps1 -WindowsOnly -OutputDir tmp/package-ci
+
+      - name: Build Windows server client package
+        shell: pwsh
+        run: ./tools/package_remote_windows.ps1 -ApiBase https://api.example.com -OutputDir tmp/package-remote-ci
 
   flutter-android:
     name: Flutter Android

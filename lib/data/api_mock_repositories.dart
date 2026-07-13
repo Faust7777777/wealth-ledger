@@ -1,5 +1,5 @@
-// Wealth Ledger — local_server 仓库（LocalServer*）：读取本地 Rust dev/local server 的 /v1 接口。
-// 仅在 DATA_SOURCE=local_server（别名 dev_server / api_mock）时启用，绝非默认；可连 --ledger-path 真实账本；
+// Wealth Ledger — API 仓库（LocalServer*）：读取 Rust server 的 /v1 接口。
+// DATA_SOURCE=local_server 用于本机服务；DATA_SOURCE=api_remote 用于 HTTPS VPS；
 // 写路径只生成 proposal；禁用端点以 403 呈现。（文件名暂留 api_mock_repositories.dart 以免动测试导入。）
 // 形状对齐 docs/contracts（DATA_SCHEMA_V1 / examples / FRONTEND_API_INTEGRATION_HANDOFF_V1）。
 import 'dart:convert';
@@ -25,7 +25,7 @@ class ApiUnauthorizedException implements Exception {
   ApiUnauthorizedException(this.path);
   final String path;
   @override
-  String toString() => '登录已失效或未登录（401）：请到「设置 → 本地服务登录」重新登录后重试（$path）';
+  String toString() => '登录已失效或未登录（401）：请到「设置」重新登录后重试（$path）';
 }
 
 /// 业务冲突（409）：带服务端 error.code（如 duplicate_pending_charge / cancel_conflict），

@@ -8,6 +8,11 @@ on:
         required: false
         default: false
         type: boolean
+      remote_api_base:
+        description: Optional HTTPS API origin for a Windows server-client package (for example https://api.example.com)
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: package-${{ github.ref }}
@@ -95,6 +100,10 @@ jobs:
         shell: pwsh
         run: ./tools/package_release.ps1 -WindowsOnly -CheckReadinessOnly
 
+      - name: Check Windows server-client readiness
+        shell: pwsh
+        run: ./tools/package_remote_windows.ps1 -ApiBase https://api.example.com -CheckReadinessOnly
+
   package-windows:
     name: Package Windows
     needs: verify-windows-source
@@ -166,4 +175,36 @@ jobs:
           path: |
             dist/*-android-readonly-preview-debug.apk
             dist/*-android-readonly-preview-debug.apk.sha256
+          if-no-files-found: error
+
+  package-windows-remote:
+    name: Package Windows server client
+    needs: verify-windows-source
+    if: ${{ inputs.remote_api_base != '' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Build Windows server client
+        shell: pwsh
+        env:
+          FINWEALTH_REMOTE_API_BASE: ${{ inputs.remote_api_base }}
+        run: ./tools/package_remote_windows.ps1 -ApiBase $env:FINWEALTH_REMOTE_API_BASE -OutputDir dist
+
+      - name: Upload Windows server-client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finwealth-windows-server-client-x64
+          path: |
+            dist/*-windows-server-client-x64.zip
+            dist/*-windows-server-client-x64.zip.sha256
           if-no-files-found: error

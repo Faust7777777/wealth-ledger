@@ -4,15 +4,17 @@ Target: a small Linux VPS, including Oracle ARM. The Rust server stays
 loopback-only (`127.0.0.1`) and should be exposed through a reverse proxy such as
 Caddy or Nginx.
 
-This is enough for private self-use testing. It is not yet a hardened production
-sync service.
+This deployment is the supported private single-user server mode. All online
+clients use the same server ledger as their source of truth; offline multi-ledger
+merge remains a separate future capability.
 
 ## 1. Build and install systemd service
 
 On the VPS:
 
 ```bash
-git clone https://github.com/Faust7777777/wealth-ledger.git
+git clone --branch feat/subscription-sync-integration --single-branch \
+  https://github.com/Faust7777777/wealth-ledger.git
 cd wealth-ledger
 sudo bash tools/install_vps_systemd.sh
 ```
@@ -71,11 +73,26 @@ sudo systemctl enable --now finwealth-server.service
 sudo systemctl status finwealth-server.service --no-pager
 ```
 
+The installer runs `finwealth-server --check-production-config` through systemd
+before starting. It rejects disabled/incomplete auth, a non-loopback bind,
+missing public Host allow-list, dev scenario enablement, and unknown quote
+provider values.
+
 Health check from the VPS:
 
 ```bash
 curl http://127.0.0.1:8790/v1/health
 ```
+
+After configuring the reverse proxy and DNS, run the complete readiness check:
+
+```bash
+sudo bash tools/check_vps_readiness.sh --public-base-url https://api.example.com
+```
+
+It verifies configuration without printing secrets, ledger/auth semantics,
+ownership and permissions, systemd state, loopback-only listening, and both
+local and public health endpoints.
 
 ## 3. Reverse proxy
 
@@ -133,18 +150,31 @@ emergency environment flags `FINWEALTH_ALLOW_UNVALIDATED_BACKUP=true` and
 recover damaged data when the validator is unavailable; such backups record
 that validation did not pass.
 
-## 4. Run Flutter against the VPS
+## 4. Build the Windows server client
 
 Windows:
 
 ```powershell
-flutter run -d windows --dart-define=DATA_SOURCE=local_server --dart-define=API_BASE=https://api.example.com
+pwsh -NoProfile -File tools\package_remote_windows.ps1 `
+  -ApiBase https://api.example.com `
+  -OutputDir C:\tmp\finwealth-server-client
+```
+
+Keep the zip with its `.sha256` sidecar. Extract it and run
+`Start-Finwealth.cmd`; the launcher validates package hashes and the public
+health endpoint before starting the client. Login is available in Settings and
+tokens are protected with Windows DPAPI.
+
+For development without packaging:
+
+```powershell
+flutter run -d windows --dart-define=DATA_SOURCE=api_remote --dart-define=API_BASE=https://api.example.com
 ```
 
 Android:
 
 ```powershell
-flutter run -d <device-id> --dart-define=DATA_SOURCE=local_server --dart-define=API_BASE=https://api.example.com
+flutter run -d <device-id> --dart-define=DATA_SOURCE=api_remote --dart-define=API_BASE=https://api.example.com
 ```
 
 Login in Settings with the username/password configured above. The client stores
@@ -153,6 +183,7 @@ tokens with Windows DPAPI / Android Keystore.
 ## Current limitations
 
 - Ledger storage is still JSON, not encrypted SQLite.
-- Sync merge endpoints are bootstrap-only and do not merge remote changes yet.
+- Offline multi-ledger merge is limited to authenticated account/create inbound
+  apply. This does not affect online clients sharing the central server ledger.
 - No real AI provider is wired.
 - Quote/FX calls are best-effort and depend on configured instruments/symbols.
