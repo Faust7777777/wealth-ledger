@@ -1282,7 +1282,13 @@ paths:
   /sync/push:
     post:
       tags: [Sync]
-      summary: Push local changes. Debug fixture data must be rejected.
+      summary: Apply authenticated-device account creates from a remote ledger.
+      description: >-
+        The bearer token determines the source device. The body deviceId and
+        every change deviceId must match it. This first inbound slice accepts
+        only entityType=account, operation=create, baseVersion=0, with a full
+        Account payload whose id equals entityId. Applied remote changes are
+        logged atomically with the account but never enter the server outbox.
       parameters:
         - $ref: "#/components/parameters/idempotencyKey"
       requestBody:
@@ -3162,6 +3168,8 @@ components:
       properties:
         id:
           $ref: "#/components/schemas/ID"
+        kind:
+          enum: [entity_already_exists]
         entityType:
           type: string
         entityId:
@@ -3212,12 +3220,37 @@ components:
       properties:
         deviceId:
           $ref: "#/components/schemas/ID"
+          description: Must equal the device identity resolved from the bearer token.
         lastKnownCursor:
           type: string
         changes:
           type: array
           items:
-            $ref: "#/components/schemas/SyncChange"
+            $ref: "#/components/schemas/InboundAccountCreateSyncChange"
+    InboundAccountCreateSyncChange:
+      type: object
+      required:
+        [id, deviceId, entityType, entityId, operation, payload, baseVersion, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        deviceId:
+          $ref: "#/components/schemas/ID"
+          description: Must equal the authenticated request device.
+        entityType:
+          const: account
+        entityId:
+          $ref: "#/components/schemas/ID"
+        operation:
+          const: create
+        payload:
+          allOf:
+            - $ref: "#/components/schemas/Account"
+          description: payload.id must equal entityId.
+        baseVersion:
+          const: 0
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
     SyncPushResultResponse:
       type: object
       required: [ok, data]
@@ -3226,16 +3259,24 @@ components:
           const: true
         data:
           type: object
-          required: [cursor, conflicts]
+          required:
+            [cursor, acceptedChangeIds, appliedChangeIds, skippedChangeIds, conflicts]
           properties:
             cursor:
               type: string
             acceptedChangeIds:
               type: array
+              description: Remote IDs whose entity and relay log were persisted.
+              items:
+                type: string
+            appliedChangeIds:
+              type: array
+              description: Remote IDs whose account entities were applied in this request.
               items:
                 type: string
             skippedChangeIds:
               type: array
+              description: Idempotent replays already identified by source device and ID.
               items:
                 type: string
             conflicts:

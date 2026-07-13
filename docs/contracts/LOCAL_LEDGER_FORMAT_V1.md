@@ -106,7 +106,8 @@ DataSourceMode =
 - `syncChanges[*].id` 必须是规范化、唯一且按日志顺序严格递增的 `local_change_N`；允许 sequence 有空洞，不允许重复或倒序。
 - 空日志的磁盘 cursor 必须为 `null`；非空日志的 `syncState.cursor` 必须等于最后一条 change ID。
 - `pendingChangeIds` 必须唯一、保持日志顺序、只引用仍存在的本地 change；远端中继 change 不得进入本地 outbox。
-- 远端中继 change 必须同时带 `sourceDeviceId` / `sourceChangeId`，二者组合在日志内唯一，并带合法 RFC3339 `receivedAt`；保留的本地 device id 不得被远端 push 冒用。
+- 当前认证设备的 `account/create` 入站应用必须在一次文件事务中同时追加完整 Account 与远端中继 change；任一校验或写入失败时两者都不得出现。
+- 远端中继 change 必须同时带 `sourceDeviceId` / `sourceChangeId`，二者组合在日志内唯一，并带合法 RFC3339 `receivedAt`；`sourceDeviceId` 来自认证上下文而非请求体。相同来源重放不重复应用实体。
 - `idempotencyState.records` 以 `Idempotency-Key` 的 SHA-256 URL-safe 摘要为键；记录请求摘要、具体操作、首次状态码/响应体、创建与过期时间，不得保存原始 key。
 
 ## 3. 空账本初始化

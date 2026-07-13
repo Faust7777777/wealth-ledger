@@ -54,8 +54,9 @@ cargo run --manifest-path server-rs/Cargo.toml -- --port 8791 --ledger-path .\tm
 - no model-backed AI; import routes create reviewable proposals only
 - outbound quote/FX/historical-price fetches are disabled by default; set
   `FINWEALTH_QUOTE_PROVIDER=yahoo` to opt in when symbols are configured
-- validated local sync log/outbox and HTTP push/pull/ack shapes, but no remote
-  coordinator or background transport
+- validated local sync log/outbox and HTTP push/pull/ack shapes; authenticated
+  inbound account/create is applied atomically and idempotently, but there is
+  no general remote coordinator or background transport
 - no transfer execution
 - no broker order endpoints
 - no AI direct ledger writes
@@ -186,7 +187,9 @@ the JSON ledger when no `?scenario=` query is present:
   reads and explicit quote refresh when a provider is configured
 - taxonomy: categories, counterparties, counterparty merge proposal
 - portfolio read models: overview, allocation, holdings, quote summary
-- sync outbox: pull/ack plus idempotent remote log relay; no entity merge yet
+- sync outbox: pull/ack plus authenticated, idempotent account/create inbound
+  apply; remote entries never echo into the local outbox and other entity
+  operations remain unsupported
 - crash-safe file boundary: temp contents are synced before rename; a valid temp
   is promoted only when the primary is missing, while an invalid temp blocks
   empty-ledger initialization and remains available for recovery

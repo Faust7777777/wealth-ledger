@@ -595,15 +595,30 @@ def run_smoke(base: str, ledger_path: Path) -> None:
             "/v1/sync/push",
             method="POST",
             body={
-                "deviceId": "smoke_remote_device",
+                "deviceId": "dev_unauthenticated_device",
                 "changes": [
                     {
                         "id": "smoke_remote_change_000001",
-                        "deviceId": "smoke_remote_device",
+                        "deviceId": "dev_unauthenticated_device",
                         "entityType": "account",
                         "entityId": "acct_smoke_remote",
                         "operation": "create",
-                        "payload": {"displayName": "Smoke Remote Account"},
+                        "baseVersion": 0,
+                        "payload": {
+                            "id": "acct_smoke_remote",
+                            "displayName": "Smoke Remote Account",
+                            "accountType": "bank",
+                            "defaultCurrency": "USD",
+                            "supportedCurrencies": ["USD"],
+                            "includeInNetWorth": True,
+                            "visibility": "normal",
+                            "status": "active",
+                            "balanceMode": "cash_balance",
+                            "cashBalances": [],
+                            "tags": [],
+                            "createdAt": "2026-06-28T00:00:00Z",
+                            "updatedAt": "2026-06-28T00:00:00Z",
+                        },
                         "createdAt": "2026-06-28T00:00:00Z",
                     }
                 ],
@@ -611,8 +626,9 @@ def run_smoke(base: str, ledger_path: Path) -> None:
         )
     )
     assert remote_push["acceptedChangeIds"] == ["smoke_remote_change_000001"]
+    assert remote_push["appliedChangeIds"] == ["smoke_remote_change_000001"]
     assert remote_push["skippedChangeIds"] == []
-    assert len(unwrap_data(request_json(base, "/v1/accounts"))) == 3
+    assert len(unwrap_data(request_json(base, "/v1/accounts"))) == 4
 
     final_sync = unwrap_data(request_json(base, "/v1/sync/changes"))
     assert final_sync["cursor"].startswith("local_change_")
@@ -641,7 +657,8 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     assert forbidden["error"]["code"] == "forbidden_product_boundary"
 
     persisted = json.loads(ledger_path.read_text(encoding="utf-8"))
-    assert len(persisted["accounts"]) == 3
+    assert len(persisted["accounts"]) == 4
+    assert any(account["id"] == "acct_smoke_remote" for account in persisted["accounts"])
     assert len(persisted["subscriptions"]) == 2
     assert len(persisted["snapshots"]) == 1
     assert persisted["syncState"]["pendingChangeIds"] == []

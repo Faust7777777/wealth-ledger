@@ -312,6 +312,9 @@ def check_rust_server() -> None:
         "plaintext fallback is not allowed when FINWEALTH_REQUIRE_AUTH=true",
         "ConstantTimeEq",
         "token_hash_eq",
+        "device_id_for_access_token",
+        "AuthenticatedDevice",
+        "DEV_UNAUTHENTICATED_DEVICE_ID",
         '"--validate-auth-state"',
         "parse_auth_state_timestamp",
         "parse_movement_list_query",
@@ -335,6 +338,9 @@ def check_rust_server() -> None:
         "list_sync_changes",
         "ack_sync_changes",
         "ingest_sync_push",
+        "validate_inbound_account_payload",
+        "account_create_sync_conflict",
+        '"appliedChangeIds"',
         "append_sync_change",
         "sync_operation_for_movement",
         "LOCAL_SYNC_GENESIS_CURSOR",
@@ -1323,6 +1329,34 @@ def main() -> None:
     logout_schema = logout.get("requestBody", {}).get("content", {}).get("application/json", {}).get("schema", {})
     if "refreshToken" not in logout_schema.get("properties", {}):
         fail("POST /auth/logout must document its optional refreshToken body")
+    sync_push_request = doc["components"]["schemas"].get("SyncPushRequest", {})
+    sync_push_change_ref = (
+        sync_push_request.get("properties", {})
+        .get("changes", {})
+        .get("items", {})
+        .get("$ref")
+    )
+    if sync_push_change_ref != "#/components/schemas/InboundAccountCreateSyncChange":
+        fail("Sync push must be narrowed to InboundAccountCreateSyncChange")
+    inbound_account_create = doc["components"]["schemas"].get(
+        "InboundAccountCreateSyncChange", {}
+    )
+    inbound_required = set(inbound_account_create.get("required", []))
+    if "baseVersion" not in inbound_required:
+        fail("Inbound account create sync changes must require baseVersion")
+    inbound_properties = inbound_account_create.get("properties", {})
+    if inbound_properties.get("entityType", {}).get("const") != "account":
+        fail("Inbound sync entityType must be constrained to account")
+    if inbound_properties.get("operation", {}).get("const") != "create":
+        fail("Inbound sync operation must be constrained to create")
+    if inbound_properties.get("baseVersion", {}).get("const") != 0:
+        fail("Inbound account create baseVersion must be constrained to 0")
+    sync_push_result = doc["components"]["schemas"].get(
+        "SyncPushResultResponse", {}
+    )
+    sync_push_data = sync_push_result.get("properties", {}).get("data", {})
+    if "appliedChangeIds" not in set(sync_push_data.get("required", [])):
+        fail("Sync push response must require appliedChangeIds")
     created_operations = (
         ("/accounts", "post"),
         ("/movements/drafts", "post"),

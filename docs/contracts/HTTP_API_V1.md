@@ -349,9 +349,10 @@ POST /v1/sync/ack
 - 当前 ack 是单一上游对本地 outbox 的高水位确认，不代表每台 Android/Windows 设备分别收妥。
 - 新 change ID 必须同时参考 `nextChangeSequence` 和已有最大 `local_change_N`，防止计数器回退后复用 ID。
 - 磁盘日志中的 change ID 必须唯一且严格递增；非空日志 cursor 必须等于日志尾，pending ID 必须唯一、存在、保持日志顺序且只指向本地 change。
-- `POST /v1/sync/push` 会把远端 `SyncChange` 作为同步日志中继保存，并返回 `acceptedChangeIds` / `skippedChangeIds`；不会直接应用到账本实体。
-- 远端 push 的 `createdAt` 必须是 RFC3339，不能冒用保留设备 ID `local_device`；相同 `(sourceDeviceId, sourceChangeId)` 只保存一次。
-- 不做远端 merge、不做冲突解决、不做 E2EE 同步。
+- `POST /v1/sync/push` 当前只接受认证设备的 `account/create`：Bearer token 决定 device ID，请求体和每条 change 不得冒充其他设备；无认证开发模式固定为 `dev_unauthenticated_device`。
+- 入站 change 必须有 `baseVersion: 0`、完整 Account payload 且 `payload.id == entityId`。账户与远端 sync log 原子提交，响应通过 `acceptedChangeIds`、`appliedChangeIds`、`skippedChangeIds` 区分接收、应用和重放。
+- 远端 change 不进入 `pendingChangeIds`。相同 `(sourceDeviceId, sourceChangeId)` 只应用一次；已存在 account ID 返回结构化 manual conflict，不覆盖、不落远端日志。
+- 暂不做 account update、movement merge、quote/snapshot/AI proposal 同步、自动冲突解决或 E2EE。
 
 ## 13. 明确禁止的 HTTP 端点
 

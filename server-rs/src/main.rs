@@ -3,7 +3,7 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Json as JsonExtractor, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
@@ -43,6 +43,7 @@ const EMPTY_BOOTSTRAP: &str =
 const REFRESH_TOKEN_TTL_DAYS: i64 = 30;
 const IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
 const IDEMPOTENCY_RETENTION_DAYS: i64 = 30;
+const DEV_UNAUTHENTICATED_DEVICE_ID: &str = "dev_unauthenticated_device";
 const OVERVIEW_EMPTY: &str =
     include_str!("../../docs/contracts/examples/portfolio_overview_empty.response.json");
 const OVERVIEW_DEGRADED: &str =
@@ -169,6 +170,11 @@ struct AuthTokens {
     expires_at: String,
     refresh_expires_at: String,
     device_id: String,
+}
+
+#[derive(Clone)]
+struct AuthenticatedDevice {
+    id: String,
 }
 
 impl AuthStore {
@@ -338,7 +344,7 @@ impl AuthStore {
         self.config.require_auth
     }
 
-    fn verify_access_token(&self, access_token: &str) -> bool {
+    fn device_id_for_access_token(&self, access_token: &str) -> Option<String> {
         let access_hash = token_hash(access_token);
         let mut state = self.inner.lock().expect("auth store mutex should lock");
         if let Some(device) = state
@@ -347,13 +353,14 @@ impl AuthStore {
             .find(|device| token_hash_eq(&device.access_token_hash, &access_hash))
         {
             if access_token_expired(&device.access_expires_at) {
-                return false;
+                return None;
             }
             device.last_seen_at = current_timestamp();
+            let device_id = device.id.clone();
             self.persist_state(&state);
-            return true;
+            return Some(device_id);
         }
-        false
+        None
     }
 
     fn verify_password(&self, username: &str, password: &str) -> bool {
@@ -1180,7 +1187,7 @@ fn app_with_state(state: AppState) -> Router {
 
 async fn require_auth_middleware(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     if state.rejects_host_header(request.headers()) {
@@ -1208,15 +1215,24 @@ async fn require_auth_middleware(
             }),
         );
     }
-    if !state.auth.should_require_auth() || is_public_auth_path(request.uri().path()) {
+    if is_public_auth_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+    if !state.auth.should_require_auth() {
+        request.extensions_mut().insert(AuthenticatedDevice {
+            id: DEV_UNAUTHENTICATED_DEVICE_ID.to_string(),
+        });
         return next.run(request).await;
     }
     let Some(token) = bearer_token(request.headers()) else {
         return unauthorized("auth_required", "Bearer access token is required.");
     };
-    if !state.auth.verify_access_token(&token) {
+    let Some(device_id) = state.auth.device_id_for_access_token(&token) else {
         return unauthorized("auth_required", "Bearer access token is required.");
-    }
+    };
+    request
+        .extensions_mut()
+        .insert(AuthenticatedDevice { id: device_id });
     next.run(request).await
 }
 
@@ -3534,17 +3550,18 @@ async fn sync_changes(
 
 async fn sync_push(
     State(state): State<AppState>,
+    Extension(authenticated_device): Extension<AuthenticatedDevice>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
     Json(input): Json<Value>,
 ) -> Response {
+    let now = current_timestamp();
     let local_idempotency = if state.should_use_local_ledger(&query) {
-        let now = current_timestamp();
         let idempotency = match idempotency_request(&headers, "POST /v1/sync/push", &input, &now) {
             Ok(request) => request,
             Err(_) => return invalid_idempotency_key(),
         };
-        Some((now, idempotency))
+        Some(idempotency)
     } else {
         None
     };
@@ -3574,15 +3591,26 @@ async fn sync_push(
             json!({ "errors": errors }),
         );
     }
+    if let Err(error) =
+        local_ledger::validate_sync_push_input(&input, &authenticated_device.id, &now)
+    {
+        return local_ledger_error(error, "invalid_sync_push");
+    }
 
     if state.should_use_local_ledger(&query) {
         let path = state
             .local_ledger_path
             .as_ref()
             .expect("local ledger path should exist when local ledger is selected");
-        let (now, idempotency) =
+        let idempotency =
             local_idempotency.expect("local idempotency should exist for local ledger");
-        return match local_ledger::ingest_sync_push(path, input, &now, &idempotency) {
+        return match local_ledger::ingest_sync_push(
+            path,
+            input,
+            &authenticated_device.id,
+            &now,
+            &idempotency,
+        ) {
             Ok(response) => idempotent_response(response),
             Err(error) => local_ledger_error(error, "invalid_sync_push"),
         };
@@ -3590,6 +3618,9 @@ async fn sync_push(
 
     envelope(json!({
         "cursor": current_sync_cursor(&state, &query),
+        "acceptedChangeIds": [],
+        "appliedChangeIds": [],
+        "skippedChangeIds": [],
         "conflicts": []
     }))
     .into_response()
@@ -4892,6 +4923,33 @@ mod tests {
             .to_string()
     }
 
+    fn sync_account_create_change(device_id: &str, change_id: &str, account_id: &str) -> Value {
+        json!({
+            "id": change_id,
+            "deviceId": device_id,
+            "entityType": "account",
+            "entityId": account_id,
+            "operation": "create",
+            "baseVersion": 0,
+            "payload": {
+                "id": account_id,
+                "displayName": "远端同步账户",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "visibility": "normal",
+                "status": "active",
+                "balanceMode": "cash_balance",
+                "cashBalances": [],
+                "tags": [],
+                "createdAt": "2026-07-13T00:00:00Z",
+                "updatedAt": "2026-07-13T00:00:00Z"
+            },
+            "createdAt": "2026-07-13T00:00:00Z"
+        })
+    }
+
     async fn request_json_with_bearer_from(
         router: Router,
         method: Method,
@@ -4906,6 +4964,41 @@ mod tests {
                     .header("authorization", format!("Bearer {token}"))
                     .header("host", "127.0.0.1")
                     .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body should read");
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("response body should be JSON")
+        };
+        (status, body)
+    }
+
+    async fn request_json_body_with_bearer_from(
+        router: Router,
+        method: Method,
+        uri: &str,
+        token: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", next_local_id("test_idempotency"))
+                    .header("host", "127.0.0.1")
+                    .body(Body::from(
+                        serde_json::to_vec(&body).expect("request body should serialize"),
+                    ))
                     .expect("request should build"),
             )
             .await
@@ -5249,6 +5342,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_push_binds_account_create_to_authenticated_device() {
+        let path = unique_test_ledger_path("sync_authenticated_device");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let auth = AuthStore::configured("wu", hash_password_for_test("correct horse"), true);
+        let router = app_with_state(AppState::local(path.clone()).with_auth(auth));
+
+        let (login_status, login_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/auth/login",
+            json!({
+                "username": "wu",
+                "password": "correct horse",
+                "deviceName": "Windows sync client"
+            }),
+        )
+        .await;
+        assert_eq!(login_status, StatusCode::OK, "{login_body}");
+        let access_token = login_body["data"]["accessToken"]
+            .as_str()
+            .expect("access token should be string");
+        let device_id = login_body["data"]["deviceId"]
+            .as_str()
+            .expect("device id should be string");
+
+        let push = json!({
+            "deviceId": device_id,
+            "changes": [{
+                "id": "authenticated_change_000001",
+                "deviceId": device_id,
+                "entityType": "account",
+                "entityId": "acct_authenticated_remote",
+                "operation": "create",
+                "baseVersion": 0,
+                "payload": {
+                    "id": "acct_authenticated_remote",
+                    "displayName": "认证远端账户",
+                    "accountType": "bank",
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "visibility": "normal",
+                    "status": "active",
+                    "balanceMode": "cash_balance",
+                    "cashBalances": [],
+                    "tags": [],
+                    "createdAt": "2026-07-13T00:00:00Z",
+                    "updatedAt": "2026-07-13T00:00:00Z"
+                },
+                "createdAt": "2026-07-13T00:00:00Z"
+            }]
+        });
+        let mut impersonated_push = push.clone();
+        impersonated_push["deviceId"] = json!("dev_auth_device_impersonated");
+        impersonated_push["changes"][0]["deviceId"] = json!("dev_auth_device_impersonated");
+        let (impersonated_status, impersonated_body) = request_json_body_with_bearer_from(
+            router.clone(),
+            Method::POST,
+            "/v1/sync/push",
+            access_token,
+            impersonated_push,
+        )
+        .await;
+        assert_eq!(impersonated_status, StatusCode::BAD_REQUEST);
+        assert_eq!(impersonated_body["error"]["code"], "invalid_sync_push");
+        let unchanged = local_ledger::read_document(&path).expect("rejected push must not mutate");
+        assert_eq!(unchanged["accounts"], json!([]));
+        assert_eq!(unchanged["syncChanges"], json!([]));
+
+        let (push_status, push_body) = request_json_body_with_bearer_from(
+            router,
+            Method::POST,
+            "/v1/sync/push",
+            access_token,
+            push,
+        )
+        .await;
+        assert_eq!(push_status, StatusCode::OK, "{push_body}");
+        assert_eq!(
+            push_body["data"]["appliedChangeIds"],
+            json!(["authenticated_change_000001"])
+        );
+        let document = local_ledger::read_document(&path).expect("push should persist atomically");
+        assert_eq!(document["accounts"][0]["id"], "acct_authenticated_remote");
+        assert_eq!(document["syncChanges"][0]["sourceDeviceId"], device_id);
+        assert_eq!(document["syncState"]["pendingChangeIds"], json!([]));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn auth_state_persists_refresh_tokens_across_store_restarts() {
         let auth_path = unique_test_ledger_path("auth_state_persistence");
         let password_hash = hash_password_for_test("correct horse");
@@ -5500,6 +5684,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_push_rejects_invalid_account_create_batches_atomically() {
+        let path = unique_test_ledger_path("sync_invalid_account_create");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let valid_change = sync_account_create_change(
+            DEV_UNAUTHENTICATED_DEVICE_ID,
+            "remote_valid_before_invalid",
+            "acct_valid_before_invalid",
+        );
+        let mut unsupported_change = sync_account_create_change(
+            DEV_UNAUTHENTICATED_DEVICE_ID,
+            "remote_unsupported_update",
+            "acct_unsupported_update",
+        );
+        unsupported_change["operation"] = json!("update");
+        let (batch_status, batch_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/sync/push",
+            json!({
+                "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
+                "changes": [valid_change, unsupported_change]
+            }),
+        )
+        .await;
+        assert_eq!(batch_status, StatusCode::BAD_REQUEST, "{batch_body}");
+        let unchanged = local_ledger::read_document(&path).expect("invalid batch must not mutate");
+        assert_eq!(unchanged["accounts"], json!([]));
+        assert_eq!(unchanged["syncChanges"], json!([]));
+
+        let mut invalid_changes = Vec::new();
+        let mut mismatched_payload = sync_account_create_change(
+            DEV_UNAUTHENTICATED_DEVICE_ID,
+            "remote_payload_mismatch",
+            "acct_payload_mismatch",
+        );
+        mismatched_payload["payload"]["id"] = json!("acct_other");
+        invalid_changes.push(mismatched_payload);
+
+        let mut unsupported_entity = sync_account_create_change(
+            DEV_UNAUTHENTICATED_DEVICE_ID,
+            "remote_unsupported_entity",
+            "acct_unsupported_entity",
+        );
+        unsupported_entity["entityType"] = json!("movement");
+        invalid_changes.push(unsupported_entity);
+
+        let mut invalid_base_version = sync_account_create_change(
+            DEV_UNAUTHENTICATED_DEVICE_ID,
+            "remote_invalid_base_version",
+            "acct_invalid_base_version",
+        );
+        invalid_base_version["baseVersion"] = json!(1);
+        invalid_changes.push(invalid_base_version);
+
+        let mut incomplete_payload = sync_account_create_change(
+            DEV_UNAUTHENTICATED_DEVICE_ID,
+            "remote_incomplete_payload",
+            "acct_incomplete_payload",
+        );
+        incomplete_payload["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("tags");
+        invalid_changes.push(incomplete_payload);
+
+        for invalid_change in invalid_changes {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/sync/push",
+                json!({
+                    "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
+                    "changes": [invalid_change]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["code"], "invalid_sync_push");
+        }
+        let final_document =
+            local_ledger::read_document(&path).expect("invalid pushes must remain atomic");
+        assert_eq!(final_document["accounts"], json!([]));
+        assert_eq!(final_document["syncChanges"], json!([]));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_bootstrap_and_sync_cursor_use_real_local_state() {
         let path = unique_test_ledger_path("bootstrap_sync_cursor");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
@@ -5621,15 +5895,30 @@ mod tests {
         assert_eq!(ack_invalid_body["error"]["code"], "invalid_sync_ack");
 
         let remote_push = json!({
-            "deviceId": "device_remote",
+            "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
             "changes": [
                 {
                     "id": "remote_change_000001",
-                    "deviceId": "device_remote",
+                    "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
                     "entityType": "account",
                     "entityId": "acct_remote",
                     "operation": "create",
-                    "payload": {"displayName": "远端账户"},
+                    "baseVersion": 0,
+                    "payload": {
+                        "id": "acct_remote",
+                        "displayName": "远端账户",
+                        "accountType": "bank",
+                        "defaultCurrency": "CNY",
+                        "supportedCurrencies": ["CNY"],
+                        "includeInNetWorth": true,
+                        "visibility": "normal",
+                        "status": "active",
+                        "balanceMode": "cash_balance",
+                        "cashBalances": [],
+                        "tags": [],
+                        "createdAt": "2026-06-28T00:00:00Z",
+                        "updatedAt": "2026-06-28T00:00:00Z"
+                    },
                     "createdAt": "2026-06-28T00:00:00Z"
                 }
             ]
@@ -5646,6 +5935,10 @@ mod tests {
             remote_push_body["data"]["acceptedChangeIds"],
             json!(["remote_change_000001"])
         );
+        assert_eq!(
+            remote_push_body["data"]["appliedChangeIds"],
+            json!(["remote_change_000001"])
+        );
         assert_eq!(remote_push_body["data"]["skippedChangeIds"], json!([]));
         assert_eq!(remote_push_body["data"]["cursor"], "local_change_000002");
 
@@ -5654,10 +5947,11 @@ mod tests {
         assert_eq!(
             pushed_document["accounts"]
                 .as_array()
-                .expect("remote sync push must not apply account payload")
+                .expect("remote sync push must apply account payload")
                 .len(),
-            1
+            2
         );
+        assert_eq!(pushed_document["accounts"][1]["id"], "acct_remote");
         assert_eq!(pushed_document["syncState"]["pendingChangeIds"], json!([]));
         assert_eq!(
             pushed_document["syncChanges"][1]["sourceChangeId"],
@@ -5665,7 +5959,7 @@ mod tests {
         );
         assert_eq!(
             pushed_document["syncChanges"][1]["deviceId"],
-            "device_remote"
+            DEV_UNAUTHENTICATED_DEVICE_ID
         );
         assert_eq!(
             pushed_document["syncChanges"][1]["payload"]["displayName"],
@@ -5677,6 +5971,7 @@ mod tests {
                 .await;
         assert_eq!(remote_retry_status, StatusCode::OK);
         assert_eq!(remote_retry_body["data"]["acceptedChangeIds"], json!([]));
+        assert_eq!(remote_retry_body["data"]["appliedChangeIds"], json!([]));
         assert_eq!(
             remote_retry_body["data"]["skippedChangeIds"],
             json!(["remote_change_000001"])
@@ -5691,19 +5986,85 @@ mod tests {
             2
         );
         assert_eq!(
+            retried_document["accounts"]
+                .as_array()
+                .expect("duplicate push should not duplicate accounts")
+                .len(),
+            2
+        );
+        assert_eq!(
             retried_document["syncState"]["cursor"],
             "local_change_000002"
         );
 
+        let (conflict_status, conflict_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/sync/push",
+            json!({
+                "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
+                "changes": [{
+                    "id": "remote_change_000002",
+                    "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
+                    "entityType": "account",
+                    "entityId": "acct_remote",
+                    "operation": "create",
+                    "baseVersion": 0,
+                    "payload": {
+                        "id": "acct_remote",
+                        "displayName": "冲突账户",
+                        "accountType": "bank",
+                        "defaultCurrency": "CNY",
+                        "supportedCurrencies": ["CNY"],
+                        "includeInNetWorth": true,
+                        "visibility": "normal",
+                        "status": "active",
+                        "balanceMode": "cash_balance",
+                        "cashBalances": [],
+                        "tags": [],
+                        "createdAt": "2026-06-28T00:00:00Z",
+                        "updatedAt": "2026-06-28T00:00:00Z"
+                    },
+                    "createdAt": "2026-06-28T00:00:00Z"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(conflict_status, StatusCode::OK, "{conflict_body}");
+        assert_eq!(conflict_body["data"]["acceptedChangeIds"], json!([]));
+        assert_eq!(conflict_body["data"]["appliedChangeIds"], json!([]));
+        assert_eq!(
+            conflict_body["data"]["conflicts"][0]["kind"],
+            "entity_already_exists"
+        );
+        assert_eq!(
+            conflict_body["data"]["conflicts"][0]["entityId"],
+            "acct_remote"
+        );
+        let conflicted_document =
+            local_ledger::read_document(&path).expect("conflict must keep ledger valid");
+        assert_eq!(
+            conflicted_document["syncState"]["cursor"],
+            "local_change_000002"
+        );
+        assert_eq!(
+            conflicted_document["syncChanges"]
+                .as_array()
+                .expect("conflict must not append a remote log entry")
+                .len(),
+            2
+        );
+
         for invalid_push in [
             json!({
-                "deviceId": "device_bad_time",
+                "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
                 "changes": [{
                     "id": "remote_bad_time",
-                    "deviceId": "device_bad_time",
+                    "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
                     "entityType": "account",
                     "entityId": "acct_bad_time",
                     "operation": "create",
+                    "baseVersion": 0,
                     "payload": {},
                     "createdAt": "not-a-time"
                 }]
@@ -5733,11 +6094,11 @@ mod tests {
             Method::POST,
             "/v1/sync/push",
             json!({
-                "deviceId": "device_test",
+                "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
                 "changes": [
                     {
                         "id": "change_demo",
-                        "deviceId": "device_test",
+                        "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
                         "entityType": "account",
                         "entityId": "acct_demo",
                         "operation": "create",

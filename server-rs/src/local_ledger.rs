@@ -595,13 +595,17 @@ pub fn ack_sync_changes(
 pub fn ingest_sync_push(
     path: &Path,
     input: Value,
+    authenticated_device_id: &str,
     now: &str,
     idempotency: &IdempotencyRequest,
 ) -> Result<IdempotentResponse, LedgerError> {
     idempotent_ledger_write(path, idempotency, 200, |document| {
-        let (device_id, incoming_changes) = sync_push_changes_for_input(&input, now)?;
+        let (device_id, incoming_changes) =
+            sync_push_changes_for_input(&input, authenticated_device_id, now)?;
         let mut accepted_change_ids = Vec::new();
+        let mut applied_change_ids = Vec::new();
         let mut skipped_change_ids = Vec::new();
+        let mut conflicts = Vec::new();
 
         for mut incoming_change in incoming_changes {
             let source_change_id = incoming_change
@@ -614,18 +618,59 @@ pub fn ingest_sync_push(
                 continue;
             }
 
+            let entity_id = incoming_change
+                .get("entityId")
+                .and_then(Value::as_str)
+                .expect("validated entityId should be a string")
+                .to_string();
+            let payload = incoming_change
+                .get("payload")
+                .expect("validated account create payload should exist")
+                .clone();
+            let existing_account = document["accounts"]
+                .as_array()
+                .expect("validated local ledger accounts should be an array")
+                .iter()
+                .find(|account| account.get("id").and_then(Value::as_str) == Some(&entity_id))
+                .cloned();
+            if let Some(existing_account) = existing_account {
+                conflicts.push(account_create_sync_conflict(
+                    &device_id,
+                    &source_change_id,
+                    &entity_id,
+                    &existing_account,
+                    &incoming_change,
+                    now,
+                ));
+                continue;
+            }
+
+            document["accounts"]
+                .as_array_mut()
+                .expect("validated local ledger accounts should be an array")
+                .push(payload);
             incoming_change["id"] = json!(next_sync_change_id(document));
             append_sync_log_change(document, incoming_change);
-            accepted_change_ids.push(source_change_id);
+            accepted_change_ids.push(source_change_id.clone());
+            applied_change_ids.push(source_change_id);
         }
 
         Ok(json!({
             "cursor": document["syncState"]["cursor"],
             "acceptedChangeIds": accepted_change_ids,
+            "appliedChangeIds": applied_change_ids,
             "skippedChangeIds": skipped_change_ids,
-            "conflicts": []
+            "conflicts": conflicts
         }))
     })
+}
+
+pub fn validate_sync_push_input(
+    input: &Value,
+    authenticated_device_id: &str,
+    now: &str,
+) -> Result<(), LedgerError> {
+    sync_push_changes_for_input(input, authenticated_device_id, now).map(|_| ())
 }
 
 pub fn list_account_anomalies(path: &Path, now: &str) -> io::Result<Value> {
@@ -4212,6 +4257,7 @@ fn sync_ack_change_ids_for_input(
 
 fn sync_push_changes_for_input(
     input: &Value,
+    authenticated_device_id: &str,
     now: &str,
 ) -> Result<(String, Vec<Value>), LedgerError> {
     let Some(object) = input.as_object() else {
@@ -4237,6 +4283,9 @@ fn sync_push_changes_for_input(
             String::new()
         }
     };
+    if device_id != authenticated_device_id {
+        errors.push("deviceId must match the authenticated device".to_string());
+    }
     if device_id == LOCAL_SYNC_DEVICE_ID {
         errors.push(format!(
             "deviceId must not use reserved id {LOCAL_SYNC_DEVICE_ID}"
@@ -4252,7 +4301,7 @@ fn sync_push_changes_for_input(
 
     let mut normalized_changes = Vec::new();
     for (index, change) in changes.iter().enumerate() {
-        match sync_change_from_push_input(change, &device_id, now) {
+        match sync_change_from_push_input(change, authenticated_device_id, now) {
             Ok(change) => normalized_changes.push(change),
             Err(mut change_errors) => {
                 errors.extend(
@@ -4283,32 +4332,13 @@ fn sync_change_from_push_input(
     let mut errors = Vec::new();
     let source_change_id = required_sync_string(object, "id", &mut errors);
     let change_device_id = required_sync_string(object, "deviceId", &mut errors);
-    let entity_type = required_sync_enum(
-        object,
-        "entityType",
-        &[
-            "account",
-            "instrument",
-            "holding",
-            "movement",
-            "dca_plan",
-            "subscription",
-            "category",
-            "counterparty",
-            "quote",
-            "fx_rate",
-            "snapshot",
-            "ai_proposal",
-        ],
-        &mut errors,
-    );
+    let entity_type = required_sync_enum(object, "entityType", &["account"], &mut errors);
     let entity_id = required_sync_string(object, "entityId", &mut errors);
-    let operation = required_sync_enum(
-        object,
-        "operation",
-        &["create", "update", "delete", "correction"],
-        &mut errors,
-    );
+    let operation = required_sync_enum(object, "operation", &["create"], &mut errors);
+    match object.get("baseVersion").and_then(Value::as_u64) {
+        Some(0) => {}
+        _ => errors.push("baseVersion must be 0 for account create".to_string()),
+    }
     let created_at = required_sync_string(object, "createdAt", &mut errors);
     let payload = match object.get("payload") {
         Some(payload) => payload.clone(),
@@ -4326,6 +4356,9 @@ fn sync_change_from_push_input(
     if created_at.as_deref().and_then(parse_rfc3339).is_none() {
         errors.push("createdAt must be an RFC3339 timestamp".to_string());
     }
+    if let Some(entity_id) = entity_id.as_deref() {
+        validate_inbound_account_payload(&payload, entity_id, &mut errors);
+    }
 
     if !errors.is_empty() {
         return Err(errors);
@@ -4341,9 +4374,125 @@ fn sync_change_from_push_input(
         "entityId": entity_id.expect("validated entityId"),
         "operation": operation.expect("validated operation"),
         "payload": payload,
+        "baseVersion": 0,
         "createdAt": created_at.expect("validated createdAt"),
         "receivedAt": now
     }))
+}
+
+fn validate_inbound_account_payload(payload: &Value, entity_id: &str, errors: &mut Vec<String>) {
+    let Some(account) = payload.as_object() else {
+        errors.push("payload must be a complete Account object".to_string());
+        return;
+    };
+
+    if account.get("id").and_then(Value::as_str) != Some(entity_id) {
+        errors.push("payload.id must equal entityId".to_string());
+    }
+    if !matches!(
+        account.get("accountType").and_then(Value::as_str),
+        Some(
+            "bank"
+                | "brokerage"
+                | "exchange"
+                | "wallet"
+                | "platform_wallet"
+                | "virtual_card"
+                | "social_security"
+                | "credit_card"
+                | "loan"
+                | "cash"
+                | "other"
+        )
+    ) {
+        errors.push("payload.accountType is invalid".to_string());
+    }
+    if !matches!(
+        account.get("visibility").and_then(Value::as_str),
+        Some("normal" | "hidden_amount" | "archived")
+    ) {
+        errors.push("payload.visibility is invalid".to_string());
+    }
+    if !matches!(
+        account.get("status").and_then(Value::as_str),
+        Some("active" | "inactive" | "archived")
+    ) {
+        errors.push("payload.status is invalid".to_string());
+    }
+    if !matches!(
+        account.get("balanceMode").and_then(Value::as_str),
+        Some("cash_balance" | "holdings" | "liability" | "mixed")
+    ) {
+        errors.push("payload.balanceMode is invalid".to_string());
+    }
+    for key in ["createdAt", "updatedAt"] {
+        if account
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339)
+            .is_none()
+        {
+            errors.push(format!("payload.{key} must be an RFC3339 timestamp"));
+        }
+    }
+    for key in ["institutionName", "note"] {
+        if account.contains_key(key) && !account.get(key).is_some_and(Value::is_string) {
+            errors.push(format!("payload.{key} must be a string"));
+        }
+    }
+    if let Some(cash_balances) = account.get("cashBalances").and_then(Value::as_array) {
+        for (index, balance) in cash_balances.iter().enumerate() {
+            if balance
+                .get("asOf")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339)
+                .is_none()
+            {
+                errors.push(format!(
+                    "payload.cashBalances[{index}].asOf must be an RFC3339 timestamp"
+                ));
+            }
+        }
+    }
+
+    let candidate = json!([payload.clone()]);
+    let mut account_errors = Vec::new();
+    validate_accounts(Some(&candidate), &mut account_errors);
+    errors.extend(
+        account_errors
+            .into_iter()
+            .map(|error| error.replacen("accounts[0]", "payload", 1)),
+    );
+}
+
+fn account_create_sync_conflict(
+    device_id: &str,
+    source_change_id: &str,
+    entity_id: &str,
+    existing_account: &Value,
+    incoming_change: &Value,
+    now: &str,
+) -> Value {
+    let mut remote_change = incoming_change.clone();
+    remote_change["id"] = json!(source_change_id);
+    json!({
+        "id": format!("account_exists:{device_id}:{source_change_id}"),
+        "kind": "entity_already_exists",
+        "entityType": "account",
+        "entityId": entity_id,
+        "localChange": {
+            "id": format!("existing:{entity_id}"),
+            "deviceId": LOCAL_SYNC_DEVICE_ID,
+            "entityType": "account",
+            "entityId": entity_id,
+            "operation": "create",
+            "payload": existing_account,
+            "baseVersion": 0,
+            "createdAt": now
+        },
+        "remoteChange": remote_change,
+        "resolution": "manual"
+    })
 }
 
 fn required_sync_string(
