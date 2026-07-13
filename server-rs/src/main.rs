@@ -11,6 +11,7 @@ use axum::{
     routing::{any, get, patch, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+mod ledger_migrations;
 mod local_ledger;
 
 use rand_core::{OsRng, RngCore};
@@ -946,7 +947,7 @@ fn run_ledger_command(command: LedgerCommand) -> std::io::Result<()> {
             Ok(())
         }
         LedgerCommand::Validate(path) => {
-            let document = local_ledger::read_document(&path)?;
+            let document = local_ledger::validate_supported_ledger(&path)?;
             println!(
                 "validated real_local ledger at {} (version {}, base {})",
                 path.display(),

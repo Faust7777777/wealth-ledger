@@ -209,6 +209,30 @@ account balance, advance `lastChargeDate`/`nextChargeDate`, call a payment
 provider, or auto-confirm anything. Each candidate remains visible in AI review
 until the user confirms or rejects its atomic group.
 
+## Ledger schema compatibility and migrations
+
+The persisted schema remains `ledgerVersion: 1`. The migration registry is an
+intentionally empty, validated skeleton in this slice; starting the server and
+ordinary API reads do not migrate or rewrite `ledger.json`.
+
+The v1 read-compatibility layer is deliberately narrow. In memory it may add a
+missing `subscriptions` array, `syncChanges` array, or version-1
+`idempotencyState`. It may add `syncState.nextChangeSequence = 1` only when the
+`syncState` object already exists. A missing `syncState`, `syncState.cursor`, or
+`syncState.pendingChangeIds` fails validation instead of guessing sync progress
+or rebuilding the outbox. These compatibility defaults do not bump
+`ledgerVersion` or append migration history.
+
+Initialization and `.tmp` recovery happen only during explicit initialization
+or server startup. Once running, request-time reads and write transactions
+require the primary ledger to still exist; if it disappears they fail closed
+instead of silently creating a new empty ledger.
+
+A future real schema upgrade must use an explicit backup-and-migrate command:
+first create and validate a complete ledger/auth snapshot, then apply one
+unambiguous contiguous registry path, validate the result, and atomically
+replace the live ledger. No such upgrade command is exposed by this slice.
+
 The Rust dev server also accepts two temporary compatibility aliases for early
 frontend integration:
 

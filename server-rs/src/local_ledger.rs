@@ -1,3 +1,4 @@
+use crate::ledger_migrations::{MIGRATION_REGISTRY, plan_migrations, validate_history};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -30,6 +31,12 @@ const INSTRUMENT_TYPES: &[&str] = &[
 ];
 
 static LEDGER_WRITE_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+enum LedgerReadPolicy {
+    Current,
+    SupportedForValidation,
+}
 
 macro_rules! with_ledger_write_lock {
     ($path:expr, $body:block) => {{
@@ -117,10 +124,17 @@ pub fn load_or_initialize(path: &Path) -> io::Result<Value> {
 }
 
 pub fn read_document(path: &Path) -> io::Result<Value> {
+    read_document_with_policy(path, LedgerReadPolicy::Current)
+}
+
+pub fn validate_supported_ledger(path: &Path) -> io::Result<Value> {
+    read_document_with_policy(path, LedgerReadPolicy::SupportedForValidation)
+}
+
+fn read_document_with_policy(path: &Path, policy: LedgerReadPolicy) -> io::Result<Value> {
     let raw = fs::read_to_string(path)?;
     let mut document: Value = serde_json::from_str(&raw).map_err(invalid_data)?;
-    normalize_document_for_read(&mut document);
-    validate_document(&document).map_err(validation_error)?;
+    prepare_document_for_read(&mut document, policy).map_err(validation_error)?;
     Ok(document)
 }
 
@@ -184,8 +198,7 @@ fn recover_unpublished_document(path: &Path) -> io::Result<Option<Value>> {
             ),
         )
     })?;
-    normalize_document_for_read(&mut document);
-    validate_document(&document).map_err(|errors| {
+    prepare_document_for_read(&mut document, LedgerReadPolicy::Current).map_err(|errors| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -209,6 +222,47 @@ fn recover_unpublished_document(path: &Path) -> io::Result<Option<Value>> {
     Ok(Some(document))
 }
 
+fn prepare_document_for_read(
+    document: &mut Value,
+    policy: LedgerReadPolicy,
+) -> Result<(), Vec<String>> {
+    let version = document
+        .as_object()
+        .ok_or_else(|| vec!["ledger document must be a JSON object".to_string()])?
+        .get("ledgerVersion")
+        .and_then(Value::as_i64)
+        .filter(|version| *version >= 1)
+        .ok_or_else(|| vec!["ledgerVersion must be a positive integer".to_string()])?;
+
+    match policy {
+        LedgerReadPolicy::Current if version != LEDGER_VERSION => {
+            return Err(vec![format!(
+                "ledgerVersion {version} is not the current supported version {LEDGER_VERSION}"
+            )]);
+        }
+        LedgerReadPolicy::SupportedForValidation => {
+            if version > LEDGER_VERSION {
+                return Err(vec![format!(
+                    "ledgerVersion {version} is newer than supported version {LEDGER_VERSION}"
+                )]);
+            }
+            plan_migrations(MIGRATION_REGISTRY, version, LEDGER_VERSION)
+                .map_err(|error| vec![error])?;
+        }
+        LedgerReadPolicy::Current => {}
+    }
+
+    match version {
+        1 => apply_v1_read_compatibility(document),
+        _ => {
+            return Err(vec![format!(
+                "ledgerVersion {version} has no registered validation implementation"
+            )]);
+        }
+    }
+    validate_document_for_version(document, version)
+}
+
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -222,7 +276,7 @@ fn sync_parent_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn normalize_document_for_read(document: &mut Value) {
+fn apply_v1_read_compatibility(document: &mut Value) {
     let Some(object) = document.as_object_mut() else {
         return;
     };
@@ -240,19 +294,10 @@ fn normalize_document_for_read(document: &mut Value) {
                 "records": {}
             })
         });
-    let sync_state = object
-        .entry("syncState".to_string())
-        .or_insert_with(|| json!({}));
-    if let Some(sync_state) = sync_state.as_object_mut() {
-        sync_state
-            .entry("cursor".to_string())
-            .or_insert(Value::Null);
+    if let Some(sync_state) = object.get_mut("syncState").and_then(Value::as_object_mut) {
         sync_state
             .entry("nextChangeSequence".to_string())
             .or_insert_with(|| json!(1));
-        sync_state
-            .entry("pendingChangeIds".to_string())
-            .or_insert_with(|| json!([]));
     }
 }
 
@@ -448,7 +493,7 @@ where
     F: FnOnce(&mut Value) -> Result<Value, LedgerError>,
 {
     with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+        let mut document = read_document(path)?;
         if let Some(response) = idempotency_replay(&mut document, request, &request.created_at)? {
             return Ok(response);
         }
@@ -466,7 +511,7 @@ pub fn replay_idempotency(
     request: &IdempotencyRequest,
 ) -> Result<Option<IdempotentResponse>, LedgerError> {
     with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+        let mut document = read_document(path)?;
         idempotency_replay(&mut document, request, &request.created_at)
     })
 }
@@ -487,7 +532,7 @@ impl From<io::Error> for LedgerError {
 }
 
 pub fn list_accounts(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let accounts = document["accounts"]
         .as_array()
         .expect("validated local ledger accounts should be an array")
@@ -508,7 +553,7 @@ pub fn get_account(path: &Path, account_id: &str) -> io::Result<Option<Value>> {
 }
 
 pub fn list_sync_changes(path: &Path, since: Option<&str>) -> Result<(String, Value), LedgerError> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let cursor = sync_cursor_from_document(&document);
     let changes = sync_changes_for_document(&document, since)?;
     Ok((cursor, changes))
@@ -580,12 +625,12 @@ pub fn ingest_sync_push(
 }
 
 pub fn list_account_anomalies(path: &Path, now: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(account_anomalies_for_document(&document, now)?))
 }
 
 pub fn list_quotes(path: &Path, now: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(project_quote_items(
         document["quotes"]
             .as_array()
@@ -595,7 +640,7 @@ pub fn list_quotes(path: &Path, now: &str) -> io::Result<Value> {
 }
 
 pub fn list_fx_rates(path: &Path, now: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(project_quote_items(
         document["fxRates"]
             .as_array()
@@ -718,7 +763,7 @@ pub fn refresh_quotes(
 }
 
 pub fn quote_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value>> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let requested_ids = input
         .get("instruments")
         .and_then(Value::as_array)
@@ -787,7 +832,7 @@ pub fn quote_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value
 }
 
 pub fn fx_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value>> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let base_currency = document
         .get("baseCurrency")
         .and_then(Value::as_str)
@@ -916,12 +961,12 @@ pub fn archive_account(
 }
 
 pub fn list_holdings(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(project_holdings_for_api(&document)))
 }
 
 pub fn list_holdings_by_account(path: &Path, account_id: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(
         project_holdings_for_api(&document)
             .into_iter()
@@ -931,7 +976,7 @@ pub fn list_holdings_by_account(path: &Path, account_id: &str) -> io::Result<Val
 }
 
 pub fn list_movements(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let movements = document["movements"]
         .as_array()
         .expect("validated local ledger movements should be an array")
@@ -1301,7 +1346,7 @@ pub fn reject_atomic_group(
 }
 
 pub fn list_dca_plans(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(
         document["dcaPlans"]
             .as_array()
@@ -1372,7 +1417,7 @@ pub fn update_dca_plan(
 }
 
 pub fn list_due_dca_reminders(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let reminders = document["dcaReminders"]
         .as_array()
         .expect("validated local ledger dcaReminders should be an array")
@@ -1589,7 +1634,7 @@ pub fn mark_dca_executed_as_proposal(
 }
 
 pub fn list_subscriptions(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let mut items = document["subscriptions"]
         .as_array()
         .expect("validated local ledger subscriptions should be an array")
@@ -1620,7 +1665,7 @@ pub fn list_subscriptions(path: &Path) -> io::Result<Value> {
 }
 
 pub fn get_subscription(path: &Path, subscription_id: &str) -> io::Result<Option<Value>> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(document["subscriptions"]
         .as_array()
         .expect("validated local ledger subscriptions should be an array")
@@ -1630,7 +1675,7 @@ pub fn get_subscription(path: &Path, subscription_id: &str) -> io::Result<Option
 }
 
 pub fn list_upcoming_subscriptions(path: &Path, through_date: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let items = document["subscriptions"]
         .as_array()
         .expect("validated local ledger subscriptions should be an array")
@@ -2080,7 +2125,7 @@ fn create_subscription_charge_proposal_in_document(
 }
 
 pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let summary = summarize_accounts(&document, now)?;
     let ai_pending_count = pending_ai_proposal_count(&document);
     let recent_movements = recent_movements_from_document(&document);
@@ -2127,7 +2172,7 @@ pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
 }
 
 pub fn asset_allocation(path: &Path, now: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let summary = summarize_accounts(&document, now)?;
     Ok(json!({
         "slices": summary.allocation_slices,
@@ -2138,7 +2183,7 @@ pub fn asset_allocation(path: &Path, now: &str) -> io::Result<Value> {
 }
 
 pub fn latest_snapshot(path: &Path, now: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     if let Some(snapshot) = latest_persisted_snapshot(&document) {
         return Ok(snapshot);
     }
@@ -2146,7 +2191,7 @@ pub fn latest_snapshot(path: &Path, now: &str) -> io::Result<Value> {
 }
 
 pub fn list_snapshots(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(
         document["snapshots"]
             .as_array()
@@ -2196,7 +2241,7 @@ pub fn create_manual_snapshot(
 }
 
 pub fn list_instruments(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(
         document["instruments"]
             .as_array()
@@ -2206,7 +2251,7 @@ pub fn list_instruments(path: &Path) -> io::Result<Value> {
 }
 
 pub fn get_instrument(path: &Path, instrument_id: &str) -> io::Result<Option<Value>> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(document["instruments"]
         .as_array()
         .expect("validated local ledger instruments should be an array")
@@ -2268,7 +2313,7 @@ pub fn update_instrument(
 }
 
 pub fn list_categories(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(
         document["categories"]
             .as_array()
@@ -2315,7 +2360,7 @@ pub fn update_category(
 }
 
 pub fn list_counterparties(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(
         document["counterparties"]
             .as_array()
@@ -2481,7 +2526,7 @@ pub fn edit_ai_atomic_group(
 }
 
 pub fn list_pending_ai_proposals(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(pending_ai_proposals_for_document(&document)))
 }
 
@@ -2503,7 +2548,7 @@ fn is_pending_ai_proposal(proposal: &Value) -> bool {
 }
 
 pub fn get_ai_proposal(path: &Path, proposal_id: &str) -> io::Result<Option<Value>> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let stored = document["aiProposals"]
         .as_array()
         .expect("validated local ledger aiProposals should be an array")
@@ -2715,14 +2760,21 @@ pub fn ensure_real_and_fixture_paths_separate(
 }
 
 pub fn validate_document(document: &Value) -> Result<(), Vec<String>> {
+    validate_document_for_version(document, LEDGER_VERSION)
+}
+
+fn validate_document_for_version(
+    document: &Value,
+    expected_version: i64,
+) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
 
     let Some(object) = document.as_object() else {
         return Err(vec!["ledger document must be a JSON object".to_string()]);
     };
 
-    if object.get("ledgerVersion").and_then(Value::as_i64) != Some(LEDGER_VERSION) {
-        errors.push(format!("ledgerVersion must be {LEDGER_VERSION}"));
+    if object.get("ledgerVersion").and_then(Value::as_i64) != Some(expected_version) {
+        errors.push(format!("ledgerVersion must be {expected_version}"));
     }
 
     match object.get("baseCurrency").and_then(Value::as_str) {
@@ -2751,6 +2803,10 @@ pub fn validate_document(document: &Value) -> Result<(), Vec<String>> {
         "migrations",
     ] {
         require_array(object, key, &mut errors);
+    }
+
+    if let Err(error) = validate_history(document, MIGRATION_REGISTRY) {
+        errors.push(error);
     }
 
     validate_sync_state_and_changes(
@@ -9212,6 +9268,46 @@ mod tests {
     }
 
     #[test]
+    fn runtime_reads_and_writes_do_not_recreate_a_missing_primary_ledger() {
+        let path = unique_temp_path("runtime_missing_primary");
+        load_or_initialize(&path).expect("ledger should initialize once at startup");
+        fs::remove_file(&path).expect("test should simulate a missing runtime ledger");
+
+        let read_error = list_accounts(&path).expect_err("runtime read must fail closed");
+        assert_eq!(read_error.kind(), io::ErrorKind::NotFound);
+        assert!(!path.exists());
+
+        let request = IdempotencyRequest::new(
+            "key-hash".to_string(),
+            "request-hash".to_string(),
+            "POST /v1/accounts".to_string(),
+            "2026-07-13T00:00:00Z".to_string(),
+            "2026-08-12T00:00:00Z".to_string(),
+        );
+        let write_error = create_account(
+            &path,
+            json!({
+                "displayName": "Must not be created",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": []
+            }),
+            "acct_missing_ledger",
+            "2026-07-13T00:00:00Z",
+            &request,
+        )
+        .expect_err("runtime write must fail closed");
+        match write_error {
+            LedgerError::Io(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+            other => panic!("expected missing-ledger IO error, got {other:?}"),
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn load_or_initialize_recovers_valid_temp_when_primary_is_missing() {
         let path = unique_temp_path("recover_valid_temp");
         let tmp_path = path.with_extension("json.tmp");
@@ -9219,11 +9315,9 @@ mod tests {
         if let Some(parent) = tmp_path.parent() {
             fs::create_dir_all(parent).expect("temp parent should exist");
         }
-        fs::write(
-            &tmp_path,
-            serde_json::to_vec_pretty(&document).expect("recovery ledger should serialize"),
-        )
-        .expect("recovery temp should write");
+        let original =
+            serde_json::to_vec_pretty(&document).expect("recovery ledger should serialize");
+        fs::write(&tmp_path, &original).expect("recovery temp should write");
 
         let recovered = load_or_initialize(&path).expect("valid recovery temp should promote");
 
@@ -9231,11 +9325,74 @@ mod tests {
         assert!(path.exists());
         assert!(!tmp_path.exists());
         assert_eq!(
+            fs::read(&path).expect("promoted primary bytes should be readable"),
+            original,
+            "recovery must promote the validated temp byte-for-byte"
+        );
+        assert_eq!(
             read_document(&path).expect("promoted ledger should read")["baseCurrency"],
             "USD"
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_or_initialize_preserves_unsupported_or_incomplete_recovery_temp() {
+        for case in ["future", "missing_cursor"] {
+            let path = unique_temp_path(&format!("reject_recovery_{case}"));
+            let tmp_path = path.with_extension("json.tmp");
+            let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+            if case == "future" {
+                document["ledgerVersion"] = json!(LEDGER_VERSION + 1);
+            } else {
+                document["syncState"]
+                    .as_object_mut()
+                    .expect("syncState should be an object")
+                    .remove("cursor");
+            }
+            fs::create_dir_all(tmp_path.parent().expect("temp should have a parent"))
+                .expect("temp parent should exist");
+            let original =
+                serde_json::to_vec_pretty(&document).expect("recovery temp should serialize");
+            fs::write(&tmp_path, &original).expect("recovery temp should write");
+
+            let error =
+                load_or_initialize(&path).expect_err("unsupported recovery temp must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "case {case}");
+            assert!(!path.exists());
+            assert!(tmp_path.exists());
+            assert_eq!(
+                fs::read(&tmp_path).expect("recovery temp bytes should remain readable"),
+                original
+            );
+            let _ = fs::remove_file(tmp_path);
+        }
+    }
+
+    #[test]
+    fn existing_primary_is_never_replaced_by_a_stale_recovery_temp() {
+        let path = unique_temp_path("ignore_stale_temp");
+        let tmp_path = path.with_extension("json.tmp");
+        let primary = empty_document("CNY");
+        write_document(&path, &primary).expect("primary ledger should write");
+        let stale = empty_document("USD");
+        let stale_bytes = serde_json::to_vec_pretty(&stale).expect("stale temp should serialize");
+        fs::write(&tmp_path, &stale_bytes).expect("stale temp should write");
+
+        let loaded = load_or_initialize(&path).expect("existing primary should win");
+
+        assert_eq!(loaded["baseCurrency"], "CNY");
+        assert_eq!(
+            read_document(&path).expect("primary should remain readable")["baseCurrency"],
+            "CNY"
+        );
+        assert_eq!(
+            fs::read(&tmp_path).expect("stale temp should remain untouched"),
+            stale_bytes
+        );
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(tmp_path);
     }
 
     #[test]
@@ -9258,32 +9415,128 @@ mod tests {
     }
 
     #[test]
-    fn read_document_normalizes_legacy_missing_idempotency_state() {
-        let path = unique_temp_path("legacy_idempotency_normalization");
+    fn read_document_applies_narrow_v1_compatibility_without_rewriting() {
+        let path = unique_temp_path("narrow_v1_read_compatibility");
         let mut document = empty_document(DEFAULT_BASE_CURRENCY);
-        document
+        let object = document
             .as_object_mut()
-            .expect("ledger should be an object")
-            .remove("idempotencyState");
-        document
+            .expect("ledger should be an object");
+        object.remove("idempotencyState");
+        object.remove("subscriptions");
+        object.remove("syncChanges");
+        object["syncState"]
             .as_object_mut()
-            .expect("ledger should be an object")
-            .remove("subscriptions");
+            .expect("syncState should be an object")
+            .remove("nextChangeSequence");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("legacy ledger directory should exist");
         }
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(&document).expect("legacy ledger should serialize"),
-        )
-        .expect("legacy ledger should write");
+        let original =
+            serde_json::to_vec_pretty(&document).expect("legacy ledger should serialize");
+        fs::write(&path, &original).expect("legacy ledger should write");
 
         let loaded = read_document(&path).expect("legacy ledger should normalize on read");
         assert_eq!(loaded["idempotencyState"]["version"], 1);
         assert_eq!(loaded["idempotencyState"]["records"], json!({}));
         assert_eq!(loaded["subscriptions"], json!([]));
+        assert_eq!(loaded["syncChanges"], json!([]));
+        assert_eq!(loaded["syncState"]["nextChangeSequence"], 1);
+        assert_eq!(loaded["migrations"], json!([]));
+        assert_eq!(
+            validate_supported_ledger(&path)
+                .expect("offline validation should accept the supported v1 profile"),
+            loaded
+        );
+        assert_eq!(
+            fs::read(&path).expect("legacy ledger bytes should remain readable"),
+            original,
+            "ordinary reads must not rewrite compatibility fields or migration history"
+        );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_document_fails_closed_when_required_sync_state_is_missing() {
+        for missing in ["syncState", "cursor", "pendingChangeIds"] {
+            let path = unique_temp_path(&format!("missing_{missing}"));
+            let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+            if missing == "syncState" {
+                document
+                    .as_object_mut()
+                    .expect("ledger should be an object")
+                    .remove("syncState");
+            } else {
+                document["syncState"]
+                    .as_object_mut()
+                    .expect("syncState should be an object")
+                    .remove(missing);
+            }
+            let original =
+                serde_json::to_vec_pretty(&document).expect("invalid ledger should serialize");
+            fs::create_dir_all(path.parent().expect("temp ledger should have a parent"))
+                .expect("temp ledger parent should exist");
+            fs::write(&path, &original).expect("invalid ledger should write");
+
+            let error = read_document(&path).expect_err("missing sync state must fail closed");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "missing {missing}"
+            );
+            assert!(
+                error.to_string().contains("syncState"),
+                "unexpected error for missing {missing}: {error}"
+            );
+            assert_eq!(
+                fs::read(&path).expect("invalid ledger bytes should remain readable"),
+                original
+            );
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn read_document_rejects_invalid_or_unsupported_versions_without_rewriting() {
+        for (label, version) in [
+            ("missing", None),
+            ("string", Some(json!("1"))),
+            ("zero", Some(json!(0))),
+            ("future", Some(json!(LEDGER_VERSION + 1))),
+        ] {
+            let path = unique_temp_path(&format!("ledger_version_{label}"));
+            let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+            match version {
+                Some(version) => document["ledgerVersion"] = version,
+                None => {
+                    document
+                        .as_object_mut()
+                        .expect("ledger should be an object")
+                        .remove("ledgerVersion");
+                }
+            }
+            let original =
+                serde_json::to_vec_pretty(&document).expect("invalid ledger should serialize");
+            fs::create_dir_all(path.parent().expect("temp ledger should have a parent"))
+                .expect("temp ledger parent should exist");
+            fs::write(&path, &original).expect("invalid ledger should write");
+
+            let error = read_document(&path).expect_err("invalid version must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "case {label}");
+            assert!(error.to_string().contains("ledgerVersion"), "{error}");
+            let validation_error = validate_supported_ledger(&path)
+                .expect_err("offline validation must also reject unsupported versions");
+            assert_eq!(
+                validation_error.kind(),
+                io::ErrorKind::InvalidData,
+                "case {label}"
+            );
+            assert_eq!(
+                fs::read(&path).expect("invalid ledger bytes should remain readable"),
+                original
+            );
+            let _ = fs::remove_file(path);
+        }
     }
 
     #[test]

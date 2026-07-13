@@ -46,6 +46,8 @@ DataSourceMode =
 
 ```json
 {
+  "ledgerVersion": 1,
+  "baseCurrency": "CNY",
   "metadata": {},
   "accounts": [],
   "instruments": [],
@@ -146,6 +148,20 @@ AI pending 读取层把 standalone pending movements 按 `atomicGroupId` 分组�
 
 ## 5. 迁移原则
 
+当前实现版本仍是 `ledgerVersion: 1`，迁移 registry 是有意保持为空的骨架。本切片不会把账本升到 v2，也不提供会改写磁盘的自动迁移。
+
+普通 `read_document` 只允许执行不改变领域语义的 v1 read compatibility：
+
+- 顶层缺少 `subscriptions` 时在内存视图中补 `[]`。
+- 顶层缺少 `syncChanges` 时在内存视图中补 `[]`。
+- 顶层缺少 `idempotencyState` 时在内存视图中补 `{ "version": 1, "records": {} }`。
+- 仅当 `syncState` 已存在且是 object 时，才可为缺少的 `nextChangeSequence` 补 `1`。
+- 缺少整个 `syncState`、缺少 `syncState.cursor` 或缺少 `syncState.pendingChangeIds` 必须 fail-closed；读取层不得猜测 cursor，也不得清空或重建 outbox。
+
+上述兼容补齐只修改当次读取的内存文档；单纯读取不得写回 `ledger.json`、追加 `migrations[]` 或提升 `ledgerVersion`。它是 v1 内的可选字段兼容，不是版本迁移。
+
+初始化和 `.tmp` 恢复只允许发生在显式 init 或服务启动阶段。服务运行后的业务读取与写事务必须读取已存在的主账本；若 `ledger.json` 消失，必须 fail-closed，不得在下一次请求中静默创建空账本。
+
 ```ts
 Migration {
   id: string;
@@ -158,10 +174,12 @@ Migration {
 
 规则：
 
+- registry 中的 migration ID 必须唯一，版本边必须严格连续且不得分叉；空 registry 对当前 v1 是合法状态。
 - 迁移器必须先创建经过校验的完整备份目录；存在同名 auth 状态时应与 `ledger.json` 一并纳入快照。
 - 迁移失败不得覆盖原账本。
 - 迁移必须可重复检测，不能重复应用同一 migration。
 - 迁移完成后必须执行完整账本校验。
+- 首次真实版本升级必须由显式的备份+迁移命令触发：先生成并校验包含 ledger/auth 的快照，再按 registry 路径迁移、校验并原子替换。服务启动或普通 API 读取不得暗中触发该流程。
 
 ## 6. 备份、恢复与导出
 

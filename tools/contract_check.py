@@ -24,6 +24,7 @@ MOCK_SERVER = ROOT / "tools" / "mock_api_server.py"
 DEV_SERVER = ROOT / "server" / "dev_server.py"
 RUST_SERVER = ROOT / "server-rs" / "src" / "main.rs"
 RUST_LOCAL_LEDGER = ROOT / "server-rs" / "src" / "local_ledger.rs"
+RUST_LEDGER_MIGRATIONS = ROOT / "server-rs" / "src" / "ledger_migrations.rs"
 RUST_MANIFEST = ROOT / "server-rs" / "Cargo.toml"
 SERVER_SMOKE = ROOT / "tools" / "server_smoke.py"
 LOCAL_LEDGER_SMOKE = ROOT / "tools" / "local_ledger_smoke.py"
@@ -364,6 +365,126 @@ def check_rust_server() -> None:
             fail(f"Rust server does not explicitly list forbidden endpoint {full_endpoint}")
 
     ok("Rust server safety checks passed")
+
+
+def check_ledger_migration_boundary() -> None:
+    if not RUST_LEDGER_MIGRATIONS.exists():
+        fail(f"Missing Rust ledger migration registry: {RUST_LEDGER_MIGRATIONS}")
+
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    local_ledger_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    migration_text = RUST_LEDGER_MIGRATIONS.read_text(encoding="utf-8")
+
+    if "mod ledger_migrations;" not in rust_text:
+        fail("Rust server must compile the ledger_migrations module")
+    if "local_ledger::validate_supported_ledger(&path)?" not in rust_text:
+        fail("--validate-ledger must use the supported-version read-only validator")
+    if "pub const LEDGER_VERSION: i64 = 1;" not in local_ledger_text:
+        fail("This slice must keep the persisted ledgerVersion at 1")
+
+    migration_snippets = [
+        "pub(crate) type MigrationApply",
+        "pub(crate) struct MigrationSpec",
+        "pub(crate) const MIGRATION_REGISTRY",
+        "pub(crate) fn validate_registry(",
+        "pub(crate) fn plan_migrations(",
+        "pub(crate) fn validate_history(",
+        "pub(crate) fn apply_migration_plan(",
+        "pub(crate) fn migrate_document(",
+        '"id": migration.id',
+        '"fromVersion": migration.from',
+        '"toVersion": migration.to',
+        '"appliedAt": applied_at',
+        "duplicate migration id",
+        "migration fork at version",
+        "migration registry gap between versions",
+    ]
+    missing = [
+        snippet for snippet in migration_snippets if snippet not in migration_text
+    ]
+    if missing:
+        fail("Rust migration registry skeleton is incomplete: " + ", ".join(missing))
+
+    empty_registry = re.search(
+        r"pub\(crate\)\s+const\s+MIGRATION_REGISTRY\s*:\s*"
+        r"&\s*\[\s*MigrationSpec\s*\]\s*=\s*&\s*\[\s*\]\s*;",
+        migration_text,
+        flags=re.DOTALL,
+    )
+    if empty_registry is None:
+        fail("Current ledgerVersion 1 slice must keep MIGRATION_REGISTRY empty")
+
+    compatibility_signature = "fn apply_v1_read_compatibility(document: &mut Value)"
+    compatibility_start = local_ledger_text.find(compatibility_signature)
+    compatibility_end = local_ledger_text.find(
+        "\n#[derive(Debug)]", compatibility_start
+    )
+    if compatibility_start < 0 or compatibility_end < 0:
+        fail("Rust local ledger must keep an explicit v1 read-compatibility function")
+    compatibility_text = local_ledger_text[compatibility_start:compatibility_end]
+
+    compatible_top_level_fields = (
+        "subscriptions",
+        "syncChanges",
+        "idempotencyState",
+    )
+    for field in compatible_top_level_fields:
+        if re.search(rf'\.entry\s*\(\s*"{field}"', compatibility_text) is None:
+            fail(f"V1 read compatibility must preserve the missing-{field} default")
+    if re.search(
+        r'\.get_mut\s*\(\s*"syncState"\s*\)', compatibility_text
+    ) is None:
+        fail("V1 read compatibility must inspect an existing syncState object")
+    if re.search(
+        r'\.entry\s*\(\s*"nextChangeSequence"', compatibility_text
+    ) is None:
+        fail("V1 read compatibility may default existing syncState.nextChangeSequence")
+
+    forbidden_sync_rebuilds = ("syncState", "cursor", "pendingChangeIds")
+    for field in forbidden_sync_rebuilds:
+        if re.search(rf'\.entry\s*\(\s*"{field}"', compatibility_text):
+            fail(
+                "V1 read compatibility must fail closed instead of rebuilding "
+                f"{field}"
+            )
+
+    if local_ledger_text.count("prepare_document_for_read(&mut document") < 2:
+        fail("Primary and recovery ledger reads must share version-aware read rules")
+    for snippet in (
+        "LedgerReadPolicy::Current",
+        "LedgerReadPolicy::SupportedForValidation",
+        "plan_migrations(MIGRATION_REGISTRY, version, LEDGER_VERSION)",
+        "1 => apply_v1_read_compatibility(document)",
+        "validate_document_for_version(document, version)",
+    ):
+        if snippet not in local_ledger_text:
+            fail(f"Rust version-aware ledger reads are missing: {snippet}")
+    read_start = local_ledger_text.find("pub fn read_document(path: &Path)")
+    read_end = local_ledger_text.find("\npub fn write_document(", read_start)
+    if read_start < 0 or read_end < 0:
+        fail("Unable to inspect the Rust local-ledger read boundary")
+    read_text = local_ledger_text[read_start:read_end]
+    if "write_document(" in read_text or "migrate_document(" in read_text:
+        fail("Ordinary ledger reads must not migrate or rewrite the on-disk document")
+    if "load_or_initialize(path)?" in local_ledger_text:
+        fail("Request-time ledger operations must not recreate a missing primary ledger")
+
+    compatibility_test_snippets = [
+        "read_document_applies_narrow_v1_compatibility_without_rewriting",
+        "read_document_fails_closed_when_required_sync_state_is_missing",
+        "read_document_rejects_invalid_or_unsupported_versions_without_rewriting",
+        "runtime_reads_and_writes_do_not_recreate_a_missing_primary_ledger",
+        "ordinary reads must not rewrite compatibility fields or migration history",
+    ]
+    missing = [
+        snippet
+        for snippet in compatibility_test_snippets
+        if snippet not in local_ledger_text
+    ]
+    if missing:
+        fail("Rust v1 compatibility regression coverage is incomplete: " + ", ".join(missing))
+
+    ok("Ledger migration registry and fail-closed v1 read compatibility passed")
 
 
 def check_subscription_due_scan(doc: dict) -> None:
@@ -1109,6 +1230,7 @@ def main() -> None:
     check_mock_server()
     check_dev_server()
     check_rust_server()
+    check_ledger_migration_boundary()
     check_server_smoke()
     check_frontend_local_server_smoke()
     check_deploy_security_defaults()
