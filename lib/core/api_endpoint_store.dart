@@ -28,11 +28,13 @@ abstract interface class ApiEndpointStore {
 
 class PlatformApiEndpointStore implements ApiEndpointStore {
   PlatformApiEndpointStore({File? file})
-    : _file = file ?? _defaultEndpointFile();
+    : _file = file ?? _defaultEndpointFile(),
+      _useFile = file != null || Platform.isWindows;
 
   static const _androidChannel = MethodChannel('finwealth.app_config');
 
   final File _file;
+  final bool _useFile;
   String? _memoryValue;
 
   @override
@@ -40,11 +42,11 @@ class PlatformApiEndpointStore implements ApiEndpointStore {
     String? raw;
     if (Platform.isAndroid) {
       raw = await _androidChannel.invokeMethod<String>('readApiBase');
-    } else if (Platform.isWindows) {
+    } else if (_useFile) {
       if (!await _file.exists()) return null;
       raw = await _file.readAsString();
     } else {
-      return _memoryValue;
+      raw = _memoryValue;
     }
     if (raw == null || raw.trim().isEmpty) return null;
     try {
@@ -66,7 +68,7 @@ class PlatformApiEndpointStore implements ApiEndpointStore {
       await _androidChannel.invokeMethod<void>('writeApiBase', {'value': raw});
       return;
     }
-    if (Platform.isWindows) {
+    if (_useFile) {
       await _file.parent.create(recursive: true);
       await _file.writeAsString(raw, flush: true);
       return;
@@ -80,7 +82,7 @@ class PlatformApiEndpointStore implements ApiEndpointStore {
       await _androidChannel.invokeMethod<void>('clearApiBase');
       return;
     }
-    if (Platform.isWindows) {
+    if (_useFile) {
       if (await _file.exists()) await _file.delete();
       return;
     }
