@@ -1,7 +1,9 @@
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs, io,
+    env, fs,
+    fs::OpenOptions,
+    io::{self, Write},
     ops::{Add, AddAssign, Neg, Sub},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -105,6 +107,10 @@ pub fn load_or_initialize(path: &Path) -> io::Result<Value> {
         return read_document(path);
     }
 
+    if let Some(document) = recover_unpublished_document(path)? {
+        return Ok(document);
+    }
+
     let document = empty_document(DEFAULT_BASE_CURRENCY);
     write_document(path, &document)?;
     Ok(document)
@@ -127,8 +133,92 @@ pub fn write_document(path: &Path, document: &Value) -> io::Result<()> {
 
     let tmp_path = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(document).map_err(invalid_data)?;
-    fs::write(&tmp_path, bytes)?;
-    fs::rename(tmp_path, path)?;
+    let result: io::Result<()> = (|| {
+        let mut temporary = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)?;
+        temporary.write_all(&bytes)?;
+        temporary.sync_all()?;
+        drop(temporary);
+
+        fs::rename(&tmp_path, path)?;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_all()?;
+        sync_parent_directory(path)?;
+        Ok(())
+    })();
+    // On failure the temp file is preserved for fail-closed startup recovery. It
+    // is never treated as authoritative while the primary ledger exists.
+    result?;
+    Ok(())
+}
+
+fn recover_unpublished_document(path: &Path) -> io::Result<Option<Value>> {
+    let tmp_path = path.with_extension("json.tmp");
+    if !tmp_path.exists() {
+        return Ok(None);
+    }
+    let metadata = fs::symlink_metadata(&tmp_path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "ledger recovery temp must be a regular non-symlink file: {}",
+                tmp_path.display()
+            ),
+        ));
+    }
+
+    let raw = fs::read_to_string(&tmp_path)?;
+    let mut document: Value = serde_json::from_str(&raw).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "primary ledger is missing and recovery temp is invalid (preserved at {}): {error}",
+                tmp_path.display()
+            ),
+        )
+    })?;
+    normalize_document_for_read(&mut document);
+    validate_document(&document).map_err(|errors| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "primary ledger is missing and recovery temp failed validation (preserved at {}): {}",
+                tmp_path.display(),
+                errors.join("; ")
+            ),
+        )
+    })?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(&tmp_path, path)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    sync_parent_directory(path)?;
+    Ok(Some(document))
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        OpenOptions::new().read(true).open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -8334,6 +8424,52 @@ mod tests {
         assert_eq!(loaded["baseCurrency"], DEFAULT_BASE_CURRENCY);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_or_initialize_recovers_valid_temp_when_primary_is_missing() {
+        let path = unique_temp_path("recover_valid_temp");
+        let tmp_path = path.with_extension("json.tmp");
+        let document = empty_document("USD");
+        if let Some(parent) = tmp_path.parent() {
+            fs::create_dir_all(parent).expect("temp parent should exist");
+        }
+        fs::write(
+            &tmp_path,
+            serde_json::to_vec_pretty(&document).expect("recovery ledger should serialize"),
+        )
+        .expect("recovery temp should write");
+
+        let recovered = load_or_initialize(&path).expect("valid recovery temp should promote");
+
+        assert_eq!(recovered["baseCurrency"], "USD");
+        assert!(path.exists());
+        assert!(!tmp_path.exists());
+        assert_eq!(
+            read_document(&path).expect("promoted ledger should read")["baseCurrency"],
+            "USD"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_or_initialize_preserves_invalid_temp_instead_of_creating_empty_ledger() {
+        let path = unique_temp_path("reject_invalid_temp");
+        let tmp_path = path.with_extension("json.tmp");
+        if let Some(parent) = tmp_path.parent() {
+            fs::create_dir_all(parent).expect("temp parent should exist");
+        }
+        fs::write(&tmp_path, b"{partial").expect("invalid recovery temp should write");
+
+        let error = load_or_initialize(&path).expect_err("invalid recovery temp must fail closed");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("recovery temp is invalid"));
+        assert!(!path.exists());
+        assert!(tmp_path.exists());
+
+        let _ = fs::remove_file(tmp_path);
     }
 
     #[test]

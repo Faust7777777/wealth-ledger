@@ -333,6 +333,10 @@ def check_rust_server() -> None:
         "idempotent_ledger_write",
         "IdempotencyKeyReused",
         "IDEMPOTENCY_MAX_RECORDS",
+        "recover_unpublished_document",
+        "temporary.sync_all()",
+        "sync_parent_directory",
+        "recovery temp is invalid",
     ]
     missing_lock_snippets = [
         snippet for snippet in ledger_lock_snippets if snippet not in local_ledger_text

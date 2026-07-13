@@ -77,5 +77,7 @@ SHA-256，且归档前后均运行无用户状态副作用的 launcher integrity
 
 ### P2：账本耐久与迁移
 
-建立显式 migration registry、临时文件 flush/fsync、遗留 `.tmp` 恢复策略和多进程文件
-锁。不要仅依赖进程内 mutex 与读取时补字段。
+本轮已完成第一步：临时文件在 rename 前 `sync_all`，提交后同步主文件，Unix 同步父目录；
+主文件缺失时仅自动提升可解析且通过完整校验的 `.tmp`，无效 `.tmp` 保留并阻止静默创建
+空账本。后续仍需显式 migration registry 和跨进程文件锁；不要仅依赖进程内 mutex 与
+读取时补字段。

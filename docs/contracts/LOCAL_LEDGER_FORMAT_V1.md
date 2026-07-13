@@ -10,14 +10,16 @@
 
 ```text
 ledger.json
-ledger.json.tmp   // 写入中临时文件；成功 rename 后可被清理
+ledger.json.tmp   // 写入中临时文件；主文件缺失时仅在完整校验通过后自动恢复
 ```
 
 规则：
 
 - `ledger.json` 是唯一真实账本文件。
 - 不存在 `accounts.csv`、`movements.csv`、`ledger.db` 等正式磁盘文件。
-- 写入流程必须是：读取现有 JSON → 内存中修改 → schema/invariant 校验 → 写入同目录 `.tmp` → 原子 rename 覆盖 `ledger.json`。
+- 写入流程必须是：读取现有 JSON → 内存中修改 → schema/invariant 校验 → 写入同目录 `.tmp` → flush/sync 文件 → 原子 rename 覆盖 `ledger.json` → sync 已提交文件（Unix 另 sync 父目录元数据）。
+- 启动时若 `ledger.json` 不存在但 `ledger.json.tmp` 存在，只在临时文件能完整解析并通过账本校验时自动提升为主文件。
+- 无效临时文件必须保留并 fail-closed，不得静默初始化空账本。主文件存在时始终以主文件为权威，临时文件不得自动覆盖它。
 - 已存在但损坏/截断的 `ledger.json` 不得被静默重建；必须返回错误，让用户先备份或人工恢复。
 - 新建账本只允许发生在目标 `ledger.json` 不存在时。
 

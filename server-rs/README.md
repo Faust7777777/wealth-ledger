@@ -3,7 +3,7 @@
 Rust/Axum server for Finwealth development and private self-use.
 
 With `--ledger-path` it is a real write-capable implementation backed by a
-validated, atomically replaced JSON ledger. It includes persistent local auth,
+validated, synced and atomically replaced JSON ledger. It includes persistent local auth,
 idempotent write handling, portfolio derivation, proposal confirmation, and a
 local sync log. Without `--ledger-path` it remains a deterministic in-memory dev
 server. It is not a multi-tenant production service: AI is not model-backed and
@@ -146,6 +146,9 @@ the JSON ledger when no `?scenario=` query is present:
 - taxonomy: categories, counterparties, counterparty merge proposal
 - portfolio read models: overview, allocation, holdings, quote summary
 - sync outbox: pull/ack plus idempotent remote log relay; no entity merge yet
+- crash-safe file boundary: temp contents are synced before rename; a valid temp
+  is promoted only when the primary is missing, while an invalid temp blocks
+  empty-ledger initialization and remains available for recovery
 
 Passing `?scenario=degraded` still uses the virtual dev dataset for frontend
 demo integration.
