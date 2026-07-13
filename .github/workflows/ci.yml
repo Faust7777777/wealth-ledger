@@ -57,6 +57,9 @@ jobs:
       - name: Run local ledger smoke
         run: python tools/local_ledger_smoke.py
 
+      - name: Run production TLS/auth/persistence topology smoke
+        run: python tools/production_topology_smoke.py
+
   flutter-windows:
     name: Flutter Windows
     runs-on: windows-latest

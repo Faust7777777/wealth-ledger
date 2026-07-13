@@ -31,6 +31,7 @@ RUST_MANIFEST = ROOT / "server-rs" / "Cargo.toml"
 RUST_SERVER_README = ROOT / "server-rs" / "README.md"
 SERVER_SMOKE = ROOT / "tools" / "server_smoke.py"
 LOCAL_LEDGER_SMOKE = ROOT / "tools" / "local_ledger_smoke.py"
+PRODUCTION_TOPOLOGY_SMOKE = ROOT / "tools" / "production_topology_smoke.py"
 FRONTEND_LOCAL_SERVER_SMOKE = ROOT / "tools" / "frontend_local_server_smoke.ps1"
 LOCAL_SERVER_SUBSCRIPTION_TEST = (
     ROOT / "test" / "local_server_subscription_integration_test.dart"
@@ -932,6 +933,31 @@ def check_server_smoke() -> None:
     ok("Server smoke script checks passed")
 
 
+def check_production_topology_smoke() -> None:
+    if not PRODUCTION_TOPOLOGY_SMOKE.exists():
+        fail(f"Missing production topology smoke: {PRODUCTION_TOPOLOGY_SMOKE}")
+    text = PRODUCTION_TOPOLOGY_SMOKE.read_text(encoding="utf-8")
+    snippets = [
+        "ssl.TLSVersion.TLSv1_2",
+        "--check-production-config",
+        "host_header_forbidden",
+        "auth_required",
+        "idempotency-replayed",
+        "/v1/subscriptions/charge-proposals/due-scan",
+        "--validate-ledger",
+        "--validate-auth-state",
+        "/v1/auth/refresh",
+        "production TLS/auth/persistence topology smoke passed",
+    ]
+    missing = [snippet for snippet in snippets if snippet not in text]
+    if missing:
+        fail("Production topology smoke missing critical coverage: " + ", ".join(missing))
+    for workflow in (CI_WORKFLOW, PACKAGE_WORKFLOW):
+        if "production_topology_smoke.py" not in workflow.read_text(encoding="utf-8"):
+            fail(f"Workflow does not run production topology smoke: {workflow}")
+    ok("Production TLS/auth/persistence topology smoke checks passed")
+
+
 def check_frontend_local_server_smoke() -> None:
     for required in (FRONTEND_LOCAL_SERVER_SMOKE, LOCAL_SERVER_SUBSCRIPTION_TEST):
         if not required.exists():
@@ -1285,16 +1311,18 @@ def check_release_packaging() -> None:
     required_workflow_snippets = [
         "finwealth-windows-self-use-x64",
         "verify-windows-source:",
+        "verify-linux-server:",
         "cargo clippy",
         "python tools/contract_check.py",
         "tools/requirements.txt",
         "python tools/local_ledger_smoke.py",
+        "python tools/production_topology_smoke.py",
         "local_backup_restore_smoke.ps1",
         "package_integrity_smoke.ps1",
         "frontend_local_server_smoke.ps1",
         "flutter analyze",
         "flutter test",
-        "needs: verify-windows-source",
+        "needs: [verify-windows-source, verify-linux-server]",
         "*-windows-self-use-x64.zip.sha256",
         "include_android_readonly_preview",
         "AndroidReadOnlyPreview",
@@ -1545,6 +1573,7 @@ def main() -> None:
     check_ledger_migration_boundary()
     check_ledger_lease_boundary()
     check_server_smoke()
+    check_production_topology_smoke()
     check_frontend_local_server_smoke()
     check_deploy_security_defaults()
     check_release_packaging()

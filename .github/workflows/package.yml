@@ -80,6 +80,10 @@ jobs:
         shell: pwsh
         run: python tools/local_ledger_smoke.py
 
+      - name: Run production TLS/auth/persistence topology smoke
+        shell: pwsh
+        run: python tools/production_topology_smoke.py
+
       - name: Run local Windows backup and restore smoke
         shell: pwsh
         run: ./tools/local_backup_restore_smoke.ps1
@@ -109,9 +113,35 @@ jobs:
         shell: pwsh
         run: ./tools/package_remote_windows.ps1 -CheckReadinessOnly
 
+  verify-linux-server:
+    name: Verify Linux VPS topology
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server-rs
+
+      - name: Install Python tooling dependencies
+        run: python -m pip install --disable-pip-version-check -r tools/requirements.txt
+
+      - name: Check Linux deployment scripts
+        run: bash -n tools/install_vps_systemd.sh tools/check_vps_readiness.sh tools/backup_vps_ledger.sh tools/restore_vps_ledger.sh tools/vps_backup_restore_smoke.sh
+
+      - name: Run VPS backup and restore smoke
+        run: bash tools/vps_backup_restore_smoke.sh
+
+      - name: Run production TLS/auth/persistence topology smoke
+        run: python tools/production_topology_smoke.py
+
   package-windows:
     name: Package Windows
-    needs: verify-windows-source
+    needs: [verify-windows-source, verify-linux-server]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -148,7 +178,7 @@ jobs:
 
   package-android:
     name: Package Android read-only preview
-    needs: verify-windows-source
+    needs: [verify-windows-source, verify-linux-server]
     if: ${{ inputs.include_android_readonly_preview }}
     runs-on: ubuntu-latest
     steps:
@@ -184,7 +214,7 @@ jobs:
 
   package-windows-remote:
     name: Package Windows server client
-    needs: verify-windows-source
+    needs: [verify-windows-source, verify-linux-server]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -215,7 +245,7 @@ jobs:
 
   package-android-remote:
     name: Package Android server client
-    needs: verify-windows-source
+    needs: [verify-windows-source, verify-linux-server]
     if: ${{ inputs.include_android_server_client }}
     runs-on: ubuntu-latest
     steps:
