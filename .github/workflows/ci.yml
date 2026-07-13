@@ -90,6 +90,10 @@ jobs:
           }
           if ($failed) { exit 1 }
 
+      - name: Run local Windows backup and restore smoke
+        shell: pwsh
+        run: ./tools/local_backup_restore_smoke.ps1
+
       - name: Analyze Flutter
         run: flutter analyze
 

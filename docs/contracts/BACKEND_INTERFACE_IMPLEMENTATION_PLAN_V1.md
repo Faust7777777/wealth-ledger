@@ -1,14 +1,16 @@
 # BACKEND_INTERFACE_IMPLEMENTATION_PLAN_V1
 
-状态：接口线执行计划。  
+状态：历史执行基线；当前能力以 README、OpenAPI、测试和后续 handoff/review 为准。
 用途：在 Claude 前端返工期间，Codex 继续推进后端/接口方向时使用。  
 边界：不接手 Flutter UI，不改前端页面，不实现真实交易/转账能力。
 
-> 2026-07-11 状态注记：本文后续“当前状态”段落保留最初的执行基线，
-> 不应再被当作运行时能力清单。当前 OpenAPI 为 58 paths / 101 schemas；
+> 2026-07-13 状态注记：本文后续“当前状态”段落保留最初的执行基线，
+> 不应再被当作运行时能力清单。本文当时记录的 OpenAPI 为 58 paths / 101 schemas；
 > `tools/mock_api_server.py` 仍是只读 mock，`server/dev_server.py` 仍是
 > 非持久化 skeleton，而 `server-rs/` 在 `--ledger-path` 模式下已经是真实
-> 可写的自用 JSON 账本实现（含本地认证、幂等写、同步日志、备份校验）。
+> 可写的自用 JSON 账本实现（含本地认证、幂等写、同步日志、订阅管理、
+> Windows/VPS 校验备份恢复）。当前实际 OpenAPI 为 63 paths / 108 schemas，
+> Rust 回归测试为 76 项；上句旧计数只用于说明历史漂移。
 > 仍属 skeleton/integration boundary 的是模型 AI、完整远端多设备同步及
 > 任何真实交易/转账能力。
 

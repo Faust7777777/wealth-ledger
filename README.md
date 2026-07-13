@@ -178,10 +178,29 @@ Back up the local JSON ledger and auth device state:
 powershell -ExecutionPolicy Bypass -File tools\backup_local_ledger.ps1
 ```
 
+The Windows backup is published as a verified directory only after staged
+copies of both ledger and auth state pass Rust validation. It includes
+`manifest.txt` and `SHA256SUMS`; close the self-use app first so the two files
+represent one quiet point in time. The script refuses to publish if either source
+changes during the copy. `-SkipValidate` is for emergency copies and is recorded
+in the manifest.
+
 Restore from a backup directory:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\restore_local_ledger.ps1 -BackupPath backups\<timestamp>
+```
+
+Restore verifies the manifest, checksums, ledger, and auth state before replacing
+live files. A verified backup that excludes auth removes the current auth file,
+preventing a mixed ledger/credential snapshot. The current files are backed up
+first and restored automatically if replacement or post-write validation fails.
+Direct JSON restores require the explicit `-AllowUnverified` emergency flag.
+
+Run the destructive-path regression smoke entirely inside a temporary directory:
+
+```powershell
+pwsh -NoProfile -File tools\local_backup_restore_smoke.ps1
 ```
 
 Manual two-terminal flow:

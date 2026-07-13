@@ -51,6 +51,17 @@ Back up both `ledger.json` and `ledger.auth.json` before moving machines or
 resetting Windows. The repository's `backup_local_ledger.ps1` remains the
 validated developer-side backup tool.
 
+Close the launcher before backup or restore. The backup tool stages both files,
+validates them with the Rust server, writes `manifest.txt` plus `SHA256SUMS`, and
+only then publishes the backup directory; it aborts if either source changes
+during the copy. Restore requires those integrity files
+by default, validates staged replacements, creates a pre-restore backup, and
+rolls both ledger and auth state back if replacement fails. If a verified backup
+states `includesAuth=false`, restore removes any current auth file instead of
+silently combining old credentials with the restored ledger. A direct JSON file
+has no integrity manifest and requires the explicit `-AllowUnverified` emergency
+flag.
+
 ## Integrity metadata
 
 `package-manifest.json` records the package mode, API base, bundled server path,

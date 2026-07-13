@@ -30,6 +30,9 @@ SYSTEMD_SERVICE = ROOT / "deploy" / "systemd" / "finwealth-server.service"
 VPS_BACKUP = ROOT / "tools" / "backup_vps_ledger.sh"
 VPS_RESTORE = ROOT / "tools" / "restore_vps_ledger.sh"
 VPS_BACKUP_RESTORE_SMOKE = ROOT / "tools" / "vps_backup_restore_smoke.sh"
+LOCAL_BACKUP = ROOT / "tools" / "backup_local_ledger.ps1"
+LOCAL_RESTORE = ROOT / "tools" / "restore_local_ledger.ps1"
+LOCAL_BACKUP_RESTORE_SMOKE = ROOT / "tools" / "local_backup_restore_smoke.ps1"
 PACKAGE_SCRIPT = ROOT / "tools" / "package_release.ps1"
 WINDOWS_LAUNCHER = ROOT / "tools" / "windows_self_use_launcher.ps1"
 WINDOWS_LAUNCHER_CMD = ROOT / "tools" / "windows_self_use_launcher.cmd"
@@ -374,6 +377,9 @@ def check_deploy_security_defaults() -> None:
         VPS_BACKUP,
         VPS_RESTORE,
         VPS_BACKUP_RESTORE_SMOKE,
+        LOCAL_BACKUP,
+        LOCAL_RESTORE,
+        LOCAL_BACKUP_RESTORE_SMOKE,
     ):
         if not required.exists():
             fail(f"Missing deploy safety artifact: {required}")
@@ -426,6 +432,63 @@ def check_deploy_security_defaults() -> None:
     missing = [snippet for snippet in restore_snippets if snippet not in restore_text]
     if missing:
         fail("VPS restore script missing consistency safeguards: " + ", ".join(missing))
+
+    local_backup_text = LOCAL_BACKUP.read_text(encoding="utf-8")
+    local_backup_snippets = [
+        "Assert-RegularFile",
+        "ReparsePoint",
+        "--validate-ledger",
+        "--validate-auth-state",
+        "SHA256SUMS",
+        ".staging",
+        "changed while the backup was being copied",
+        "Move-Item -LiteralPath $staging -Destination $target",
+    ]
+    missing = [
+        snippet for snippet in local_backup_snippets if snippet not in local_backup_text
+    ]
+    if missing:
+        fail(
+            "Local Windows backup script missing consistency safeguards: "
+            + ", ".join(missing)
+        )
+
+    local_restore_text = LOCAL_RESTORE.read_text(encoding="utf-8")
+    local_restore_snippets = [
+        "Read-ManifestValue",
+        "AllowUnverified",
+        "expectedLedgerHash",
+        "authAction",
+        "Install-StagedFile",
+        "File]::Replace",
+        "rolling back current state",
+        "pre-restore",
+    ]
+    missing = [
+        snippet for snippet in local_restore_snippets if snippet not in local_restore_text
+    ]
+    if missing:
+        fail(
+            "Local Windows restore script missing consistency safeguards: "
+            + ", ".join(missing)
+        )
+
+    local_smoke_text = LOCAL_BACKUP_RESTORE_SMOKE.read_text(encoding="utf-8")
+    local_smoke_snippets = [
+        "checksum mismatch",
+        "includesAuth=false",
+        "FINWEALTH_TEST_FAIL_AFTER_LEDGER_REPLACE",
+        "did not roll back ledger",
+        "direct ledger restore unexpectedly bypassed",
+    ]
+    missing = [
+        snippet for snippet in local_smoke_snippets if snippet not in local_smoke_text
+    ]
+    if missing:
+        fail(
+            "Local Windows backup/restore smoke missing regression coverage: "
+            + ", ".join(missing)
+        )
 
     ok("Deploy security defaults passed")
 
