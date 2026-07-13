@@ -159,6 +159,8 @@ AI pending 读取层把 standalone pending movements 按 `atomicGroupId` 分组�
 - 写入前完成金额、币种、账户引用、分录方向、AI validation 等校验。
 - decimal string 必须使用统一校验口径；当前最多允许 8 位小数。
 - 已确认记录更正必须生成 correction movement，不静默覆盖原记录。
+- 多腿更正必须在一个 correction movement 内包含全部原分录的反向腿和完整 replacement 腿；确认时作为单个 atomic group 应用，不允许部分确认。
+- 同一 confirmed movement 同时最多有一个 pending correction；账本效果未变化的 replacement 不得落盘。
 - AI approve 必须消费服务端 `ledgerWrite` / `confirmedMovementIds`，前端不得自行猜测“已入账”。
 - 写入后如影响净值/持仓/快照，必须返回或标记 `snapshotInvalidated`。
 

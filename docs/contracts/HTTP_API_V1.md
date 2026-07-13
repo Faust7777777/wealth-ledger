@@ -201,6 +201,9 @@ POST  /v1/movements/corrections
 - draft / pending review 不影响正式余额。
 - `atomicGroupId` 是最小确认单位。
 - confirmed movement 的修改优先走 correction。
+- correction 兼容单分录 `proposedDiffs`，也可提交完整 `replacementEntries` 更正多腿交易。
+- 多腿更正会在同一个 pending correction movement 中逐腿反向原分录并写入完整替换分录；确认前不影响余额，确认时整组原子应用，原 confirmed movement 永不改写。
+- `replacementEntries` 是完整目标状态而非局部 patch；无账本效果变化的 replacement 返回 400，同一原记录已有 pending correction 时返回 409。
 
 ## 7. DCA
 

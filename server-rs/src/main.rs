@@ -8430,6 +8430,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ledger_multileg_correction_replaces_transfer_effect_atomically() {
+        let path = unique_test_ledger_path("multileg_correction");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        async fn create_account_with_balance(router: Router, name: &str, amount: &str) -> String {
+            let (status, body) = request_json_body_from(
+                router,
+                Method::POST,
+                "/v1/accounts",
+                json!({
+                    "displayName": name,
+                    "accountType": "bank",
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": "cash_balance",
+                    "openingBalances": [{"currency": "CNY", "amount": amount}]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            body["data"]["id"].as_str().expect("account id").to_string()
+        }
+
+        let source_id = create_account_with_balance(router.clone(), "转出账户", "100.00").await;
+        let destination_id = create_account_with_balance(router.clone(), "转入账户", "0.00").await;
+        let (draft_status, draft_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            json!({
+                "type": "transfer",
+                "occurredAt": "2026-07-13T12:00:00+08:00",
+                "title": "账户调拨",
+                "entries": [
+                    {
+                        "accountId": source_id,
+                        "amount": "40.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source"
+                    },
+                    {
+                        "accountId": destination_id,
+                        "amount": "40.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination"
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(draft_status, StatusCode::CREATED, "{draft_body}");
+        let original_movement_id = draft_body["data"]["id"]
+            .as_str()
+            .expect("movement id")
+            .to_string();
+        let original_group_id = draft_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("group id")
+            .to_string();
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{original_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+
+        let (noop_status, noop_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": original_movement_id,
+                "reason": "没有实际变化",
+                "replacementEntries": [
+                    {
+                        "accountId": source_id,
+                        "amount": "40.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source"
+                    },
+                    {
+                        "accountId": destination_id,
+                        "amount": "40.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination"
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(noop_status, StatusCode::BAD_REQUEST, "{noop_body}");
+        assert_eq!(noop_body["error"]["code"], "invalid_correction_input");
+
+        let (correction_status, correction_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": original_movement_id,
+                "reason": "实际只转了 25 元",
+                "replacementEntries": [
+                    {
+                        "accountId": source_id,
+                        "amount": "25.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source"
+                    },
+                    {
+                        "accountId": destination_id,
+                        "amount": "25.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination"
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(correction_status, StatusCode::OK, "{correction_body}");
+        assert_eq!(correction_body["data"]["operation"], "correction");
+        assert_eq!(
+            correction_body["data"]["proposedMovements"][0]["entries"]
+                .as_array()
+                .expect("correction entries")
+                .len(),
+            4
+        );
+
+        let (duplicate_status, duplicate_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": original_movement_id,
+                "reason": "重复候选",
+                "replacementEntries": [
+                    {
+                        "accountId": source_id,
+                        "amount": "20.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source"
+                    },
+                    {
+                        "accountId": destination_id,
+                        "amount": "20.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination"
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate_body}");
+        assert_eq!(duplicate_body["error"]["code"], "local_ledger_conflict");
+
+        for (account_id, expected) in [(&source_id, "60.00"), (&destination_id, "40.00")] {
+            let (status, body) = request_json_from(
+                router.clone(),
+                Method::GET,
+                &format!("/v1/accounts/{account_id}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["data"]["value"]["amount"], expected);
+        }
+
+        let correction_group_id = correction_body["data"]["id"]
+            .as_str()
+            .expect("correction group id");
+        let (confirm_correction_status, confirm_correction_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{correction_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_correction_status,
+            StatusCode::OK,
+            "{confirm_correction_body}"
+        );
+
+        for (account_id, expected) in [(&source_id, "75.00"), (&destination_id, "25.00")] {
+            let (status, body) = request_json_from(
+                router.clone(),
+                Method::GET,
+                &format!("/v1/accounts/{account_id}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["data"]["value"]["amount"], expected);
+        }
+
+        let (original_status, original_body) = request_json_from(
+            router,
+            Method::GET,
+            &format!("/v1/movements/{original_movement_id}"),
+        )
+        .await;
+        assert_eq!(original_status, StatusCode::OK, "{original_body}");
+        assert_eq!(
+            original_body["data"]["entries"]
+                .as_array()
+                .expect("original entries")
+                .len(),
+            2
+        );
+        assert_eq!(original_body["data"]["entries"][0]["amount"], "40.00");
+        assert_eq!(original_body["data"]["entries"][1]["amount"], "40.00");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_manual_snapshot_persists_current_net_worth() {
         let path = unique_test_ledger_path("manual_snapshot");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");

@@ -116,6 +116,7 @@ AiAtomicGroupStatus =
 - `create`：创建新账户、记录、分类、对手方等候选。
 - `modify`：修改未确认或允许直接编辑的对象，必须展示 diff。
 - `correction`：对 confirmed 记录生成反向/更正事件，优先于原地改写。
+- 多腿 correction 必须整组包含原分录反向腿与完整替换腿，不允许只更正其中一腿或拆分审批。
 - `merge`：用于对手方归并，例如“瑞幸”与“瑞幸咖啡”。
 - `classify`：用于分类/标签建议。
 - subscription 扣费候选的 group 必须携带 `subscriptionId` 与 `scheduledChargeDate`，便于调用方定位计划和计费期。

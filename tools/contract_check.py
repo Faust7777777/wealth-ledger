@@ -845,6 +845,62 @@ def check_subscription_due_scan(doc: dict) -> None:
     ok("Subscription due-scan contract and implementation checks passed")
 
 
+def check_multileg_correction(doc: dict) -> None:
+    schemas = doc["components"]["schemas"]
+    correction = schemas.get("CreateCorrectionInput", {})
+    alternatives = {
+        tuple(option.get("required", []))
+        for option in correction.get("anyOf", [])
+        if isinstance(option, dict)
+    }
+    if alternatives != {("proposedDiffs",), ("replacementEntries",)}:
+        fail("CreateCorrectionInput must require proposedDiffs or replacementEntries")
+    replacement = correction.get("properties", {}).get("replacementEntries", {})
+    if replacement.get("minItems") != 1:
+        fail("replacementEntries must be documented as non-empty")
+    if replacement.get("items", {}).get("$ref") != "#/components/schemas/MovementEntryInput":
+        fail("replacementEntries must use MovementEntryInput")
+    entry_input = schemas.get("MovementEntryInput", {})
+    if set(entry_input.get("required", [])) != {
+        "accountId",
+        "amount",
+        "currency",
+        "direction",
+        "role",
+    }:
+        fail("MovementEntryInput must require the five ledger entry fields")
+    if "id" in entry_input.get("properties", {}):
+        fail("MovementEntryInput must not accept a persisted entry id")
+
+    local_ledger_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    required_implementation = [
+        "correction_entries_for_replacement(",
+        "movement_entry_effects(",
+        "pending_correction_exists(",
+        '"replacementEntries must change the target movement ledger effect"',
+        '"target movement already has a pending correction',
+        '"entry_{movement_id}_reversal_{index}"',
+    ]
+    missing = [item for item in required_implementation if item not in local_ledger_text]
+    if missing:
+        fail("Rust multi-leg correction implementation is incomplete: " + ", ".join(missing))
+
+    smoke_text = LOCAL_LEDGER_SMOKE.read_text(encoding="utf-8")
+    required_smoke = [
+        "def create_and_confirm_multileg_correction(",
+        '"replacementEntries": [',
+        "create_and_confirm_multileg_correction(base, cash[\"id\"], reserve[\"id\"])",
+    ]
+    missing = [item for item in required_smoke if item not in smoke_text]
+    if missing:
+        fail("Real-local smoke must exercise multi-leg correction: " + ", ".join(missing))
+
+    http_text = HTTP_MD.read_text(encoding="utf-8")
+    if "完整 `replacementEntries` 更正多腿交易" not in http_text:
+        fail("HTTP contract must document complete multi-leg replacement correction")
+    ok("Multi-leg correction contract and implementation checks passed")
+
+
 def check_server_smoke() -> None:
     if not SERVER_SMOKE.exists():
         fail(f"Missing server smoke script: {SERVER_SMOKE}")
@@ -1377,6 +1433,7 @@ def main() -> None:
     ok("Critical AI/DCA invariants are represented")
 
     check_subscription_due_scan(doc)
+    check_multileg_correction(doc)
     check_examples()
     check_mock_server()
     check_dev_server()

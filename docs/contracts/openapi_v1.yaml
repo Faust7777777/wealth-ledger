@@ -403,6 +403,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AiAtomicGroupResponse"
+        "400":
+          description: Invalid or no-op correction input.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The target already has a pending correction.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
 
   /atomic-groups/{atomicGroupId}/confirm:
     post:
@@ -1860,6 +1872,22 @@ components:
           enum: [in, out]
         role:
           enum: [source, destination, fee, discount, pnl, tax, adjustment]
+    MovementEntryInput:
+      type: object
+      required: [accountId, amount, currency, direction, role]
+      properties:
+        accountId:
+          $ref: "#/components/schemas/ID"
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        amount:
+          $ref: "#/components/schemas/DecimalString"
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+        direction:
+          enum: [in, out]
+        role:
+          enum: [source, destination, fee, discount, pnl, tax, adjustment]
     TransactionAmountBreakdown:
       type: object
       required: [paidAmount]
@@ -1962,7 +1990,7 @@ components:
         entries:
           type: array
           items:
-            $ref: "#/components/schemas/MovementEntry"
+            $ref: "#/components/schemas/MovementEntryInput"
         categoryId:
           $ref: "#/components/schemas/ID"
         counterpartyId:
@@ -2028,6 +2056,15 @@ components:
     CreateCorrectionInput:
       type: object
       required: [targetMovementId, reason]
+      description: >-
+        Provide proposedDiffs for the legacy single-entry amount adjustment, or
+        replacementEntries for a complete multi-leg replacement. The server
+        creates one correction movement containing reversals of every original
+        entry followed by the complete replacement entries. The original
+        confirmed movement is never modified.
+      anyOf:
+        - required: [proposedDiffs]
+        - required: [replacementEntries]
       properties:
         targetMovementId:
           $ref: "#/components/schemas/ID"
@@ -2035,8 +2072,15 @@ components:
           type: string
         proposedDiffs:
           type: array
+          minItems: 1
           items:
             $ref: "#/components/schemas/AiFieldDiff"
+        replacementEntries:
+          type: array
+          minItems: 1
+          description: Complete desired entries, not a partial patch.
+          items:
+            $ref: "#/components/schemas/MovementEntryInput"
 
     DcaPlan:
       type: object
