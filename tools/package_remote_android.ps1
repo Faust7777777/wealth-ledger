@@ -68,6 +68,35 @@ $source = Join-Path $Root "build\app\outputs\flutter-apk\app-debug.apk"
 if (!(Test-Path -LiteralPath $source -PathType Leaf)) {
   throw "Android debug APK was not produced."
 }
+$apkAnalyzer = Get-Command apkanalyzer -ErrorAction SilentlyContinue
+$apkAnalyzerPath = if ($apkAnalyzer) { $apkAnalyzer.Source } else { $null }
+if (!$apkAnalyzerPath) {
+  $sdkRoot = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { $env:ANDROID_SDK_ROOT }
+  $candidate = if (!$sdkRoot) {
+    $null
+  } elseif ($IsWindows) {
+    Join-Path $sdkRoot "cmdline-tools\latest\bin\apkanalyzer.bat"
+  } else {
+    Join-Path $sdkRoot "cmdline-tools/latest/bin/apkanalyzer"
+  }
+  if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+    $apkAnalyzerPath = $candidate
+  }
+}
+if (!$apkAnalyzerPath) {
+  throw "apkanalyzer not found; packaged Android network policy cannot be verified."
+}
+$permissions = (& $apkAnalyzerPath manifest permissions $source) -join "`n"
+$compiledManifest = (& $apkAnalyzerPath manifest print $source) -join "`n"
+if ($LASTEXITCODE -ne 0 -or $permissions -notmatch "android.permission.INTERNET") {
+  throw "Packaged Android client is missing INTERNET permission."
+}
+if (
+  $compiledManifest -notmatch 'android:usesCleartextTraffic="false"' -or
+  $compiledManifest -notmatch 'android:allowBackup="false"'
+) {
+  throw "Packaged Android client does not enforce the reviewed network/backup policy."
+}
 $target = Join-Path $dist "finwealth-$versionLine-$stamp-android-server-client-debug.apk"
 Copy-Item -LiteralPath $source -Destination $target
 $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToLowerInvariant()
@@ -83,6 +112,7 @@ $manifest = [ordered]@{
   apiBase = $ApiBase
   platform = "android"
   signing = "debug-self-use"
+  networkPolicyVerified = $true
   apk = (Split-Path -Leaf $target)
   apkSha256 = $sha
 } | ConvertTo-Json -Compress

@@ -1246,6 +1246,8 @@ def check_release_packaging() -> None:
         "endpointMode",
         "remote_server_setup_test.dart",
         "debug-self-use",
+        "apkanalyzer",
+        "networkPolicyVerified",
         "apkSha256",
         "manifest.json",
     ]
