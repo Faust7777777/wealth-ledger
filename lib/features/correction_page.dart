@@ -99,8 +99,7 @@ class _CorrectionPageState extends ConsumerState<CorrectionPage> {
               return const EmptyState(
                 icon: Icons.lock_outline,
                 title: '当前记录暂不支持更正',
-                message:
-                    'MVP 只支持 confirmed / in_transit 的单分录金额更正。转账、多腿交易和 correction 本身需要更完整的 diff。',
+                message: '仅支持已确认或在途的单分录金额更正。',
               );
             }
             final oldAmount = entry.amount;

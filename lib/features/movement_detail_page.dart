@@ -153,29 +153,22 @@ class MovementDetailPage extends ConsumerWidget {
                     ),
                   ),
                 ],
-                const SizedBox(height: AppSpacing.lg),
-                // 更正=生成候选：还需服务端 canPersistPendingProposal 能力。
-                OutlinedButton(
-                  onPressed:
-                      canCorrect &&
-                          ref.writeCapabilities.canPersistPendingProposal
-                      ? () => context.push('/movement/${m.id}/correction')
-                      : null,
-                  child: const Text('发起更正'),
-                ),
-                if (!canCorrect)
-                  Padding(
-                    padding: const EdgeInsets.only(top: AppSpacing.xs),
-                    child: Text(
-                      'MVP 只支持单分录金额更正；多腿交易更正后续做。',
-                      style: AppType.caption,
-                    ),
-                  )
-                else if (!ref.writeCapabilities.canPersistPendingProposal)
-                  Padding(
-                    padding: const EdgeInsets.only(top: AppSpacing.xs),
-                    child: Text(kReadOnlyHint, style: AppType.caption),
+                // 更正=生成候选：不适用的记录（多腿/更正本身）直接隐藏动作；
+                // capability 缺失时保留禁用态 + 简短恢复提示。
+                if (canCorrect) ...[
+                  const SizedBox(height: AppSpacing.lg),
+                  OutlinedButton(
+                    onPressed: ref.writeCapabilities.canPersistPendingProposal
+                        ? () => context.push('/movement/${m.id}/correction')
+                        : null,
+                    child: const Text('发起更正'),
                   ),
+                  if (!ref.writeCapabilities.canPersistPendingProposal)
+                    Padding(
+                      padding: const EdgeInsets.only(top: AppSpacing.xs),
+                      child: Text(kReadOnlyHint, style: AppType.caption),
+                    ),
+                ],
               ],
             );
           },

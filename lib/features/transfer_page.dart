@@ -225,8 +225,6 @@ class _TransferPageState extends ConsumerState<TransferPage> {
                   onPressed: _canSave ? () => _save(accounts) : null,
                   child: Text(_busy ? '转账中…' : '转账'),
                 ),
-                const SizedBox(height: AppSpacing.sm),
-                Text('同额同币种转账；暂不支持跨币种折算。不下单、不连银行。', style: AppType.caption),
               ],
             );
           },

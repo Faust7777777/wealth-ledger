@@ -217,9 +217,7 @@ class _ReminderTileState extends ConsumerState<_ReminderTile> {
     await ref.read(dcaRepositoryProvider).markExecutedAsProposal(r.id);
     _refresh();
     ref.invalidate(aiPendingProvider);
-    messenger.showSnackBar(
-      const SnackBar(content: Text('已生成待确认记录（不下单 / 不转账）；见 AI 待确认')),
-    );
+    messenger.showSnackBar(const SnackBar(content: Text('已生成待确认记录，见 AI 待确认')));
   });
 
   Future<void> _skip() => _run(() async {

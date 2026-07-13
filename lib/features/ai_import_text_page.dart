@@ -52,11 +52,6 @@ class _AiImportTextPageState extends ConsumerState<AiImportTextPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text(
-              'AI 只根据你输入的文本生成候选记录；不连接券商、不下单、不转账，需你逐条确认后才入账。',
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
-            const SizedBox(height: AppSpacing.base),
             TextField(
               controller: _controller,
               maxLines: 6,
