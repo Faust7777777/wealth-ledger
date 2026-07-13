@@ -10,6 +10,7 @@ import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
+import 'subscription_form_validation.dart';
 import 'subscription_visuals.dart';
 
 const List<String> _currencies = ['CNY', 'USD', 'HKD', 'USDT', 'BTC', 'ETH'];
@@ -353,39 +354,29 @@ class _SubscriptionFormPageState extends ConsumerState<SubscriptionFormPage> {
   bool _accountSupports(AccountVm a, String currency) =>
       a.defaultCurrency == currency || a.cashBalances.containsKey(currency);
 
-  /// 客户端可用性校验：返回首个错误文案，全部通过返回 null。
+  /// 客户端可用性校验：返回首个错误文案，全部通过返回 null。校验逻辑见
+  /// [subscription_form_validation]（纯函数、可单测）。
   String? _validate(AccountVm? account) {
     if (_displayName.text.trim().isEmpty) return '请填写名称';
     if (_provider.text.trim().isEmpty) return '请填写服务商';
-    final amountErr = _amountError(_amount.text.trim());
+    final amountErr = amountError(_amount.text.trim());
     if (amountErr != null) return amountErr;
     if (_paymentAccountId == null) return '请选择付款账户';
     if (account != null && !_accountSupports(account, _currency)) {
       return '付款账户不支持 $_currency，请改用支持该币种的账户（不自动换汇）';
     }
-    final interval = int.tryParse(_billingInterval.text.trim());
-    if (interval == null || interval < 1) return '计费周期必须为正整数';
-    final reminder = int.tryParse(_reminderDays.text.trim());
-    if (reminder == null || reminder < 0) return '提前提醒天数必须为非负整数';
+    final intervalErr = positiveIntError(_billingInterval.text, '计费周期');
+    if (intervalErr != null) return intervalErr;
+    final reminderErr = nonNegativeIntError(_reminderDays.text, '提前提醒天数');
+    if (reminderErr != null) return reminderErr;
     if (_termMode == _TermMode.duration) {
-      final count = int.tryParse(_durationCount.text.trim());
-      if (count == null || count < 1) return '持续时长必须为正整数';
+      final countErr = positiveIntError(_durationCount.text, '持续时长');
+      if (countErr != null) return countErr;
     }
     if (_termMode == _TermMode.endDate) {
-      if (_endDate == null) return '请选择结束日期';
-      if (_endDate!.compareTo(_startDate) <= 0) return '结束日期须晚于开始日期';
+      final endErr = endDateAfterStartError(_endDate, _startDate);
+      if (endErr != null) return endErr;
     }
-    return null;
-  }
-
-  /// 金额：正数、最多 8 位小数（纯字符串校验，不经 double）。
-  String? _amountError(String raw) {
-    if (raw.isEmpty) return '请填写金额';
-    if (!RegExp(r'^\d+(\.\d+)?$').hasMatch(raw)) return '金额格式不正确';
-    final dot = raw.indexOf('.');
-    if (dot >= 0 && raw.length - dot - 1 > 8) return '金额最多 8 位小数';
-    // 正数：去掉所有 0 和小数点后仍有数字即 > 0。
-    if (raw.replaceAll(RegExp(r'[0.]'), '').isEmpty) return '金额必须大于 0';
     return null;
   }
 

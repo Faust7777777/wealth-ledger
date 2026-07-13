@@ -10,6 +10,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:finwealth/app/app.dart';
 import 'package:finwealth/core/env.dart';
+import 'package:finwealth/core/types.dart';
 import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/view_models.dart';
 import 'package:finwealth/features/accounts_page.dart';
@@ -17,6 +18,8 @@ import 'package:finwealth/features/ai_review_page.dart';
 import 'package:finwealth/features/investment_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/overview_page.dart';
+import 'package:finwealth/features/subscription_detail_page.dart';
+import 'package:finwealth/features/subscriptions_page.dart';
 import 'package:finwealth/theme/app_theme.dart';
 
 Future<void> _loadFonts() async {
@@ -285,6 +288,126 @@ void main() {
     await expectLater(
       find.byType(ManualRecordPage),
       matchesGoldenFile('goldens/form_light.png'),
+    );
+  });
+
+  // —— 订阅管理预览 ——
+  const gptSub = SubscriptionVm(
+    id: 'sub_gpt',
+    displayName: 'ChatGPT Plus',
+    provider: 'OpenAI',
+    planName: 'Plus',
+    amount: Money(amount: '20.00', currency: 'USD'),
+    paymentAccountId: 'a1',
+    billingCycle: SubscriptionBillingCycleVm(
+      unit: BillingUnit.month,
+      interval: 1,
+    ),
+    billingAnchorDay: 5,
+    startDate: '2026-01-05',
+    nextChargeDate: '2026-08-05',
+    autoRenew: true,
+    reminderDaysBefore: 3,
+    status: SubscriptionStatus.active,
+  );
+  const claudeSub = SubscriptionVm(
+    id: 'sub_claude',
+    displayName: 'Claude Pro',
+    provider: 'Anthropic',
+    planName: 'Pro',
+    amount: Money(amount: '20.00', currency: 'USD'),
+    paymentAccountId: 'a1',
+    billingCycle: SubscriptionBillingCycleVm(
+      unit: BillingUnit.month,
+      interval: 1,
+    ),
+    billingAnchorDay: 12,
+    startDate: '2026-03-12',
+    nextChargeDate: '2026-07-12',
+    autoRenew: true,
+    reminderDaysBefore: 3,
+    status: SubscriptionStatus.active,
+    pendingChargeMovementId: 'mov_pending',
+    pendingChargeDate: '2026-07-12',
+  );
+  const subAccount = AccountVm(
+    id: 'a1',
+    displayName: '美股券商',
+    accountType: AccountType.brokerage,
+    isLiability: false,
+    defaultCurrency: 'USD',
+  );
+
+  Widget subsHost(ThemeData theme, Widget page) => ProviderScope(
+    overrides: [
+      capabilitiesProvider.overrideWith(
+        (ref) async => const LedgerCapabilitiesVm(
+          dataSourceMode: 'local_server',
+          canWriteConfirmedLedger: true,
+          canCreateAccount: true,
+          canRecordMovement: true,
+          canConfirmProposal: true,
+          canPersistPendingProposal: true,
+          proposalPersistence: 'file',
+          canManageSubscriptions: true,
+        ),
+      ),
+      accountsProvider.overrideWith((ref) async => const [subAccount]),
+      subscriptionsProvider.overrideWith(
+        (ref) async => const [gptSub, claudeSub],
+      ),
+      upcomingSubscriptionsProvider.overrideWith(
+        (ref) async => const [claudeSub],
+      ),
+      subscriptionByIdProvider(
+        'sub_claude',
+      ).overrideWith((ref) async => claudeSub),
+    ],
+    child: MaterialApp(theme: theme, home: page),
+  );
+
+  testWidgets('subscriptions list · dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 900));
+    await tester.pumpWidget(
+      subsHost(buildDarkTheme(), const SubscriptionsPage()),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(SubscriptionsPage),
+      matchesGoldenFile('goldens/subscriptions_dark.png'),
+    );
+  });
+
+  testWidgets('subscriptions list · light', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 900));
+    await tester.pumpWidget(
+      subsHost(buildLightTheme(), const SubscriptionsPage()),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(SubscriptionsPage),
+      matchesGoldenFile('goldens/subscriptions_light.png'),
+    );
+  });
+
+  testWidgets('subscription detail · dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 1000));
+    await tester.pumpWidget(
+      subsHost(
+        buildDarkTheme(),
+        const SubscriptionDetailPage(subscriptionId: 'sub_claude'),
+      ),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(SubscriptionDetailPage),
+      matchesGoldenFile('goldens/subscription_detail_dark.png'),
     );
   });
 }
