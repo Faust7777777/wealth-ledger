@@ -12,17 +12,32 @@
 ledger.json
 ledger.json.tmp   // 写入中临时文件；主文件缺失时仅在完整校验通过后自动恢复
 ledger.auth.json  // 可选；设备与 token 哈希状态，不属于业务账本
+ledger.json.lock  // 永久 sidecar；服务进程持有 OS 文件锁，文件本身不删除
 ```
 
 规则：
 
 - `ledger.json` 是唯一真实业务账本文件；`ledger.auth.json` 仅保存本地认证状态，不包含明文 token，也不得混入账本 JSON。
+- `ledger.json.lock` 是进程协调 sidecar，不是账本、auth 状态或备份完整性证据；不得根据文件是否存在判断服务是否正在运行。
 - 不存在 `accounts.csv`、`movements.csv`、`ledger.db` 等正式磁盘文件。
 - 写入流程必须是：读取现有 JSON → 内存中修改 → schema/invariant 校验 → 写入同目录 `.tmp` → flush/sync 文件 → 原子 rename 覆盖 `ledger.json` → sync 已提交文件（Unix 另 sync 父目录元数据）。
 - 启动时若 `ledger.json` 不存在但 `ledger.json.tmp` 存在，只在临时文件能完整解析并通过账本校验时自动提升为主文件。
 - 无效临时文件必须保留并 fail-closed，不得静默初始化空账本。主文件存在时始终以主文件为权威，临时文件不得自动覆盖它。
 - 已存在但损坏/截断的 `ledger.json` 不得被静默重建；必须返回错误，让用户先备份或人工恢复。
 - 新建账本只允许发生在目标 `ledger.json` 不存在时。
+
+## 0A. 服务生命周期独占 lease
+
+使用 `--ledger-path` 启动时，Rust 服务必须在读取、初始化账本或打开 sibling auth 状态之前，对规范化账本路径完整追加 `.lock` 得到 sidecar 路径，并获取独占 OS 文件锁。例如 `ledger.json` 对应 `ledger.json.lock`，不是替换 `.json` 扩展名。
+
+规则：
+
+- lease guard 由 `AppState` 以 `Arc<LedgerLease>` 持有，直到服务退出；不得只锁住单次 `write_document` 或单个 read-modify-write。
+- 默认最多等待 3 秒获取 lease。第二个指向同一规范化 ledger 路径的服务实例超时后必须 fail-closed，不得以只读、无 auth 或新建空账本方式继续。
+- 同一 lease 同时界定 `ledger.json`、其临时替换文件与 sibling `ledger.auth.json` 的服务级所有权，避免两个进程分别改写业务与认证状态。
+- 崩溃、强制终止或正常 drop 时由操作系统释放锁；sidecar 文件永久保留，服务不得删除它。
+- 当前 JSON 账本只支持单机单服务进程，不支持 active-active、多写者或通过共享文件系统横向扩展。
+- 实现使用 Rust 标准库文件锁 API，最低 Rust 版本必须为 1.89。
 
 ## 1. 数据源模式
 

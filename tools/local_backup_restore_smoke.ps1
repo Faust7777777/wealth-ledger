@@ -13,6 +13,7 @@ $backupRoot = Join-Path $tempRoot "backups"
 $preRestoreRoot = Join-Path $tempRoot "pre-restore"
 $ledgerPath = Join-Path $dataDir "ledger.json"
 $authPath = Join-Path $dataDir "ledger.auth.json"
+$lockPath = "$ledgerPath.lock"
 
 function Assert-True {
   param([bool]$Condition, [string]$Message)
@@ -155,6 +156,30 @@ try {
   Assert-True ($firstManifest -contains "validatedAuth=true") "auth validation must be recorded"
 
   Add-TestAccount -ServerExecutable $ServerExecutable -LedgerPath $ledgerPath -DisplayName "changed before restore"
+  $liveHashBeforeLockedRestore = (Get-FileHash $ledgerPath).Hash
+  $lockLease = [System.IO.FileStream]::new(
+    $lockPath,
+    [System.IO.FileMode]::OpenOrCreate,
+    [System.IO.FileAccess]::ReadWrite,
+    [System.IO.FileShare]::None
+  )
+  $lockLease.Lock(0, 1)
+  $lockedRestoreRejected = $false
+  try {
+    Invoke-Restore -Source $firstBackup
+  } catch {
+    $lockedRestoreRejected = $true
+  } finally {
+    try {
+      $lockLease.Unlock(0, 1)
+    } finally {
+      $lockLease.Dispose()
+    }
+  }
+  Assert-True $lockedRestoreRejected "restore unexpectedly replaced a ledger while its lock was held"
+  Assert-True ((Get-FileHash $ledgerPath).Hash -eq $liveHashBeforeLockedRestore) "lock-rejected restore changed live ledger"
+  Assert-True (Test-Path -LiteralPath $lockPath -PathType Leaf) "restore removed the permanent ledger lock sidecar"
+
   Invoke-Restore -Source $firstBackup
   Assert-True ((Get-FileHash $ledgerPath).Hash -eq (Get-FileHash (Join-Path $firstBackup "ledger.json")).Hash) "verified restore did not reproduce ledger"
   Assert-True ((Get-FileHash $authPath).Hash -eq (Get-FileHash (Join-Path $firstBackup "ledger.auth.json")).Hash) "verified restore did not reproduce auth"

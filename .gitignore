@@ -28,6 +28,7 @@ dist/
 ledger.json
 ledger.json.tmp
 ledger.auth.json
+ledger.json.lock
 
 # IntelliJ related
 *.iml

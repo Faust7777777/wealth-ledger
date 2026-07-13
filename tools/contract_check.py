@@ -19,13 +19,16 @@ CONTRACTS = ROOT / "docs" / "contracts"
 README = CONTRACTS / "README.md"
 HTTP_MD = CONTRACTS / "HTTP_API_V1.md"
 OPENAPI = CONTRACTS / "openapi_v1.yaml"
+LOCAL_LEDGER_FORMAT = CONTRACTS / "LOCAL_LEDGER_FORMAT_V1.md"
 EXAMPLES = CONTRACTS / "examples"
 MOCK_SERVER = ROOT / "tools" / "mock_api_server.py"
 DEV_SERVER = ROOT / "server" / "dev_server.py"
 RUST_SERVER = ROOT / "server-rs" / "src" / "main.rs"
 RUST_LOCAL_LEDGER = ROOT / "server-rs" / "src" / "local_ledger.rs"
 RUST_LEDGER_MIGRATIONS = ROOT / "server-rs" / "src" / "ledger_migrations.rs"
+RUST_LEDGER_LEASE = ROOT / "server-rs" / "src" / "ledger_lease.rs"
 RUST_MANIFEST = ROOT / "server-rs" / "Cargo.toml"
+RUST_SERVER_README = ROOT / "server-rs" / "README.md"
 SERVER_SMOKE = ROOT / "tools" / "server_smoke.py"
 LOCAL_LEDGER_SMOKE = ROOT / "tools" / "local_ledger_smoke.py"
 FRONTEND_LOCAL_SERVER_SMOKE = ROOT / "tools" / "frontend_local_server_smoke.ps1"
@@ -487,6 +490,113 @@ def check_ledger_migration_boundary() -> None:
     ok("Ledger migration registry and fail-closed v1 read compatibility passed")
 
 
+def check_ledger_lease_boundary() -> None:
+    if not RUST_LEDGER_LEASE.exists():
+        fail(f"Missing Rust local-ledger lease module: {RUST_LEDGER_LEASE}")
+
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    lease_text = RUST_LEDGER_LEASE.read_text(encoding="utf-8")
+    manifest = RUST_MANIFEST.read_text(encoding="utf-8")
+    ledger_format_text = LOCAL_LEDGER_FORMAT.read_text(encoding="utf-8")
+    server_readme_text = RUST_SERVER_README.read_text(encoding="utf-8")
+
+    rust_version_match = re.search(
+        r'^rust-version\s*=\s*"(\d+)\.(\d+)(?:\.(\d+))?"\s*$',
+        manifest,
+        flags=re.MULTILINE,
+    )
+    if rust_version_match is None:
+        fail("Rust server manifest must declare rust-version for file locking")
+    rust_version = tuple(
+        int(part or 0) for part in rust_version_match.groups(default="0")
+    )
+    if rust_version < (1, 89, 0):
+        fail("Rust standard-library ledger locking requires rust-version >= 1.89")
+
+    main_snippets = [
+        "mod ledger_lease;",
+        "_ledger_lease: Option<Arc<ledger_lease::LedgerLease>>",
+        "fn local_with_lease(path: PathBuf, lease: Arc<ledger_lease::LedgerLease>)",
+        "Self::local_state(path, Some(lease))",
+        "_ledger_lease: lease",
+        "let auth_state_path = default_auth_state_path(&path);",
+        "AuthStore::from_env_or_dev_with_default_state_path(Some(auth_state_path))",
+        "ledger_lease::acquire_ledger_lease(&requested_path)",
+        "AppState::local_with_lease(path, Arc::new(lease))",
+    ]
+    missing = [snippet for snippet in main_snippets if snippet not in rust_text]
+    if missing:
+        fail("Rust server does not retain the ledger lease for AppState: " + ", ".join(missing))
+
+    startup_start = rust_text.find("let state = read_ledger_path(env::args())")
+    startup_end = rust_text.find("let local_ledger_enabled", startup_start)
+    if startup_start < 0 or startup_end < 0:
+        fail("Unable to inspect real-local server startup ordering")
+    startup_text = rust_text[startup_start:startup_end]
+    startup_steps = (
+        "ledger_lease::acquire_ledger_lease(&requested_path)",
+        "local_ledger::load_or_initialize(&path)",
+        "AppState::local_with_lease(path, Arc::new(lease))",
+    )
+    positions = [startup_text.find(step) for step in startup_steps]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        fail("Server must acquire the lease before opening ledger and sibling auth state")
+
+    lease_snippets = [
+        "pub(crate) const DEFAULT_LEDGER_LEASE_TIMEOUT: Duration = Duration::from_secs(3);",
+        "pub(crate) struct LedgerLease",
+        "_file: File",
+        "pub(crate) fn acquire_ledger_lease(",
+        "pub(crate) fn acquire_ledger_lease_with_timeout(",
+        "pub(crate) fn normalized_ledger_path(",
+        "file.try_lock()",
+        'lock_path.push(".lock")',
+        "ledger is already in use",
+        "regular non-symlink file",
+        "default_timeout_is_three_seconds",
+        "different_ledgers_can_be_leased_concurrently",
+        "non_file_sidecar_is_rejected_fail_closed",
+        "second_handle_times_out_while_first_lease_is_held",
+        "drop_releases_lock_immediately_and_preserves_sidecar",
+        "relative_parent_alias_conflicts_with_absolute_path",
+    ]
+    combined_lease_text = lease_text + "\n" + rust_text
+    missing = [
+        snippet for snippet in lease_snippets if snippet not in combined_lease_text
+    ]
+    if missing:
+        fail("Rust ledger lease boundary is incomplete: " + ", ".join(missing))
+    if "remove_file" in lease_text:
+        fail("Ledger lease implementation must preserve the permanent .lock sidecar")
+
+    ledger_format_snippets = [
+        "ledger.json.lock",
+        "Arc<LedgerLease>",
+        "默认最多等待 3 秒",
+        "active-active",
+        "最低 Rust 版本必须为 1.89",
+    ]
+    missing = [
+        snippet for snippet in ledger_format_snippets if snippet not in ledger_format_text
+    ]
+    if missing:
+        fail("Local-ledger format must document the process lease: " + ", ".join(missing))
+    server_readme_snippets = [
+        "ledger.json.lock",
+        "ledger is already in use",
+        "three seconds",
+        "active-active",
+        "Rust 1.89",
+    ]
+    missing = [
+        snippet for snippet in server_readme_snippets if snippet not in server_readme_text
+    ]
+    if missing:
+        fail("Rust server README must document the process lease: " + ", ".join(missing))
+
+    ok("Cross-process service-lifetime ledger lease checks passed")
+
+
 def check_subscription_due_scan(doc: dict) -> None:
     path = "/subscriptions/charge-proposals/due-scan"
     path_item = doc["paths"].get(path)
@@ -878,6 +988,10 @@ def check_deploy_security_defaults() -> None:
 
     local_restore_text = LOCAL_RESTORE.read_text(encoding="utf-8")
     local_restore_snippets = [
+        "Acquire-LedgerRestoreLease",
+        "[System.IO.FileShare]::None",
+        "$stream.Lock(0, 1)",
+        "Release-LedgerRestoreLease",
         "Read-ManifestValue",
         "AllowUnverified",
         "expectedLedgerHash",
@@ -898,6 +1012,8 @@ def check_deploy_security_defaults() -> None:
 
     local_smoke_text = LOCAL_BACKUP_RESTORE_SMOKE.read_text(encoding="utf-8")
     local_smoke_snippets = [
+        "restore unexpectedly replaced a ledger while its lock was held",
+        "restore removed the permanent ledger lock sidecar",
         "checksum mismatch",
         "includesAuth=false",
         "FINWEALTH_TEST_FAIL_AFTER_LEDGER_REPLACE",
@@ -1062,6 +1178,7 @@ def check_repository_hygiene() -> None:
         "ledger.json",
         "ledger.json.tmp",
         "ledger.auth.json",
+        "ledger.json.lock",
         "backups/",
         "dist/",
     ]
@@ -1231,6 +1348,7 @@ def main() -> None:
     check_dev_server()
     check_rust_server()
     check_ledger_migration_boundary()
+    check_ledger_lease_boundary()
     check_server_smoke()
     check_frontend_local_server_smoke()
     check_deploy_security_defaults()

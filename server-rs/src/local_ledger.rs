@@ -1,4 +1,7 @@
-use crate::ledger_migrations::{MIGRATION_REGISTRY, plan_migrations, validate_history};
+use crate::{
+    ledger_lease::normalized_ledger_path,
+    ledger_migrations::{MIGRATION_REGISTRY, plan_migrations, validate_history},
+};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -61,14 +64,15 @@ fn ledger_write_lock(path: &Path) -> Arc<Mutex<()>> {
 }
 
 fn normalized_lock_path(path: &Path) -> PathBuf {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    };
-    absolute.canonicalize().unwrap_or(absolute)
+    normalized_ledger_path(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        }
+    })
 }
 
 pub fn empty_document(base_currency: &str) -> Value {

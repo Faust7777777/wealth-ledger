@@ -141,10 +141,30 @@ Persisted files for the default path pair are:
 ```text
 tmp\ledger.json       # business ledger, sync log, idempotency records
 tmp\ledger.auth.json  # optional device state and token hashes; no plaintext tokens
+tmp\ledger.json.lock  # permanent process-lease sidecar; never infer ownership from existence
 ```
 
 The sibling auth state backs login/refresh/logout and device list/revoke routes;
 it is not part of portfolio or movement derivation.
+
+## Exclusive local-ledger lease
+
+`--ledger-path` mode is single-process by design. Before initializing or reading
+the ledger and before opening its sibling auth state, the server acquires an
+exclusive OS file lock on a permanent sidecar formed by appending `.lock` to the
+normalized ledger path. The `LedgerLease` guard is retained by `AppState` for
+the entire server lifetime, so one lease protects both ledger and auth writes.
+
+Acquisition waits for at most three seconds by default. A second server for the
+same ledger then fails closed with a `ledger is already in use` error; it does
+not continue in a degraded mode or initialize replacement state. Process exit
+or a crash releases the lock through the operating system, but the sidecar file
+itself is deliberately never deleted. Its presence therefore does not mean a
+process currently owns the ledger.
+
+This boundary does not provide active-active service, multiple writers, or
+shared-filesystem clustering. The implementation uses Rust standard-library
+file locking and requires Rust 1.89 or newer.
 
 Running the server with `--ledger-path` makes the first self-use write paths use
 the JSON ledger when no `?scenario=` query is present:

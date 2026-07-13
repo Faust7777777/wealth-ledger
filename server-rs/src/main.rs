@@ -11,6 +11,7 @@ use axum::{
     routing::{any, get, patch, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+mod ledger_lease;
 mod ledger_migrations;
 mod local_ledger;
 
@@ -58,6 +59,7 @@ static LOCAL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 struct AppState {
     ledger: DevLedgerCore,
     local_ledger_path: Option<PathBuf>,
+    _ledger_lease: Option<Arc<ledger_lease::LedgerLease>>,
     auth: AuthStore,
     allow_ledger_scenario: bool,
     allowed_hosts: Vec<String>,
@@ -68,17 +70,28 @@ impl AppState {
         Self {
             ledger: DevLedgerCore::new(),
             local_ledger_path: None,
+            _ledger_lease: None,
             auth: AuthStore::from_env_or_dev_with_default_state_path(None),
             allow_ledger_scenario: env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
             allowed_hosts: allowed_hosts_from_env(),
         }
     }
 
+    fn local_with_lease(path: PathBuf, lease: Arc<ledger_lease::LedgerLease>) -> Self {
+        Self::local_state(path, Some(lease))
+    }
+
+    #[cfg(test)]
     fn local(path: PathBuf) -> Self {
+        Self::local_state(path, None)
+    }
+
+    fn local_state(path: PathBuf, lease: Option<Arc<ledger_lease::LedgerLease>>) -> Self {
         let auth_state_path = default_auth_state_path(&path);
         Self {
             ledger: DevLedgerCore::new(),
             local_ledger_path: Some(path),
+            _ledger_lease: lease,
             auth: AuthStore::from_env_or_dev_with_default_state_path(Some(auth_state_path)),
             allow_ledger_scenario: env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
             allowed_hosts: allowed_hosts_from_env(),
@@ -819,10 +832,23 @@ async fn main() {
     let addr = read_addr();
     assert_loopback(addr);
     let state = read_ledger_path(env::args())
-        .map(|path| {
+        .map(|requested_path| {
+            let lease =
+                ledger_lease::acquire_ledger_lease(&requested_path).unwrap_or_else(|error| {
+                    eprintln!(
+                        "failed to acquire exclusive local-ledger lease for {}: {error}",
+                        requested_path.display()
+                    );
+                    process::exit(2);
+                });
+            let path = lease.ledger_path().to_path_buf();
             local_ledger::load_or_initialize(&path).expect("real_local ledger should initialize");
             println!("real_local ledger enabled at {}", path.display());
-            AppState::local(path)
+            println!(
+                "exclusive local-ledger lease held at {}",
+                lease.lock_path().display()
+            );
+            AppState::local_with_lease(path, Arc::new(lease))
         })
         .unwrap_or_else(AppState::dev);
     let local_ledger_enabled = state.local_ledger_path.is_some();
@@ -936,7 +962,9 @@ where
 
 fn run_ledger_command(command: LedgerCommand) -> std::io::Result<()> {
     match command {
-        LedgerCommand::Init(path) => {
+        LedgerCommand::Init(requested_path) => {
+            let lease = ledger_lease::acquire_ledger_lease(&requested_path)?;
+            let path = lease.ledger_path().to_path_buf();
             let document = local_ledger::load_or_initialize(&path)?;
             println!(
                 "initialized real_local ledger at {} (version {}, base {})",
@@ -4637,6 +4665,39 @@ mod tests {
             read_ledger_command_from(["finwealth-server", "--port", "8791"]),
             None
         );
+    }
+
+    #[test]
+    fn app_state_holds_ledger_lease_for_its_lifetime() {
+        let requested_path = unique_test_ledger_path("app_state_lease");
+        let lease = ledger_lease::acquire_ledger_lease_with_timeout(
+            &requested_path,
+            std::time::Duration::from_millis(60),
+        )
+        .expect("first lease should be acquired");
+        let ledger_path = lease.ledger_path().to_path_buf();
+        let lock_path = lease.lock_path().to_path_buf();
+        let state = AppState::local_with_lease(ledger_path.clone(), Arc::new(lease));
+
+        let error = ledger_lease::acquire_ledger_lease_with_timeout(
+            &ledger_path,
+            std::time::Duration::from_millis(60),
+        )
+        .expect_err("AppState must keep the lease held");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        drop(state);
+        let reacquired = ledger_lease::acquire_ledger_lease_with_timeout(
+            &ledger_path,
+            std::time::Duration::ZERO,
+        )
+        .expect("dropping AppState should release the OS lease");
+        drop(reacquired);
+        assert!(lock_path.is_file(), "the permanent sidecar must remain");
+        let _ = fs::remove_file(lock_path);
+        if let Some(parent) = ledger_path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
     }
 
     #[test]
