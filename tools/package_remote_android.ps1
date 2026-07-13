@@ -36,15 +36,23 @@ if ($sourceDirty -and !$AllowDirtySource) {
 }
 
 $flutter = Get-Command flutter -ErrorAction SilentlyContinue
-$flutterExe = if ($flutter) { $flutter.Source } else { Join-Path $env:USERPROFILE "tools\flutter\bin\flutter.bat" }
-if (!(Test-Path -LiteralPath $flutterExe -PathType Leaf)) {
+$flutterExe = if ($flutter) {
+  $flutter.Source
+} elseif ($IsWindows -and $env:USERPROFILE) {
+  Join-Path $env:USERPROFILE "tools\flutter\bin\flutter.bat"
+} else {
+  $null
+}
+if (!$flutterExe -or !(Test-Path -LiteralPath $flutterExe -PathType Leaf)) {
   throw "flutter not found. Install Flutter or add it to PATH."
 }
 
-& $flutterExe test `
-  test\auth_client_test.dart `
-  test\api_remote_mode_test.dart `
-  test\remote_server_setup_test.dart
+$readinessTests = @(
+  (Join-Path $Root "test/auth_client_test.dart"),
+  (Join-Path $Root "test/api_remote_mode_test.dart"),
+  (Join-Path $Root "test/remote_server_setup_test.dart")
+)
+& $flutterExe test @readinessTests
 if ($LASTEXITCODE -ne 0) {
   throw "Android remote auth/data-source readiness tests failed."
 }
@@ -64,7 +72,7 @@ $versionLine = (Select-String -Path (Join-Path $Root "pubspec.yaml") -Pattern "^
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $dist = if ([System.IO.Path]::IsPathRooted($OutputDir)) { $OutputDir } else { Join-Path $Root $OutputDir }
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
-$source = Join-Path $Root "build\app\outputs\flutter-apk\app-debug.apk"
+$source = Join-Path $Root "build/app/outputs/flutter-apk/app-debug.apk"
 if (!(Test-Path -LiteralPath $source -PathType Leaf)) {
   throw "Android debug APK was not produced."
 }
@@ -75,7 +83,7 @@ if (!$apkAnalyzerPath) {
   $candidate = if (!$sdkRoot) {
     $null
   } elseif ($IsWindows) {
-    Join-Path $sdkRoot "cmdline-tools\latest\bin\apkanalyzer.bat"
+    Join-Path $sdkRoot "cmdline-tools/latest/bin/apkanalyzer.bat"
   } else {
     Join-Path $sdkRoot "cmdline-tools/latest/bin/apkanalyzer"
   }
