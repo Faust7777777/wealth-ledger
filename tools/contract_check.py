@@ -63,6 +63,7 @@ SERVER_MODE_ALGORITHMS = CONTRACTS / "SERVER_MODE_ALGORITHMS_V1.md"
 PACKAGE_WORKFLOW = ROOT / ".github" / "workflows" / "package.yml"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 GITIGNORE = ROOT / ".gitignore"
+GITATTRIBUTES = ROOT / ".gitattributes"
 
 FORBIDDEN_ENDPOINTS = {
     "/transfers/execute",
@@ -1383,6 +1384,16 @@ def check_repository_hygiene() -> None:
     missing = [pattern for pattern in required_patterns if pattern not in lines]
     if missing:
         fail("Repository ignore policy is missing sensitive patterns: " + ", ".join(missing))
+    if not GITATTRIBUTES.exists():
+        fail(f"Missing repository line-ending policy: {GITATTRIBUTES}")
+    attributes = GITATTRIBUTES.read_text(encoding="utf-8")
+    for generated in (
+        "windows/flutter/generated_plugin_registrant.cc text eol=lf",
+        "windows/flutter/generated_plugin_registrant.h text eol=lf",
+        "windows/flutter/generated_plugins.cmake text eol=lf",
+    ):
+        if generated not in attributes:
+            fail(f"Generated Windows plugin file lacks LF policy: {generated}")
     ok("Repository sensitive-file ignore policy passed")
 
 
