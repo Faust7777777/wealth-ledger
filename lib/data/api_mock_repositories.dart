@@ -28,6 +28,18 @@ class ApiUnauthorizedException implements Exception {
   String toString() => '登录已失效或未登录（401）：请到「设置 → 本地服务登录」重新登录后重试（$path）';
 }
 
+/// 业务冲突（409）：带服务端 error.code（如 duplicate_pending_charge / cancel_conflict），
+/// 由 UI 映射成可恢复提示，不清空用户输入。
+class ApiConflictException implements Exception {
+  ApiConflictException(this.path, {this.code, this.message});
+  final String path;
+  final String? code;
+  final String? message;
+  @override
+  String toString() =>
+      message ?? '操作冲突（409${code == null ? '' : ' · $code'}）：$path';
+}
+
 class DevApiClient {
   DevApiClient(
     this.baseUrl, {
@@ -74,6 +86,13 @@ class DevApiClient {
     if (res.statusCode == 403) {
       throw ApiForbiddenException(path);
     }
+    if (res.statusCode == 409) {
+      throw ApiConflictException(
+        path,
+        code: _errorField(res, 'code'),
+        message: _errorField(res, 'message'),
+      );
+    }
     if (res.statusCode >= 400) {
       throw Exception('HTTP ${res.statusCode} · $path');
     }
@@ -86,6 +105,17 @@ class DevApiClient {
       return body['data'] ?? body;
     }
     return body;
+  }
+
+  /// 读取错误信封 {ok:false, error:{code, message}} 的字段（供 409 等使用）。
+  String? _errorField(http.Response res, String key) {
+    try {
+      final body = jsonDecode(utf8.decode(res.bodyBytes));
+      final error = body is Map ? body['error'] : null;
+      return error is Map ? error[key]?.toString() : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<Object?> getData(String path) => _send('GET', path);
@@ -689,6 +719,7 @@ LedgerCapabilitiesVm parseLedgerCapabilitiesData(Map<String, dynamic> j) =>
       canConfirmProposal: _bool(j['canConfirmProposal']),
       canPersistPendingProposal: _bool(j['canPersistPendingProposal']),
       proposalPersistence: '${j['proposalPersistence'] ?? 'none'}',
+      canManageSubscriptions: _bool(j['canManageSubscriptions']),
     );
 
 // ———— 仓库实现 ————
@@ -1226,4 +1257,174 @@ class LocalServerSnapshotRepository implements SnapshotRepository {
     );
     return _snapshot(_m(d));
   }
+}
+
+// ———— 订阅解析 / 枚举映射 / 输入构建 ————
+SubscriptionStatus _subStatus(Object? s) => switch (s) {
+  'trial' => SubscriptionStatus.trial,
+  'paused' => SubscriptionStatus.paused,
+  'cancelled' => SubscriptionStatus.cancelled,
+  'expired' => SubscriptionStatus.expired,
+  _ => SubscriptionStatus.active,
+};
+String _subStatusWire(SubscriptionStatus s) => switch (s) {
+  SubscriptionStatus.trial => 'trial',
+  SubscriptionStatus.active => 'active',
+  SubscriptionStatus.paused => 'paused',
+  SubscriptionStatus.cancelled => 'cancelled',
+  SubscriptionStatus.expired => 'expired',
+};
+BillingUnit _billingUnit(Object? s) => switch (s) {
+  'day' => BillingUnit.day,
+  'week' => BillingUnit.week,
+  'year' => BillingUnit.year,
+  _ => BillingUnit.month,
+};
+String _billingUnitWire(BillingUnit u) => switch (u) {
+  BillingUnit.day => 'day',
+  BillingUnit.week => 'week',
+  BillingUnit.month => 'month',
+  BillingUnit.year => 'year',
+};
+SubscriptionDurationUnit _durationUnit(Object? s) => switch (s) {
+  'day' => SubscriptionDurationUnit.day,
+  'year' => SubscriptionDurationUnit.year,
+  _ => SubscriptionDurationUnit.month,
+};
+String _durationUnitWire(SubscriptionDurationUnit u) => switch (u) {
+  SubscriptionDurationUnit.day => 'day',
+  SubscriptionDurationUnit.month => 'month',
+  SubscriptionDurationUnit.year => 'year',
+};
+
+SubscriptionBillingCycleVm _billingCycle(Map<String, dynamic> j) =>
+    SubscriptionBillingCycleVm(
+      unit: _billingUnit(j['unit']),
+      interval: _int(j['interval']),
+    );
+SubscriptionDurationVm? _durationOrNull(Object? o) {
+  if (o is! Map) return null;
+  final j = _m(o);
+  return SubscriptionDurationVm(
+    unit: _durationUnit(j['unit']),
+    count: _int(j['count']),
+  );
+}
+
+/// 公开以便单测直接喂 subscription JSON。
+SubscriptionVm parseSubscriptionData(Map<String, dynamic> j) => SubscriptionVm(
+  id: '${j['id']}',
+  displayName: '${j['displayName'] ?? ''}',
+  provider: '${j['provider'] ?? ''}',
+  planName: j['planName']?.toString(),
+  amount: _money(j['amount']),
+  paymentAccountId: '${j['paymentAccountId'] ?? ''}',
+  billingCycle: _billingCycle(_m(j['billingCycle'])),
+  billingAnchorDay: _int(j['billingAnchorDay']),
+  startDate: '${j['startDate'] ?? ''}',
+  duration: _durationOrNull(j['duration']),
+  endDate: j['endDate']?.toString(),
+  nextChargeDate: j['nextChargeDate']?.toString(),
+  autoRenew: _bool(j['autoRenew'], fallback: true),
+  reminderDaysBefore: _int(j['reminderDaysBefore']),
+  status: _subStatus(j['status']),
+  pendingChargeMovementId: j['pendingChargeMovementId']?.toString(),
+  pendingChargeDate: j['pendingChargeDate']?.toString(),
+  lastChargeMovementId: j['lastChargeMovementId']?.toString(),
+  lastChargeDate: j['lastChargeDate']?.toString(),
+  cancelledAt: j['cancelledAt']?.toString(),
+  note: j['note']?.toString(),
+);
+
+Map<String, dynamic> _moneyJson(Money m) => {
+  'amount': m.amount,
+  'currency': m.currency,
+};
+Map<String, dynamic> _billingCycleJson(SubscriptionBillingCycleVm c) => {
+  'unit': _billingUnitWire(c.unit),
+  'interval': c.interval,
+};
+Map<String, dynamic> _durationJson(SubscriptionDurationVm d) => {
+  'unit': _durationUnitWire(d.unit),
+  'count': d.count,
+};
+Map<String, dynamic> _createSubBody(CreateSubscriptionInput i) => {
+  'displayName': i.displayName,
+  'provider': i.provider,
+  if (i.planName != null && i.planName!.isNotEmpty) 'planName': i.planName,
+  'amount': _moneyJson(i.amount),
+  'paymentAccountId': i.paymentAccountId,
+  'billingCycle': _billingCycleJson(i.billingCycle),
+  'startDate': i.startDate,
+  if (i.duration != null) 'duration': _durationJson(i.duration!),
+  if (i.endDate != null && i.endDate!.isNotEmpty) 'endDate': i.endDate,
+  'autoRenew': i.autoRenew,
+  'reminderDaysBefore': i.reminderDaysBefore,
+  if (i.note != null && i.note!.isNotEmpty) 'note': i.note,
+};
+// PATCH 走整表单替换语义：可空字段显式传 null 表示清除；duration/endDate 互斥。
+Map<String, dynamic> _updateSubBody(UpdateSubscriptionInput i) => {
+  'displayName': i.displayName,
+  'provider': i.provider,
+  'planName': (i.planName?.isNotEmpty ?? false) ? i.planName : null,
+  'amount': _moneyJson(i.amount),
+  'paymentAccountId': i.paymentAccountId,
+  'billingCycle': _billingCycleJson(i.billingCycle),
+  'startDate': i.startDate,
+  'duration': i.duration != null ? _durationJson(i.duration!) : null,
+  'endDate': (i.endDate?.isNotEmpty ?? false) ? i.endDate : null,
+  'autoRenew': i.autoRenew,
+  'reminderDaysBefore': i.reminderDaysBefore,
+  'status': _subStatusWire(i.status),
+  'note': (i.note?.isNotEmpty ?? false) ? i.note : null,
+};
+
+class LocalServerSubscriptionRepository implements SubscriptionRepository {
+  LocalServerSubscriptionRepository(this._c);
+  final DevApiClient _c;
+
+  @override
+  Future<List<SubscriptionVm>> listSubscriptions() async => [
+    for (final s in _list(await _c.getData('/v1/subscriptions')))
+      parseSubscriptionData(_m(s)),
+  ];
+  @override
+  Future<List<SubscriptionVm>> listUpcomingSubscriptions({
+    int days = 30,
+  }) async {
+    final d = days.clamp(1, 365);
+    return [
+      for (final s in _list(
+        await _c.getData('/v1/subscriptions/upcoming?days=$d'),
+      ))
+        parseSubscriptionData(_m(s)),
+    ];
+  }
+
+  @override
+  Future<SubscriptionVm> getSubscription(Id id) async =>
+      parseSubscriptionData(_m(await _c.getData('/v1/subscriptions/$id')));
+  @override
+  Future<SubscriptionVm> createSubscription(
+    CreateSubscriptionInput input,
+  ) async => parseSubscriptionData(
+    _m(await _c.postData('/v1/subscriptions', body: _createSubBody(input))),
+  );
+  @override
+  Future<SubscriptionVm> updateSubscription(
+    Id id,
+    UpdateSubscriptionInput input,
+  ) async => parseSubscriptionData(
+    _m(
+      await _c.patchData('/v1/subscriptions/$id', body: _updateSubBody(input)),
+    ),
+  );
+  @override
+  Future<SubscriptionVm> cancelSubscription(Id id) async =>
+      parseSubscriptionData(
+        _m(await _c.postData('/v1/subscriptions/$id/cancel')),
+      );
+  @override
+  Future<AiAtomicGroupVm> createChargeProposal(Id id) async =>
+      _group(_m(await _c.postData('/v1/subscriptions/$id/charge-proposal')));
 }

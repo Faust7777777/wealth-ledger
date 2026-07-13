@@ -188,6 +188,9 @@ class _GroupBlock extends ConsumerWidget {
     try {
       final result = await op();
       ref.invalidate(aiPendingProvider);
+      // 该组可能是订阅扣费候选：确认或拒绝后订阅 pending/nextCharge 都会变，一并刷新。
+      ref.invalidate(subscriptionsProvider);
+      ref.invalidate(upcomingSubscriptionsProvider);
       final shouldRefreshLedgerViews =
           result?.ledgerWrite == true || result?.snapshotInvalidated == true;
       if (shouldRefreshLedgerViews) {

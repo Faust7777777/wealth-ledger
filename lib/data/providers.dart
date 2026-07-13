@@ -283,6 +283,45 @@ final movementByIdProvider = FutureProvider.family<MovementVm?, String>(
   (ref, id) => ref.watch(movementRepositoryProvider).getMovement(id),
 );
 
+// —— 订阅管理 ——
+// 计划本身不写流水；charge-proposal 只生成候选，走 AI 复核确认后才动余额。
+final subscriptionRepositoryProvider = Provider<SubscriptionRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalSubscriptionRepository(),
+    fixture: () => const FixtureSubscriptionRepository(),
+    api: () =>
+        LocalServerSubscriptionRepository(ref.watch(devApiClientProvider)),
+  ),
+);
+final subscriptionsProvider = FutureProvider<List<SubscriptionVm>>(
+  (ref) => ref.watch(subscriptionRepositoryProvider).listSubscriptions(),
+);
+
+/// 即将扣费（默认 30 天窗口），用于「财务管理」入口的到期提醒。
+final upcomingSubscriptionsProvider = FutureProvider<List<SubscriptionVm>>(
+  (ref) =>
+      ref.watch(subscriptionRepositoryProvider).listUpcomingSubscriptions(),
+);
+final subscriptionByIdProvider = FutureProvider.family<SubscriptionVm, String>(
+  (ref, id) => ref.watch(subscriptionRepositoryProvider).getSubscription(id),
+);
+
+extension SubscriptionRefreshX on WidgetRef {
+  /// 订阅本体写成功后（新建/编辑/取消）：精确失效列表、即将扣费、该订阅详情。
+  void refreshSubscriptions({String? id}) {
+    invalidate(subscriptionsProvider);
+    invalidate(upcomingSubscriptionsProvider);
+    if (id != null) invalidate(subscriptionByIdProvider(id));
+  }
+
+  /// 生成扣费候选成功后：订阅视图外还要失效 AI 待确认（候选进了复核队列）。
+  void refreshAfterChargeProposal({required String id}) {
+    refreshSubscriptions(id: id);
+    invalidate(aiPendingProvider);
+  }
+}
+
 // —— 主题（深色默认）——
 class ThemeModeNotifier extends Notifier<ThemeMode> {
   @override

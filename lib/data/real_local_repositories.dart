@@ -196,3 +196,31 @@ class RealLocalSnapshotRepository implements SnapshotRepository {
     required String reason,
   }) async => throw UnsupportedError('real_local 暂不支持创建快照；请用 local_server');
 }
+
+class RealLocalSubscriptionRepository implements SubscriptionRepository {
+  const RealLocalSubscriptionRepository();
+  @override
+  Future<List<SubscriptionVm>> listSubscriptions() async => const [];
+  @override
+  Future<List<SubscriptionVm>> listUpcomingSubscriptions({
+    int days = 30,
+  }) async => const [];
+  @override
+  Future<SubscriptionVm> getSubscription(Id id) async =>
+      throw UnsupportedError('real_local 暂不支持订阅；请用 local_server');
+  @override
+  Future<SubscriptionVm> createSubscription(
+    CreateSubscriptionInput input,
+  ) async => throw UnsupportedError('real_local 暂不支持创建订阅；请用 local_server');
+  @override
+  Future<SubscriptionVm> updateSubscription(
+    Id id,
+    UpdateSubscriptionInput input,
+  ) async => throw UnsupportedError('real_local 暂不支持编辑订阅；请用 local_server');
+  @override
+  Future<SubscriptionVm> cancelSubscription(Id id) async =>
+      throw UnsupportedError('real_local 暂不支持取消订阅；请用 local_server');
+  @override
+  Future<AiAtomicGroupVm> createChargeProposal(Id id) async =>
+      throw UnsupportedError('real_local 暂不支持生成扣费候选；请用 local_server');
+}
