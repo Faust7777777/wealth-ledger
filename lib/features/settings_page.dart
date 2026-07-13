@@ -57,6 +57,18 @@ class SettingsPage extends ConsumerWidget {
             const _LocalServerAuthSection(),
           ],
           const Divider(),
+          Padding(
+            padding: const EdgeInsets.only(top: AppSpacing.sm),
+            child: Text('财务管理', style: Theme.of(context).textTheme.titleMedium),
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.subscriptions_outlined),
+            title: const Text('订阅管理'),
+            subtitle: const Text('管理 ChatGPT、Claude 等周期订阅，按期生成待确认扣费'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => context.push('/subscriptions'),
+          ),
           ListTile(
             contentPadding: EdgeInsets.zero,
             leading: const Icon(Icons.label_outline),
