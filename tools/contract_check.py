@@ -40,6 +40,8 @@ PYTHON_REQUIREMENTS = ROOT / "tools" / "requirements.txt"
 DEPLOY_ENV_EXAMPLE = ROOT / "deploy" / "finwealth-server.env.example"
 SYSTEMD_SERVICE = ROOT / "deploy" / "systemd" / "finwealth-server.service"
 VPS_INSTALL = ROOT / "tools" / "install_vps_systemd.sh"
+VPS_BUNDLE_INSTALL = ROOT / "tools" / "install_vps_bundle.sh"
+VPS_PACKAGE = ROOT / "tools" / "package_vps_server.sh"
 VPS_READINESS = ROOT / "tools" / "check_vps_readiness.sh"
 VPS_BACKUP = ROOT / "tools" / "backup_vps_ledger.sh"
 VPS_RESTORE = ROOT / "tools" / "restore_vps_ledger.sh"
@@ -1007,6 +1009,8 @@ def check_deploy_security_defaults() -> None:
     for required in (
         SYSTEMD_SERVICE,
         VPS_INSTALL,
+        VPS_BUNDLE_INSTALL,
+        VPS_PACKAGE,
         VPS_READINESS,
         VPS_BACKUP,
         VPS_RESTORE,
@@ -1025,6 +1029,42 @@ def check_deploy_security_defaults() -> None:
     install_text = VPS_INSTALL.read_text(encoding="utf-8")
     if "--check-production-config" not in install_text or "EnvironmentFile" not in install_text:
         fail("VPS installer must validate production configuration through systemd")
+
+    bundle_install_text = VPS_BUNDLE_INSTALL.read_text(encoding="utf-8")
+    bundle_install_snippets = [
+        "sha256sum -c SHA256SUMS",
+        "PACKAGE_ARCH",
+        "HOST_ARCH",
+        "--check-bundle-only",
+        "change-me",
+        "--check-production-config",
+        "EnvironmentFile",
+    ]
+    missing = [
+        snippet
+        for snippet in bundle_install_snippets
+        if snippet not in bundle_install_text
+    ]
+    if missing:
+        fail("Prebuilt VPS installer missing safety gates: " + ", ".join(missing))
+
+    vps_package_text = VPS_PACKAGE.read_text(encoding="utf-8")
+    vps_package_snippets = [
+        "Source worktree is dirty",
+        "cargo build",
+        "--release --locked",
+        "sourceCommit",
+        "sourceDirty",
+        "SHA256SUMS",
+        "sha256sum -c SHA256SUMS",
+        "install_vps_bundle.sh",
+        "--check-bundle-only",
+    ]
+    missing = [
+        snippet for snippet in vps_package_snippets if snippet not in vps_package_text
+    ]
+    if missing:
+        fail("VPS bundle packaging missing provenance gates: " + ", ".join(missing))
 
     readiness_text = VPS_READINESS.read_text(encoding="utf-8")
     readiness_snippets = [
@@ -1167,6 +1207,8 @@ def check_release_packaging() -> None:
         REMOTE_ANDROID_PACKAGE_DOC,
         ANDROID_MANIFEST,
         SERVER_MODE_ALGORITHMS,
+        VPS_BUNDLE_INSTALL,
+        VPS_PACKAGE,
         PACKAGE_WORKFLOW,
         CI_WORKFLOW,
     ):
@@ -1336,6 +1378,10 @@ def check_release_packaging() -> None:
         "include_android_server_client",
         "package_remote_android.ps1",
         "android-server-client-debug",
+        "package-linux-server:",
+        "package_vps_server.sh",
+        "finwealth-linux-x86_64-vps-server",
+        "*-linux-x86_64-vps.tar.gz.sha256",
     ]
     missing = [
         snippet for snippet in required_workflow_snippets if snippet not in workflow_text

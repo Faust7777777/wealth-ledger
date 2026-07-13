@@ -31,6 +31,26 @@ The script:
 If `/etc/finwealth/server.env` still contains `change-me`, the script installs
 files but intentionally does not start the service.
 
+### Prebuilt bundle path
+
+The manual Package workflow also publishes `finwealth-linux-x86_64-vps-server`.
+Use this path when the VPS should not install Rust or when uploading through a
+cloud-provider console:
+
+```bash
+tar -xzf finwealth-server-*-linux-x86_64-vps.tar.gz
+cd finwealth-server-*-linux-x86_64-vps
+sha256sum -c SHA256SUMS
+sudo bash tools/install_vps_bundle.sh
+```
+
+The bundle contains the release server binary, systemd unit, environment
+example, readiness check, backup and restore scripts, an internal checksum
+manifest and source provenance. The installer rejects a mismatched CPU
+architecture, preserves an existing ledger and environment file, and follows
+the same fail-closed `change-me` and production-config rules as the source
+installer.
+
 ## 2. Configure auth
 
 Generate an Argon2 password hash on the VPS:
