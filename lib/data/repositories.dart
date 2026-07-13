@@ -134,4 +134,12 @@ abstract interface class SubscriptionRepository {
   /// 生成本期待确认扣费候选（pending_review）。返回 atomic group，交 AI 复核确认。
   /// 本期已有候选时服务端返回 409。
   Future<AiAtomicGroupVm> createChargeProposal(Id id);
+
+  /// 到期扫描：为 nextChargeDate <= throughDate 的 trial/active 计划批量生成
+  /// 待确认候选。limit（1–200）只限本次新建数量，skip 照常报告。
+  /// 用户显式触发的命令；不自动确认、不扣款、不推进日期。
+  Future<SubscriptionDueScanResultVm> scanDueChargeProposals({
+    required IsoDate throughDate,
+    int limit = 100,
+  });
 }

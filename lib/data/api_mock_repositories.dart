@@ -1338,6 +1338,42 @@ SubscriptionVm parseSubscriptionData(Map<String, dynamic> j) => SubscriptionVm(
   note: j['note']?.toString(),
 );
 
+SubscriptionDueScanSkipReason _dueScanSkipReason(Object? s) => switch (s) {
+  'payment_account_unavailable' =>
+    SubscriptionDueScanSkipReason.paymentAccountUnavailable,
+  'payment_currency_unsupported' =>
+    SubscriptionDueScanSkipReason.paymentCurrencyUnsupported,
+  _ => SubscriptionDueScanSkipReason.alreadyPending,
+};
+
+SubscriptionDueScanSkipVm _dueScanSkip(Map<String, dynamic> j) =>
+    SubscriptionDueScanSkipVm(
+      subscriptionId: '${j['subscriptionId']}',
+      scheduledChargeDate: '${j['scheduledChargeDate'] ?? ''}',
+      reason: _dueScanSkipReason(j['reason']),
+    );
+
+// created 项是 AiAtomicGroup 本体附加 subscriptionId/scheduledChargeDate（allOf）。
+SubscriptionDueScanCreatedVm _dueScanCreated(Map<String, dynamic> j) =>
+    SubscriptionDueScanCreatedVm(
+      group: _group(j),
+      subscriptionId: '${j['subscriptionId']}',
+      scheduledChargeDate: '${j['scheduledChargeDate'] ?? ''}',
+    );
+
+/// 公开以便单测直接喂 due-scan JSON。
+SubscriptionDueScanResultVm parseDueScanData(Map<String, dynamic> j) =>
+    SubscriptionDueScanResultVm(
+      throughDate: '${j['throughDate'] ?? ''}',
+      createdCount: _int(j['createdCount']),
+      alreadyPendingCount: _int(j['alreadyPendingCount']),
+      blockedCount: _int(j['blockedCount']),
+      remainingEligibleCount: _int(j['remainingEligibleCount']),
+      hasMore: _bool(j['hasMore'], fallback: false),
+      created: [for (final c in _list(j['created'])) _dueScanCreated(_m(c))],
+      skipped: [for (final s in _list(j['skipped'])) _dueScanSkip(_m(s))],
+    );
+
 Map<String, dynamic> _moneyJson(Money m) => {
   'amount': m.amount,
   'currency': m.currency,
@@ -1429,4 +1465,16 @@ class LocalServerSubscriptionRepository implements SubscriptionRepository {
   @override
   Future<AiAtomicGroupVm> createChargeProposal(Id id) async =>
       _group(_m(await _c.postData('/v1/subscriptions/$id/charge-proposal')));
+  @override
+  Future<SubscriptionDueScanResultVm> scanDueChargeProposals({
+    required IsoDate throughDate,
+    int limit = 100,
+  }) async => parseDueScanData(
+    _m(
+      await _c.postData(
+        '/v1/subscriptions/charge-proposals/due-scan',
+        body: {'throughDate': throughDate, 'limit': limit.clamp(1, 200)},
+      ),
+    ),
+  );
 }

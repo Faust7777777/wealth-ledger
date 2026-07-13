@@ -57,6 +57,15 @@ String durationLabel(SubscriptionDurationVm d) {
   return '${d.count} $unit';
 }
 
+/// due-scan skip 原因 → 中文可恢复提示（不出现「已扣款」等入账措辞）。
+String dueScanSkipReasonLabel(SubscriptionDueScanSkipReason r) => switch (r) {
+  SubscriptionDueScanSkipReason.alreadyPending => '已有待确认扣费，去 AI 审核处理即可',
+  SubscriptionDueScanSkipReason.paymentAccountUnavailable =>
+    '付款账户缺失或已归档，请先在订阅里换一个付款账户',
+  SubscriptionDueScanSkipReason.paymentCurrencyUnsupported =>
+    '付款账户不支持该订阅币种，请调整付款账户或订阅币种',
+};
+
 /// 本地日历日期字符串（YYYY-MM-DD）。绝不经 UTC 转换，避免跨时区改变日历日。
 String isoDateOf(DateTime d) {
   String two(int n) => n.toString().padLeft(2, '0');

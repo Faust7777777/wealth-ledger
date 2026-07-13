@@ -5,6 +5,8 @@ import 'dart:convert';
 import 'package:finwealth/core/types.dart';
 import 'package:finwealth/data/api_mock_repositories.dart';
 import 'package:finwealth/data/auth_store.dart';
+import 'package:finwealth/data/fixture_repositories.dart';
+import 'package:finwealth/data/real_local_repositories.dart';
 import 'package:finwealth/data/repositories.dart';
 import 'package:finwealth/data/view_models.dart';
 import 'package:finwealth/features/subscription_form_validation.dart';
@@ -431,6 +433,144 @@ void main() {
       expect(endDateAfterStartError('2026-01-05', '2026-01-05'), isNotNull);
       expect(endDateAfterStartError('2025-12-31', '2026-01-05'), isNotNull);
       expect(endDateAfterStartError('2026-02-01', '2026-01-05'), isNull);
+    });
+  });
+
+  group('cat13: due-scan 映射与请求', () {
+    Map<String, dynamic> dueScanJson() => {
+      'throughDate': '2026-07-13',
+      'createdCount': 1,
+      'alreadyPendingCount': 1,
+      'blockedCount': 2,
+      'remainingEligibleCount': 3,
+      'hasMore': true,
+      'created': [
+        {
+          'id': 'ag_scan_1',
+          'title': '订阅扣费：ChatGPT Plus',
+          'operation': 'create',
+          'status': 'pending',
+          'subscriptionId': 'sub_1',
+          'scheduledChargeDate': '2026-07-05',
+        },
+      ],
+      'skipped': [
+        {
+          'subscriptionId': 'sub_2',
+          'scheduledChargeDate': '2026-07-01',
+          'reason': 'already_pending',
+        },
+        {
+          'subscriptionId': 'sub_3',
+          'scheduledChargeDate': '2026-07-02',
+          'reason': 'payment_account_unavailable',
+        },
+        {
+          'subscriptionId': 'sub_4',
+          'scheduledChargeDate': '2026-07-03',
+          'reason': 'payment_currency_unsupported',
+        },
+      ],
+    };
+
+    test('完整响应解析（含三种 skip reason）', () {
+      final r = parseDueScanData(dueScanJson());
+      expect(r.throughDate, '2026-07-13');
+      expect(r.createdCount, 1);
+      expect(r.alreadyPendingCount, 1);
+      expect(r.blockedCount, 2);
+      expect(r.remainingEligibleCount, 3);
+      expect(r.hasMore, isTrue);
+      final c = r.created.single;
+      expect(c.group.id, 'ag_scan_1');
+      expect(c.group.status, AiGroupStatus.pending);
+      expect(c.subscriptionId, 'sub_1');
+      expect(c.scheduledChargeDate, '2026-07-05');
+      expect(r.skipped, hasLength(3));
+      expect(r.skipped[0].reason, SubscriptionDueScanSkipReason.alreadyPending);
+      expect(
+        r.skipped[1].reason,
+        SubscriptionDueScanSkipReason.paymentAccountUnavailable,
+      );
+      expect(
+        r.skipped[2].reason,
+        SubscriptionDueScanSkipReason.paymentCurrencyUnsupported,
+      );
+      expect(r.skipped[1].subscriptionId, 'sub_3');
+      expect(r.skipped[1].scheduledChargeDate, '2026-07-02');
+    });
+
+    test('POST 路径、请求体与幂等键；limit 夹取 1–200', () async {
+      http.Request? seen;
+      final repo = LocalServerSubscriptionRepository(
+        _client((req) async {
+          seen = req;
+          return _ok(dueScanJson());
+        }),
+      );
+      await repo.scanDueChargeProposals(throughDate: '2026-07-13');
+      expect(seen!.method, 'POST');
+      expect(seen!.url.path, '/v1/subscriptions/charge-proposals/due-scan');
+      expect(jsonDecode(seen!.body), {
+        'throughDate': '2026-07-13',
+        'limit': 100,
+      });
+      expect(
+        seen!.headers['idempotency-key'],
+        matches(RegExp(r'^[0-9a-f]{32}$')),
+      );
+
+      await repo.scanDueChargeProposals(throughDate: '2026-07-13', limit: 999);
+      expect(jsonDecode(seen!.body)['limit'], 200);
+    });
+
+    test('401 refresh 后重放复用同一幂等键', () async {
+      final store = MemoryAuthTokenStore();
+      await store.write(
+        const StoredAuthSession(
+          accessToken: 'access_expired',
+          refreshToken: 'refresh_old',
+          expiresAt: '2026-07-13T12:00:00+08:00',
+          deviceId: 'device_1',
+        ),
+      );
+      final businessKeys = <String>[];
+      final repo = LocalServerSubscriptionRepository(
+        _client(store: store, (req) async {
+          if (req.url.path == '/v1/auth/refresh') {
+            return _ok({
+              'accessToken': 'access_new',
+              'refreshToken': 'refresh_new',
+              'expiresAt': '2026-07-13T13:00:00+08:00',
+              'deviceId': 'device_1',
+            });
+          }
+          final k = req.headers['idempotency-key'];
+          if (k != null) businessKeys.add(k);
+          if (req.headers['authorization'] == 'Bearer access_expired') {
+            return http.Response(jsonEncode({'ok': false}), 401);
+          }
+          return _ok(dueScanJson());
+        }),
+      );
+      await repo.scanDueChargeProposals(throughDate: '2026-07-13');
+      expect(businessKeys, hasLength(2));
+      expect(businessKeys[0], businessKeys[1]);
+    });
+
+    test('real_local / fixture 不伪造扫描成功', () async {
+      await expectLater(
+        const RealLocalSubscriptionRepository().scanDueChargeProposals(
+          throughDate: '2026-07-13',
+        ),
+        throwsUnsupportedError,
+      );
+      await expectLater(
+        const FixtureSubscriptionRepository().scanDueChargeProposals(
+          throughDate: '2026-07-13',
+        ),
+        throwsUnsupportedError,
+      );
     });
   });
 }

@@ -250,7 +250,8 @@ class _ActionsState extends ConsumerState<_Actions> {
   @override
   Widget build(BuildContext context) {
     final canCharge = sub.isSchedulable && !sub.hasPendingCharge;
-    final canCancel = sub.isSchedulable;
+    // pending 时本地禁用取消（与生成扣费一致）；409 兜底仅处理页面数据过期的竞态。
+    final canCancel = sub.isSchedulable && !sub.hasPendingCharge;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [

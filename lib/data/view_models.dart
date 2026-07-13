@@ -839,3 +839,59 @@ class UpdateSubscriptionInput {
   final SubscriptionStatus status;
   final String? note;
 }
+
+// —— 订阅到期扫描（HTTP_API_V1 §7A due-scan）——
+// 显式调用命令：只批量生成 pending_review 候选，不自动确认、不扣款、不推进日期。
+
+enum SubscriptionDueScanSkipReason {
+  alreadyPending,
+  paymentAccountUnavailable,
+  paymentCurrencyUnsupported,
+}
+
+/// 被跳过的到期项：already_pending 去审核即可，payment_* 需先修订阅/账户。
+class SubscriptionDueScanSkipVm {
+  const SubscriptionDueScanSkipVm({
+    required this.subscriptionId,
+    required this.scheduledChargeDate,
+    required this.reason,
+  });
+  final Id subscriptionId;
+  final IsoDate scheduledChargeDate;
+  final SubscriptionDueScanSkipReason reason;
+}
+
+/// 扫描新建的候选：atomic group 附所属订阅与计费期（AI_PROPOSAL_SCHEMA §3）。
+class SubscriptionDueScanCreatedVm {
+  const SubscriptionDueScanCreatedVm({
+    required this.group,
+    required this.subscriptionId,
+    required this.scheduledChargeDate,
+  });
+  final AiAtomicGroupVm group;
+  final Id subscriptionId;
+  final IsoDate scheduledChargeDate;
+}
+
+/// 一次 due-scan 的结果。limit 只限新建数量：
+/// remainingEligibleCount 统计仅因 limit 未创建的项，hasMore 等价于其 > 0。
+class SubscriptionDueScanResultVm {
+  const SubscriptionDueScanResultVm({
+    required this.throughDate,
+    required this.createdCount,
+    required this.alreadyPendingCount,
+    required this.blockedCount,
+    required this.remainingEligibleCount,
+    required this.hasMore,
+    this.created = const [],
+    this.skipped = const [],
+  });
+  final IsoDate throughDate;
+  final int createdCount;
+  final int alreadyPendingCount;
+  final int blockedCount;
+  final int remainingEligibleCount;
+  final bool hasMore;
+  final List<SubscriptionDueScanCreatedVm> created;
+  final List<SubscriptionDueScanSkipVm> skipped;
+}

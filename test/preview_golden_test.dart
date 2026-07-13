@@ -410,4 +410,63 @@ void main() {
       matchesGoldenFile('goldens/subscription_detail_dark.png'),
     );
   });
+
+  // —— 到期扫描结果对话框（created/already-pending/blocked/hasMore 全区段）——
+  const dueScanResult = SubscriptionDueScanResultVm(
+    throughDate: '2026-07-13',
+    createdCount: 2,
+    alreadyPendingCount: 1,
+    blockedCount: 1,
+    remainingEligibleCount: 3,
+    hasMore: true,
+    skipped: [
+      SubscriptionDueScanSkipVm(
+        subscriptionId: 'sub_claude',
+        scheduledChargeDate: '2026-07-12',
+        reason: SubscriptionDueScanSkipReason.alreadyPending,
+      ),
+      SubscriptionDueScanSkipVm(
+        subscriptionId: 'sub_gpt',
+        scheduledChargeDate: '2026-07-05',
+        reason: SubscriptionDueScanSkipReason.paymentAccountUnavailable,
+      ),
+    ],
+  );
+  const dueScanNames = {'sub_gpt': 'ChatGPT Plus', 'sub_claude': 'Claude Pro'};
+
+  Widget dueScanHost(ThemeData theme) => subsHost(
+    theme,
+    const Scaffold(
+      body: Center(
+        child: DueScanResultDialog(
+          result: dueScanResult,
+          subscriptionNames: dueScanNames,
+        ),
+      ),
+    ),
+  );
+
+  testWidgets('subscription due-scan dialog · dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 760));
+    await tester.pumpWidget(dueScanHost(buildDarkTheme()));
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(DueScanResultDialog),
+      matchesGoldenFile('goldens/subscription_due_scan_dialog_dark.png'),
+    );
+  });
+
+  testWidgets('subscription due-scan dialog · light', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 760));
+    await tester.pumpWidget(dueScanHost(buildLightTheme()));
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(DueScanResultDialog),
+      matchesGoldenFile('goldens/subscription_due_scan_dialog_light.png'),
+    );
+  });
 }

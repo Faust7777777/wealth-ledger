@@ -315,10 +315,20 @@ extension SubscriptionRefreshX on WidgetRef {
     if (id != null) invalidate(subscriptionByIdProvider(id));
   }
 
-  /// 生成扣费候选成功后：订阅视图外还要失效 AI 待确认（候选进了复核队列）。
+  /// 生成扣费候选成功后：订阅视图外还要失效 AI 待确认（候选进了复核队列）
+  /// 与首页聚合（aiPendingCount 变了）。
   void refreshAfterChargeProposal({required String id}) {
     refreshSubscriptions(id: id);
     invalidate(aiPendingProvider);
+    invalidate(overviewProvider);
+  }
+
+  /// 到期扫描成功后：批量候选可能涉及多个订阅，全量失效订阅视图、
+  /// AI 待确认与首页聚合（pending count）。
+  void refreshAfterDueScan() {
+    refreshSubscriptions();
+    invalidate(aiPendingProvider);
+    invalidate(overviewProvider);
   }
 }
 

@@ -141,4 +141,117 @@ void main() {
         ? 'Set LOCAL_SERVER_API_BASE through --dart-define; run tools/frontend_local_server_smoke.ps1.'
         : false,
   );
+
+  test(
+    'due-scan proposes only due subscriptions and defers charging to confirmation',
+    () async {
+      final client = DevApiClient(_baseUrl);
+      final account = _map(
+        await client.postData(
+          '/v1/accounts',
+          body: {
+            'displayName': 'Due Scan USD Card',
+            'accountType': 'virtual_card',
+            'defaultCurrency': 'USD',
+            'supportedCurrencies': ['USD'],
+            'includeInNetWorth': true,
+            'balanceMode': 'cash_balance',
+            'openingBalances': [
+              {'currency': 'USD', 'amount': '100.00', 'quality': 'exact'},
+            ],
+          },
+        ),
+      );
+      final accountId = '${account['id']}';
+      final repository = LocalServerSubscriptionRepository(client);
+
+      CreateSubscriptionInput input(String name, String startDate) =>
+          CreateSubscriptionInput(
+            displayName: name,
+            provider: 'OpenAI',
+            planName: 'Plus',
+            amount: const Money(amount: '20.00', currency: 'USD'),
+            paymentAccountId: accountId,
+            billingCycle: const SubscriptionBillingCycleVm(
+              unit: BillingUnit.month,
+              interval: 1,
+            ),
+            startDate: startDate,
+            autoRenew: false,
+            reminderDaysBefore: 3,
+          );
+
+      final due = await repository.createSubscription(
+        input('Due scan target', '2026-01-05'),
+      );
+      final future = await repository.createSubscription(
+        input('Future plan untouched', '2099-01-05'),
+      );
+      expect(due.nextChargeDate, '2026-01-05');
+      expect(future.nextChargeDate, '2099-01-05');
+
+      // 1) 只为到期项生成候选；未来项不动。
+      final scan = await repository.scanDueChargeProposals(
+        throughDate: '2026-07-13',
+      );
+      expect(scan.createdCount, 1);
+      expect(scan.created.single.subscriptionId, due.id);
+      expect(scan.created.single.scheduledChargeDate, '2026-01-05');
+      expect(scan.created.single.group.status, AiGroupStatus.pending);
+      expect(scan.skipped, isEmpty);
+      expect(scan.hasMore, isFalse);
+      expect(scan.remainingEligibleCount, 0);
+
+      // 2) 扫描后余额、lastChargeDate、nextChargeDate 均不变。
+      expect(
+        _cashBalance(await client.getData('/v1/accounts/$accountId'), 'USD'),
+        '100.00',
+      );
+      final afterScan = await repository.getSubscription(due.id);
+      expect(afterScan.lastChargeDate, isNull);
+      expect(afterScan.nextChargeDate, '2026-01-05');
+      expect(afterScan.hasPendingCharge, isTrue);
+      final futureAfterScan = await repository.getSubscription(future.id);
+      expect(futureAfterScan.hasPendingCharge, isFalse);
+      expect(futureAfterScan.nextChargeDate, '2099-01-05');
+
+      // 3) AI pending 投影可读取新候选（standalone pending movement 投影）。
+      final groupId = scan.created.single.group.id;
+      final pendingProposals =
+          (await client.getData('/v1/ai/proposals/pending') as List)
+              .map((p) => _map(p))
+              .toList();
+      final pendingGroupIds = [
+        for (final p in pendingProposals)
+          for (final g in (p['atomicGroups'] as List)) '${_map(g)['id']}',
+      ];
+      expect(pendingGroupIds, contains(groupId));
+
+      // 4) 重扫不重复建：already_pending 跳过。
+      final rescan = await repository.scanDueChargeProposals(
+        throughDate: '2026-07-13',
+      );
+      expect(rescan.createdCount, 0);
+      expect(rescan.alreadyPendingCount, 1);
+      expect(
+        rescan.skipped.single.reason,
+        SubscriptionDueScanSkipReason.alreadyPending,
+      );
+      expect(rescan.skipped.single.subscriptionId, due.id);
+
+      // 5) 用户确认后才扣款并推进日期。
+      await client.postData('/v1/atomic-groups/$groupId/confirm');
+      expect(
+        _cashBalance(await client.getData('/v1/accounts/$accountId'), 'USD'),
+        '80.00',
+      );
+      final afterConfirm = await repository.getSubscription(due.id);
+      expect(afterConfirm.lastChargeDate, '2026-01-05');
+      expect(afterConfirm.nextChargeDate, '2026-02-05');
+      expect(afterConfirm.hasPendingCharge, isFalse);
+    },
+    skip: _baseUrl.isEmpty
+        ? 'Set LOCAL_SERVER_API_BASE through --dart-define; run tools/frontend_local_server_smoke.ps1.'
+        : false,
+  );
 }
