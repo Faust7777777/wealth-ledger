@@ -27,8 +27,14 @@ jobs:
         with:
           workspaces: server-rs
 
+      - name: Install Python tooling dependencies
+        run: python -m pip install --disable-pip-version-check -r tools/requirements.txt
+
       - name: Check Python syntax
         run: python -m py_compile tools/contract_check.py tools/mock_api_server.py tools/server_smoke.py tools/local_ledger_smoke.py server/dev_server.py
+
+      - name: Run contract checks
+        run: python tools/contract_check.py
 
       - name: Check shell scripts
         run: bash -n tools/install_vps_systemd.sh tools/backup_vps_ledger.sh tools/restore_vps_ledger.sh tools/vps_backup_restore_smoke.sh
@@ -92,9 +98,11 @@ jobs:
 
       - name: Run local Windows backup and restore smoke
         shell: pwsh
-        run: |
-          ./tools/local_backup_restore_smoke.ps1
-          ./tools/package_integrity_smoke.ps1
+        run: ./tools/local_backup_restore_smoke.ps1
+
+      - name: Run package integrity smoke
+        shell: pwsh
+        run: ./tools/package_integrity_smoke.ps1
 
       - name: Analyze Flutter
         run: flutter analyze
@@ -102,11 +110,18 @@ jobs:
       - name: Run Flutter tests
         run: flutter test
 
-      - name: Build and check paired Windows self-use package
+      - name: Run Flutter and Rust local-server subscription smoke
         shell: pwsh
-        run: |
-          ./tools/package_release.ps1 -WindowsOnly -CheckReadinessOnly
-          ./tools/package_release.ps1 -WindowsOnly -OutputDir tmp/package-ci
+        timeout-minutes: 10
+        run: ./tools/frontend_local_server_smoke.ps1
+
+      - name: Check paired Windows self-use package readiness
+        shell: pwsh
+        run: ./tools/package_release.ps1 -WindowsOnly -CheckReadinessOnly
+
+      - name: Build paired Windows self-use package
+        shell: pwsh
+        run: ./tools/package_release.ps1 -WindowsOnly -OutputDir tmp/package-ci
 
   flutter-android:
     name: Flutter Android

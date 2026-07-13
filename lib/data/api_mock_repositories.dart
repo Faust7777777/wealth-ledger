@@ -102,7 +102,7 @@ class DevApiClient {
     final body = jsonDecode(utf8.decode(res.bodyBytes));
     if (body is Map<String, dynamic>) {
       if (body['ok'] == false) throw Exception('API error · $path');
-      return body['data'] ?? body;
+      return body.containsKey('data') ? body['data'] : body;
     }
     return body;
   }
@@ -923,7 +923,9 @@ class LocalServerMovementRepository implements MovementRepository {
   final DevApiClient _c;
   @override
   Future<List<MovementVm>> listRecentMovements({int limit = 20}) async => [
-    for (final m in _list(await _c.getData('/v1/movements/recent')))
+    for (final m in _list(
+      await _c.getData('/v1/movements/recent?limit=$limit'),
+    ))
       _movement(_m(m)),
   ];
   @override
@@ -1243,8 +1245,8 @@ class LocalServerSnapshotRepository implements SnapshotRepository {
   ];
   @override
   Future<NetWorthSnapshotVm?> getLatest() async {
-    final all = await listSnapshots();
-    return all.isEmpty ? null : all.first;
+    final d = await _c.getData('/v1/snapshots/latest');
+    return d == null ? null : _snapshot(_m(d));
   }
 
   @override

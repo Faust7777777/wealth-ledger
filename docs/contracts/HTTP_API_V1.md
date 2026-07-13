@@ -240,6 +240,7 @@ POST  /v1/subscriptions/{subscriptionId}/charge-proposal
 - `billingCycle` 支持日、周、自然月、自然年及正整数间隔。
 - 自然月/年保留最初扣款日作为 `billingAnchorDay`；31 日遇短月取月末，后续月份恢复锚点，不永久漂移到 28 日。
 - 创建时可提供 `duration` 或 `endDate`，二者互斥；不提供表示持续订阅。
+- PATCH 将 nullable `duration`/`endDate` 视为一组排期替换字段：二者都非空时冲突；`duration` 非空时按 `startDate` 计算 `endDate`；仅 `endDate` 非空时移除 `duration`；两者都为 `null` 时清除有限期限。
 - subscription 计划本身不写支出。`charge-proposal` 只创建 `pending_review` expense，确认 atomic group 后才影响账户余额并推进 `nextChargeDate`；拒绝后允许重新生成同一期候选。
 - 取消不会删除历史 movement，只停止未来计划扣款。
 - 所有写操作必须提供 `Idempotency-Key`。

@@ -45,9 +45,10 @@ cargo run --manifest-path server-rs/Cargo.toml -- --port 8791 --ledger-path .\tm
 
 - localhost only
 - no persistence in the default deterministic dev mode
-- `--ledger-path` enables real-local JSON persistence for accounts, movements,
-  DCA plans/reminders, AI proposals, snapshots, categories, counterparties, and
-  derived portfolio read models
+- `--ledger-path` enables real-local JSON persistence for accounts,
+  instruments/holdings, movements, DCA plans/reminders, subscriptions, AI
+  proposals, snapshots, categories/counterparties, quote/FX cache, sync log,
+  idempotency records, and derived portfolio read models
 - persistent configurable local auth for login/refresh/devices; dev-compatible
   tokens are used only when auth env vars are absent
 - no model-backed AI; import routes create reviewable proposals only
@@ -122,9 +123,10 @@ continues to work until the client stores and sends tokens.
 
 ## Real-local ledger bootstrap
 
-The first real-local storage seam is a validated JSON ledger file. This is a
-bootstrap format for local self-use development: it is not the debug fixture,
-not synced, and not encrypted yet. Future SQLite/encryption work should sit
+The first real-local storage seam is a validated JSON ledger file plus an
+optional sibling auth-state file. This is a bootstrap format for local self-use
+development: it is not the debug fixture, it has a local sync log but no remote
+coordinator, and it is not encrypted yet. Future SQLite/encryption work should sit
 behind the same ledger boundary instead of changing route handlers.
 
 ```powershell
@@ -134,6 +136,16 @@ cargo run --manifest-path server-rs/Cargo.toml -- --validate-auth-state .\tmp\le
 cargo run --manifest-path server-rs/Cargo.toml -- --check-ledger-paths .\tmp\ledger.json .\tmp\ledger.fixture.json
 ```
 
+Persisted files for the default path pair are:
+
+```text
+tmp\ledger.json       # business ledger, sync log, idempotency records
+tmp\ledger.auth.json  # optional device state and token hashes; no plaintext tokens
+```
+
+The sibling auth state backs login/refresh/logout and device list/revoke routes;
+it is not part of portfolio or movement derivation.
+
 Running the server with `--ledger-path` makes the first self-use write paths use
 the JSON ledger when no `?scenario=` query is present:
 
@@ -141,8 +153,17 @@ the JSON ledger when no `?scenario=` query is present:
 - movements: draft → submit review → confirm/reject, detail, list
 - DCA: create plan, list due reminders, skip/snooze, record executed as a
   confirmable proposal
+- subscriptions: `GET/POST /v1/subscriptions`,
+  `GET /v1/subscriptions/upcoming`,
+  `GET/PATCH /v1/subscriptions/{subscription_id}`,
+  `POST /v1/subscriptions/{subscription_id}/cancel`, and
+  `POST /v1/subscriptions/{subscription_id}/charge-proposal`; plans never
+  charge an external payment provider, and only confirmed proposals affect
+  balances
 - AI proposal review: text/image/CSV import proposals, edit, approve/reject
 - snapshots: latest/list/manual baseline
+- instruments and cached market data: instrument create/update plus quote/FX
+  reads and explicit quote refresh when a provider is configured
 - taxonomy: categories, counterparties, counterparty merge proposal
 - portfolio read models: overview, allocation, holdings, quote summary
 - sync outbox: pull/ack plus idempotent remote log relay; no entity merge yet
@@ -150,8 +171,9 @@ the JSON ledger when no `?scenario=` query is present:
   is promoted only when the primary is missing, while an invalid temp blocks
   empty-ledger initialization and remains available for recovery
 
-Passing `?scenario=degraded` still uses the virtual dev dataset for frontend
-demo integration.
+With a real ledger mounted, `?scenario=` is rejected by default so virtual data
+cannot be mixed with real state. `FINWEALTH_ALLOW_LEDGER_SCENARIO=true` is an
+explicit dev-only diagnostic override.
 
 The validator rejects debug fixture markers and basic invalid money shapes so a
 real-local file cannot silently become demo data.
@@ -195,8 +217,8 @@ POST /v1/atomic-groups/{atomic_group_id}/reject
 ```
 
 Approve/confirm responses include `ledgerWrite: false` and an empty
-`confirmedMovementIds` list in this dev server. This is intentional until the
-real local ledger store exists.
+`confirmedMovementIds` list when no ledger path is mounted. This is intentional
+because deterministic dev mode has no durable confirmed ledger.
 
 Within a running dev-server process, proposal create / approve / reject / edit
 state is tracked in memory so the frontend can verify review flows. Restarting
@@ -234,6 +256,8 @@ Current route regression tests cover:
 - degraded portfolio overview pending summary
 - empty-list defaults for first-batch read routes
 - degraded account / holding / movement / DCA / AI / snapshot / quote routes
+- subscription scheduling, pending-charge conflict, rejection/retry,
+  confirmation date advancement, cancellation, and foreign-currency charging
 - DCA mark-executed returns `pending_review` proposal and states no order/no transfer
 - dev-only AI/DCA proposal write paths do not write confirmed ledger
 - forbidden product-boundary endpoints return 403

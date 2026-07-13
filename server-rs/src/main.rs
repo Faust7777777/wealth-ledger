@@ -8416,6 +8416,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscription_patch_accepts_nullable_schedule_replacement_fields() {
+        let path = unique_test_ledger_path("subscription_patch_nullable_schedule");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (_, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "USD card",
+                "accountType": "virtual_card",
+                "defaultCurrency": "USD",
+                "supportedCurrencies": ["USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "USD", "amount": "100.00"}]
+            }),
+        )
+        .await;
+        let account_id = account_body["data"]["id"].as_str().expect("account id");
+
+        let (_, create_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/subscriptions",
+            json!({
+                "displayName": "Claude Pro",
+                "provider": "Anthropic",
+                "amount": {"amount": "20.00", "currency": "USD"},
+                "paymentAccountId": account_id,
+                "billingCycle": {"unit": "month", "interval": 1},
+                "startDate": "2026-01-31",
+                "duration": {"unit": "month", "count": 3}
+            }),
+        )
+        .await;
+        let subscription_id = create_body["data"]["id"].as_str().expect("subscription id");
+
+        let (empty_status, empty_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/subscriptions/{subscription_id}"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(empty_status, StatusCode::BAD_REQUEST, "{empty_body}");
+        assert_eq!(
+            empty_body["error"]["details"]["errors"][0],
+            "subscription patch must contain at least one field"
+        );
+
+        let (duration_clear_status, duration_clear_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/subscriptions/{subscription_id}"),
+            json!({"duration": null}),
+        )
+        .await;
+        assert_eq!(
+            duration_clear_status,
+            StatusCode::OK,
+            "{duration_clear_body}"
+        );
+        assert!(duration_clear_body["data"].get("duration").is_none());
+        assert_eq!(duration_clear_body["data"]["endDate"], Value::Null);
+
+        let (patch_status, patch_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/subscriptions/{subscription_id}"),
+            json!({"duration": null, "endDate": "2026-04-30"}),
+        )
+        .await;
+        assert_eq!(patch_status, StatusCode::OK, "{patch_body}");
+        assert!(patch_body["data"].get("duration").is_none());
+        assert_eq!(patch_body["data"]["endDate"], "2026-04-30");
+
+        let (duration_status, duration_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/subscriptions/{subscription_id}"),
+            json!({
+                "duration": {"unit": "month", "count": 2},
+                "endDate": null
+            }),
+        )
+        .await;
+        assert_eq!(duration_status, StatusCode::OK, "{duration_body}");
+        assert_eq!(duration_body["data"]["duration"]["count"], 2);
+        assert_eq!(duration_body["data"]["endDate"], "2026-03-30");
+
+        let (end_clear_status, end_clear_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/subscriptions/{subscription_id}"),
+            json!({"endDate": null}),
+        )
+        .await;
+        assert_eq!(end_clear_status, StatusCode::OK, "{end_clear_body}");
+        assert!(end_clear_body["data"].get("duration").is_none());
+        assert_eq!(end_clear_body["data"]["endDate"], Value::Null);
+
+        let (clear_status, clear_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/subscriptions/{subscription_id}"),
+            json!({"duration": null, "endDate": null}),
+        )
+        .await;
+        assert_eq!(clear_status, StatusCode::OK, "{clear_body}");
+        assert!(clear_body["data"].get("duration").is_none());
+        assert_eq!(clear_body["data"]["endDate"], Value::Null);
+
+        let (conflict_status, conflict_body) = request_json_body_from(
+            router,
+            Method::PATCH,
+            &format!("/v1/subscriptions/{subscription_id}"),
+            json!({
+                "duration": {"unit": "month", "count": 2},
+                "endDate": "2026-04-30"
+            }),
+        )
+        .await;
+        assert_eq!(conflict_status, StatusCode::BAD_REQUEST, "{conflict_body}");
+        assert_eq!(
+            conflict_body["error"]["details"]["errors"][0],
+            "duration and endDate are mutually exclusive"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn health_route_returns_ok() {
         let (status, body) = request_json(Method::GET, "/v1/health").await;
         assert_eq!(status, StatusCode::OK);

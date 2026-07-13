@@ -6,16 +6,17 @@
 
 ## 0. 当前物理格式
 
-当前真实本地账本是一个 UTF-8 JSON 文件，由 Rust local ledger 读写：
+当前真实本地业务账本是一个 UTF-8 JSON 文件，由 Rust local ledger 读写；启用持久化登录时还会有一个独立的 auth 状态文件：
 
 ```text
 ledger.json
 ledger.json.tmp   // 写入中临时文件；主文件缺失时仅在完整校验通过后自动恢复
+ledger.auth.json  // 可选；设备与 token 哈希状态，不属于业务账本
 ```
 
 规则：
 
-- `ledger.json` 是唯一真实账本文件。
+- `ledger.json` 是唯一真实业务账本文件；`ledger.auth.json` 仅保存本地认证状态，不包含明文 token，也不得混入账本 JSON。
 - 不存在 `accounts.csv`、`movements.csv`、`ledger.db` 等正式磁盘文件。
 - 写入流程必须是：读取现有 JSON → 内存中修改 → schema/invariant 校验 → 写入同目录 `.tmp` → flush/sync 文件 → 原子 rename 覆盖 `ledger.json` → sync 已提交文件（Unix 另 sync 父目录元数据）。
 - 启动时若 `ledger.json` 不存在但 `ledger.json.tmp` 存在，只在临时文件能完整解析并通过账本校验时自动提升为主文件。
@@ -144,25 +145,37 @@ Migration {
 
 规则：
 
-- 迁移器必须先备份整个 `ledger.json`。
+- 迁移器必须先创建经过校验的完整备份目录；存在同名 auth 状态时应与 `ledger.json` 一并纳入快照。
 - 迁移失败不得覆盖原账本。
 - 迁移必须可重复检测，不能重复应用同一 migration。
 - 迁移完成后必须执行完整账本校验。
 
-## 6. 备份与导出
+## 6. 备份、恢复与导出
 
-MVP 备份口径：
+当前 Windows 自用备份以 `tools/backup_local_ledger.ps1` 生成的目录为边界，不再把手工复制单个 `ledger.json` 视为完整、可验证备份：
 
-- 手动备份 = 复制整个 `ledger.json`。
-- 备份不包含 fixture。
-- 备份不包含运行时 token、设备密钥、服务端 env。
-- CSV 导入导出是应用层能力，不是当前本地账本的物理格式。
+- 先在备份根目录的未发布 staging 目录复制 `ledger.json`，以及存在时的 `ledger.auth.json`。
+- 复制前后比较源文件 SHA-256 与 auth 存在性；复制期间源状态变化则失败并删除 staging，避免发布混合时点快照。
+- 默认使用 Rust `--validate-ledger` / `--validate-auth-state` 校验 staging 副本。
+- staging 内生成固定文件名 `manifest.txt` 与 `SHA256SUMS`，记录格式版本、是否包含 auth 及校验状态，再以目录移动发布最终备份。
+- 备份不包含 fixture、明文运行时 token、密码、服务端 env 或外部设备密钥；auth 文件只包含设备信息与 token 哈希，仍应按敏感数据保护。
+
+当前恢复以 `tools/restore_local_ledger.ps1` 为准：
+
+- 默认只接受带 `manifest.txt` / `SHA256SUMS` 且内容一致的备份目录；直接文件或损坏/缺失清单只能通过显式 `-AllowUnverified` 进入应急路径。
+- 当前 live ledger 存在时，替换前先创建 pre-restore 备份；恢复事务还会在目标目录 stage 账本/auth，并重新校验 SHA-256 和 Rust 语义。
+- 已验证备份包含 auth 时同时恢复；明确 `includesAuth=false` 时删除旧 live auth，禁止把新账本与旧登录状态拼成混合快照。
+- ledger/auth 替换开始后的任何失败或写后验证失败，都必须恢复两者各自的原始存在状态和内容。
+- `-SkipValidate` / `-AllowUnverified` 只用于明确的应急恢复，不应作为日常备份或发布验收路径。
+
+CSV 导入导出是应用层能力，不是当前本地账本的物理格式。
 
 未来如提供 CSV 导出，应明确标注为“导出视图”，不是可直接替代 `ledger.json` 的完整备份。
 
 ## 7. 安全边界
 
 - `ledger.json` 可能包含完整资产、账户名称、AI evidence 摘要，默认应按敏感文件处理。
+- `ledger.auth.json`、备份目录和 pre-restore 目录同样属于敏感本地状态。
 - 不在日志中输出完整余额、token、密钥、原始图片内容。
 - localhost server 必须保持 loopback bind，并通过 Host allow-list 防 DNS rebinding。
 - 真实账本模式建议开启 auth；开发脚本不得无提示地以无 auth 方式打开真实账本。

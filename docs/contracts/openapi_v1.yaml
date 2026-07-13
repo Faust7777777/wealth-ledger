@@ -2220,6 +2220,7 @@ components:
     UpdateSubscriptionRequest:
       type: object
       minProperties: 1
+      description: Nullable duration and endDate form one schedule replacement group. Two non-null values conflict; non-null duration computes endDate from startDate; only non-null endDate removes duration; two null values clear the finite schedule.
       properties:
         displayName:
           type: string

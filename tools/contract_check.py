@@ -25,6 +25,11 @@ DEV_SERVER = ROOT / "server" / "dev_server.py"
 RUST_SERVER = ROOT / "server-rs" / "src" / "main.rs"
 RUST_MANIFEST = ROOT / "server-rs" / "Cargo.toml"
 SERVER_SMOKE = ROOT / "tools" / "server_smoke.py"
+FRONTEND_LOCAL_SERVER_SMOKE = ROOT / "tools" / "frontend_local_server_smoke.ps1"
+LOCAL_SERVER_SUBSCRIPTION_TEST = (
+    ROOT / "test" / "local_server_subscription_integration_test.dart"
+)
+PYTHON_REQUIREMENTS = ROOT / "tools" / "requirements.txt"
 DEPLOY_ENV_EXAMPLE = ROOT / "deploy" / "finwealth-server.env.example"
 SYSTEMD_SERVICE = ROOT / "deploy" / "systemd" / "finwealth-server.service"
 VPS_BACKUP = ROOT / "tools" / "backup_vps_ledger.sh"
@@ -40,6 +45,7 @@ WINDOWS_LAUNCHER_CMD = ROOT / "tools" / "windows_self_use_launcher.cmd"
 WINDOWS_PACKAGE_DOC = ROOT / "docs" / "deploy" / "WINDOWS_SELF_USE_PACKAGE.md"
 PACKAGE_WORKFLOW = ROOT / ".github" / "workflows" / "package.yml"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+GITIGNORE = ROOT / ".gitignore"
 
 FORBIDDEN_ENDPOINTS = {
     "/transfers/execute",
@@ -337,6 +343,8 @@ def check_rust_server() -> None:
         "temporary.sync_all()",
         "sync_parent_directory",
         "recovery temp is invalid",
+        "subscription patch must contain at least one field",
+        "duration and endDate are mutually exclusive",
     ]
     missing_lock_snippets = [
         snippet for snippet in ledger_lock_snippets if snippet not in local_ledger_text
@@ -377,6 +385,48 @@ def check_server_smoke() -> None:
         fail("Server smoke script missing required checks: " + ", ".join(missing))
 
     ok("Server smoke script checks passed")
+
+
+def check_frontend_local_server_smoke() -> None:
+    for required in (FRONTEND_LOCAL_SERVER_SMOKE, LOCAL_SERVER_SUBSCRIPTION_TEST):
+        if not required.exists():
+            fail(f"Missing local-server frontend integration artifact: {required}")
+
+    smoke_text = FRONTEND_LOCAL_SERVER_SMOKE.read_text(encoding="utf-8")
+    smoke_snippets = [
+        "finwealth-server.exe",
+        "--ledger-path",
+        "LOCAL_SERVER_API_BASE",
+        "local_server_subscription_integration_test.dart",
+        "Stop-Process",
+    ]
+    missing = [snippet for snippet in smoke_snippets if snippet not in smoke_text]
+    if missing:
+        fail(
+            "Frontend local-server smoke missing required behavior: "
+            + ", ".join(missing)
+        )
+
+    test_text = LOCAL_SERVER_SUBSCRIPTION_TEST.read_text(encoding="utf-8")
+    test_snippets = [
+        "ChatGPT Plus integration",
+        "currency: 'USD'",
+        "2026-01-31",
+        "2026-02-28",
+        "updateSubscription",
+        "2026-04-30",
+        "ApiConflictException",
+        "ledgerWrite",
+        "SubscriptionStatus.cancelled",
+    ]
+    missing = [snippet for snippet in test_snippets if snippet not in test_text]
+    if missing:
+        fail(
+            "Local-server subscription test missing regression coverage: "
+            + ", ".join(missing)
+        )
+
+    ok("Frontend local-server subscription smoke checks passed")
 
 
 def check_deploy_security_defaults() -> None:
@@ -507,6 +557,8 @@ def check_release_packaging() -> None:
     for required in (
         PACKAGE_SCRIPT,
         PACKAGE_INTEGRITY_SMOKE,
+        FRONTEND_LOCAL_SERVER_SMOKE,
+        PYTHON_REQUIREMENTS,
         WINDOWS_LAUNCHER,
         WINDOWS_LAUNCHER_CMD,
         WINDOWS_PACKAGE_DOC,
@@ -515,6 +567,9 @@ def check_release_packaging() -> None:
     ):
         if not required.exists():
             fail(f"Missing self-use packaging artifact: {required}")
+
+    if PYTHON_REQUIREMENTS.read_text(encoding="utf-8").strip() != "PyYAML==6.0.3":
+        fail("Python tooling must pin the reviewed PyYAML version")
 
     package_text = PACKAGE_SCRIPT.read_text(encoding="utf-8")
     required_package_snippets = [
@@ -593,9 +648,11 @@ def check_release_packaging() -> None:
         "verify-windows-source:",
         "cargo clippy",
         "python tools/contract_check.py",
+        "tools/requirements.txt",
         "python tools/local_ledger_smoke.py",
         "local_backup_restore_smoke.ps1",
         "package_integrity_smoke.ps1",
+        "frontend_local_server_smoke.ps1",
         "flutter analyze",
         "flutter test",
         "needs: verify-windows-source",
@@ -615,8 +672,40 @@ def check_release_packaging() -> None:
         fail("CI must not swallow the client idempotency packaging blocker")
     if "package_release.ps1 -WindowsOnly -OutputDir" not in ci_workflow_text:
         fail("CI must build the paired Windows package rather than readiness-check only")
+    if "frontend_local_server_smoke.ps1" not in ci_workflow_text:
+        fail("CI must run the real Flutter and Rust subscription smoke")
+    if "python tools/contract_check.py" not in ci_workflow_text:
+        fail("CI must execute the contract checks")
+    if "tools/requirements.txt" not in ci_workflow_text:
+        fail("CI must install the pinned Python tooling dependencies")
 
     ok("Self-use release packaging checks passed")
+
+
+def check_repository_hygiene() -> None:
+    if not GITIGNORE.exists():
+        fail(f"Missing repository ignore policy: {GITIGNORE}")
+    lines = {
+        line.strip()
+        for line in GITIGNORE.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    required_patterns = [
+        ".env",
+        ".env.*",
+        "*.pem",
+        "*.pfx",
+        "*.keystore",
+        "ledger.json",
+        "ledger.json.tmp",
+        "ledger.auth.json",
+        "backups/",
+        "dist/",
+    ]
+    missing = [pattern for pattern in required_patterns if pattern not in lines]
+    if missing:
+        fail("Repository ignore policy is missing sensitive patterns: " + ", ".join(missing))
+    ok("Repository sensitive-file ignore policy passed")
 
 
 def missing_items(items: Iterable[Path]) -> list[Path]:
@@ -726,6 +815,19 @@ def main() -> None:
     confirm_required = set(confirm_result.get("required", []))
     if "ledgerWrite" not in confirm_required:
         fail("ConfirmResult must require ledgerWrite so clients do not guess write semantics")
+    update_subscription = doc["components"]["schemas"].get(
+        "UpdateSubscriptionRequest", {}
+    )
+    if update_subscription.get("minProperties") != 1:
+        fail("UpdateSubscriptionRequest must reject an empty PATCH body")
+    update_subscription_description = update_subscription.get("description", "")
+    for required_phrase in (
+        "Two non-null values conflict",
+        "non-null duration computes endDate",
+        "two null values clear the finite schedule",
+    ):
+        if required_phrase not in update_subscription_description:
+            fail("UpdateSubscriptionRequest must document nullable schedule replacement semantics")
     categories_post_schema = doc["paths"]["/categories"]["post"]["requestBody"]["content"]["application/json"]["schema"].get("$ref")
     if categories_post_schema != "#/components/schemas/CreateCategoryInput":
         fail("POST /categories must use CreateCategoryInput, not the response Category schema")
@@ -765,8 +867,10 @@ def main() -> None:
     check_dev_server()
     check_rust_server()
     check_server_smoke()
+    check_frontend_local_server_smoke()
     check_deploy_security_defaults()
     check_release_packaging()
+    check_repository_hygiene()
 
     if not forbidden_present and not missing_from_openapi:
         ok("Contract check passed")

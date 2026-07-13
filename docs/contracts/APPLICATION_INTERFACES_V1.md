@@ -172,6 +172,64 @@ DcaService {
 - 不下单。
 - 不转账。
 
+## 5A. SubscriptionService
+
+```ts
+SubscriptionService {
+  listSubscriptions(): Result<Subscription[]>;
+  listUpcoming(days?: number): Result<Subscription[]>;
+  getSubscription(subscriptionId: ID): Result<Subscription>;
+  createSubscription(input: CreateSubscriptionInput): Result<Subscription>;
+  updateSubscription(subscriptionId: ID, patch: UpdateSubscriptionPatch): Result<Subscription>;
+  cancelSubscription(subscriptionId: ID): Result<Subscription>;
+  createChargeProposal(subscriptionId: ID): Result<AiAtomicGroup>;
+}
+
+CreateSubscriptionInput {
+  displayName: string;
+  provider: string;
+  planName?: string;
+  amount: Money;
+  paymentAccountId: ID;
+  billingCycle: SubscriptionBillingCycle;
+  startDate: ISODate;
+  duration?: SubscriptionDuration;
+  endDate?: ISODate;
+  nextChargeDate?: ISODate;
+  autoRenew?: boolean;
+  reminderDaysBefore?: number;
+  status?: "trial" | "active" | "paused";
+  note?: string;
+}
+
+UpdateSubscriptionPatch {
+  displayName?: string;
+  provider?: string;
+  planName?: string | null;
+  amount?: Money;
+  paymentAccountId?: ID;
+  billingCycle?: SubscriptionBillingCycle;
+  startDate?: ISODate;
+  duration?: SubscriptionDuration | null;
+  endDate?: ISODate | null;
+  nextChargeDate?: ISODate;
+  autoRenew?: boolean;
+  reminderDaysBefore?: number;
+  status?: "trial" | "active" | "paused";
+  note?: string | null;
+}
+```
+
+约束：
+
+- 订阅计划本身不是已发生的 Movement，不得在创建或编辑计划时扣款。
+- `listUpcoming` 默认窗口为 30 天，`days` 只接受 1–365。
+- `amount` 保留原币种；`duration` 与 `endDate` 最多一个为非空值。
+- `createChargeProposal` 只生成 `pending_review` 支出候选；同一计费日期不得重复生成候选。
+- 候选确认后才写正式流水、影响余额并推进 `nextChargeDate`；拒绝后保留原计费日期。
+- 存在待确认扣费候选时取消订阅必须返回冲突；取消不删除历史扣费记录。
+- 该服务不连接支付平台，不自动续费或代扣。
+
 ## 6. AiProposalService
 
 ```ts

@@ -1,27 +1,31 @@
 # FRONTEND_API_INTEGRATION_HANDOFF_V1
 
-状态：给 Flutter 前端线的本地联调交接。  
-用途：让前端在不等待真实服务器、真实行情、真实 AI 的情况下，对准同一套接口形状。  
+状态：历史阶段交接；保留用于解释早期 mock/dev 接线，不再作为当前实现矩阵。
+用途：记录 Flutter 前端早期在不等待真实服务器、真实行情、真实 AI 时如何对准接口形状。
 非用途：不是生产后端说明，不授权接真实钱、真实交易、真实 AI 写账。
 
-## 1. 当前结论
+> 当前权威边界以 `openapi_v1.yaml`、`HTTP_API_V1.md`、`LOCAL_LEDGER_FORMAT_V1.md`、`server-rs/README.md` 和最新 `docs/handoffs/` 回执为准。本文后续“第一阶段”“当前”均指早期联调阶段，端点列表不是现状的完整清单。
 
-第一阶段前端可以并行做三种数据源，但默认仍是本地空账本：
+## 1. 当前真实/空壳边界（2026-07-13）
 
-```text
-real_local      默认；真实本地账本壳；当前返回空态
-debug_fixture   仅 debug/demo；虚构演示数据；必须显示 DEMO；禁止同步
-api_mock        仅本地联调；请求 localhost stub；不得作为默认模式
-```
-
-当前仓库已经有两个可用于本地联调的 HTTP 服务：
+Flutter 当前仍保留多种数据源，但它们的真实性边界不同：
 
 ```text
-Python dev server  http://127.0.0.1:8790
-Rust dev server    http://127.0.0.1:8791
+real_local      默认；Flutter 内部空账本壳；不直接读写 JSON，写操作不支持
+debug_fixture   仅 debug/demo；虚构只读演示数据；显示 DEMO；禁止同步/备份
+local_server    Flutter HTTP adapter；连接带 --ledger-path 的 Rust 服务时是真实本地持久化路径
+api_remote      预留；尚不是完整 VPS 多设备同步实现
 ```
 
-前端若新增远端/HTTP repository，建议命名为 `api_mock` 或 `dev_server`，不要命名成生产 `api_remote`。`api_remote` 留给未来 VPS 同步服务。
+服务端边界：
+
+```text
+Rust + --ledger-path  真实 accounts/movements/DCA/subscriptions/proposals/snapshots/taxonomy 持久化
+Rust 无 ledger path   确定性 empty/degraded 读模型与进程内 proposal 联调；重启丢失
+Python dev/mock       接口形状与 smoke；不得作为真实副作用验收依据
+```
+
+`local_server` 的写入能力必须由 `/v1/ledger/bootstrap.data.capabilities` fail-closed 控制。当前已落地的订阅管理路由包括 list/upcoming/detail/create/update/cancel/charge-proposal；订阅计划不会自动扣款，charge proposal 经用户确认后才影响余额。真实 AI 模型、支付代扣、券商交易和完整远端同步仍未实现。
 
 ## 2. 前端接入顺序
 

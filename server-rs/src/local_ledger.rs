@@ -5937,6 +5937,11 @@ fn apply_subscription_patch(
     let object = patch
         .as_object()
         .expect("subscription patch object validated before mutation");
+    if object.is_empty() {
+        return Err(LedgerError::InvalidInput(vec![
+            "subscription patch must contain at least one field".to_string(),
+        ]));
+    }
     let allowed = [
         "displayName",
         "provider",
@@ -5964,7 +5969,9 @@ fn apply_subscription_patch(
             unknown.join(", ")
         )]));
     }
-    if object.contains_key("duration") && object.contains_key("endDate") {
+    if object.get("duration").is_some_and(|value| !value.is_null())
+        && object.get("endDate").is_some_and(|value| !value.is_null())
+    {
         return Err(LedgerError::InvalidInput(vec![
             "duration and endDate are mutually exclusive".to_string(),
         ]));
@@ -6020,36 +6027,34 @@ fn apply_subscription_patch(
         }
         candidate["status"] = value.clone();
     }
-    if let Some(value) = object.get("duration") {
-        if value.is_null() {
-            candidate
-                .as_object_mut()
-                .expect("subscription should be an object")
-                .remove("duration");
-            candidate["endDate"] = Value::Null;
-        } else {
-            let mut errors = Vec::new();
-            let duration = normalized_subscription_duration(Some(value), &mut errors);
-            let start =
-                normalized_subscription_date(candidate.get("startDate"), "startDate", &mut errors);
-            let end = match (start, duration.as_ref()) {
-                (Some(start), Some(duration)) => {
-                    subscription_duration_end_date(start, duration, &mut errors)
-                }
-                _ => None,
-            };
-            if !errors.is_empty() {
-                return Err(LedgerError::InvalidInput(errors));
+    if let Some(value) = object.get("duration").filter(|value| !value.is_null()) {
+        let mut errors = Vec::new();
+        let duration = normalized_subscription_duration(Some(value), &mut errors);
+        let start =
+            normalized_subscription_date(candidate.get("startDate"), "startDate", &mut errors);
+        let end = match (start, duration.as_ref()) {
+            (Some(start), Some(duration)) => {
+                subscription_duration_end_date(start, duration, &mut errors)
             }
-            candidate["duration"] = duration.expect("validated duration");
-            candidate["endDate"] = json!(end.expect("validated end date").to_string());
+            _ => None,
+        };
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
         }
+        candidate["duration"] = duration.expect("validated duration");
+        candidate["endDate"] = json!(end.expect("validated end date").to_string());
     } else if let Some(value) = object.get("endDate") {
         candidate
             .as_object_mut()
             .expect("subscription should be an object")
             .remove("duration");
         candidate["endDate"] = value.clone();
+    } else if object.contains_key("duration") {
+        candidate
+            .as_object_mut()
+            .expect("subscription should be an object")
+            .remove("duration");
+        candidate["endDate"] = Value::Null;
     } else if object.contains_key("startDate")
         && let Some(duration) = candidate.get("duration").cloned()
     {

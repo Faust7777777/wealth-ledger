@@ -31,6 +31,7 @@ Application Services
   ↓
 LedgerCore
   ├─ LedgerStorePort
+  ├─ SubscriptionStorePort
   ├─ ProposalStorePort
   ├─ QuoteStorePort
   ├─ SnapshotStorePort
@@ -53,6 +54,7 @@ LedgerCore {
   portfolio: PortfolioUseCases;
   movements: MovementUseCases;
   dca: DcaUseCases;
+  subscriptions: SubscriptionUseCases;
   aiProposals: AiProposalUseCases;
   quotes: QuoteUseCases;
   snapshots: SnapshotUseCases;
@@ -65,6 +67,26 @@ LedgerCore {
 - facade 不暴露数据库表。
 - facade 不暴露 debug fixture 真实路径。
 - facade 不包含自动交易接口。
+
+### SubscriptionUseCases
+
+```ts
+SubscriptionUseCases {
+  listSubscriptions(): Subscription[];
+  listUpcoming(days?: number): Subscription[];
+  getSubscription(subscriptionId: ID): Subscription | null;
+  createSubscription(input: CreateSubscriptionInput): Subscription;
+  updateSubscription(subscriptionId: ID, patch: UpdateSubscriptionPatch): Subscription;
+  cancelSubscription(subscriptionId: ID): Subscription;
+  createChargeProposal(subscriptionId: ID): AiAtomicGroup;
+}
+```
+
+规则：
+
+- 创建、编辑、暂停或取消计划只改变订阅资源，不直接写 confirmed movement。
+- `createChargeProposal` 只创建待确认候选，并记录该订阅当前计费日期的 pending 引用。
+- 候选确认与拒绝复用 atomic-group 事务边界，不另建绕过复核的扣款路径。
 
 ## 3. Store ports
 
@@ -100,6 +122,24 @@ LedgerStorePort {
 - `saveMovementsAtomic` 必须事务化。
 - `pending_review` / `draft` 不应被写入 confirmed ledger 视图。
 - confirmed movement 不应被静默覆盖。
+
+### SubscriptionStorePort
+
+```ts
+SubscriptionStorePort {
+  listSubscriptions(): Subscription[];
+  getSubscription(id: ID): Subscription | null;
+  saveSubscription(subscription: Subscription): void;
+}
+```
+
+不变量：
+
+- subscription 保存未来周期计划与 pending/last charge 引用，不等同于 confirmed movement。
+- 同一订阅、同一计费日期最多有一个待确认扣费候选。
+- 创建候选时，proposal 写入与订阅 pending 引用必须处于同一事务边界。
+- 确认扣费时，movement 写入、pending 清除、last charge 更新和 `nextChargeDate` 推进必须处于同一事务边界。
+- 拒绝候选只清除 pending 引用，不推进计费日期。
 
 ### ProposalStorePort
 
@@ -262,9 +302,10 @@ confirmAtomicGroup(groupId: ID): ConfirmResult
 2. 校验状态为 pending / edited。
 3. 重新运行 validation。
 4. 事务写入 confirmed movements/entities。
-5. 更新 proposal group 状态。
-6. 标记快照过期。
-7. 追加 sync outbox。
+5. 若为订阅扣费候选，清除 pending 引用、记录本次扣费并推进下次计费日期。
+6. 更新 proposal group 状态。
+7. 标记快照过期。
+8. 追加 sync outbox。
 
 返回值必须包含 `ledgerWrite`；调用方只能在 `ledgerWrite=true` 时展示“已入账”或按正式账本写入刷新派生视图。
 
@@ -302,16 +343,31 @@ markDcaExecutedAsProposal(reminderId: ID): AiAtomicGroup
 - pending proposal / draft 可以持久化，但用户确认前不得写入 confirmed/effective ledger。
 - 确认 atomic group 后才影响余额、持仓、净值和快照。
 
-## 7. Data source mode
+### Generate subscription charge proposal
 
 ```ts
-DataSourceMode = "real_local" | "debug_fixture" | "api_remote";
+createSubscriptionChargeProposal(subscriptionId: ID): AiAtomicGroup
 ```
 
 规则：
 
-- `real_local` 是默认。
+- 只为 active / trial 且存在下一计费日期的计划生成支出候选。
+- 金额保持订阅原币种，付款账户必须支持该币种。
+- 已存在 pending 扣费候选时返回冲突，不重复创建。
+- 确认前不影响余额、流水、净值或快照；确认后才推进计划日期。
+- 不调用支付平台，不执行自动续费或真实代扣。
+
+## 7. Data source mode
+
+```ts
+DataSourceMode = "real_local" | "debug_fixture" | "local_server" | "api_remote";
+```
+
+规则：
+
+- `real_local` 是 Flutter 默认空壳 adapter，当前不直接打开 JSON 文件。
 - `debug_fixture` 使用独立 store，实现同样 ports，但永不进入 sync outbox。
+- `local_server` 通过 localhost HTTP 调 Rust；只有服务挂载 `--ledger-path` 时才是当前真实本地持久化实现。
 - `api_remote` 走 HTTP API，但仍不得暴露交易权限。
 
 ## 8. 后续实现建议
