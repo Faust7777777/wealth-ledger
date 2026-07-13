@@ -60,9 +60,10 @@ const _account = AccountVm(
 );
 
 class _FakeSubRepo implements SubscriptionRepository {
-  _FakeSubRepo({this.onCharge, this.onCancel});
+  _FakeSubRepo({this.onCharge, this.onCancel, this.onScan});
   final Future<AiAtomicGroupVm> Function()? onCharge;
   final Future<SubscriptionVm> Function()? onCancel;
+  final Future<SubscriptionDueScanResultVm> Function()? onScan;
 
   @override
   Future<AiAtomicGroupVm> createChargeProposal(Id id) =>
@@ -74,7 +75,7 @@ class _FakeSubRepo implements SubscriptionRepository {
   Future<SubscriptionDueScanResultVm> scanDueChargeProposals({
     required IsoDate throughDate,
     int limit = 100,
-  }) => throw UnsupportedError('no scan');
+  }) => onScan?.call() ?? (throw UnsupportedError('no scan'));
   @override
   Future<List<SubscriptionVm>> listSubscriptions() async => const [];
   @override
@@ -98,6 +99,23 @@ AiAtomicGroupVm _chargeGroup() => const AiAtomicGroupVm(
   title: '订阅扣费：ChatGPT Plus',
   operation: AiOperation.create,
   status: AiGroupStatus.pending,
+);
+
+SubscriptionDueScanResultVm _scanResult({
+  int created = 0,
+  int alreadyPending = 0,
+  int blocked = 0,
+  int remaining = 0,
+  bool hasMore = false,
+  List<SubscriptionDueScanSkipVm> skipped = const [],
+}) => SubscriptionDueScanResultVm(
+  throughDate: '2026-07-13',
+  createdCount: created,
+  alreadyPendingCount: alreadyPending,
+  blockedCount: blocked,
+  remainingEligibleCount: remaining,
+  hasMore: hasMore,
+  skipped: skipped,
 );
 
 // flutter_riverpod 3.x 未公开导出 Override 类型：用 dynamic 承接列表字面量（元素推断为 Override）。
@@ -375,6 +393,143 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(cancelButton(tester).onPressed, isNotNull);
+    });
+  });
+
+  group('cat14: 到期扫描入口', () {
+    Finder scanButton() => find.widgetWithIcon(IconButton, Icons.manage_search);
+
+    Future<void> pumpList(
+      WidgetTester tester, {
+      required SubscriptionRepository repo,
+      LedgerCapabilitiesVm caps = _canManage,
+    }) async {
+      await tester.pumpWidget(
+        _app(
+          const SubscriptionsPage(),
+          overrides: [
+            capabilitiesProvider.overrideWith((ref) async => caps),
+            subscriptionsProvider.overrideWith((ref) async => [_sub()]),
+            upcomingSubscriptionsProvider.overrideWith((ref) async => const []),
+            subscriptionRepositoryProvider.overrideWithValue(repo),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('只读能力下扫描按钮禁用', (tester) async {
+      await pumpList(
+        tester,
+        repo: _FakeSubRepo(),
+        caps: LedgerCapabilitiesVm.locked,
+      );
+      expect(tester.widget<IconButton>(scanButton()).onPressed, isNull);
+    });
+
+    testWidgets('created 结果显示数量与「前往审核」', (tester) async {
+      await pumpList(
+        tester,
+        repo: _FakeSubRepo(onScan: () async => _scanResult(created: 2)),
+      );
+      await tester.tap(scanButton());
+      await tester.pumpAndSettle();
+      expect(find.text('已生成 2 个待确认扣费'), findsOneWidget);
+      expect(find.widgetWithText(FilledButton, '前往审核'), findsOneWidget);
+      expect(find.textContaining('已扣款'), findsNothing);
+    });
+
+    testWidgets('already-pending/blocked 结果不出现「已扣款」，blocked 显示名称与原因', (
+      tester,
+    ) async {
+      await pumpList(
+        tester,
+        repo: _FakeSubRepo(
+          onScan: () async => _scanResult(
+            alreadyPending: 1,
+            blocked: 1,
+            skipped: const [
+              SubscriptionDueScanSkipVm(
+                subscriptionId: 'sub_2',
+                scheduledChargeDate: '2026-07-01',
+                reason: SubscriptionDueScanSkipReason.alreadyPending,
+              ),
+              SubscriptionDueScanSkipVm(
+                subscriptionId: 'sub_1',
+                scheduledChargeDate: '2026-07-02',
+                reason: SubscriptionDueScanSkipReason.paymentAccountUnavailable,
+              ),
+            ],
+          ),
+        ),
+      );
+      await tester.tap(scanButton());
+      await tester.pumpAndSettle();
+      expect(find.text('本次没有生成新的扣费候选。'), findsOneWidget);
+      expect(find.textContaining('已在审核队列 1 个'), findsOneWidget);
+      // blocked 项映射为名称 + 日期 + 中文可恢复原因。
+      expect(
+        find.textContaining('ChatGPT Plus · 计划 2026-07-02'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('付款账户缺失或已归档'), findsOneWidget);
+      expect(find.textContaining('已扣款'), findsNothing);
+      expect(find.textContaining('已入账'), findsNothing);
+    });
+
+    testWidgets('busy 状态不能重复发起扫描', (tester) async {
+      var scanCalls = 0;
+      final gate = Completer<SubscriptionDueScanResultVm>();
+      await pumpList(
+        tester,
+        repo: _FakeSubRepo(
+          onScan: () {
+            scanCalls += 1;
+            return gate.future;
+          },
+        ),
+      );
+      await tester.tap(scanButton());
+      await tester.pump();
+      // 请求进行中：图标被进度圈替换，按钮禁用。
+      final busyButton = find.ancestor(
+        of: find.byType(CircularProgressIndicator),
+        matching: find.byType(IconButton),
+      );
+      expect(tester.widget<IconButton>(busyButton).onPressed, isNull);
+      await tester.tap(busyButton, warnIfMissed: false);
+      await tester.pump();
+      expect(scanCalls, 1);
+      gate.complete(_scanResult());
+      await tester.pumpAndSettle();
+      expect(find.textContaining('没有需要生成的到期扣费'), findsOneWidget);
+      await tester.tap(find.text('关闭'));
+      await tester.pumpAndSettle();
+      expect(scanCalls, 1);
+    });
+
+    testWidgets('hasMore 显示剩余数量，「再次扫描」再跑一轮', (tester) async {
+      var scanCalls = 0;
+      await pumpList(
+        tester,
+        repo: _FakeSubRepo(
+          onScan: () async {
+            scanCalls += 1;
+            return scanCalls == 1
+                ? _scanResult(created: 1, remaining: 3, hasMore: true)
+                : _scanResult(created: 1);
+          },
+        ),
+      );
+      await tester.tap(scanButton());
+      await tester.pumpAndSettle();
+      expect(find.textContaining('还有 3 个到期订阅本次未生成'), findsOneWidget);
+      await tester.tap(find.widgetWithText(OutlinedButton, '再次扫描'));
+      await tester.pumpAndSettle();
+      expect(scanCalls, 2);
+      // 第二轮结果没有 hasMore：不再提供「再次扫描」。
+      expect(find.widgetWithText(OutlinedButton, '再次扫描'), findsNothing);
+      expect(find.text('已生成 1 个待确认扣费'), findsOneWidget);
     });
   });
 
