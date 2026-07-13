@@ -4,18 +4,19 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT_DIR="${1:-$ROOT/dist}"
 MANIFEST="$ROOT/server-rs/Cargo.toml"
-BIN="$ROOT/server-rs/target/release/finwealth-server"
+TARGET="${FINWEALTH_LINUX_TARGET:-x86_64-unknown-linux-musl}"
 
 if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
   echo "Source worktree is dirty; refusing to package a VPS server bundle." >&2
   exit 2
 fi
 
-case "$(uname -m)" in
-  x86_64|amd64) ARCH="x86_64" ;;
-  aarch64|arm64) ARCH="aarch64" ;;
-  *) echo "Unsupported packaging architecture: $(uname -m)" >&2; exit 2 ;;
+case "$TARGET" in
+  x86_64-unknown-linux-musl) ARCH="x86_64" ;;
+  aarch64-unknown-linux-musl) ARCH="aarch64" ;;
+  *) echo "Unsupported Linux packaging target: $TARGET" >&2; exit 2 ;;
 esac
+BIN="$ROOT/server-rs/target/$TARGET/release/finwealth-server"
 
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$MANIFEST" | head -n 1)"
 SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
@@ -28,7 +29,12 @@ trap 'rm -rf -- "$STAGING"' EXIT
 BUNDLE="$STAGING/$NAME"
 mkdir -p "$BUNDLE/bin" "$BUNDLE/deploy/systemd" "$BUNDLE/tools" "$BUNDLE/docs"
 
-cargo build --manifest-path "$MANIFEST" --release --locked
+cargo build --manifest-path "$MANIFEST" --release --locked --target "$TARGET"
+if readelf -l "$BIN" | grep -q "Requesting program interpreter"; then
+  echo "VPS server binary is dynamically linked; refusing non-portable bundle." >&2
+  exit 2
+fi
+printf 'bundle-execution-smoke' | "$BIN" --hash-password-stdin >/dev/null
 cp "$BIN" "$BUNDLE/bin/finwealth-server"
 if command -v strip >/dev/null 2>&1; then
   strip "$BUNDLE/bin/finwealth-server"
@@ -43,7 +49,7 @@ cp "$ROOT/tools/restore_vps_ledger.sh" "$BUNDLE/tools/"
 cp "$ROOT/docs/deploy/VPS_DEPLOYMENT.md" "$BUNDLE/docs/"
 
 cat >"$BUNDLE/package-manifest.json" <<EOF
-{"packageFormat":1,"serverVersion":"$VERSION","createdAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","sourceCommit":"$SOURCE_COMMIT","sourceDirty":false,"platform":"linux","architecture":"$ARCH"}
+{"packageFormat":1,"serverVersion":"$VERSION","createdAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","sourceCommit":"$SOURCE_COMMIT","sourceDirty":false,"platform":"linux","architecture":"$ARCH","target":"$TARGET","libc":"musl","linkage":"static"}
 EOF
 
 cat >"$BUNDLE/README.md" <<'EOF'

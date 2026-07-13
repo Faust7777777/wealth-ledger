@@ -196,6 +196,11 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install static Linux build tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -203,6 +208,8 @@ jobs:
           workspaces: server-rs
 
       - name: Build precompiled VPS bundle
+        env:
+          FINWEALTH_LINUX_TARGET: x86_64-unknown-linux-musl
         run: bash tools/package_vps_server.sh dist
 
       - name: Upload VPS server artifact

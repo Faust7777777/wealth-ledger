@@ -1053,8 +1053,13 @@ def check_deploy_security_defaults() -> None:
         "Source worktree is dirty",
         "cargo build",
         "--release --locked",
+        "x86_64-unknown-linux-musl",
+        "Requesting program interpreter",
+        "bundle-execution-smoke",
         "sourceCommit",
         "sourceDirty",
+        '"libc":"musl"',
+        '"linkage":"static"',
         "SHA256SUMS",
         "sha256sum -c SHA256SUMS",
         "install_vps_bundle.sh",
@@ -1382,6 +1387,8 @@ def check_release_packaging() -> None:
         "package_vps_server.sh",
         "finwealth-linux-x86_64-vps-server",
         "*-linux-x86_64-vps.tar.gz.sha256",
+        "x86_64-unknown-linux-musl",
+        "musl-tools",
     ]
     missing = [
         snippet for snippet in required_workflow_snippets if snippet not in workflow_text

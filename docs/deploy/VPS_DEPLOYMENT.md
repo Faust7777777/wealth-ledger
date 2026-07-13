@@ -44,7 +44,8 @@ sha256sum -c SHA256SUMS
 sudo bash tools/install_vps_bundle.sh
 ```
 
-The bundle contains the release server binary, systemd unit, environment
+The x86_64 bundle contains a statically linked musl release server binary,
+systemd unit, environment
 example, readiness check, backup and restore scripts, an internal checksum
 manifest and source provenance. The installer rejects a mismatched CPU
 architecture, preserves an existing ledger and environment file, and follows
