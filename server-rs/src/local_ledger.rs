@@ -1098,11 +1098,12 @@ pub fn create_correction_proposal(
         let mut errors = Vec::new();
         let target_movement_id = required_string(object, "targetMovementId", &mut errors);
         let reason = required_string(object, "reason", &mut errors);
-        let proposed_diffs = object
+        let mut proposed_diffs = object
             .get("proposedDiffs")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let replacement_entries = object.get("replacementEntries");
 
         if !errors.is_empty() {
             return Err(LedgerError::InvalidInput(errors));
@@ -1132,7 +1133,36 @@ pub fn create_correction_proposal(
             )));
         }
 
-        let correction_entry = correction_entry_from_diffs(&target, &proposed_diffs, movement_id)?;
+        if pending_correction_exists(document, &target_movement_id) {
+            return Err(LedgerError::Conflict(format!(
+                "target movement already has a pending correction: {target_movement_id}"
+            )));
+        }
+
+        let correction_entries = if let Some(replacement_entries) = replacement_entries {
+            let (entries, normalized_replacement) = correction_entries_for_replacement(
+                document,
+                &target,
+                replacement_entries,
+                movement_id,
+            )?;
+            if proposed_diffs.is_empty() {
+                proposed_diffs.push(json!({
+                    "fieldPath": "entries",
+                    "oldValue": target["entries"],
+                    "newValue": normalized_replacement,
+                    "severity": "danger",
+                    "reason": reason
+                }));
+            }
+            entries
+        } else {
+            vec![correction_entry_from_diffs(
+                &target,
+                &proposed_diffs,
+                movement_id,
+            )?]
+        };
         let target_title = target
             .get("title")
             .and_then(Value::as_str)
@@ -1146,7 +1176,7 @@ pub fn create_correction_proposal(
             "status": "pending_review",
             "title": format!("更正：{target_title}"),
             "description": reason,
-            "entries": [correction_entry],
+            "entries": correction_entries,
             "tags": ["correction"],
             "source": {
                 "kind": "manual",
@@ -4894,6 +4924,155 @@ fn correction_entry_from_diffs(
         entry["instrumentId"] = json!(instrument_id);
     }
     Ok(entry)
+}
+
+fn correction_entries_for_replacement(
+    document: &Value,
+    target: &Value,
+    replacement_input: &Value,
+    movement_id: &str,
+) -> Result<(Vec<Value>, Vec<Value>), LedgerError> {
+    let Some(replacement_items) = replacement_input.as_array() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "replacementEntries must be a non-empty array".to_string(),
+        ]));
+    };
+    let sanitized_items = replacement_items
+        .iter()
+        .map(|item| {
+            let mut item = item.clone();
+            if let Some(object) = item.as_object_mut() {
+                object.remove("id");
+            }
+            item
+        })
+        .collect::<Vec<_>>();
+    let mut errors = Vec::new();
+    let replacement_value = json!(sanitized_items);
+    let replacement_entries =
+        normalized_movement_entries(document, Some(&replacement_value), movement_id, &mut errors)
+            .unwrap_or_default();
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(
+            errors
+                .into_iter()
+                .map(|error| {
+                    error
+                        .replacen("entries[", "replacementEntries[", 1)
+                        .replacen("entries must", "replacementEntries must", 1)
+                })
+                .collect(),
+        ));
+    }
+
+    let target_entries = target
+        .get("entries")
+        .and_then(Value::as_array)
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "target movement must have entries for replacement correction".to_string(),
+            ])
+        })?;
+    if movement_entry_effects(target_entries)? == movement_entry_effects(&replacement_entries)? {
+        return Err(LedgerError::InvalidInput(vec![
+            "replacementEntries must change the target movement ledger effect".to_string(),
+        ]));
+    }
+
+    let mut correction_entries =
+        Vec::with_capacity(target_entries.len() + replacement_entries.len());
+    for (index, target_entry) in target_entries.iter().enumerate() {
+        let account_id = target_entry
+            .get("accountId")
+            .and_then(Value::as_str)
+            .expect("validated target entry accountId should exist");
+        let amount = target_entry
+            .get("amount")
+            .and_then(Value::as_str)
+            .expect("validated target entry amount should exist");
+        let currency = target_entry
+            .get("currency")
+            .and_then(Value::as_str)
+            .expect("validated target entry currency should exist");
+        let direction = match target_entry.get("direction").and_then(Value::as_str) {
+            Some("in") => "out",
+            Some("out") => "in",
+            _ => unreachable!("validated target entry direction should be in or out"),
+        };
+        let mut reversal = json!({
+            "id": format!("entry_{movement_id}_reversal_{index}"),
+            "accountId": account_id,
+            "amount": amount,
+            "currency": currency,
+            "direction": direction,
+            "role": "adjustment"
+        });
+        if let Some(instrument_id) = target_entry.get("instrumentId").and_then(Value::as_str) {
+            reversal["instrumentId"] = json!(instrument_id);
+        }
+        correction_entries.push(reversal);
+    }
+    correction_entries.extend(replacement_entries.clone());
+    Ok((correction_entries, replacement_entries))
+}
+
+fn movement_entry_effects(
+    entries: &[Value],
+) -> Result<BTreeMap<String, DecimalAmount>, LedgerError> {
+    let mut effects = BTreeMap::new();
+    for entry in entries {
+        let account_id = entry
+            .get("accountId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["entry.accountId is required".to_string()])
+            })?;
+        let currency = entry
+            .get("currency")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["entry.currency is required".to_string()])
+            })?;
+        let instrument_id = entry
+            .get("instrumentId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let amount =
+            parse_decimal(entry.get("amount").and_then(Value::as_str).ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["entry.amount is required".to_string()])
+            })?)
+            .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+        let signed = match entry.get("direction").and_then(Value::as_str) {
+            Some("in") => amount,
+            Some("out") => -amount,
+            _ => {
+                return Err(LedgerError::InvalidInput(vec![
+                    "entry.direction must be in or out".to_string(),
+                ]));
+            }
+        };
+        let key = format!("{account_id}\u{1f}{currency}\u{1f}{instrument_id}");
+        *effects.entry(key).or_insert(DecimalAmount::ZERO) += signed;
+    }
+    effects.retain(|_, amount| *amount != DecimalAmount::ZERO);
+    Ok(effects)
+}
+
+fn pending_correction_exists(document: &Value, target_movement_id: &str) -> bool {
+    document["movements"]
+        .as_array()
+        .expect("validated movements should be an array")
+        .iter()
+        .any(|movement| {
+            movement.get("type").and_then(Value::as_str) == Some("correction")
+                && movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                && movement
+                    .get("source")
+                    .and_then(|source| source.get("sourceId"))
+                    .and_then(Value::as_str)
+                    == Some(target_movement_id)
+        })
 }
 
 fn diff_value_as_decimal(value: Option<&Value>) -> Option<DecimalAmount> {

@@ -187,6 +187,9 @@ the JSON ledger when no `?scenario=` query is present:
   reads and explicit quote refresh when a provider is configured
 - taxonomy: categories, counterparties, counterparty merge proposal
 - portfolio read models: overview, allocation, holdings, quote summary
+- confirmed movement corrections: legacy single-entry amount deltas plus
+  atomic full-entry replacement for multi-leg transfers/trades; originals are
+  immutable and duplicate pending corrections are rejected
 - sync outbox: pull/ack plus authenticated, idempotent account/create inbound
   apply; remote entries never echo into the local outbox and other entity
   operations remain unsupported

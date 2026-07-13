@@ -227,6 +227,106 @@ def create_and_confirm_manual_expense(base: str, account_id: str) -> dict[str, A
     return confirmed
 
 
+def create_and_confirm_multileg_correction(
+    base: str, source_account_id: str, destination_account_id: str
+) -> None:
+    original = unwrap_data(
+        request_json(
+            base,
+            "/v1/movements/drafts",
+            method="POST",
+            expected_status=201,
+            body={
+                "type": "transfer",
+                "occurredAt": "2026-06-27T09:00:00Z",
+                "title": "local smoke corrected transfer",
+                "entries": [
+                    {
+                        "accountId": source_account_id,
+                        "amount": "40.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source",
+                    },
+                    {
+                        "accountId": destination_account_id,
+                        "amount": "40.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination",
+                    },
+                ],
+            },
+        )
+    )
+    unwrap_data(
+        request_json(
+            base,
+            f"/v1/atomic-groups/{original['atomicGroupId']}/confirm",
+            method="POST",
+        )
+    )
+    correction = unwrap_data(
+        request_json(
+            base,
+            "/v1/movements/corrections",
+            method="POST",
+            body={
+                "targetMovementId": original["id"],
+                "reason": "local smoke actual transfer was 25",
+                "replacementEntries": [
+                    {
+                        "accountId": source_account_id,
+                        "amount": "25.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source",
+                    },
+                    {
+                        "accountId": destination_account_id,
+                        "amount": "25.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination",
+                    },
+                ],
+            },
+        )
+    )
+    assert correction["operation"] == "correction"
+    assert len(correction["proposedMovements"][0]["entries"]) == 4
+    before_confirm_source = unwrap_data(
+        request_json(base, f"/v1/accounts/{source_account_id}")
+    )
+    before_confirm_destination = unwrap_data(
+        request_json(base, f"/v1/accounts/{destination_account_id}")
+    )
+    assert before_confirm_source["cashBalances"][0]["amount"] == "960.00"
+    assert before_confirm_destination["cashBalances"][0]["amount"] == "290.00"
+
+    confirmed = unwrap_data(
+        request_json(
+            base,
+            f"/v1/atomic-groups/{correction['id']}/confirm",
+            method="POST",
+        )
+    )
+    assert confirmed["ledgerWrite"] is True
+    after_source = unwrap_data(request_json(base, f"/v1/accounts/{source_account_id}"))
+    after_destination = unwrap_data(
+        request_json(base, f"/v1/accounts/{destination_account_id}")
+    )
+    assert after_source["cashBalances"][0]["amount"] == "975.00"
+    assert after_destination["cashBalances"][0]["amount"] == "275.00"
+    unchanged_original = unwrap_data(
+        request_json(base, f"/v1/movements/{original['id']}")
+    )
+    assert [entry["amount"] for entry in unchanged_original["entries"]] == [
+        "40.00",
+        "40.00",
+    ]
+
+
 def create_dca_and_mark_executed(base: str, account_id: str) -> dict[str, Any]:
     plan = unwrap_data(
         request_json(
@@ -535,6 +635,8 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     assert account_changes[-1]["payload"]["displayName"] == "Smoke Reserve Updated"
     sync_after_cursor = unwrap_data(request_json(base, f"/v1/sync/changes?since={sync['cursor']}"))
     assert sync_after_cursor["changes"] == []
+
+    create_and_confirm_multileg_correction(base, cash["id"], reserve["id"])
 
     expense = create_and_confirm_manual_expense(base, cash["id"])
     assert expense["title"] == "local smoke coffee"
