@@ -8,7 +8,6 @@ import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
-import '../theme/app_typography.dart';
 
 const List<String> _currencies = ['CNY', 'USD', 'HKD', 'USDT', 'BTC', 'ETH'];
 
@@ -312,8 +311,6 @@ class _ManualRecordPageState extends ConsumerState<ManualRecordPage> {
                       : null,
                   child: Text(_busy ? '入账中…' : '记一笔'),
                 ),
-                const SizedBox(height: AppSpacing.sm),
-                Text('记账会生成候选并即时确认入账；不下单、不转账、不连券商。', style: AppType.caption),
               ],
             );
           },

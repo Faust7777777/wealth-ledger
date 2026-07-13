@@ -10,6 +10,10 @@ import '../data/view_models.dart';
 import '../features/record_sheet.dart';
 import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
+import '../theme/app_typography.dart';
+
+/// 桌面 Rail 记录入口的稳定 Key（折叠/扩展共用，widget 测试断言尺寸用）。
+const kDesktopRecordActionKey = ValueKey('desktop_record_action');
 
 typedef _Dest = ({IconData icon, IconData selected, String label});
 
@@ -88,12 +92,38 @@ class HomeShell extends ConsumerWidget {
     // 宽屏（>=1360）用 256px 扩展侧栏（图标+文字横排），否则窄图标栏。
     final extendedRail = width >= AppLayout.bpExpanded;
 
-    // FAB 常显；sheet 内条目按服务端 capabilities 逐项禁用并给出原因。
+    // 记录入口常显；sheet 内条目按服务端 capabilities 逐项禁用并给出原因。
+    void openRecord() => showRecordSheet(context, ref.writeCapabilities);
+
+    // 移动端保留可发现的「记录」FAB。
     final fab = FloatingActionButton.extended(
-      onPressed: () => showRecordSheet(context, ref.writeCapabilities),
+      onPressed: openRecord,
       icon: const Icon(Icons.add),
       label: const Text('记录'),
     );
+
+    // 桌面 Rail 用紧凑控件：折叠=图标钮（tooltip/semantics「记录」，不出常驻文字，
+    // 不溢出 72px Rail）；扩展=紧凑文字钮（≤48 高、≤128 宽，bodyStrong 字级）。
+    final desktopRecord = extendedRail
+        ? FilledButton.icon(
+            key: kDesktopRecordActionKey,
+            onPressed: openRecord,
+            style: FilledButton.styleFrom(
+              minimumSize: const Size(96, 40),
+              maximumSize: const Size(128, 44),
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.base),
+              textStyle: AppType.bodyStrong,
+            ),
+            icon: const Icon(Icons.add, size: 18),
+            label: const Text('记录'),
+          )
+        : IconButton.filled(
+            key: kDesktopRecordActionKey,
+            onPressed: openRecord,
+            tooltip: '记录',
+            constraints: const BoxConstraints.tightFor(width: 44, height: 44),
+            icon: const Icon(Icons.add),
+          );
 
     final appBar = AppBar(
       title: const Text('Wealth Ledger'),
@@ -144,7 +174,7 @@ class HomeShell extends ConsumerWidget {
                   alignment: extendedRail
                       ? Alignment.centerLeft
                       : Alignment.center,
-                  child: fab,
+                  child: desktopRecord,
                 ),
               ),
               destinations: [
