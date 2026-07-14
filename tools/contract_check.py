@@ -1157,6 +1157,9 @@ def check_deploy_security_defaults() -> None:
         "SHA256SUMS",
         "mktemp -d",
         'mv -- "$STAGING" "$TARGET"',
+        "stop_proxy_companions",
+        "start_proxy_sockets",
+        "finwealth-docker-proxy@*.socket",
     ]
     missing = [snippet for snippet in backup_snippets if snippet not in backup_text]
     if missing:
@@ -1173,6 +1176,9 @@ def check_deploy_security_defaults() -> None:
         "systemctl stop",
         "systemctl start",
         "--allow-unverified",
+        "stop_proxy_companions",
+        "start_proxy_sockets",
+        "finwealth-docker-proxy@*.socket",
     ]
     missing = [snippet for snippet in restore_snippets if snippet not in restore_text]
     if missing:

@@ -10,11 +10,13 @@ DATA_DIR="$TMP/data"
 BACKUP_ROOT="$TMP/backups"
 PRE_RESTORE_ROOT="$TMP/pre-restore"
 STATE_FILE="$TMP/systemctl.state"
+PROXY_STATE_FILE="$TMP/systemctl.proxy.state"
 SYSTEMCTL_LOG="$TMP/systemctl.log"
 FAIL_MARKER="$TMP/fail-live-validation"
 START_FAIL_MARKER="$TMP/fail-service-start"
 mkdir -p "$FAKE_BIN" "$DATA_DIR" "$BACKUP_ROOT"
 printf '%s\n' active > "$STATE_FILE"
+printf '%s\n' active > "$PROXY_STATE_FILE"
 : > "$SYSTEMCTL_LOG"
 
 cat > "$FAKE_BIN/systemctl" <<'EOF'
@@ -22,19 +24,45 @@ cat > "$FAKE_BIN/systemctl" <<'EOF'
 set -euo pipefail
 printf '%s\n' "$*" >> "$FAKE_SYSTEMCTL_LOG"
 case "${1:-}" in
+  list-units)
+    if [ "$(cat "$FAKE_SYSTEMCTL_PROXY_STATE")" = "active" ]; then
+      printf '%s loaded active listening fake\n' \
+        'finwealth-docker-proxy@172.19.0.1:8791.socket'
+    fi
+    ;;
   is-active)
     [ "$(cat "$FAKE_SYSTEMCTL_STATE")" = "active" ]
     ;;
   stop)
-    printf '%s\n' inactive > "$FAKE_SYSTEMCTL_STATE"
+    shift
+    for unit in "$@"; do
+      case "$unit" in
+        finwealth-docker-proxy@*)
+          printf '%s\n' inactive > "$FAKE_SYSTEMCTL_PROXY_STATE"
+          ;;
+        *)
+          printf '%s\n' inactive > "$FAKE_SYSTEMCTL_STATE"
+          ;;
+      esac
+    done
     ;;
   start)
-    if [ -n "${FAKE_START_FAIL_MARKER:-}" ] && [ -f "$FAKE_START_FAIL_MARKER" ]; then
-      rm -f -- "$FAKE_START_FAIL_MARKER"
-      printf '%s\n' inactive > "$FAKE_SYSTEMCTL_STATE"
-      exit 1
-    fi
-    printf '%s\n' active > "$FAKE_SYSTEMCTL_STATE"
+    shift
+    for unit in "$@"; do
+      case "$unit" in
+        finwealth-docker-proxy@*)
+          printf '%s\n' active > "$FAKE_SYSTEMCTL_PROXY_STATE"
+          ;;
+        *)
+          if [ -n "${FAKE_START_FAIL_MARKER:-}" ] && [ -f "$FAKE_START_FAIL_MARKER" ]; then
+            rm -f -- "$FAKE_START_FAIL_MARKER"
+            printf '%s\n' inactive > "$FAKE_SYSTEMCTL_STATE"
+            exit 1
+          fi
+          printf '%s\n' active > "$FAKE_SYSTEMCTL_STATE"
+          ;;
+      esac
+    done
     ;;
   *)
     echo "unexpected fake systemctl command: $*" >&2
@@ -112,6 +140,7 @@ else
 fi
 export FAKE_PYTHON
 export FAKE_SYSTEMCTL_STATE="$STATE_FILE"
+export FAKE_SYSTEMCTL_PROXY_STATE="$PROXY_STATE_FILE"
 export FAKE_SYSTEMCTL_LOG="$SYSTEMCTL_LOG"
 export FAKE_START_FAIL_MARKER="$START_FAIL_MARKER"
 export PATH="$FAKE_BIN:$PATH"
@@ -151,6 +180,8 @@ grep -qx 'includesAuth=true' "$FIRST_BACKUP/manifest.txt"
 [ "$(cat "$STATE_FILE")" = "active" ]
 grep -q '^stop finwealth-test.service$' "$SYSTEMCTL_LOG"
 grep -q '^start finwealth-test.service$' "$SYSTEMCTL_LOG"
+grep -q '^stop finwealth-docker-proxy@172.19.0.1:8791.socket finwealth-docker-proxy@172.19.0.1:8791.service$' "$SYSTEMCTL_LOG"
+grep -q '^start finwealth-docker-proxy@172.19.0.1:8791.socket$' "$SYSTEMCTL_LOG"
 
 CORRUPT_BACKUP="$TMP/corrupt-backup"
 cp -R "$FIRST_BACKUP" "$CORRUPT_BACKUP"
