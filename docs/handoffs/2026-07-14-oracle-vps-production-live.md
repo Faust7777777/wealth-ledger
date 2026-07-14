@@ -16,17 +16,25 @@
 ```text
 Cloudflare HTTPS wuwaidut.com
   -> existing Caddy Docker container
-  -> 172.19.0.1:8791 (Docker bridge only)
-  -> systemd-socket-proxyd as finwealth
-  -> 127.0.0.1:8790
-  -> finwealth-server
-  -> /var/lib/finwealth/ledger.json
+     -> known Finwealth /v1 paths
+        -> 172.19.0.1:8791 (Docker bridge only)
+        -> systemd-socket-proxyd as finwealth
+        -> 127.0.0.1:8790
+        -> finwealth-server
+        -> /var/lib/finwealth/ledger.json
+     -> all other paths
+        -> cli-proxy-api:8317
 ```
 
 - Rust 只监听 `127.0.0.1:8790`。
 - bridge relay 只监听 `172.19.0.1:8791`，没有绑定公网接口。
 - Rust Host allow-list 只允许 `wuwaidut.com` 与内置 loopback hosts。
 - Caddy 根域站点只接受 Cloudflare 来源地址，其他来源返回 403。
+- `wuwaidut.com` 使用白名单路径并行分流：已知账本 API 进入 Rust，根路径、
+  `/v1/models`、`/v1/chat/completions` 和其他未来中转路由回落到
+  `cli-proxy-api:8317`。
+- 根域 `/management.html` 返回 404，避免创建一个绕过现有 Sub2API Access
+  policy 的第二管理入口。
 - 原 `sub2api.wuwaidut.com` site block 未替换；Caddy 使用原子 reload，容器未重启。
 - Caddy 原配置备份：
   `/home/opc/sub2api-deploy/Caddyfile.before-finwealth-20260714T0642Z`。
@@ -37,6 +45,8 @@ Cloudflare HTTPS wuwaidut.com
 - systemd server：enabled / active。
 - Docker bridge socket：enabled / active。
 - 本地、bridge、Caddy container 和公网 `/v1/health` 均返回 200。
+- 公网 `wuwaidut.com/` 返回 CLI Proxy API Server 响应。
+- 公网 `wuwaidut.com/v1/models` 进入中转站，并返回预期的未认证 401。
 - 未认证 `/v1/accounts` 返回 401。
 - 错误密码登录返回 `invalid_credentials` / 401。
 - 重启前后 ledger SHA-256 均为：
