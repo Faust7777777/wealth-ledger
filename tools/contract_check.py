@@ -45,6 +45,7 @@ SYSTEMD_DOCKER_PROXY_SOCKET = (
 SYSTEMD_DOCKER_PROXY_SERVICE = (
     ROOT / "deploy" / "systemd" / "finwealth-docker-proxy@.service"
 )
+CADDY_FINWEALTH_SITE = ROOT / "deploy" / "caddy" / "finwealth-wuwaidut.com.caddy"
 VPS_INSTALL = ROOT / "tools" / "install_vps_systemd.sh"
 VPS_BUNDLE_INSTALL = ROOT / "tools" / "install_vps_bundle.sh"
 VPS_PACKAGE = ROOT / "tools" / "package_vps_server.sh"
@@ -1017,6 +1018,7 @@ def check_deploy_security_defaults() -> None:
         SYSTEMD_SERVICE,
         SYSTEMD_DOCKER_PROXY_SOCKET,
         SYSTEMD_DOCKER_PROXY_SERVICE,
+        CADDY_FINWEALTH_SITE,
         VPS_INSTALL,
         VPS_BUNDLE_INSTALL,
         VPS_PACKAGE,
@@ -1147,6 +1149,21 @@ def check_deploy_security_defaults() -> None:
     ]
     if missing:
         fail("Docker bridge proxy service missing hardening: " + ", ".join(missing))
+
+    caddy_site_text = CADDY_FINWEALTH_SITE.read_text(encoding="utf-8")
+    caddy_site_snippets = [
+        "wuwaidut.com {",
+        "remote_ip 173.245.48.0/20",
+        "reverse_proxy 172.19.0.1:8791",
+        "header_up Host {host}",
+        "CF-Connecting-IP",
+        'respond "Forbidden" 403',
+    ]
+    missing = [
+        snippet for snippet in caddy_site_snippets if snippet not in caddy_site_text
+    ]
+    if missing:
+        fail("Finwealth Caddy site missing origin safeguards: " + ", ".join(missing))
 
     backup_text = VPS_BACKUP.read_text(encoding="utf-8")
     backup_snippets = [

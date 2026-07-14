@@ -165,6 +165,12 @@ The socket template listens only on the named Docker bridge address and starts
 loopback Rust service. Point the reverse-proxy container at
 `172.19.0.1:8791`. Never bind this relay to `0.0.0.0` or a public interface.
 
+The repository includes `deploy/caddy/finwealth-wuwaidut.com.caddy` as the
+reviewed production site block for the current private deployment. It preserves
+the existing Cloudflare-only origin rule and forwards the public Host header to
+the Rust allow-list. Validate the combined Caddyfile before an atomic reload;
+do not replace unrelated site blocks.
+
 Manual backup:
 
 ```bash
