@@ -6,7 +6,7 @@
 - 公网 API origin：`https://wuwaidut.com`。
 - Rust server 来源提交：`d972744f88b29a6d8e26c7bdf22904c1ad44e56b`。
 - 当前集成分支：`feat/subscription-sync-integration`。
-- 当前源码提交：`eb53cea49038f829445815b6c2c6f816336dd60f`。
+- 当前生产路由配置来源提交：`0a8c29a`。
 
 部署使用原生 ARM64 静态 musl bundle。上传 sidecar、内部 `SHA256SUMS`、CPU 架构、
 无动态 interpreter 和服务器端实际执行均已通过。
@@ -38,6 +38,8 @@ Cloudflare HTTPS wuwaidut.com
 - 原 `sub2api.wuwaidut.com` site block 未替换；Caddy 使用原子 reload，容器未重启。
 - Caddy 原配置备份：
   `/home/opc/sub2api-deploy/Caddyfile.before-finwealth-20260714T0642Z`。
+- 并行路由前配置备份：
+  `/home/opc/sub2api-deploy/Caddyfile.before-parallel-20260714T0941Z`。
 
 ## 3. 已验证门禁
 
@@ -84,15 +86,24 @@ GitHub Actions run：`29316603799`，全部必需 jobs 成功。
 
 两个 artifacts 的 sidecar 与实际 SHA-256 一致，来源均为干净的 `eb53cea`。
 
-## 5. 尚需本人凭据完成的验收
+## 5. 已完成的带认证生产验收
 
-服务密码由用户直接在 VPS 交互设置，未进入聊天、仓库或日志。以下项目必须由用户在
-客户端使用本人密码登录后继续验证，不能用错误密码或未认证 health 间接替代：
+服务密码由用户直接设置，未进入聊天、仓库或日志。Windows 客户端登录、DPAPI token
+持久化和以下真实生产链路均已完成：
 
-- 正确密码登录与 token 持久化；
-- 创建真实账户；
-- 创建订阅、扫描到期候选、确认后扣款；
-- 登录后重启及 refresh token 旋转。
+- 有效登录态下账户、订阅和设备接口返回 200；
+- 创建临时 USD 账户与 ChatGPT Plus 订阅；
+- due-scan 只创建 pending 候选，余额保持 `100.00 USD`；
+- 重扫返回 `already_pending=1`，没有重复候选；
+- AI pending 投影可读取候选；
+- 用户确认后才扣款至 `80.00 USD`，日期由 `2026-07-01` 推进到
+  `2026-08-01`；
+- 重启服务后余额和订阅日期保持，证明数据已持久化；
+- refresh token 成功旋转，新 access token 可用，旧 refresh token 返回 401；
+- Windows DPAPI token store 已原子更新。
+
+验收临时数据已恢复，正式账本重新为空。完整回执见
+`docs/handoffs/2026-07-14-production-authenticated-acceptance-complete.md`。
 
 ## 6. 独立安全观察
 
