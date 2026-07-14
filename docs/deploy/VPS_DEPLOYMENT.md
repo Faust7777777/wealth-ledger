@@ -33,7 +33,8 @@ files but intentionally does not start the service.
 
 ### Prebuilt bundle path
 
-The manual Package workflow also publishes `finwealth-linux-x86_64-vps-server`.
+The manual Package workflow publishes `finwealth-linux-x86_64-vps-server` and
+`finwealth-linux-aarch64-vps-server`.
 Use this path when the VPS should not install Rust or when uploading through a
 cloud-provider console:
 
@@ -44,7 +45,9 @@ sha256sum -c SHA256SUMS
 sudo bash tools/install_vps_bundle.sh
 ```
 
-The x86_64 bundle contains a statically linked musl release server binary,
+On an ARM64 VPS, use the corresponding `linux-aarch64-vps` archive and directory.
+
+Both architecture bundles contain a statically linked musl release server binary,
 systemd unit, environment
 example, readiness check, backup and restore scripts, an internal checksum
 manifest and source provenance. The installer rejects a mismatched CPU

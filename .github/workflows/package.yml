@@ -221,6 +221,40 @@ jobs:
             dist/*-linux-x86_64-vps.tar.gz.sha256
           if-no-files-found: error
 
+  package-linux-server-arm64:
+    name: Package Linux ARM64 VPS server
+    needs: [verify-windows-source, verify-linux-server]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install static Linux build tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server-rs
+
+      - name: Build precompiled ARM64 VPS bundle
+        env:
+          FINWEALTH_LINUX_TARGET: aarch64-unknown-linux-musl
+        run: bash tools/package_vps_server.sh dist
+
+      - name: Upload ARM64 VPS server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finwealth-linux-aarch64-vps-server
+          path: |
+            dist/*-linux-aarch64-vps.tar.gz
+            dist/*-linux-aarch64-vps.tar.gz.sha256
+          if-no-files-found: error
+
   package-android:
     name: Package Android read-only preview
     needs: [verify-windows-source, verify-linux-server]

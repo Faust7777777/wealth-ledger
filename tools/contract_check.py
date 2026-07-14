@@ -1388,6 +1388,11 @@ def check_release_packaging() -> None:
         "finwealth-linux-x86_64-vps-server",
         "*-linux-x86_64-vps.tar.gz.sha256",
         "x86_64-unknown-linux-musl",
+        "package-linux-server-arm64:",
+        "ubuntu-24.04-arm",
+        "finwealth-linux-aarch64-vps-server",
+        "*-linux-aarch64-vps.tar.gz.sha256",
+        "aarch64-unknown-linux-musl",
         "musl-tools",
     ]
     missing = [
