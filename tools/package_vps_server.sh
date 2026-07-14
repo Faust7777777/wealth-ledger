@@ -42,6 +42,8 @@ fi
 
 cp "$ROOT/deploy/finwealth-server.env.example" "$BUNDLE/deploy/"
 cp "$ROOT/deploy/systemd/finwealth-server.service" "$BUNDLE/deploy/systemd/"
+cp "$ROOT/deploy/systemd/finwealth-docker-proxy@.socket" "$BUNDLE/deploy/systemd/"
+cp "$ROOT/deploy/systemd/finwealth-docker-proxy@.service" "$BUNDLE/deploy/systemd/"
 cp "$ROOT/tools/install_vps_bundle.sh" "$BUNDLE/tools/"
 cp "$ROOT/tools/check_vps_readiness.sh" "$BUNDLE/tools/"
 cp "$ROOT/tools/backup_vps_ledger.sh" "$BUNDLE/tools/"

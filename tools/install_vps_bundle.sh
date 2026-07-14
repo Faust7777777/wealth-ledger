@@ -69,6 +69,10 @@ chown root:root "$ENV_FILE"
 chmod 0600 "$ENV_FILE"
 
 install -m 0644 "$ROOT/deploy/systemd/finwealth-server.service" "$SERVICE_FILE"
+install -m 0644 "$ROOT/deploy/systemd/finwealth-docker-proxy@.socket" \
+  /etc/systemd/system/finwealth-docker-proxy@.socket
+install -m 0644 "$ROOT/deploy/systemd/finwealth-docker-proxy@.service" \
+  /etc/systemd/system/finwealth-docker-proxy@.service
 systemctl daemon-reload
 
 if grep -q "change-me" "$ENV_FILE"; then

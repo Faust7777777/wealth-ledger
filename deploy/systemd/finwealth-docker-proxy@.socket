@@ -1,0 +1,12 @@
+[Unit]
+Description=Finwealth Docker bridge proxy socket on %I
+After=docker.service
+Requires=docker.service
+
+[Socket]
+ListenStream=%I
+Accept=no
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

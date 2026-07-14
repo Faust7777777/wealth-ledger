@@ -135,6 +135,22 @@ Server-side firewall/security-list requirements:
 - keep `/etc/finwealth/server.env` mode `0600`;
 - back up `/var/lib/finwealth/ledger.json` and `/var/lib/finwealth/ledger.auth.json`.
 
+### Reverse proxy running inside Docker
+
+When Caddy/Nginx runs in a bridge-network container, keep the Rust service on
+`127.0.0.1:8790` and expose only a bridge-address relay. For a Docker network
+whose host gateway is `172.19.0.1`:
+
+```bash
+sudo systemctl enable --now \
+  'finwealth-docker-proxy@172.19.0.1:8791.socket'
+```
+
+The socket template listens only on the named Docker bridge address and starts
+`systemd-socket-proxyd` as the unprivileged `finwealth` user, forwarding to the
+loopback Rust service. Point the reverse-proxy container at
+`172.19.0.1:8791`. Never bind this relay to `0.0.0.0` or a public interface.
+
 Manual backup:
 
 ```bash

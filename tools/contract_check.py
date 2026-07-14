@@ -39,6 +39,12 @@ LOCAL_SERVER_SUBSCRIPTION_TEST = (
 PYTHON_REQUIREMENTS = ROOT / "tools" / "requirements.txt"
 DEPLOY_ENV_EXAMPLE = ROOT / "deploy" / "finwealth-server.env.example"
 SYSTEMD_SERVICE = ROOT / "deploy" / "systemd" / "finwealth-server.service"
+SYSTEMD_DOCKER_PROXY_SOCKET = (
+    ROOT / "deploy" / "systemd" / "finwealth-docker-proxy@.socket"
+)
+SYSTEMD_DOCKER_PROXY_SERVICE = (
+    ROOT / "deploy" / "systemd" / "finwealth-docker-proxy@.service"
+)
 VPS_INSTALL = ROOT / "tools" / "install_vps_systemd.sh"
 VPS_BUNDLE_INSTALL = ROOT / "tools" / "install_vps_bundle.sh"
 VPS_PACKAGE = ROOT / "tools" / "package_vps_server.sh"
@@ -1008,6 +1014,8 @@ def check_deploy_security_defaults() -> None:
         fail(f"Missing deploy env example: {DEPLOY_ENV_EXAMPLE}")
     for required in (
         SYSTEMD_SERVICE,
+        SYSTEMD_DOCKER_PROXY_SOCKET,
+        SYSTEMD_DOCKER_PROXY_SERVICE,
         VPS_INSTALL,
         VPS_BUNDLE_INSTALL,
         VPS_PACKAGE,
@@ -1098,6 +1106,25 @@ def check_deploy_security_defaults() -> None:
     missing = [snippet for snippet in required_snippets if snippet not in service_text]
     if missing:
         fail("Systemd service missing hardening snippets: " + ", ".join(missing))
+
+    proxy_socket_text = SYSTEMD_DOCKER_PROXY_SOCKET.read_text(encoding="utf-8")
+    for snippet in ("ListenStream=%I", "Accept=no", "Requires=docker.service"):
+        if snippet not in proxy_socket_text:
+            fail(f"Docker bridge proxy socket missing safety setting: {snippet}")
+
+    proxy_service_text = SYSTEMD_DOCKER_PROXY_SERVICE.read_text(encoding="utf-8")
+    proxy_service_snippets = [
+        "User=finwealth",
+        "systemd-socket-proxyd 127.0.0.1:8790",
+        "Requires=finwealth-server.service",
+        "NoNewPrivileges=true",
+        "ProtectSystem=strict",
+    ]
+    missing = [
+        snippet for snippet in proxy_service_snippets if snippet not in proxy_service_text
+    ]
+    if missing:
+        fail("Docker bridge proxy service missing hardening: " + ", ".join(missing))
 
     backup_text = VPS_BACKUP.read_text(encoding="utf-8")
     backup_snippets = [
