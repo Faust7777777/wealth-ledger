@@ -58,6 +58,7 @@ install -d -m 0700 -o "$APP_USER" -g "$APP_USER" "$DATA_DIR"
 install -d -m 0750 "$CONFIG_DIR"
 install -m 0755 "$BIN" "$APP_DIR/finwealth-server"
 install -m 0755 "$ROOT/tools/check_vps_readiness.sh" "$APP_DIR/tools/"
+install -m 0755 "$ROOT/tools/configure_vps_auth.sh" "$APP_DIR/tools/"
 install -m 0755 "$ROOT/tools/backup_vps_ledger.sh" "$APP_DIR/tools/"
 install -m 0755 "$ROOT/tools/restore_vps_ledger.sh" "$APP_DIR/tools/"
 

@@ -57,6 +57,20 @@ installer.
 
 ## 2. Configure auth
 
+Preferred interactive path after installation:
+
+```bash
+sudo bash /opt/finwealth/tools/configure_vps_auth.sh your-name api.example.com
+```
+
+The password is entered twice without echoing. The script requires at least 12
+characters, generates Argon2 locally on the VPS, validates the complete
+production configuration through a temporary private EnvironmentFile, then
+atomically publishes `/etc/finwealth/server.env` and starts the service. It does
+not print or store the plaintext password.
+
+Manual configuration remains available when needed:
+
 Generate an Argon2 password hash on the VPS:
 
 ```bash

@@ -46,6 +46,7 @@ cp "$ROOT/deploy/systemd/finwealth-docker-proxy@.socket" "$BUNDLE/deploy/systemd
 cp "$ROOT/deploy/systemd/finwealth-docker-proxy@.service" "$BUNDLE/deploy/systemd/"
 cp "$ROOT/tools/install_vps_bundle.sh" "$BUNDLE/tools/"
 cp "$ROOT/tools/check_vps_readiness.sh" "$BUNDLE/tools/"
+cp "$ROOT/tools/configure_vps_auth.sh" "$BUNDLE/tools/"
 cp "$ROOT/tools/backup_vps_ledger.sh" "$BUNDLE/tools/"
 cp "$ROOT/tools/restore_vps_ledger.sh" "$BUNDLE/tools/"
 cp "$ROOT/docs/deploy/VPS_DEPLOYMENT.md" "$BUNDLE/docs/"

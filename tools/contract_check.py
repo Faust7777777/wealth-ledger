@@ -48,6 +48,7 @@ SYSTEMD_DOCKER_PROXY_SERVICE = (
 VPS_INSTALL = ROOT / "tools" / "install_vps_systemd.sh"
 VPS_BUNDLE_INSTALL = ROOT / "tools" / "install_vps_bundle.sh"
 VPS_PACKAGE = ROOT / "tools" / "package_vps_server.sh"
+VPS_AUTH_CONFIGURE = ROOT / "tools" / "configure_vps_auth.sh"
 VPS_READINESS = ROOT / "tools" / "check_vps_readiness.sh"
 VPS_BACKUP = ROOT / "tools" / "backup_vps_ledger.sh"
 VPS_RESTORE = ROOT / "tools" / "restore_vps_ledger.sh"
@@ -1019,6 +1020,7 @@ def check_deploy_security_defaults() -> None:
         VPS_INSTALL,
         VPS_BUNDLE_INSTALL,
         VPS_PACKAGE,
+        VPS_AUTH_CONFIGURE,
         VPS_READINESS,
         VPS_BACKUP,
         VPS_RESTORE,
@@ -1078,6 +1080,26 @@ def check_deploy_security_defaults() -> None:
     ]
     if missing:
         fail("VPS bundle packaging missing provenance gates: " + ", ".join(missing))
+
+    auth_configure_text = VPS_AUTH_CONFIGURE.read_text(encoding="utf-8")
+    auth_configure_snippets = [
+        "read -rsp",
+        "PASSWORD_CONFIRM",
+        "minimum 12",
+        "--hash-password-stdin",
+        "mktemp",
+        "EnvironmentFile=$TEMP_ENV",
+        "--check-production-config",
+        "mv -f -- \"$TEMP_ENV\" \"$ENV_FILE\"",
+        "systemctl enable --now",
+    ]
+    missing = [
+        snippet
+        for snippet in auth_configure_snippets
+        if snippet not in auth_configure_text
+    ]
+    if missing:
+        fail("Interactive VPS auth configuration missing safety gates: " + ", ".join(missing))
 
     readiness_text = VPS_READINESS.read_text(encoding="utf-8")
     readiness_snippets = [
