@@ -451,6 +451,33 @@ class CreateDcaPlanInput {
   final String? note;
 }
 
+/// 真实成交输入（openapi DcaExecutionInput）。
+/// 计划金额只是提醒/默认值，绝不复用为成交数量；本命令只生成候选，不下单。
+class DcaExecutionInput {
+  const DcaExecutionInput({
+    required this.holdingAccountId,
+    required this.quantity,
+    required this.totalCost,
+    required this.quoteCurrency,
+    this.executedAt,
+  });
+
+  /// 持仓账户（balanceMode=holdings|mixed 的未归档账户）。
+  final Id holdingAccountId;
+
+  /// 实际买到的数量（>0，≤8 位小数的十进制字符串）。
+  final DecimalString quantity;
+
+  /// 实际总成本（>0；资金账户币种）。
+  final Money totalCost;
+
+  /// 标的/持仓分录的报价币种（默认持仓账户 defaultCurrency，可改）。
+  final CurrencyCode quoteCurrency;
+
+  /// 成交时间（可空；省略由服务端取当前时间；提供须带时区）。
+  final IsoDateTime? executedAt;
+}
+
 class UpdateDcaPlanPatch {
   const UpdateDcaPlanPatch({
     this.displayName,

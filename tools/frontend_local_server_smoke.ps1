@@ -72,10 +72,11 @@ try {
   $flutterExitCode = 1
   Push-Location $root
   try {
-    # 两个联调文件共享同一账本进程：--concurrency=1 串行执行，避免写入交错。
+    # 联调文件共享同一账本进程：--concurrency=1 串行执行，避免写入交错。
     & flutter test "--dart-define=LOCAL_SERVER_API_BASE=$baseUrl" --concurrency=1 `
       test/local_server_subscription_integration_test.dart `
-      test/local_server_account_integration_test.dart
+      test/local_server_account_integration_test.dart `
+      test/local_server_dca_integration_test.dart
     $flutterExitCode = $LASTEXITCODE
   } finally {
     Pop-Location

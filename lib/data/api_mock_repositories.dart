@@ -1117,9 +1117,19 @@ class LocalServerDcaRepository implements DcaRepository {
   }
 
   @override
-  Future<void> markExecutedAsProposal(Id reminderId) async {
+  Future<void> markExecutedAsProposal(
+    Id reminderId,
+    DcaExecutionInput input,
+  ) async {
     await _c.postData(
       '/v1/dca/reminders/$reminderId/mark-executed-as-proposal',
+      body: {
+        'holdingAccountId': input.holdingAccountId,
+        'quantity': input.quantity,
+        'totalCost': _moneyJson(input.totalCost),
+        'quoteCurrency': input.quoteCurrency,
+        if (input.executedAt != null) 'executedAt': input.executedAt,
+      },
     );
   }
 

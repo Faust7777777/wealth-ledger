@@ -17,6 +17,7 @@ import 'package:finwealth/features/accounts_page.dart';
 import 'package:finwealth/features/ai_review_page.dart';
 import 'package:finwealth/features/account_form_page.dart';
 import 'package:finwealth/features/account_type_picker.dart';
+import 'package:finwealth/features/dca_execution_dialog.dart';
 import 'package:finwealth/features/investment_page.dart';
 import 'package:finwealth/features/liabilities_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
@@ -579,6 +580,54 @@ void main() {
     await expectLater(
       find.byType(AccountTypePickerDialog),
       matchesGoldenFile('goldens/account_type_picker_dark.png'),
+    );
+  });
+
+  // —— DCA 真实成交记录表单（2026-07-16 批）——
+  testWidgets('dca execution dialog · dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(460, 760));
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildDarkTheme(),
+        home: const Scaffold(
+          body: Center(
+            child: DcaExecutionDialog(
+              reminder: DcaReminderVm(
+                id: 'rem_preview',
+                planId: 'plan_preview',
+                displayName: '沪深300ETF',
+                plannedAmount: Money(amount: '200.00', currency: 'CNY'),
+                dueDate: '2026-07-16',
+                status: DcaReminderStatus.due,
+              ),
+              holdingAccounts: [
+                AccountVm(
+                  id: 'a1',
+                  displayName: '美股券商',
+                  accountType: AccountType.brokerage,
+                  isLiability: false,
+                  balanceMode: 'holdings',
+                  defaultCurrency: 'USD',
+                ),
+                AccountVm(
+                  id: 'a2',
+                  displayName: '混合老账户',
+                  accountType: AccountType.brokerage,
+                  isLiability: false,
+                  balanceMode: 'mixed',
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(DcaExecutionDialog),
+      matchesGoldenFile('goldens/dca_execution_dialog_dark.png'),
     );
   });
 }

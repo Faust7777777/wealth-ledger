@@ -467,9 +467,10 @@ class FixtureDcaRepository implements DcaRepository {
   Future<DcaPlanVm> updatePlan(Id planId, UpdateDcaPlanPatch patch) async =>
       throw UnsupportedError('DEMO 演示只读，不支持更新定投计划；请用 local_server');
   @override
-  Future<void> markExecutedAsProposal(Id reminderId) async {
-    /* DEMO：模拟生成候选 */
-  }
+  Future<void> markExecutedAsProposal(
+    Id reminderId,
+    DcaExecutionInput input,
+  ) async => throw UnsupportedError('DEMO 演示只读，不会真的记录成交候选；请用 local_server');
   @override
   Future<void> skipReminder(Id reminderId) async {
     /* DEMO：模拟跳过 */
