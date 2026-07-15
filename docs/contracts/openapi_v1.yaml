@@ -1453,7 +1453,7 @@ components:
       format: date-time
     DecimalString:
       type: string
-      pattern: "^-?[0-9]+(\\.[0-9]+)?$"
+      pattern: "^-?[0-9]+(\\.[0-9]{1,8})?$"
     CurrencyCode:
       type: string
       minLength: 2
@@ -1906,6 +1906,34 @@ components:
           $ref: "#/components/schemas/Money"
         benefitSource:
           enum: [coupon, platform_subsidy, merchant_discount, free_order, other]
+    InvestmentSaleResult:
+      type: object
+      additionalProperties: false
+      required:
+        - costBasisMethod
+        - grossProceeds
+        - feeAndTaxTotal
+        - netProceeds
+        - realizedPnlStatus
+      description: >-
+        Server-derived immutable accounting result added when a sell movement is
+        confirmed. Realized PnL uses the average-cost basis released by this sale.
+        Different currencies are never subtracted without an execution-time FX basis.
+      properties:
+        costBasisMethod:
+          const: average_cost
+        grossProceeds:
+          $ref: "#/components/schemas/Money"
+        feeAndTaxTotal:
+          $ref: "#/components/schemas/Money"
+        netProceeds:
+          $ref: "#/components/schemas/Money"
+        costBasisReleased:
+          $ref: "#/components/schemas/Money"
+        realizedPnl:
+          $ref: "#/components/schemas/Money"
+        realizedPnlStatus:
+          enum: [calculated, cost_basis_unavailable, currency_mismatch]
     SettlementInfo:
       type: object
       required: [status]
@@ -2011,6 +2039,8 @@ components:
           $ref: "#/components/schemas/SettlementInfo"
         transferMeta:
           $ref: "#/components/schemas/TransferMeta"
+        saleResult:
+          $ref: "#/components/schemas/InvestmentSaleResult"
         source:
           $ref: "#/components/schemas/DataSourceInfo"
         createdAt:

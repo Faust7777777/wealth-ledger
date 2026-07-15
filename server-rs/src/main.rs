@@ -7872,6 +7872,7 @@ mod tests {
             request_json_body_from(router.clone(), Method::POST, "/v1/movements/drafts", sell)
                 .await;
         assert_eq!(sell_status, StatusCode::CREATED, "{sell_body}");
+        let sell_id = sell_body["data"]["id"].as_str().expect("sell movement id");
         let sell_group = sell_body["data"]["atomicGroupId"]
             .as_str()
             .expect("sell atomic group id");
@@ -7902,6 +7903,20 @@ mod tests {
         let (_, holdings) = request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
         assert_eq!(holdings["data"][0]["quantity"], "6");
         assert_eq!(holdings["data"][0]["costBasisTotal"]["amount"], "61.80");
+        let (_, confirmed_sell) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/movements/{sell_id}"),
+        )
+        .await;
+        let sale_result = &confirmed_sell["data"]["saleResult"];
+        assert_eq!(sale_result["costBasisMethod"], "average_cost");
+        assert_eq!(sale_result["grossProceeds"]["amount"], "40.00");
+        assert_eq!(sale_result["feeAndTaxTotal"]["amount"], "2.00");
+        assert_eq!(sale_result["netProceeds"]["amount"], "38.00");
+        assert_eq!(sale_result["costBasisReleased"]["amount"], "41.20");
+        assert_eq!(sale_result["realizedPnl"]["amount"], "-3.20");
+        assert_eq!(sale_result["realizedPnlStatus"], "calculated");
 
         let (refresh_status, refresh_body) = request_json_body_from(
             router.clone(),
@@ -10346,12 +10361,55 @@ mod tests {
         assert_eq!(draft_status, StatusCode::BAD_REQUEST);
         assert_eq!(draft_body["error"]["code"], "invalid_movement_draft_input");
 
+        let valid_draft = json!({
+            "type": "expense",
+            "occurredAt": "2026-06-26T10:01:00+08:00",
+            "title": "八位小数支出",
+            "entries": [
+                {
+                    "accountId": account_id,
+                    "amount": "0.00000001",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }
+            ]
+        });
+        let (valid_status, valid_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            valid_draft,
+        )
+        .await;
+        assert_eq!(valid_status, StatusCode::CREATED, "{valid_body}");
+        let valid_group = valid_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("valid decimal atomic group");
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{valid_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+        let (_, account_after) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(
+            account_after["data"]["cashBalances"][0]["amount"],
+            "10.12345677"
+        );
+
         let (overview_status, overview_body) =
             request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
         assert_eq!(overview_status, StatusCode::OK);
         assert_eq!(
             overview_body["data"]["latestSnapshot"]["netWorth"]["amount"],
-            "10.12"
+            "10.12345677"
         );
 
         let _ = std::fs::remove_file(path);

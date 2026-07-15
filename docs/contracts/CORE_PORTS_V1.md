@@ -314,6 +314,8 @@ confirmAtomicGroup(groupId: ID): ConfirmResult
 - 买入 principal、fee、tax 的现金流出合计计入持仓成本基础。
 - 卖出现金净流入等于 gross proceeds 减 fee/tax，成本基础按出售数量比例减少。
 - fee/tax 必须与 principal 使用同一现金账户和币种；未提供 FX 明细时不得跨币种归集。
+- 卖出确认必须把毛回款、费用合计、净回款、平均成本释放额及已实现盈亏计算状态固化到
+  confirmed movement；不允许前端提交或覆盖派生结果。
 7. 标记快照过期。
 8. 追加 sync outbox。
 

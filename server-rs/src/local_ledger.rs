@@ -3750,6 +3750,7 @@ fn validate_movements<'a>(
                 validate_movement_semantics(document, movement_type, entries, errors);
             }
         }
+        validate_investment_sale_result(movement, index, errors);
     }
     index_by_id
 }
@@ -3906,6 +3907,176 @@ fn validate_non_negative_money(value: &Value, label: &str, errors: &mut Vec<Stri
         .is_none_or(str::is_empty)
     {
         errors.push(format!("{label}.currency must be a non-empty string"));
+    }
+}
+
+fn parsed_money_parts<'a>(
+    value: Option<&'a Value>,
+    label: &str,
+    errors: &mut Vec<String>,
+) -> Option<(DecimalAmount, &'a str)> {
+    let Some(value) = value else {
+        errors.push(format!("{label} is required"));
+        return None;
+    };
+    let Some(object) = value.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return None;
+    };
+    let amount = match object.get("amount").and_then(Value::as_str) {
+        Some(amount) => match parse_decimal(amount) {
+            Ok(amount) => Some(amount),
+            Err(_) => {
+                errors.push(format!("{label}.amount must be a decimal string"));
+                None
+            }
+        },
+        None => {
+            errors.push(format!("{label}.amount must be a decimal string"));
+            None
+        }
+    };
+    let currency = match object.get("currency").and_then(Value::as_str) {
+        Some(currency) if !currency.is_empty() => Some(currency),
+        _ => {
+            errors.push(format!("{label}.currency must be a non-empty string"));
+            None
+        }
+    };
+    amount.zip(currency)
+}
+
+fn validate_investment_sale_result(
+    movement: &serde_json::Map<String, Value>,
+    movement_index: usize,
+    errors: &mut Vec<String>,
+) {
+    let Some(result) = movement.get("saleResult") else {
+        return;
+    };
+    let label = format!("movements[{movement_index}].saleResult");
+    if movement.get("type").and_then(Value::as_str) != Some("sell") {
+        errors.push(format!("{label} is only valid for sell movements"));
+    }
+    if !matches!(
+        movement.get("status").and_then(Value::as_str),
+        Some("confirmed" | "in_transit" | "reversed")
+    ) {
+        errors.push(format!(
+            "{label} is only valid after a sell movement is confirmed"
+        ));
+    }
+    let Some(result) = result.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    if result.get("costBasisMethod").and_then(Value::as_str) != Some("average_cost") {
+        errors.push(format!("{label}.costBasisMethod must be average_cost"));
+    }
+    let status = result.get("realizedPnlStatus").and_then(Value::as_str);
+    if !matches!(
+        status,
+        Some("calculated" | "cost_basis_unavailable" | "currency_mismatch")
+    ) {
+        errors.push(format!("{label}.realizedPnlStatus is invalid"));
+    }
+
+    let gross = parsed_money_parts(
+        result.get("grossProceeds"),
+        &format!("{label}.grossProceeds"),
+        errors,
+    );
+    let fees = parsed_money_parts(
+        result.get("feeAndTaxTotal"),
+        &format!("{label}.feeAndTaxTotal"),
+        errors,
+    );
+    let net = parsed_money_parts(
+        result.get("netProceeds"),
+        &format!("{label}.netProceeds"),
+        errors,
+    );
+    for (field, value) in [
+        ("grossProceeds", gross),
+        ("feeAndTaxTotal", fees),
+        ("netProceeds", net),
+    ] {
+        if value.is_some_and(|(amount, _)| amount < DecimalAmount::ZERO) {
+            errors.push(format!("{label}.{field}.amount must be non-negative"));
+        }
+    }
+    if let (
+        Some((gross_amount, gross_currency)),
+        Some((fee_amount, fee_currency)),
+        Some((net_amount, net_currency)),
+    ) = (gross, fees, net)
+    {
+        if gross_currency != fee_currency || gross_currency != net_currency {
+            errors.push(format!(
+                "{label} gross proceeds, fees, and net proceeds must use one currency"
+            ));
+        }
+        if gross_amount - fee_amount != net_amount {
+            errors.push(format!("{label}.netProceeds must equal gross minus fees"));
+        }
+    }
+
+    let released = result.get("costBasisReleased").and_then(|value| {
+        parsed_money_parts(Some(value), &format!("{label}.costBasisReleased"), errors)
+    });
+    if released.is_some_and(|(amount, _)| amount < DecimalAmount::ZERO) {
+        errors.push(format!(
+            "{label}.costBasisReleased.amount must be non-negative"
+        ));
+    }
+    let pnl = result
+        .get("realizedPnl")
+        .and_then(|value| parsed_money_parts(Some(value), &format!("{label}.realizedPnl"), errors));
+
+    match status {
+        Some("calculated") => {
+            let (
+                Some((net_amount, net_currency)),
+                Some((released_amount, released_currency)),
+                Some((pnl_amount, pnl_currency)),
+            ) = (net, released, pnl)
+            else {
+                errors.push(format!(
+                    "{label} calculated status requires costBasisReleased and realizedPnl"
+                ));
+                return;
+            };
+            if net_currency != released_currency || net_currency != pnl_currency {
+                errors.push(format!("{label} calculated amounts must use one currency"));
+            }
+            if net_amount - released_amount != pnl_amount {
+                errors.push(format!(
+                    "{label}.realizedPnl must equal net proceeds minus released cost basis"
+                ));
+            }
+        }
+        Some("cost_basis_unavailable") => {
+            if released.is_some() || pnl.is_some() {
+                errors.push(format!(
+                    "{label} unavailable cost basis must not include released cost or realized PnL"
+                ));
+            }
+        }
+        Some("currency_mismatch") => {
+            if released.is_none() || pnl.is_some() {
+                errors.push(format!(
+                    "{label} currency mismatch requires released cost and no realized PnL"
+                ));
+            }
+            if let (Some((_, net_currency)), Some((_, released_currency))) = (net, released)
+                && net_currency == released_currency
+            {
+                errors.push(format!(
+                    "{label} currency mismatch requires different proceeds and cost currencies"
+                ));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -7453,8 +7624,15 @@ impl DecimalAmount {
     }
 
     fn money_string(self) -> String {
-        let cents = round_div(self.0, Self::SCALE / 100);
-        signed_fixed_string(cents, 2)
+        let raw = signed_fixed_string(self.0, 8);
+        let Some((integer, fraction)) = raw.split_once('.') else {
+            return format!("{raw}.00");
+        };
+        let mut keep = fraction.len();
+        while keep > 2 && fraction.as_bytes()[keep - 1] == b'0' {
+            keep -= 1;
+        }
+        format!("{integer}.{}", &fraction[..keep])
     }
 
     fn decimal_string(self) -> String {
@@ -8900,8 +9078,8 @@ fn apply_movement_effect(
             LedgerError::InvalidInput(vec!["movement.entries is missing".to_string()])
         })?;
     match movement.get("type").and_then(Value::as_str) {
-        Some("buy") => apply_buy_or_sell_movement(document, entries, true, now),
-        Some("sell") => apply_buy_or_sell_movement(document, entries, false, now),
+        Some("buy") => apply_buy_or_sell_movement(document, movement, entries, true, now),
+        Some("sell") => apply_buy_or_sell_movement(document, movement, entries, false, now),
         _ => apply_movement_entries(document, entries, now),
     }
 }
@@ -8951,6 +9129,7 @@ fn apply_movement_entries(
 
 fn apply_buy_or_sell_movement(
     document: &mut Value,
+    movement: &Value,
     entries: &[Value],
     is_buy: bool,
     now: &str,
@@ -9030,7 +9209,7 @@ fn apply_buy_or_sell_movement(
                 "sell fee/tax total must not exceed gross proceeds".to_string(),
             ]));
         }
-        apply_holding_sale(
+        let released_cost_basis = apply_holding_sale(
             document,
             holding_account_id,
             instrument_id,
@@ -9038,15 +9217,59 @@ fn apply_buy_or_sell_movement(
             quantity,
             now,
         )?;
-        apply_account_cash_delta(
+        let net_proceeds = cash_amount - fee_total;
+        apply_account_cash_delta(document, cash_account_id, cash_currency, net_proceeds, now)?;
+        record_investment_sale_result(
             document,
-            cash_account_id,
+            movement,
+            cash_amount,
+            fee_total,
+            net_proceeds,
             cash_currency,
-            cash_amount - fee_total,
-            now,
+            released_cost_basis,
         )?;
     }
 
+    Ok(())
+}
+
+fn record_investment_sale_result(
+    document: &mut Value,
+    movement: &Value,
+    gross_proceeds: DecimalAmount,
+    fee_and_tax_total: DecimalAmount,
+    net_proceeds: DecimalAmount,
+    cash_currency: &str,
+    released_cost_basis: Option<(DecimalAmount, String)>,
+) -> Result<(), LedgerError> {
+    let movement_id = movement
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::InvalidInput(vec!["movement.id is missing".to_string()]))?;
+    let stored = document["movements"]
+        .as_array_mut()
+        .expect("validated local ledger movements should be an array")
+        .iter_mut()
+        .find(|stored| stored.get("id").and_then(Value::as_str) == Some(movement_id))
+        .ok_or_else(|| LedgerError::NotFound(format!("movement does not exist: {movement_id}")))?;
+
+    let mut result = json!({
+        "costBasisMethod": "average_cost",
+        "grossProceeds": money(gross_proceeds, cash_currency),
+        "feeAndTaxTotal": money(fee_and_tax_total, cash_currency),
+        "netProceeds": money(net_proceeds, cash_currency),
+        "realizedPnlStatus": "cost_basis_unavailable"
+    });
+    if let Some((released_amount, released_currency)) = released_cost_basis {
+        result["costBasisReleased"] = money(released_amount, &released_currency);
+        if released_currency == cash_currency {
+            result["realizedPnl"] = money(net_proceeds - released_amount, cash_currency);
+            result["realizedPnlStatus"] = json!("calculated");
+        } else {
+            result["realizedPnlStatus"] = json!("currency_mismatch");
+        }
+    }
+    stored["saleResult"] = result;
     Ok(())
 }
 
@@ -9275,7 +9498,7 @@ fn apply_holding_sale(
     quote_currency: &str,
     quantity: DecimalAmount,
     now: &str,
-) -> Result<(), LedgerError> {
+) -> Result<Option<(DecimalAmount, String)>, LedgerError> {
     if !active_account_exists(document, account_id) {
         return Err(LedgerError::NotFound(format!(
             "account does not exist or is archived: {account_id}"
@@ -9315,6 +9538,44 @@ fn apply_holding_sale(
         next_quantity,
         "holding cost basis",
     )?;
+    let released_cost_basis =
+        match (existing.get("costBasisTotal"), &next_cost_basis) {
+            (Some(current), Some((remaining_amount, remaining_currency))) => {
+                let current_amount =
+                    parse_decimal(current.get("amount").and_then(Value::as_str).ok_or_else(
+                        || {
+                            LedgerError::InvalidInput(vec![
+                                "holding cost basis.amount is missing".to_string(),
+                            ])
+                        },
+                    )?)
+                    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+                let current_currency =
+                    current
+                        .get("currency")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            LedgerError::InvalidInput(vec![
+                                "holding cost basis.currency is missing".to_string(),
+                            ])
+                        })?;
+                if current_currency != remaining_currency {
+                    return Err(LedgerError::InvalidInput(vec![
+                        "holding cost basis currency changed during sale".to_string(),
+                    ]));
+                }
+                Some((
+                    current_amount - *remaining_amount,
+                    current_currency.to_string(),
+                ))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(LedgerError::InvalidInput(vec![
+                    "holding cost basis reduction is inconsistent".to_string(),
+                ]));
+            }
+        };
     let next_market_value = proportional_remaining_value(
         existing.get("marketValue"),
         current_quantity,
@@ -9345,7 +9606,7 @@ fn apply_holding_sale(
         object.remove("unrealizedPnl");
         object.remove("unrealizedPnlRate");
     }
-    Ok(())
+    Ok(released_cost_basis)
 }
 
 fn proportional_remaining_value(
@@ -12069,6 +12330,155 @@ mod tests {
             errors
                 .iter()
                 .any(|error| error.contains("duplicate sourceDeviceId/sourceChangeId"))
+        );
+    }
+
+    #[test]
+    fn investment_sale_result_requires_conserved_realized_pnl() {
+        let mut movement = json!({
+            "type": "sell",
+            "status": "confirmed",
+            "saleResult": {
+                "costBasisMethod": "average_cost",
+                "grossProceeds": {"amount": "40.00", "currency": "CNY"},
+                "feeAndTaxTotal": {"amount": "2.00", "currency": "CNY"},
+                "netProceeds": {"amount": "38.00", "currency": "CNY"},
+                "costBasisReleased": {"amount": "41.20", "currency": "CNY"},
+                "realizedPnl": {"amount": "-3.20", "currency": "CNY"},
+                "realizedPnlStatus": "calculated"
+            }
+        });
+        let mut errors = Vec::new();
+        validate_investment_sale_result(
+            movement.as_object().expect("movement object"),
+            0,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        movement["saleResult"]["realizedPnl"]["amount"] = json!("3.20");
+        let mut errors = Vec::new();
+        validate_investment_sale_result(
+            movement.as_object().expect("movement object"),
+            0,
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains("realizedPnl must equal net proceeds minus released cost basis")
+        }));
+    }
+
+    #[test]
+    fn investment_sale_result_never_subtracts_mismatched_currencies() {
+        let now = "2026-07-16T00:00:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["accounts"] = json!([
+            account_from_create_input(
+                &json!({
+                    "displayName": "人民币资金",
+                    "accountType": "bank",
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": "cash_balance",
+                    "openingBalances": [{"currency": "CNY", "amount": "0.00"}]
+                }),
+                "acct_sale_cash",
+                now,
+            )
+            .expect("cash account"),
+            account_from_create_input(
+                &json!({
+                    "displayName": "跨币种持仓",
+                    "accountType": "brokerage",
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": "holdings",
+                    "openingBalances": []
+                }),
+                "acct_sale_holding",
+                now,
+            )
+            .expect("holding account")
+        ]);
+        document["instruments"] = json!([{
+            "id": "inst_sale_fx",
+            "type": "fund",
+            "displayName": "跨币种基金",
+            "quoteCurrency": "CNY"
+        }]);
+        document["holdings"] = json!([{
+            "id": "holding_sale_fx",
+            "accountId": "acct_sale_holding",
+            "instrumentId": "inst_sale_fx",
+            "quantity": "10",
+            "costBasisTotal": {"amount": "100.00", "currency": "USD"},
+            "marketValue": {
+                "amount": "100.00",
+                "currency": "USD",
+                "asOf": now,
+                "quality": "estimated"
+            },
+            "quoteStatus": "stale",
+            "asOf": now
+        }]);
+        let movement = json!({
+            "id": "mov_sale_fx",
+            "type": "sell",
+            "entries": [
+                {
+                    "accountId": "acct_sale_holding",
+                    "instrumentId": "inst_sale_fx",
+                    "amount": "4",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": "acct_sale_cash",
+                    "amount": "50.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        document["movements"] = json!([movement.clone()]);
+        apply_buy_or_sell_movement(
+            &mut document,
+            &movement,
+            movement["entries"].as_array().expect("entries"),
+            false,
+            now,
+        )
+        .expect("cross-currency sale should apply without fake PnL");
+
+        let result = &document["movements"][0]["saleResult"];
+        assert_eq!(result["costBasisReleased"]["amount"], "40.00");
+        assert_eq!(result["costBasisReleased"]["currency"], "USD");
+        assert_eq!(result["netProceeds"]["currency"], "CNY");
+        assert_eq!(result["realizedPnlStatus"], "currency_mismatch");
+        assert!(result.get("realizedPnl").is_none());
+    }
+
+    #[test]
+    fn money_amount_preserves_up_to_eight_decimal_places() {
+        assert_eq!(
+            money_amount(parse_decimal("100").expect("integer")),
+            "100.00"
+        );
+        assert_eq!(
+            money_amount(parse_decimal("1.23000000").expect("two decimals")),
+            "1.23"
+        );
+        assert_eq!(
+            money_amount(parse_decimal("0.00000001").expect("satoshi")),
+            "0.00000001"
+        );
+        assert_eq!(
+            money_amount(parse_decimal("-2.34567890").expect("signed precision")),
+            "-2.3456789"
         );
     }
 

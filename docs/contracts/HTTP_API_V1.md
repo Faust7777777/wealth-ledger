@@ -211,6 +211,9 @@ POST  /v1/movements/corrections
 - 卖出持仓为 `out/source`，principal 为现金 `in/destination`；现金增加
   `gross proceeds - fee - tax`，费用/税费总额不得超过 gross proceeds；成本基础仍按出售
   数量比例减少。报价后按 `quantity × price` 估值。
+- sell 确认后 movement 增加只读 `saleResult`。服务端按平均成本法固化
+  `costBasisReleased`；同币种时计算 `realizedPnl = netProceeds - costBasisReleased`，成本
+  未知或币种不一致时分别标记 `cost_basis_unavailable` / `currency_mismatch`，不裸数相减。
 - `loan_disbursement` 必须从负债账户 `out/source` 到非负债账户 `in/destination`；`loan_repayment` 方向相反；两腿同币种同金额且账户不同。
 - 普通 draft 不接受 `type=correction`；更正只能通过 `/v1/movements/corrections` 创建，避免绕过原记录引用与反向分录。
 - 当前不接受含持仓腿的投资 movement 更正；在数量和成本基础的完整 replacement 语义进入契约前，明确返回 400，避免把数量差额误当金额差额。

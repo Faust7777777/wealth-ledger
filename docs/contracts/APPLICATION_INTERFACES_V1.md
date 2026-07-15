@@ -134,6 +134,7 @@ CreateMovementDraftInput {
   amountBreakdown?: TransactionAmountBreakdown;
   settlement?: SettlementInfo;
   transferMeta?: TransferMeta;
+  saleResult?: InvestmentSaleResult; // sell 确认时由服务端生成，客户端不可提交
 }
 
 ConfirmResult {
@@ -159,6 +160,8 @@ ConfirmResult {
   费用从 gross proceeds 扣除；贷款放款/还款必须在负债账户与非负债账户之间同额流转。
 - 每条分录币种必须由账户支持；持仓腿只能进入 `holdings` / `mixed` 账户。普通 draft
   不得直接声明 `correction`，必须走 `createCorrection`。
+- 已确认 sell 返回服务端固化的平均成本结果：毛回款、费用税费合计、净回款、释放成本及
+  可计算时的已实现盈亏。跨币种且无历史成交 FX 依据时只返回 `currency_mismatch`。
 
 ## 5. DcaService
 

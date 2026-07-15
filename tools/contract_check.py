@@ -739,6 +739,76 @@ def check_investment_fee_semantics(doc: dict) -> None:
     ok("Investment fee/tax accounting checks passed")
 
 
+def check_investment_sale_result(doc: dict) -> None:
+    schemas = doc["components"]["schemas"]
+    if schemas.get("DecimalString", {}).get("pattern") != r"^-?[0-9]+(\.[0-9]{1,8})?$":
+        fail("DecimalString must enforce at most eight decimal places")
+    result = schemas.get("InvestmentSaleResult", {})
+    required = {
+        "costBasisMethod",
+        "grossProceeds",
+        "feeAndTaxTotal",
+        "netProceeds",
+        "realizedPnlStatus",
+    }
+    properties = result.get("properties", {})
+    if result.get("type") != "object" or result.get("additionalProperties") is not False:
+        fail("InvestmentSaleResult must be a closed object")
+    if set(result.get("required", [])) != required:
+        fail("InvestmentSaleResult required fields drifted")
+    if set(properties) != required | {"costBasisReleased", "realizedPnl"}:
+        fail("InvestmentSaleResult properties drifted")
+    if properties.get("costBasisMethod", {}).get("const") != "average_cost":
+        fail("InvestmentSaleResult must use average_cost")
+    statuses = set(properties.get("realizedPnlStatus", {}).get("enum", []))
+    if statuses != {"calculated", "cost_basis_unavailable", "currency_mismatch"}:
+        fail("InvestmentSaleResult status values drifted")
+    movement_ref = schemas["Movement"]["properties"].get("saleResult", {}).get("$ref")
+    if movement_ref != "#/components/schemas/InvestmentSaleResult":
+        fail("Movement.saleResult must reference InvestmentSaleResult")
+
+    local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    for snippet in [
+        '"costBasisMethod": "average_cost"',
+        '"realizedPnlStatus": "cost_basis_unavailable"',
+        'result["realizedPnlStatus"] = json!("calculated")',
+        'result["realizedPnlStatus"] = json!("currency_mismatch")',
+        '"realizedPnl must equal net proceeds minus released cost basis"',
+        "while keep > 2",
+        'parse_decimal("0.00000001")',
+        "investment_sale_result_never_subtracts_mismatched_currencies",
+    ]:
+        if snippet not in local_text:
+            fail(f"Investment sale-result implementation is incomplete: {snippet}")
+
+    rust_tests = RUST_SERVER.read_text(encoding="utf-8")
+    for snippet in [
+        'sale_result["costBasisReleased"]["amount"], "41.20"',
+        'sale_result["realizedPnl"]["amount"], "-3.20"',
+        'sale_result["realizedPnlStatus"], "calculated"',
+        '"10.12345677"',
+    ]:
+        if snippet not in rust_tests:
+            fail(f"Investment sale-result API regression is incomplete: {snippet}")
+
+    smoke_text = LOCAL_LEDGER_SMOKE.read_text(encoding="utf-8")
+    for snippet in [
+        'sale_result["costBasisReleased"]',
+        '"amount": "20.60"',
+        'sale_result["realizedPnl"]',
+        '"amount": "2.90"',
+    ]:
+        if snippet not in smoke_text:
+            fail(f"Investment sale-result smoke is incomplete: {snippet}")
+
+    http_text = HTTP_MD.read_text(encoding="utf-8")
+    for snippet in ["saleResult", "costBasisReleased", "currency_mismatch"]:
+        if snippet not in http_text:
+            fail(f"HTTP investment sale-result contract is incomplete: {snippet}")
+
+    ok("Investment realized-PnL sale-result checks passed")
+
+
 def check_subscription_due_scan(doc: dict) -> None:
     path = "/subscriptions/charge-proposals/due-scan"
     path_item = doc["paths"].get(path)
@@ -1830,6 +1900,7 @@ def main() -> None:
 
     check_dca_execution_input(doc)
     check_investment_fee_semantics(doc)
+    check_investment_sale_result(doc)
     check_subscription_due_scan(doc)
     check_multileg_correction(doc)
     check_examples()

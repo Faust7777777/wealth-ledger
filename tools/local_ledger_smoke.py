@@ -394,6 +394,21 @@ def create_and_confirm_investment_with_fees(
     )
     assert remaining["quantity"] == "3"
     assert remaining["costBasisTotal"]["amount"] == "30.90"
+    confirmed_sell = unwrap_data(request_json(base, f"/v1/movements/{sell['id']}"))
+    sale_result = confirmed_sell["saleResult"]
+    assert sale_result["costBasisMethod"] == "average_cost"
+    assert sale_result["grossProceeds"] == {"amount": "24.00", "currency": "CNY"}
+    assert sale_result["feeAndTaxTotal"] == {
+        "amount": "0.50",
+        "currency": "CNY",
+    }
+    assert sale_result["netProceeds"] == {"amount": "23.50", "currency": "CNY"}
+    assert sale_result["costBasisReleased"] == {
+        "amount": "20.60",
+        "currency": "CNY",
+    }
+    assert sale_result["realizedPnl"] == {"amount": "2.90", "currency": "CNY"}
+    assert sale_result["realizedPnlStatus"] == "calculated"
 
 
 def create_and_confirm_multileg_correction(

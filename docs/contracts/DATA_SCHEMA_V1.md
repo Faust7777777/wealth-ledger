@@ -21,7 +21,7 @@
 type ID = string;              // UUID/ULID，具体算法由实现层决定
 type ISODate = string;         // YYYY-MM-DD
 type ISODateTime = string;     // ISO 8601 with timezone
-type DecimalString = string;   // 任意精度十进制字符串
+type DecimalString = string;   // 定点十进制字符串，当前最多 8 位小数
 type CurrencyCode = string;    // CNY/USD/HKD/USDT/BTC/ETH 等
 ```
 
@@ -217,6 +217,7 @@ Movement {
   amountBreakdown?: TransactionAmountBreakdown;
   settlement?: SettlementInfo;
   transferMeta?: TransferMeta;
+  saleResult?: InvestmentSaleResult;
   subscriptionId?: ID;
   scheduledChargeDate?: ISODate;
   source: DataSourceInfo;
@@ -262,6 +263,19 @@ MovementEntry {
     | "tax"
     | "adjustment";
 }
+
+InvestmentSaleResult {
+  costBasisMethod: "average_cost";
+  grossProceeds: Money;
+  feeAndTaxTotal: Money;
+  netProceeds: Money;
+  costBasisReleased?: Money;
+  realizedPnl?: Money;
+  realizedPnlStatus:
+    | "calculated"
+    | "cost_basis_unavailable"
+    | "currency_mismatch";
+}
 ```
 
 规则：
@@ -278,6 +292,9 @@ MovementEntry {
 - 买入现金实际流出与成本基础增加额均为 `principal + fee + tax`；卖出现金实际流入为
   `gross proceeds - fee - tax`，成本基础按出售数量比例减少。费用不得混入数量，卖出费用
   总额不得超过 gross proceeds。报价估值仍使用 `quantity × price`。
+- sell 确认时服务端固化 `saleResult`：平均成本法释放本次成本，`netProceeds =
+  grossProceeds - feeAndTaxTotal`。只有净回款与释放成本同币种时才写 `realizedPnl =
+  netProceeds - costBasisReleased`；成本未知或币种不一致时写明确状态，不伪造数字。
 
 ## 6. Transfer / 在途 / 折损
 

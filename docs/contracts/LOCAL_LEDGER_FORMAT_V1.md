@@ -173,11 +173,16 @@ AI pending 读取层把 standalone pending movements 按 `atomicGroupId` 分组�
 - 同 key、同请求命中未过期记录时不得再次执行领域修改；必须原样重放保存的状态码/响应体。同 key、不同请求必须拒绝。
 - 写入前完成金额、币种、账户引用、分录方向、AI validation 等校验。
 - decimal string 必须使用统一校验口径；当前最多允许 8 位小数。
+- 现金余额、成本基础、成交结果等派生 Money 写回时必须保留最多 8 位有效小数，不得在
+  账本层强制截断或四舍五入为 2 位；整数和普通法币仍可规范显示为两位小数。
 - 已确认记录更正必须生成 correction movement，不静默覆盖原记录。
 - 多腿更正必须在一个 correction movement 内包含全部原分录的反向腿和完整 replacement 腿；确认时作为单个 atomic group 应用，不允许部分确认。
 - 投资 buy/sell 可在 principal 现金腿和数量持仓腿之外追加同账户、同币种的 `fee|tax`
   现金流出腿；买入费用计入成本基础，卖出费用从 gross proceeds 扣除。所有腿必须在同一
   atomic group 确认，禁止只应用费用或只应用持仓。
+- 新确认的 sell movement 可带服务端派生 `saleResult`。其净回款必须等于毛回款减费用，
+  平均成本释放额必须与持仓减少一致；`calculated` 状态下已实现盈亏必须守恒。旧账本中
+  不含 `saleResult` 的历史 sell 继续兼容读取，不在缺乏历史状态时回填猜测值。
 - 同一 confirmed movement 同时最多有一个 pending correction；账本效果未变化的 replacement 不得落盘。
 - AI approve 必须消费服务端 `ledgerWrite` / `confirmedMovementIds`，前端不得自行猜测“已入账”。
 - 写入后如影响净值/持仓/快照，必须返回或标记 `snapshotInvalidated`。
