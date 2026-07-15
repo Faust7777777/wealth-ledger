@@ -72,15 +72,18 @@ try {
   $flutterExitCode = 1
   Push-Location $root
   try {
-    & flutter test "--dart-define=LOCAL_SERVER_API_BASE=$baseUrl" test/local_server_subscription_integration_test.dart
+    # 两个联调文件共享同一账本进程：--concurrency=1 串行执行，避免写入交错。
+    & flutter test "--dart-define=LOCAL_SERVER_API_BASE=$baseUrl" --concurrency=1 `
+      test/local_server_subscription_integration_test.dart `
+      test/local_server_account_integration_test.dart
     $flutterExitCode = $LASTEXITCODE
   } finally {
     Pop-Location
   }
   if ($flutterExitCode -ne 0) {
-    throw "Flutter local-server subscription integration test failed"
+    throw "Flutter local-server integration tests failed"
   }
-  Write-Host "OK: Flutter local-server subscription integration smoke passed"
+  Write-Host "OK: Flutter local-server integration smoke passed (subscriptions + accounts)"
 } catch {
   Write-Host "FAILED: $($_.Exception.Message)"
   foreach ($logPath in @($stdout, $stderr)) {
