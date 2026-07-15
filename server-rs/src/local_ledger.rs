@@ -2911,6 +2911,7 @@ fn validate_document_for_version(
     }
 
     validate_accounts(object.get("accounts"), &mut errors);
+    validate_core_ledger_entities(document, &mut errors);
     validate_subscriptions(
         object.get("subscriptions"),
         object.get("accounts"),
@@ -3047,6 +3048,447 @@ fn validate_accounts(accounts: Option<&Value>, errors: &mut Vec<String>) {
                 ));
             }
         }
+    }
+}
+
+fn validate_core_ledger_entities(document: &Value, errors: &mut Vec<String>) {
+    let account_ids = document["accounts"]
+        .as_array()
+        .map(|accounts| {
+            accounts
+                .iter()
+                .filter_map(|account| account.get("id").and_then(Value::as_str))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let instrument_ids = validate_instruments(document.get("instruments"), errors);
+    validate_holdings(
+        document.get("holdings"),
+        &account_ids,
+        &instrument_ids,
+        errors,
+    );
+    let movement_index = validate_movements(document, &account_ids, &instrument_ids, errors);
+    validate_movement_entry_index(document.get("movementEntries"), &movement_index, errors);
+}
+
+fn validate_instruments<'a>(
+    instruments: Option<&'a Value>,
+    errors: &mut Vec<String>,
+) -> BTreeSet<&'a str> {
+    let Some(instruments) = instruments.and_then(Value::as_array) else {
+        return BTreeSet::new();
+    };
+    let mut ids = BTreeSet::new();
+    for (index, instrument) in instruments.iter().enumerate() {
+        let Some(instrument) = instrument.as_object() else {
+            errors.push(format!("instruments[{index}] must be an object"));
+            continue;
+        };
+        let id = instrument.get("id").and_then(Value::as_str);
+        match id {
+            Some(id) if !id.is_empty() => {
+                if !ids.insert(id) {
+                    errors.push(format!("duplicate instrument id: {id}"));
+                }
+            }
+            _ => errors.push(format!(
+                "instruments[{index}].id must be a non-empty string"
+            )),
+        }
+        for key in ["displayName", "quoteCurrency"] {
+            if instrument
+                .get(key)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                errors.push(format!(
+                    "instruments[{index}].{key} must be a non-empty string"
+                ));
+            }
+        }
+        if !matches!(
+            instrument.get("type").and_then(Value::as_str),
+            Some("cash" | "equity" | "fund" | "crypto" | "fx_cash" | "receivable" | "other")
+        ) {
+            errors.push(format!("instruments[{index}].type is invalid"));
+        }
+    }
+    ids
+}
+
+fn validate_holdings(
+    holdings: Option<&Value>,
+    account_ids: &BTreeSet<&str>,
+    instrument_ids: &BTreeSet<&str>,
+    errors: &mut Vec<String>,
+) {
+    let Some(holdings) = holdings.and_then(Value::as_array) else {
+        return;
+    };
+    let mut ids = BTreeSet::new();
+    let mut account_instruments = BTreeSet::new();
+    for (index, holding) in holdings.iter().enumerate() {
+        let Some(holding) = holding.as_object() else {
+            errors.push(format!("holdings[{index}] must be an object"));
+            continue;
+        };
+        let id = holding.get("id").and_then(Value::as_str);
+        match id {
+            Some(id) if !id.is_empty() => {
+                if !ids.insert(id) {
+                    errors.push(format!("duplicate holding id: {id}"));
+                }
+            }
+            _ => errors.push(format!("holdings[{index}].id must be a non-empty string")),
+        }
+        let account_id = holding.get("accountId").and_then(Value::as_str);
+        match account_id {
+            Some(account_id) if account_ids.contains(account_id) => {}
+            _ => errors.push(format!(
+                "holdings[{index}].accountId must reference an existing account"
+            )),
+        }
+        let instrument_id = holding.get("instrumentId").and_then(Value::as_str);
+        match instrument_id {
+            Some(instrument_id) if instrument_ids.contains(instrument_id) => {}
+            _ => errors.push(format!(
+                "holdings[{index}].instrumentId must reference an existing instrument"
+            )),
+        }
+        if let (Some(account_id), Some(instrument_id)) = (account_id, instrument_id)
+            && !account_instruments.insert((account_id, instrument_id))
+        {
+            errors.push(format!(
+                "duplicate holding for account/instrument: {account_id}/{instrument_id}"
+            ));
+        }
+        match holding.get("quantity").and_then(Value::as_str) {
+            Some(quantity)
+                if is_decimal_string(quantity)
+                    && parse_decimal(quantity)
+                        .is_ok_and(|quantity| quantity >= DecimalAmount::ZERO) => {}
+            _ => errors.push(format!(
+                "holdings[{index}].quantity must be a non-negative decimal string"
+            )),
+        }
+        if let Some(cost_basis) = holding.get("costBasisTotal") {
+            validate_non_negative_money(
+                cost_basis,
+                &format!("holdings[{index}].costBasisTotal"),
+                errors,
+            );
+        }
+        if let Some(market_value) = holding.get("marketValue") {
+            validate_non_negative_money(
+                market_value,
+                &format!("holdings[{index}].marketValue"),
+                errors,
+            );
+            if market_value
+                .get("asOf")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                errors.push(format!(
+                    "holdings[{index}].marketValue.asOf must be a non-empty string"
+                ));
+            }
+            if !matches!(
+                market_value.get("quality").and_then(Value::as_str),
+                Some("exact" | "estimated" | "incomplete" | "unpriceable" | "anomaly")
+            ) {
+                errors.push(format!("holdings[{index}].marketValue.quality is invalid"));
+            }
+        }
+        if !matches!(
+            holding.get("quoteStatus").and_then(Value::as_str),
+            Some("fresh" | "stale" | "offline_cached" | "incomplete" | "unpriceable" | "error")
+        ) {
+            errors.push(format!("holdings[{index}].quoteStatus is invalid"));
+        }
+        if holding
+            .get("asOf")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("holdings[{index}].asOf must be a non-empty string"));
+        }
+    }
+}
+
+#[derive(Default)]
+struct StoredMovementIndex<'a> {
+    groups: BTreeMap<&'a str, &'a str>,
+    entry_ids: BTreeMap<&'a str, BTreeSet<&'a str>>,
+}
+
+fn validate_movements<'a>(
+    document: &'a Value,
+    account_ids: &BTreeSet<&str>,
+    instrument_ids: &BTreeSet<&str>,
+    errors: &mut Vec<String>,
+) -> StoredMovementIndex<'a> {
+    let Some(movements) = document["movements"].as_array() else {
+        return StoredMovementIndex::default();
+    };
+    let mut index_by_id = StoredMovementIndex::default();
+    for (index, movement) in movements.iter().enumerate() {
+        let Some(movement) = movement.as_object() else {
+            errors.push(format!("movements[{index}] must be an object"));
+            continue;
+        };
+        let movement_id = movement.get("id").and_then(Value::as_str);
+        let atomic_group_id = movement.get("atomicGroupId").and_then(Value::as_str);
+        match (movement_id, atomic_group_id) {
+            (Some(movement_id), Some(group_id))
+                if !movement_id.is_empty() && !group_id.is_empty() =>
+            {
+                if index_by_id.groups.insert(movement_id, group_id).is_some() {
+                    errors.push(format!("duplicate movement id: {movement_id}"));
+                }
+            }
+            _ => {
+                if movement_id.is_none_or(str::is_empty) {
+                    errors.push(format!("movements[{index}].id must be a non-empty string"));
+                }
+                if atomic_group_id.is_none_or(str::is_empty) {
+                    errors.push(format!(
+                        "movements[{index}].atomicGroupId must be a non-empty string"
+                    ));
+                }
+            }
+        }
+        for key in [
+            "occurredAt",
+            "recordedAt",
+            "title",
+            "createdAt",
+            "updatedAt",
+        ] {
+            if movement
+                .get(key)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                errors.push(format!(
+                    "movements[{index}].{key} must be a non-empty string"
+                ));
+            }
+        }
+        let movement_type = movement.get("type").and_then(Value::as_str);
+        if !matches!(
+            movement_type,
+            Some(
+                "income"
+                    | "expense"
+                    | "transfer"
+                    | "buy"
+                    | "sell"
+                    | "dividend"
+                    | "interest"
+                    | "fee"
+                    | "adjustment"
+                    | "loan_disbursement"
+                    | "loan_repayment"
+                    | "correction"
+            )
+        ) {
+            errors.push(format!("movements[{index}].type is invalid"));
+        }
+        if !matches!(
+            movement.get("status").and_then(Value::as_str),
+            Some(
+                "draft" | "pending_review" | "confirmed" | "in_transit" | "cancelled" | "reversed"
+            )
+        ) {
+            errors.push(format!("movements[{index}].status is invalid"));
+        }
+        validate_string_array(
+            movement.get("tags"),
+            &format!("movements[{index}].tags"),
+            errors,
+        );
+        let entry_ids = validate_stored_movement_entries(
+            movement.get("entries"),
+            index,
+            account_ids,
+            instrument_ids,
+            matches!(
+                movement.get("status").and_then(Value::as_str),
+                Some("confirmed" | "in_transit" | "reversed")
+            ),
+            errors,
+        );
+        if let Some(movement_id) = movement_id {
+            index_by_id.entry_ids.insert(movement_id, entry_ids);
+        }
+        if let (Some(movement_type), Some(entries)) = (
+            movement_type,
+            movement.get("entries").and_then(Value::as_array),
+        ) {
+            if movement_type == "transfer" {
+                validate_simple_transfer(Some(entries), movement.get("transferMeta"), errors);
+            } else if movement_type != "correction" {
+                validate_movement_semantics(document, movement_type, entries, errors);
+            }
+        }
+    }
+    index_by_id
+}
+
+fn validate_stored_movement_entries<'a>(
+    entries: Option<&'a Value>,
+    movement_index: usize,
+    account_ids: &BTreeSet<&str>,
+    instrument_ids: &BTreeSet<&str>,
+    require_instrument_exists: bool,
+    errors: &mut Vec<String>,
+) -> BTreeSet<&'a str> {
+    let Some(entries) = entries.and_then(Value::as_array) else {
+        errors.push(format!(
+            "movements[{movement_index}].entries must be a non-empty array"
+        ));
+        return BTreeSet::new();
+    };
+    if entries.is_empty() {
+        errors.push(format!(
+            "movements[{movement_index}].entries must be a non-empty array"
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let label = format!("movements[{movement_index}].entries[{entry_index}]");
+        let Some(entry) = entry.as_object() else {
+            errors.push(format!("{label} must be an object"));
+            continue;
+        };
+        let id = entry.get("id").and_then(Value::as_str);
+        match id {
+            Some(id) if !id.is_empty() => {
+                if !ids.insert(id) {
+                    errors.push(format!("duplicate movement entry id: {id}"));
+                }
+            }
+            _ => errors.push(format!("{label}.id must be a non-empty string")),
+        }
+        let account_id = entry.get("accountId").and_then(Value::as_str);
+        if account_id.is_none_or(|account_id| !account_ids.contains(account_id)) {
+            errors.push(format!(
+                "{label}.accountId must reference an existing account"
+            ));
+        }
+        if !entry
+            .get("amount")
+            .and_then(Value::as_str)
+            .is_some_and(is_positive_decimal_string)
+        {
+            errors.push(format!("{label}.amount must be a positive decimal string"));
+        }
+        if entry
+            .get("currency")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.currency must be a non-empty string"));
+        }
+        if !matches!(
+            entry.get("direction").and_then(Value::as_str),
+            Some("in" | "out")
+        ) {
+            errors.push(format!("{label}.direction must be in or out"));
+        }
+        if !matches!(
+            entry.get("role").and_then(Value::as_str),
+            Some("source" | "destination" | "fee" | "discount" | "pnl" | "tax" | "adjustment")
+        ) {
+            errors.push(format!("{label}.role is invalid"));
+        }
+        if let Some(instrument_id) = entry.get("instrumentId").and_then(Value::as_str)
+            && require_instrument_exists
+            && !instrument_ids.contains(instrument_id)
+        {
+            errors.push(format!(
+                "{label}.instrumentId must reference an existing instrument"
+            ));
+        }
+    }
+    ids
+}
+
+fn validate_movement_entry_index(
+    entries: Option<&Value>,
+    movements: &StoredMovementIndex<'_>,
+    errors: &mut Vec<String>,
+) {
+    let Some(entries) = entries.and_then(Value::as_array) else {
+        return;
+    };
+    let mut indexed = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut global_entry_ids = BTreeSet::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(entry) = entry.as_object() else {
+            errors.push(format!("movementEntries[{index}] must be an object"));
+            continue;
+        };
+        let movement_id = entry.get("movementId").and_then(Value::as_str);
+        let atomic_group_id = entry.get("atomicGroupId").and_then(Value::as_str);
+        let entry_id = entry.get("id").and_then(Value::as_str);
+        match movement_id {
+            Some(movement_id) if movements.groups.contains_key(movement_id) => {
+                if atomic_group_id != movements.groups.get(movement_id).copied() {
+                    errors.push(format!(
+                        "movementEntries[{index}].atomicGroupId must match its movement"
+                    ));
+                }
+                if let Some(entry_id) = entry_id {
+                    indexed.entry(movement_id).or_default().insert(entry_id);
+                }
+            }
+            _ => errors.push(format!(
+                "movementEntries[{index}].movementId must reference an existing movement"
+            )),
+        }
+        match entry_id {
+            Some(entry_id) if !entry_id.is_empty() => {
+                if !global_entry_ids.insert(entry_id) {
+                    errors.push(format!("duplicate indexed movement entry id: {entry_id}"));
+                }
+            }
+            _ => errors.push(format!(
+                "movementEntries[{index}].id must be a non-empty string"
+            )),
+        }
+    }
+    for (movement_id, expected_ids) in &movements.entry_ids {
+        let actual_ids = indexed.get(movement_id).cloned().unwrap_or_default();
+        if &actual_ids != expected_ids {
+            errors.push(format!(
+                "movementEntries index does not match movement.entries for {movement_id}"
+            ));
+        }
+    }
+}
+
+fn validate_non_negative_money(value: &Value, label: &str, errors: &mut Vec<String>) {
+    let Some(value) = value.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    match value.get("amount").and_then(Value::as_str) {
+        Some(amount)
+            if is_decimal_string(amount)
+                && parse_decimal(amount).is_ok_and(|amount| amount >= DecimalAmount::ZERO) => {}
+        _ => errors.push(format!(
+            "{label}.amount must be a non-negative decimal string"
+        )),
+    }
+    if value
+        .get("currency")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        errors.push(format!("{label}.currency must be a non-empty string"));
     }
 }
 
@@ -10117,6 +10559,127 @@ mod tests {
     }
 
     #[test]
+    fn validate_document_rejects_malformed_core_ledger_entities() {
+        let now = "2026-07-15T00:00:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        let account = account_from_create_input(
+            &json!({
+                "displayName": "核心校验账户",
+                "accountType": "brokerage",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "holdings",
+                "openingBalances": [{"currency": "CNY", "amount": "0.00"}]
+            }),
+            "acct_core_validation",
+            now,
+        )
+        .expect("account fixture should be valid");
+        document["accounts"] = json!([account]);
+        document["instruments"] = json!([{
+            "id": "inst_core_validation",
+            "type": "fund",
+            "displayName": "核心校验基金",
+            "quoteCurrency": "CNY"
+        }]);
+        document["holdings"] = json!([{
+            "id": "holding_core_validation",
+            "accountId": "acct_core_validation",
+            "instrumentId": "inst_core_validation",
+            "quantity": "10",
+            "costBasisTotal": {"amount": "100.00", "currency": "CNY"},
+            "marketValue": {
+                "amount": "100.00",
+                "currency": "CNY",
+                "asOf": now,
+                "quality": "estimated"
+            },
+            "quoteStatus": "stale",
+            "asOf": now
+        }]);
+        let mut movement = movement_from_create_input(
+            &document,
+            &json!({
+                "type": "sell",
+                "occurredAt": now,
+                "title": "核心校验卖出",
+                "entries": [
+                    {
+                        "accountId": "acct_core_validation",
+                        "instrumentId": "inst_core_validation",
+                        "amount": "1",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source"
+                    },
+                    {
+                        "accountId": "acct_core_validation",
+                        "amount": "10.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination"
+                    }
+                ]
+            }),
+            "movement_core_validation",
+            "group_core_validation",
+            now,
+        )
+        .expect("movement fixture should be valid");
+        movement["status"] = json!("confirmed");
+        document["movementEntries"] = json!(
+            movement["entries"]
+                .as_array()
+                .expect("movement entries")
+                .iter()
+                .map(|entry| {
+                    let mut indexed = entry.clone();
+                    indexed["movementId"] = json!("movement_core_validation");
+                    indexed["atomicGroupId"] = json!("group_core_validation");
+                    indexed
+                })
+                .collect::<Vec<_>>()
+        );
+        document["movements"] = json!([movement]);
+        validate_document(&document).expect("complete core fixture should validate");
+
+        let mut bad_direction = document.clone();
+        bad_direction["movements"][0]["entries"][0]["direction"] = json!("sideways");
+        let errors = validate_document(&bad_direction).expect_err("bad direction must fail");
+        assert!(errors.iter().any(|error| error.contains("direction")));
+
+        let mut negative_holding = document.clone();
+        negative_holding["holdings"][0]["quantity"] = json!("-1");
+        let errors = validate_document(&negative_holding).expect_err("negative holding must fail");
+        assert!(errors.iter().any(|error| error.contains("quantity")));
+
+        let mut missing_instrument = document.clone();
+        missing_instrument["holdings"][0]["instrumentId"] = json!("inst_missing");
+        let errors =
+            validate_document(&missing_instrument).expect_err("missing instrument must fail");
+        assert!(errors.iter().any(|error| error.contains("instrumentId")));
+
+        let mut duplicate_instrument = document.clone();
+        duplicate_instrument["instruments"] = json!([
+            document["instruments"][0].clone(),
+            document["instruments"][0].clone()
+        ]);
+        let errors =
+            validate_document(&duplicate_instrument).expect_err("duplicate instrument must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("duplicate instrument id"))
+        );
+
+        let mut broken_index = document;
+        broken_index["movementEntries"][0]["movementId"] = json!("movement_missing");
+        let errors = validate_document(&broken_index).expect_err("broken entry index must fail");
+        assert!(errors.iter().any(|error| error.contains("movementId")));
+    }
+
+    #[test]
     fn validate_document_rejects_broken_subscription_pending_links() {
         let now = "2026-07-13T00:00:00Z";
         let mut document = empty_document(DEFAULT_BASE_CURRENCY);
@@ -10152,13 +10715,42 @@ mod tests {
         subscription["pendingChargeMovementId"] = json!("movement_subscription_1");
         subscription["pendingChargeDate"] = json!("2026-07-13");
         document["subscriptions"] = json!([subscription]);
-        document["movements"] = json!([{
-            "id": "movement_subscription_1",
-            "atomicGroupId": "group_subscription_1",
-            "status": "pending_review",
-            "subscriptionId": "subscription_1",
-            "scheduledChargeDate": "2026-07-13"
-        }]);
+        let mut movement = movement_from_create_input(
+            &document,
+            &json!({
+                "type": "expense",
+                "occurredAt": now,
+                "title": "GPT Plus charge",
+                "entries": [{
+                    "accountId": "acct_subscription",
+                    "amount": "20.00",
+                    "currency": "USD",
+                    "direction": "out",
+                    "role": "source"
+                }]
+            }),
+            "movement_subscription_1",
+            "group_subscription_1",
+            now,
+        )
+        .expect("subscription movement fixture should be valid");
+        movement["status"] = json!("pending_review");
+        movement["subscriptionId"] = json!("subscription_1");
+        movement["scheduledChargeDate"] = json!("2026-07-13");
+        document["movementEntries"] = json!(
+            movement["entries"]
+                .as_array()
+                .expect("movement entries")
+                .iter()
+                .map(|entry| {
+                    let mut indexed = entry.clone();
+                    indexed["movementId"] = json!("movement_subscription_1");
+                    indexed["atomicGroupId"] = json!("group_subscription_1");
+                    indexed
+                })
+                .collect::<Vec<_>>()
+        );
+        document["movements"] = json!([movement]);
         validate_document(&document).expect("matching pending link should validate");
 
         let mut missing = document.clone();

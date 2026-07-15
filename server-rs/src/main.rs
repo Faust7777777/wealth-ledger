@@ -9795,6 +9795,26 @@ mod tests {
     async fn movement_and_snapshot_queries_apply_documented_filters_and_ordering() {
         let path = unique_test_ledger_path("movement_snapshot_queries");
         let mut document = local_ledger::empty_document("CNY");
+        document["accounts"] = json!([{
+            "id": "acct_query",
+            "displayName": "查询测试账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "visibility": "normal",
+            "status": "active",
+            "balanceMode": "cash_balance",
+            "cashBalances": [{
+                "currency": "CNY",
+                "amount": "100.00",
+                "asOf": "2026-01-01T00:00:00Z",
+                "quality": "exact"
+            }],
+            "tags": [],
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z"
+        }]);
         document["movements"] = json!([
             {
                 "id": "mov_query_1",
@@ -9804,7 +9824,19 @@ mod tests {
                 "recordedAt": "2026-01-01T09:00:00Z",
                 "status": "confirmed",
                 "title": "old confirmed",
-                "entries": []
+                "entries": [{
+                    "id": "entry_query_1",
+                    "accountId": "acct_query",
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }],
+                "tags": [],
+                "settlement": {"status": "settled"},
+                "source": {"kind": "manual", "createdBy": "user"},
+                "createdAt": "2026-01-01T09:00:00Z",
+                "updatedAt": "2026-01-01T09:00:00Z"
             },
             {
                 "id": "mov_query_2",
@@ -9814,7 +9846,19 @@ mod tests {
                 "recordedAt": "2026-01-03T09:00:00Z",
                 "status": "pending_review",
                 "title": "new pending",
-                "entries": []
+                "entries": [{
+                    "id": "entry_query_2",
+                    "accountId": "acct_query",
+                    "amount": "2.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }],
+                "tags": [],
+                "settlement": {"status": "settled"},
+                "source": {"kind": "manual", "createdBy": "user"},
+                "createdAt": "2026-01-03T09:00:00Z",
+                "updatedAt": "2026-01-03T09:00:00Z"
             },
             {
                 "id": "mov_query_3",
@@ -9824,7 +9868,51 @@ mod tests {
                 "recordedAt": "2026-01-02T09:00:00Z",
                 "status": "confirmed",
                 "title": "middle confirmed",
-                "entries": []
+                "entries": [{
+                    "id": "entry_query_3",
+                    "accountId": "acct_query",
+                    "amount": "3.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "source"
+                }],
+                "tags": [],
+                "settlement": {"status": "settled"},
+                "source": {"kind": "manual", "createdBy": "user"},
+                "createdAt": "2026-01-02T09:00:00Z",
+                "updatedAt": "2026-01-02T09:00:00Z"
+            }
+        ]);
+        document["movementEntries"] = json!([
+            {
+                "id": "entry_query_1",
+                "movementId": "mov_query_1",
+                "atomicGroupId": "ag_query_1",
+                "accountId": "acct_query",
+                "amount": "1.00",
+                "currency": "CNY",
+                "direction": "out",
+                "role": "source"
+            },
+            {
+                "id": "entry_query_2",
+                "movementId": "mov_query_2",
+                "atomicGroupId": "ag_query_2",
+                "accountId": "acct_query",
+                "amount": "2.00",
+                "currency": "CNY",
+                "direction": "out",
+                "role": "source"
+            },
+            {
+                "id": "entry_query_3",
+                "movementId": "mov_query_3",
+                "atomicGroupId": "ag_query_3",
+                "accountId": "acct_query",
+                "amount": "3.00",
+                "currency": "CNY",
+                "direction": "in",
+                "role": "source"
             }
         ]);
         document["snapshots"] = json!([

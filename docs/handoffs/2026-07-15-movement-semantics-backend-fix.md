@@ -40,6 +40,17 @@
 Rust 118 项测试、clippy、OpenAPI/contract check、mock/dev/Rust server smoke 与真实
 local-ledger smoke 均通过。
 
+后续同轮加固把 `--validate-ledger` 从账户/订阅/同步状态扩展到核心 confirmed ledger：
+
+- instrument ID/类型/报价币种；
+- holding 唯一性、非负数量、account/instrument 引用、成本与市值 Money；
+- movement 必填字段、枚举、分录形状与类型语义；
+- 已确认持仓分录的 instrument 引用；
+- 顶层 `movementEntries` 与 movement 内 entries 的双向 ID/atomic-group 一致性。
+
+新增损坏账本回归证明：非法方向、负持仓、悬空 instrument、重复 instrument 和断裂
+movementEntries 索引都会让备份/恢复语义校验 fail closed。Rust 测试增至 119 项。
+
 ## 明确边界
 
 - 手续费、税费对投资成本基础的多腿归属尚未扩展，不能静默混入数量。

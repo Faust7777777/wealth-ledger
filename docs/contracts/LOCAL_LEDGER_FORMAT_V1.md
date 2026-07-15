@@ -236,7 +236,10 @@ CSV 导入导出是应用层能力，不是当前本地账本的物理格式。
 - decimal string 格式与小数位数。
 - currency code 非空。
 - movement entries 引用的账户存在。
-- holding 指向 account / instrument 存在。
+- instrument ID 唯一且核心字段、类型、报价币种有效。
+- holding ID 与 `(accountId, instrumentId)` 组合唯一，数量非负，指向的 account / instrument 存在，成本与市值 Money 合法。
+- movement ID、状态、类型、时间、tags 与 entries 完整；已确认/在途/已反向的持仓分录必须引用已存在 instrument。
+- 顶层 `movementEntries` 索引必须与每个 `movement.entries` 的 ID 集合、movementId 和 atomicGroupId 完全一致，禁止悬空或漏项。
 - transfer 双边账户存在且不直接执行外部转账。
 - AI proposal 通过 validation 后才可 approve。
 - debug fixture 与 real ledger 路径互斥。
