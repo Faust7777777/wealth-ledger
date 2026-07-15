@@ -200,7 +200,19 @@ jobs:
           targets: x86_64-unknown-linux-musl
 
       - name: Install static Linux build tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: |
+          sudo sed -i 's|http://ports.ubuntu.com|https://ports.ubuntu.com|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::ForceIPv4=true update && \
+               sudo apt-get -o Acquire::ForceIPv4=true install -y musl-tools; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
@@ -234,7 +246,19 @@ jobs:
           targets: aarch64-unknown-linux-musl
 
       - name: Install static Linux build tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: |
+          sudo sed -i 's|http://ports.ubuntu.com|https://ports.ubuntu.com|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::ForceIPv4=true update && \
+               sudo apt-get -o Acquire::ForceIPv4=true install -y musl-tools; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
