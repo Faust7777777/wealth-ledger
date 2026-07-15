@@ -757,6 +757,7 @@ class LocalServerAccountRepository implements AccountRepository {
   ];
   @override
   Future<AccountVm> createAccount(CreateAccountInput input) async {
+    final opening = input.openingBalance;
     final d = await _c.postData(
       '/v1/accounts',
       body: {
@@ -768,6 +769,14 @@ class LocalServerAccountRepository implements AccountRepository {
         'balanceMode': input.balanceMode,
         if (input.institutionName != null)
           'institutionName': input.institutionName,
+        'openingBalances': [
+          if (opening != null)
+            {
+              'currency': opening.currency,
+              'amount': opening.amount,
+              'quality': 'exact',
+            },
+        ],
       },
     );
     return _account(_m(d));

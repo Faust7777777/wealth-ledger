@@ -120,6 +120,7 @@ class CreateAccountInput {
     required this.balanceMode,
     this.includeInNetWorth = true,
     this.institutionName,
+    this.openingBalance,
   });
   final String displayName;
   final AccountType accountType;
@@ -127,6 +128,10 @@ class CreateAccountInput {
   final String balanceMode; // cash_balance | holdings | liability | mixed
   final bool includeInNetWorth;
   final String? institutionName;
+
+  /// 期初余额（仅创建时使用；负债欠款已在 UI 层转为账本负数）。
+  /// null → openingBalances: []。编辑（PATCH）不发送、不覆盖既有余额。
+  final Money? openingBalance;
 }
 
 /// 用户维护的分类词表。不是封闭目录；AI 可读取并填充，用户确认后才入账。
