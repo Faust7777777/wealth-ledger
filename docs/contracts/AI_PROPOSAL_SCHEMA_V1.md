@@ -223,6 +223,7 @@ EditAtomicGroup {
 DcaExecutedProposal {
   reminderId: ID;
   planId: ID;
+  execution: DcaExecutionInput;
   proposedMovement: Movement;
 }
 ```
@@ -230,6 +231,8 @@ DcaExecutedProposal {
 规则：
 
 - 不连接券商。
+- 现金腿来自 `execution.totalCost`，持仓腿数量来自 `execution.quantity`；计划金额不能冒充数量。
+- `execution.holdingAccountId` 决定持仓归属，资金账户仍来自 DCA plan。
 - 不下单。
 - 不转账。
 - pending proposal / draft 可以持久化，以便刷新或重启后继续复核。

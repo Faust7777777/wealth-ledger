@@ -335,12 +335,15 @@ createCorrection(input: CreateCorrectionInput): AiAtomicGroup
 ### Mark DCA executed
 
 ```ts
-markDcaExecutedAsProposal(reminderId: ID): AiAtomicGroup
+markDcaExecutedAsProposal(reminderId: ID, input: DcaExecutionInput): AiAtomicGroup
 ```
 
 规则：
 
 - 只生成 proposal。
+- `input.quantity` 形成持仓腿，`input.totalCost` 形成现金腿；计划金额不能代替成交数量。
+- 资金账户必须支持成本币种；持仓账户必须支持持仓并支持标的报价币种。
+- 同一 reminder 只能有一个 pending proposal；同一幂等请求可安全重放。
 - 不下单。
 - 不转账。
 - 不连接券商交易接口。

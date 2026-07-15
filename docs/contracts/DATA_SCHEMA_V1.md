@@ -394,7 +394,18 @@ DcaReminder {
   dueDate: ISODate;
   status: "due" | "overdue" | "snoozed" | "recorded" | "skipped";
 }
+
+DcaExecutionInput {
+  holdingAccountId: ID;
+  quantity: DecimalString;      // 实际成交数量，必须 > 0
+  totalCost: Money;             // 实际总成本，amount 必须 > 0
+  quoteCurrency: CurrencyCode;  // 标的报价币种
+  executedAt?: ISODateTime;     // 缺省为服务端当前时间
+}
 ```
+
+`plannedAmount` 只表达计划投入额，不是成交数量。记录执行时，现金腿使用
+`totalCost.amount`，持仓腿使用 `quantity`；两者不得复用同一个字段。
 
 UI 动作：
 

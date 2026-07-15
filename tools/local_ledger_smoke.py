@@ -156,6 +156,7 @@ def create_account(
     *,
     account_type: str = "bank",
     currency: str = "CNY",
+    balance_mode: str = "cash_balance",
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     return unwrap_data(
@@ -172,7 +173,7 @@ def create_account(
                 "defaultCurrency": currency,
                 "supportedCurrencies": [currency],
                 "includeInNetWorth": True,
-                "balanceMode": "cash_balance",
+                "balanceMode": balance_mode,
                 "openingBalances": [
                     {
                         "currency": currency,
@@ -327,7 +328,9 @@ def create_and_confirm_multileg_correction(
     ]
 
 
-def create_dca_and_mark_executed(base: str, account_id: str) -> dict[str, Any]:
+def create_dca_and_mark_executed(
+    base: str, funding_account_id: str, holding_account_id: str
+) -> dict[str, Any]:
     plan = unwrap_data(
         request_json(
             base,
@@ -337,7 +340,7 @@ def create_dca_and_mark_executed(base: str, account_id: str) -> dict[str, Any]:
             body={
                 "displayName": "local smoke DCA",
                 "targetInstrumentId": "inst_local_smoke_fund",
-                "fundingAccountId": account_id,
+                "fundingAccountId": funding_account_id,
                 "plannedAmount": {"amount": "100.00", "currency": "CNY"},
                 "frequency": "monthly",
                 "nextDueDate": "2026-06-27",
@@ -353,16 +356,30 @@ def create_dca_and_mark_executed(base: str, account_id: str) -> dict[str, Any]:
             base,
             f"/v1/dca/reminders/{reminder['id']}/mark-executed-as-proposal",
             method="POST",
+            body={
+                "holdingAccountId": holding_account_id,
+                "quantity": "4",
+                "totalCost": {"amount": "100.00", "currency": "CNY"},
+                "quoteCurrency": "CNY",
+                "executedAt": "2026-06-27T10:00:00Z",
+            },
         )
     )
     assert group["status"] == "pending"
     assert group["warnings"][0]["code"] == "record_only_no_order"
+    movement = group["proposedMovements"][0]
+    assert movement["entries"][0]["amount"] == "100.00"
+    assert movement["entries"][1]["amount"] == "4"
 
     confirmed = unwrap_data(
         request_json(base, f"/v1/atomic-groups/{group['id']}/confirm", method="POST")
     )
     assert confirmed["ledgerWrite"] is True
     assert len(confirmed["confirmedMovementIds"]) == 1
+    holdings = unwrap_data(request_json(base, "/v1/holdings"))
+    holding = next(item for item in holdings if item["accountId"] == holding_account_id)
+    assert holding["quantity"] == "4"
+    assert holding["costBasisTotal"]["amount"] == "100.00"
 
     due_after = unwrap_data(request_json(base, "/v1/dca/reminders/due"))
     assert all(item["id"] != reminder["id"] for item in due_after)
@@ -615,6 +632,13 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     )
     assert replayed_cash == cash
     reserve = create_account(base, "Smoke Reserve", "250.00", account_type="wallet")
+    brokerage = create_account(
+        base,
+        "Smoke Brokerage",
+        "0.00",
+        account_type="brokerage",
+        balance_mode="mixed",
+    )
     assert cash["cashBalances"][0]["amount"] == "1000.00"
 
     updated = unwrap_data(
@@ -653,7 +677,7 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     assert expense_changes[0]["payload"]["status"] == "confirmed"
     assert expense_changes[0]["payload"]["title"] == "local smoke coffee"
 
-    create_dca_and_mark_executed(base, cash["id"])
+    create_dca_and_mark_executed(base, cash["id"], brokerage["id"])
     create_and_confirm_ai_csv(base, cash["id"])
     create_image_proposal_without_writing(base)
 
@@ -730,7 +754,7 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     assert remote_push["acceptedChangeIds"] == ["smoke_remote_change_000001"]
     assert remote_push["appliedChangeIds"] == ["smoke_remote_change_000001"]
     assert remote_push["skippedChangeIds"] == []
-    assert len(unwrap_data(request_json(base, "/v1/accounts"))) == 4
+    assert len(unwrap_data(request_json(base, "/v1/accounts"))) == 5
 
     final_sync = unwrap_data(request_json(base, "/v1/sync/changes"))
     assert final_sync["cursor"].startswith("local_change_")
@@ -759,7 +783,7 @@ def run_smoke(base: str, ledger_path: Path) -> None:
     assert forbidden["error"]["code"] == "forbidden_product_boundary"
 
     persisted = json.loads(ledger_path.read_text(encoding="utf-8"))
-    assert len(persisted["accounts"]) == 4
+    assert len(persisted["accounts"]) == 5
     assert any(account["id"] == "acct_smoke_remote" for account in persisted["accounts"])
     assert len(persisted["subscriptions"]) == 2
     assert len(persisted["snapshots"]) == 1

@@ -682,7 +682,7 @@ impl DevLedgerCore {
         })
     }
 
-    fn mark_dca_executed_as_proposal(&self, reminder_id: &str) -> Option<Value> {
+    fn mark_dca_executed_as_proposal(&self, reminder_id: &str, input: &Value) -> Option<Value> {
         if !matches!(
             reminder_id,
             "reminder_001" | "dca_reminder_001" | "rem_csi300_20260710"
@@ -692,6 +692,19 @@ impl DevLedgerCore {
 
         let mut proposal = example_data(DCA_PROPOSAL);
         proposal["requestedReminderId"] = json!(reminder_id);
+        proposal["proposedMovements"][0]["occurredAt"] = input
+            .get("executedAt")
+            .cloned()
+            .unwrap_or_else(|| proposal["proposedMovements"][0]["occurredAt"].clone());
+        proposal["proposedMovements"][0]["entries"][0]["amount"] =
+            input["totalCost"]["amount"].clone();
+        proposal["proposedMovements"][0]["entries"][0]["currency"] =
+            input["totalCost"]["currency"].clone();
+        proposal["proposedMovements"][0]["entries"][1]["accountId"] =
+            input["holdingAccountId"].clone();
+        proposal["proposedMovements"][0]["entries"][1]["amount"] = input["quantity"].clone();
+        proposal["proposedMovements"][0]["entries"][1]["currency"] = input["quoteCurrency"].clone();
+        proposal["proposedMovements"][0]["source"]["sourceId"] = json!(reminder_id);
         if let Some(group_id) = proposal.get("id").and_then(Value::as_str) {
             self.with_store(|store| {
                 store
@@ -2120,11 +2133,13 @@ async fn mark_dca_executed_as_proposal(
     State(state): State<AppState>,
     Path(reminder_id): Path<String>,
     headers: HeaderMap,
+    body: Option<Json<Value>>,
 ) -> Response {
+    let input = body.map(|Json(value)| value).unwrap_or(Value::Null);
     if let Some(path) = state.local_ledger_path.as_ref() {
         let now = current_timestamp();
         let operation = format!("POST /v1/dca/reminders/{reminder_id}/mark-executed-as-proposal");
-        let idempotency = match idempotency_request(&headers, &operation, &Value::Null, &now) {
+        let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
             Ok(request) => request,
             Err(_) => return invalid_idempotency_key(),
         };
@@ -2135,6 +2150,7 @@ async fn mark_dca_executed_as_proposal(
             &reminder_id,
             &movement_id,
             &atomic_group_id,
+            &input,
             &now,
             &idempotency,
         ) {
@@ -2143,7 +2159,29 @@ async fn mark_dca_executed_as_proposal(
         };
     }
 
-    match state.ledger.mark_dca_executed_as_proposal(&reminder_id) {
+    let Some(object) = input.as_object() else {
+        return bad_request(
+            "invalid_dca_mark_executed",
+            "DCA execution input must be a JSON object.",
+            json!({}),
+        );
+    };
+    let missing = ["holdingAccountId", "quantity", "totalCost", "quoteCurrency"]
+        .into_iter()
+        .filter(|key| !object.contains_key(*key))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return bad_request(
+            "invalid_dca_mark_executed",
+            "DCA execution input is incomplete.",
+            json!({"missingFields": missing}),
+        );
+    }
+
+    match state
+        .ledger
+        .mark_dca_executed_as_proposal(&reminder_id, &input)
+    {
         Some(proposal) => envelope(proposal).into_response(),
         None => not_found(
             "dca_reminder_not_found",
@@ -8981,13 +9019,62 @@ mod tests {
             .expect("reminder id should be string")
             .to_string();
 
-        let (mark_status, mark_body) = request_json_from(
+        let execution_input = json!({
+            "holdingAccountId": account_id,
+            "quantity": "10",
+            "totalCost": {"amount": "200.00", "currency": "CNY"},
+            "quoteCurrency": "CNY",
+            "executedAt": "2026-07-15T10:30:00Z"
+        });
+        for invalid_input in [
+            json!({}),
+            json!({
+                "holdingAccountId": account_id,
+                "quantity": "0",
+                "totalCost": {"amount": "200.00", "currency": "CNY"},
+                "quoteCurrency": "CNY"
+            }),
+            json!({
+                "holdingAccountId": account_id,
+                "quantity": "10",
+                "totalCost": {"amount": "200.00", "currency": "USD"},
+                "quoteCurrency": "CNY"
+            }),
+            json!({
+                "holdingAccountId": account_id,
+                "quantity": "10",
+                "totalCost": {"amount": "200.00", "currency": "CNY"},
+                "quoteCurrency": "USD"
+            }),
+            json!({
+                "holdingAccountId": account_id,
+                "quantity": "10",
+                "totalCost": {"amount": "200.00", "currency": "CNY"},
+                "quoteCurrency": "CNY",
+                "unexpected": true
+            }),
+        ] {
+            let (invalid_status, invalid_body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                &format!("/v1/dca/reminders/{reminder_id}/mark-executed-as-proposal"),
+                invalid_input,
+            )
+            .await;
+            assert_eq!(invalid_status, StatusCode::BAD_REQUEST, "{invalid_body}");
+        }
+
+        let idempotency_key = "dca-execution-retry";
+        let (mark_status, mark_headers, mark_body) = request_json_body_with_idempotency_from(
             router.clone(),
             Method::POST,
             &format!("/v1/dca/reminders/{reminder_id}/mark-executed-as-proposal"),
+            execution_input.clone(),
+            Some(idempotency_key),
         )
         .await;
         assert_eq!(mark_status, StatusCode::OK);
+        assert!(mark_headers.get("idempotency-replayed").is_none());
         assert_eq!(mark_body["data"]["status"], "pending");
         assert_eq!(
             mark_body["data"]["proposedMovements"][0]["status"],
@@ -8997,6 +9084,44 @@ mod tests {
             .as_str()
             .expect("atomic group id should be string")
             .to_string();
+        assert_eq!(
+            mark_body["data"]["proposedMovements"][0]["entries"][0]["amount"],
+            "200.00"
+        );
+        assert_eq!(
+            mark_body["data"]["proposedMovements"][0]["entries"][1]["amount"],
+            "10"
+        );
+        assert_eq!(
+            mark_body["data"]["proposedMovements"][0]["occurredAt"],
+            "2026-07-15T10:30:00Z"
+        );
+
+        let (replay_status, replay_headers, replay_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/dca/reminders/{reminder_id}/mark-executed-as-proposal"),
+            execution_input.clone(),
+            Some(idempotency_key),
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::OK, "{replay_body}");
+        assert_eq!(replay_body, mark_body);
+        assert_eq!(
+            replay_headers
+                .get("idempotency-replayed")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+
+        let (duplicate_status, duplicate_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/dca/reminders/{reminder_id}/mark-executed-as-proposal"),
+            execution_input,
+        )
+        .await;
+        assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate_body}");
 
         let (holdings_before_status, holdings_before_body) =
             request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
@@ -9041,7 +9166,11 @@ mod tests {
         let persisted =
             local_ledger::read_document(&path).expect("ledger should persist DCA execution");
         assert_eq!(persisted["dcaReminders"][0]["status"], "recorded");
-        assert_eq!(persisted["holdings"][0]["quantity"], "200");
+        assert_eq!(persisted["holdings"][0]["quantity"], "10");
+        assert_eq!(
+            persisted["holdings"][0]["costBasisTotal"]["amount"],
+            "200.00"
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -11088,9 +11217,17 @@ mod tests {
 
     #[tokio::test]
     async fn dca_mark_executed_only_returns_pending_proposal() {
-        let (status, body) = request_json(
+        let (status, body) = request_json_body_from(
+            app(),
             Method::POST,
             "/v1/dca/reminders/reminder_001/mark-executed-as-proposal",
+            json!({
+                "holdingAccountId": "acct_fund",
+                "quantity": "10",
+                "totalCost": {"amount": "1000.00", "currency": "CNY"},
+                "quoteCurrency": "CNY",
+                "executedAt": "2026-07-10T09:00:00+08:00"
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -11108,9 +11245,16 @@ mod tests {
 
     #[tokio::test]
     async fn dca_mark_executed_rejects_unknown_reminder() {
-        let (status, body) = request_json(
+        let (status, body) = request_json_body_from(
+            app(),
             Method::POST,
             "/v1/dca/reminders/missing_reminder/mark-executed-as-proposal",
+            json!({
+                "holdingAccountId": "acct_fund",
+                "quantity": "10",
+                "totalCost": {"amount": "1000.00", "currency": "CNY"},
+                "quoteCurrency": "CNY"
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);

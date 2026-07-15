@@ -625,6 +625,68 @@ def check_ledger_lease_boundary() -> None:
     ok("Cross-process service-lifetime ledger lease checks passed")
 
 
+def check_dca_execution_input(doc: dict) -> None:
+    schemas = doc["components"]["schemas"]
+    execution = schemas.get("DcaExecutionInput", {})
+    required = {"holdingAccountId", "quantity", "totalCost", "quoteCurrency"}
+    if execution.get("type") != "object":
+        fail("DcaExecutionInput must be an object")
+    if execution.get("additionalProperties") is not False:
+        fail("DcaExecutionInput must reject undocumented fields")
+    if set(execution.get("required", [])) != required:
+        fail("DcaExecutionInput required fields drifted")
+    properties = execution.get("properties", {})
+    if set(properties) != required | {"executedAt"}:
+        fail("DcaExecutionInput properties drifted")
+
+    operation = doc["paths"]["/dca/reminders/{reminderId}/mark-executed-as-proposal"][
+        "post"
+    ]
+    request_body = operation.get("requestBody", {})
+    if request_body.get("required") is not True:
+        fail("DCA mark-executed request body must be required")
+    schema = (
+        request_body.get("content", {})
+        .get("application/json", {})
+        .get("schema", {})
+    )
+    if schema.get("$ref") != "#/components/schemas/DcaExecutionInput":
+        fail("DCA mark-executed must use DcaExecutionInput")
+
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    for snippet in [
+        "body: Option<Json<Value>>",
+        "idempotency_request(&headers, &operation, &input, &now)",
+        "local_ledger::mark_dca_executed_as_proposal(",
+    ]:
+        if snippet not in rust_text:
+            fail(f"Rust DCA execution handler is incomplete: {snippet}")
+
+    local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    for snippet in [
+        '"holdingAccountId" | "quantity" | "totalCost" | "quoteCurrency" | "executedAt"',
+        '"quantity must be a positive decimal string"',
+        '"totalCost.amount must be a positive decimal string"',
+        'Some("holdings" | "mixed")',
+        '"DCA reminder already has a pending execution proposal',
+        '"amount": total_cost_amount',
+        '"amount": quantity',
+    ]:
+        if snippet not in local_text:
+            fail(f"Rust DCA execution implementation is incomplete: {snippet}")
+
+    smoke_text = LOCAL_LEDGER_SMOKE.read_text(encoding="utf-8")
+    for snippet in [
+        '"holdingAccountId": holding_account_id',
+        '"quantity": "4"',
+        'holding["costBasisTotal"]["amount"] == "100.00"',
+    ]:
+        if snippet not in smoke_text:
+            fail(f"Local-ledger smoke must verify real DCA execution semantics: {snippet}")
+
+    ok("DCA real-execution contract and implementation checks passed")
+
+
 def check_subscription_due_scan(doc: dict) -> None:
     path = "/subscriptions/charge-proposals/due-scan"
     path_item = doc["paths"].get(path)
@@ -1714,6 +1776,7 @@ def main() -> None:
             fail(f"{method.upper()} {path} must document invalid cursor responses")
     ok("Critical AI/DCA invariants are represented")
 
+    check_dca_execution_input(doc)
     check_subscription_due_scan(doc)
     check_multileg_correction(doc)
     check_examples()

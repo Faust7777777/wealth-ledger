@@ -28,7 +28,7 @@
             "id": "entry_dca_fund_in",
             "accountId": "acct_fund",
             "instrumentId": "inst_csi300_fund",
-            "amount": "1000.00",
+            "amount": "10",
             "currency": "CNY",
             "direction": "in",
             "role": "destination"

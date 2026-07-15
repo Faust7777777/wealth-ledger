@@ -225,6 +225,13 @@ POST  /v1/dca/reminders/{reminderId}/snooze
 
 规则：
 
+- `mark-executed-as-proposal` 必须提交真实成交输入：持仓账户、实际成交数量、实际总成本、
+  标的报价币种，以及可选成交时间。计划金额只用于提醒或前端默认值，不得兼作成交数量。
+- 资金账户沿用 DCA plan 的 `fundingAccountId`，必须支持 `totalCost.currency`；持仓账户必须是
+  未归档的 `holdings` / `mixed` 账户并支持 `quoteCurrency`。已存在标的的报价币种必须一致。
+- 生成的 buy 候选中，现金腿金额等于 `totalCost.amount`，持仓腿金额等于 `quantity`。
+- 同一 reminder 同时最多存在一个 `pending_review` 候选；同幂等键重放原响应，不同幂等键
+  重复创建返回冲突。
 - `mark-executed-as-proposal` 只生成 pending AI / manual proposal 或 draft，可持久化用于复核。
 - 不下单。
 - 不转账。

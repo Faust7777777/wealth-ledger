@@ -167,15 +167,26 @@ DcaService {
   listDueReminders(): Result<DcaReminder[]>;
   createPlan(input: CreateDcaPlanInput): Result<DcaPlan>;
   updatePlan(planId: ID, patch: UpdateDcaPlanPatch): Result<DcaPlan>;
-  markExecutedAsProposal(reminderId: ID): Result<AiAtomicGroup>;
+  markExecutedAsProposal(reminderId: ID, input: DcaExecutionInput): Result<AiAtomicGroup>;
   skipReminder(reminderId: ID): Result<DcaReminder>;
   snoozeReminder(reminderId: ID, until: ISODateTime): Result<DcaReminder>;
+}
+
+DcaExecutionInput {
+  holdingAccountId: ID;
+  quantity: DecimalString;
+  totalCost: Money;
+  quoteCurrency: CurrencyCode;
+  executedAt?: ISODateTime;
 }
 ```
 
 约束：
 
 - `markExecutedAsProposal` 只生成候选 Movement。
+- `quantity` 是真实成交数量，`totalCost` 是真实现金总成本；不得使用 `plannedAmount.amount`
+  同时填充两条分录。
+- 资金账户来自 plan，持仓账户来自执行输入；调用方必须让用户确认实际成交数据。
 - 不连接券商。
 - 不下单。
 - 不转账。

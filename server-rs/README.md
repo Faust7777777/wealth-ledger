@@ -293,6 +293,10 @@ POST /v1/atomic-groups/{atomic_group_id}/confirm
 POST /v1/atomic-groups/{atomic_group_id}/reject
 ```
 
+The DCA record command requires the actual holding account, acquired quantity,
+total cash cost, quote currency, and optional execution timestamp. It creates a
+pending proposal only; the plan amount is never reused as the holding quantity.
+
 Approve/confirm responses include `ledgerWrite: false` and an empty
 `confirmedMovementIds` list when no ledger path is mounted. This is intentional
 because deterministic dev mode has no durable confirmed ledger.

@@ -1564,10 +1564,68 @@ pub fn mark_dca_executed_as_proposal(
     reminder_id: &str,
     movement_id: &str,
     atomic_group_id: &str,
+    input: &Value,
     now: &str,
     idempotency: &IdempotencyRequest,
 ) -> Result<IdempotentResponse, LedgerError> {
     idempotent_ledger_write(path, idempotency, 200, |document| {
+        let Some(object) = input.as_object() else {
+            return Err(LedgerError::InvalidInput(vec![
+                "DCA execution input must be a JSON object".to_string(),
+            ]));
+        };
+        let mut errors = Vec::new();
+        for key in object.keys() {
+            if !matches!(
+                key.as_str(),
+                "holdingAccountId" | "quantity" | "totalCost" | "quoteCurrency" | "executedAt"
+            ) {
+                errors.push(format!("unsupported DCA execution field: {key}"));
+            }
+        }
+        let holding_account_id = required_string(object, "holdingAccountId", &mut errors);
+        let quantity = required_string(object, "quantity", &mut errors);
+        let total_cost =
+            normalized_required_money(object.get("totalCost"), "totalCost", &mut errors);
+        let quote_currency = required_string(object, "quoteCurrency", &mut errors);
+        let executed_at = match object.get("executedAt") {
+            None | Some(Value::Null) => Some(now.to_string()),
+            Some(Value::String(value)) if parse_rfc3339(value).is_some() => Some(value.to_string()),
+            _ => {
+                errors.push("executedAt must be an RFC3339 timestamp".to_string());
+                None
+            }
+        };
+        if let Some(quantity) = quantity.as_deref()
+            && !is_positive_decimal_string(quantity)
+        {
+            errors.push("quantity must be a positive decimal string".to_string());
+        }
+        if let Some(amount) = total_cost
+            .as_ref()
+            .and_then(|money| money.get("amount"))
+            .and_then(Value::as_str)
+            && !is_positive_decimal_string(amount)
+        {
+            errors.push("totalCost.amount must be a positive decimal string".to_string());
+        }
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
+        let holding_account_id = holding_account_id.expect("validated holdingAccountId");
+        let quantity = quantity.expect("validated quantity");
+        let total_cost = total_cost.expect("validated totalCost");
+        let total_cost_amount = total_cost["amount"]
+            .as_str()
+            .expect("validated totalCost.amount")
+            .to_string();
+        let total_cost_currency = total_cost["currency"]
+            .as_str()
+            .expect("validated totalCost.currency")
+            .to_string();
+        let quote_currency = quote_currency.expect("validated quoteCurrency");
+        let executed_at = executed_at.expect("validated executedAt");
+
         let reminder = document["dcaReminders"]
             .as_array()
             .expect("validated local ledger dcaReminders should be an array")
@@ -1592,6 +1650,29 @@ pub fn mark_dca_executed_as_proposal(
             }
         }
 
+        if document["movements"]
+            .as_array()
+            .expect("validated local ledger movements should be an array")
+            .iter()
+            .any(|movement| {
+                movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                    && movement
+                        .get("source")
+                        .and_then(|source| source.get("kind"))
+                        .and_then(Value::as_str)
+                        == Some("system")
+                    && movement
+                        .get("source")
+                        .and_then(|source| source.get("sourceId"))
+                        .and_then(Value::as_str)
+                        == Some(reminder_id)
+            })
+        {
+            return Err(LedgerError::Conflict(format!(
+                "DCA reminder already has a pending execution proposal: {reminder_id}"
+            )));
+        }
+
         let plan_id = reminder
             .get("planId")
             .and_then(Value::as_str)
@@ -1613,10 +1694,49 @@ pub fn mark_dca_executed_as_proposal(
                     "DCA plan.fundingAccountId is required to record execution".to_string(),
                 ])
             })?;
-        if !active_account_exists(document, funding_account_id) {
-            return Err(LedgerError::NotFound(format!(
+        let funding_account = active_account(document, funding_account_id).ok_or_else(|| {
+            LedgerError::NotFound(format!(
                 "DCA funding account does not exist or is archived: {funding_account_id}"
-            )));
+            ))
+        })?;
+        if !funding_account
+            .get("supportedCurrencies")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.as_str() == Some(total_cost_currency.as_str()))
+            })
+        {
+            return Err(LedgerError::InvalidInput(vec![format!(
+                "DCA funding account does not support totalCost currency: {total_cost_currency}"
+            )]));
+        }
+        let holding_account = active_account(document, &holding_account_id).ok_or_else(|| {
+            LedgerError::NotFound(format!(
+                "DCA holding account does not exist or is archived: {holding_account_id}"
+            ))
+        })?;
+        if !matches!(
+            holding_account.get("balanceMode").and_then(Value::as_str),
+            Some("holdings" | "mixed")
+        ) {
+            return Err(LedgerError::InvalidInput(vec![format!(
+                "DCA holding account must use holdings or mixed balanceMode: {holding_account_id}"
+            )]));
+        }
+        if !holding_account
+            .get("supportedCurrencies")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.as_str() == Some(quote_currency.as_str()))
+            })
+        {
+            return Err(LedgerError::InvalidInput(vec![format!(
+                "DCA holding account does not support quoteCurrency: {quote_currency}"
+            )]));
         }
         let target_instrument_id = plan
             .get("targetInstrumentId")
@@ -1626,29 +1746,19 @@ pub fn mark_dca_executed_as_proposal(
                     "DCA plan.targetInstrumentId is required".to_string(),
                 ])
             })?;
-        let planned_amount = plan.get("plannedAmount").ok_or_else(|| {
-            LedgerError::InvalidInput(vec!["DCA plan.plannedAmount is required".to_string()])
-        })?;
-        let amount = planned_amount
-            .get("amount")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                LedgerError::InvalidInput(vec![
-                    "DCA plan.plannedAmount.amount is required".to_string(),
-                ])
-            })?;
-        let currency = planned_amount
-            .get("currency")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                LedgerError::InvalidInput(vec![
-                    "DCA plan.plannedAmount.currency is required".to_string(),
-                ])
-            })?;
-        if !is_positive_decimal_string(amount) {
-            return Err(LedgerError::InvalidInput(vec![
-                "DCA plan.plannedAmount.amount must be a positive decimal string".to_string(),
-            ]));
+        if let Some(instrument) = document["instruments"]
+            .as_array()
+            .expect("validated local ledger instruments should be an array")
+            .iter()
+            .find(|instrument| {
+                instrument.get("id").and_then(Value::as_str) == Some(target_instrument_id)
+            })
+            && instrument.get("quoteCurrency").and_then(Value::as_str)
+                != Some(quote_currency.as_str())
+        {
+            return Err(LedgerError::Conflict(format!(
+                "DCA target instrument quote currency does not match execution: {target_instrument_id}"
+            )));
         }
 
         let display_name = plan
@@ -1659,7 +1769,7 @@ pub fn mark_dca_executed_as_proposal(
             "id": movement_id,
             "atomicGroupId": atomic_group_id,
             "type": "buy",
-            "occurredAt": now,
+            "occurredAt": executed_at,
             "recordedAt": now,
             "status": "pending_review",
             "title": format!("记录{display_name}定投"),
@@ -1668,17 +1778,17 @@ pub fn mark_dca_executed_as_proposal(
                 {
                     "id": format!("entry_{movement_id}_cash_out"),
                     "accountId": funding_account_id,
-                    "amount": amount,
-                    "currency": currency,
+                    "amount": total_cost_amount,
+                    "currency": total_cost_currency,
                     "direction": "out",
                     "role": "source"
                 },
                 {
                     "id": format!("entry_{movement_id}_holding_in"),
-                    "accountId": funding_account_id,
+                    "accountId": holding_account_id,
                     "instrumentId": target_instrument_id,
-                    "amount": amount,
-                    "currency": currency,
+                    "amount": quantity,
+                    "currency": quote_currency,
                     "direction": "in",
                     "role": "destination"
                 }

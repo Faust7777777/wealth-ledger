@@ -518,6 +518,12 @@ paths:
       parameters:
         - $ref: "#/components/parameters/reminderId"
         - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DcaExecutionInput"
       responses:
         "200":
           description: Candidate atomic group.
@@ -2154,6 +2160,30 @@ components:
           $ref: "#/components/schemas/ISODate"
         note:
           type: string
+    DcaExecutionInput:
+      type: object
+      additionalProperties: false
+      required: [holdingAccountId, quantity, totalCost, quoteCurrency]
+      description: >-
+        Actual user-reported execution. The plan amount is only a reminder/default;
+        it is never reused as the acquired quantity. This command records a pending
+        proposal and never places an order.
+      properties:
+        holdingAccountId:
+          $ref: "#/components/schemas/ID"
+        quantity:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Positive quantity actually acquired.
+        totalCost:
+          allOf:
+            - $ref: "#/components/schemas/Money"
+          description: Positive actual total cash cost in the funding-account currency.
+        quoteCurrency:
+          type: string
+          description: Quote currency of the target instrument and holding entry.
+        executedAt:
+          $ref: "#/components/schemas/ISODateTime"
     DcaReminder:
       type: object
       required: [id, planId, dueDate, status]
