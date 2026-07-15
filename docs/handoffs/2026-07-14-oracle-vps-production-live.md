@@ -4,7 +4,7 @@
 
 - VPS：Oracle Linux 9.7，`aarch64`。
 - 公网 API origin：`https://wuwaidut.com`。
-- Rust server 来源提交：`d972744f88b29a6d8e26c7bdf22904c1ad44e56b`。
+- Rust server 当前来源提交：`a57385e`。
 - 当前集成分支：`feat/subscription-sync-integration`。
 - 当前生产路由配置来源提交：`0a8c29a`。
 
@@ -56,6 +56,8 @@ Cloudflare HTTPS wuwaidut.com
 - readiness 通过。
 - 首次真实备份：`/var/backups/finwealth/20260714-063912Z`。
 - 备份 ledger SHA-256 校验和语义校验通过，服务及 bridge 自动恢复。
+- 2026-07-15 部署信用卡正余额净值修复后的推荐恢复点：
+  `/var/backups/finwealth/20260715-134853Z`。
 
 部署中发现 bridge proxy companion 会阻塞旧版备份停服务流程；提交 `a51f8ac`
 修复 backup/restore 停机顺序，并增加 active proxy socket 回归测试。修复已在 VPS

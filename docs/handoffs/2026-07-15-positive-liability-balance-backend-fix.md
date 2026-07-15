@@ -71,3 +71,41 @@ C:\tmp\2026-07-15-claude-account-liability-ux-handoff.md
 
 前端仍需把负债原始负数展示为正的“当前欠款”，并将正余额显示为“余额/溢缴款”；
 不得在 mapping 层抹掉原始符号。
+
+## 6. CI 与生产部署
+
+- GitHub Actions Package run：`29419523055`；
+- 来源提交：`a57385e`；
+- Verify source、Linux topology、ARM64/x64 server、Windows、Windows server client、
+  Android server client 全部成功；
+- ARM64 外层 artifact SHA-256：
+  `ddb3a7818d273fffc996ab2af7c2ccf823328cb887d138d3f75590dd8dc030dd`；
+- VPS 安装后二进制 SHA-256：
+  `ec2e9059a69f98568a627f63d4d98154b7d345df25ac86eb1153e08f70fb0b2d`；
+- bundle 内部 `SHA256SUMS`、ARM64 架构、production config、ledger/auth 语义校验通过；
+- `finwealth-server.service` 与 Docker bridge socket 均为 active。
+
+没有向正式账本写测试数据。使用服务器上已安装的同一二进制和隔离临时账本验证：
+
+```text
+isolated_production_binary_test=ok
+gross_assets=5.00
+liabilities=0.00
+net_worth=5.00
+anomalies=0
+```
+
+公网 `/v1/health` 和根域中转均返回 200。access token 到期后正常使用 refresh token
+旋转，DPAPI store 更新；账户、订阅、overview、devices 认证读取均返回 200。
+
+部署前备份：
+
+```text
+/var/backups/finwealth/20260715-134228Z
+```
+
+部署与认证旋转后的当前推荐恢复点：
+
+```text
+/var/backups/finwealth/20260715-134853Z
+```

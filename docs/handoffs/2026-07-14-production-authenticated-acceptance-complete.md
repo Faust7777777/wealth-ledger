@@ -74,13 +74,16 @@ ai pending=0
 - 旧 refresh token 重放返回 401；
 - 新会话已使用 Windows CurrentUser DPAPI 加密保存。
 
-最终推荐恢复点：
+当轮最终恢复点：
 
 ```text
 /var/backups/finwealth/20260714-121559Z
 ```
 
 此备份包含空正式账本和旋转后的当前认证状态，ledger 与 auth 语义校验均通过。
+
+该恢复点已被 2026-07-15 后端算法更新后的
+`/var/backups/finwealth/20260715-134853Z` 取代；后者是当前推荐恢复点。
 
 ## 5. 当前剩余工作
 
