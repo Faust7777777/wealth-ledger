@@ -72,7 +72,9 @@ abstract interface class DcaRepository {
   Future<DcaPlanVm> updatePlan(Id planId, UpdateDcaPlanPatch patch);
 
   /// 「记录已执行」：只生成待确认候选记录；不下单、不转账、不连券商。
-  Future<void> markExecutedAsProposal(Id reminderId);
+  /// 「记录已执行」：提交真实成交（数量/总成本/持仓账户），只生成待确认候选。
+  /// 同一 reminder 已有 pending 时服务端返回 409。
+  Future<void> markExecutedAsProposal(Id reminderId, DcaExecutionInput input);
   Future<void> skipReminder(Id reminderId);
   Future<void> snoozeReminder(Id reminderId, {required IsoDate until});
 }
