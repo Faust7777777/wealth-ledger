@@ -7392,6 +7392,264 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ledger_rejects_unbalanced_same_currency_transfer() {
+        let path = unique_test_ledger_path("unbalanced_transfer");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let mut account_ids = Vec::new();
+        for display_name in ["转出账户", "转入账户"] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/accounts",
+                json!({
+                    "displayName": display_name,
+                    "accountType": "bank",
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": "cash_balance",
+                    "openingBalances": [{"currency": "CNY", "amount": "100.00"}]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            account_ids.push(
+                body["data"]["id"]
+                    .as_str()
+                    .expect("account id should be a string")
+                    .to_string(),
+            );
+        }
+
+        let draft_input = json!({
+            "type": "transfer",
+            "occurredAt": "2026-07-15T12:00:00Z",
+            "title": "不守恒转账",
+            "entries": [
+                {
+                    "accountId": account_ids[0],
+                    "amount": "60.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "amount": "50.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ],
+            "transferMeta": {
+                "fromAccountId": account_ids[0],
+                "toAccountId": account_ids[1]
+            }
+        });
+        let (status, body) =
+            request_json_body_from(router, Method::POST, "/v1/movements/drafts", draft_input).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_movement_draft_input");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_credit_card_purchase_and_repayment_preserve_accounting_identity() {
+        let path = unique_test_ledger_path("credit_card_repayment");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (bank_status, bank_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "还款银行卡",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "CNY", "amount": "1000.00"}]
+            }),
+        )
+        .await;
+        assert_eq!(bank_status, StatusCode::CREATED);
+        let bank_id = bank_body["data"]["id"]
+            .as_str()
+            .expect("bank id should be a string")
+            .to_string();
+
+        let (card_status, card_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "测试信用卡",
+                "accountType": "credit_card",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "liability",
+                "openingBalances": [{"currency": "CNY", "amount": "0.00"}]
+            }),
+        )
+        .await;
+        assert_eq!(card_status, StatusCode::CREATED);
+        let card_id = card_body["data"]["id"]
+            .as_str()
+            .expect("credit card id should be a string")
+            .to_string();
+
+        let (purchase_status, purchase_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            json!({
+                "type": "expense",
+                "occurredAt": "2026-07-15T12:00:00Z",
+                "title": "信用卡消费",
+                "entries": [{
+                    "accountId": card_id,
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(purchase_status, StatusCode::CREATED);
+        let purchase_id = purchase_body["data"]["id"]
+            .as_str()
+            .expect("purchase id should be a string");
+        let purchase_group_id = purchase_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("purchase group id should be a string");
+        let (submit_purchase_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/movements/{purchase_id}/submit-review"),
+        )
+        .await;
+        assert_eq!(submit_purchase_status, StatusCode::OK);
+        let (confirm_purchase_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{purchase_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_purchase_status, StatusCode::OK);
+
+        let (_, after_purchase) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(
+            after_purchase["data"]["latestSnapshot"]["grossAssets"]["amount"],
+            "1000.00"
+        );
+        assert_eq!(
+            after_purchase["data"]["latestSnapshot"]["totalLiabilities"]["amount"],
+            "100.00"
+        );
+        assert_eq!(
+            after_purchase["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "900.00"
+        );
+
+        let (repayment_status, repayment_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            json!({
+                "type": "transfer",
+                "occurredAt": "2026-07-15T13:00:00Z",
+                "title": "信用卡还款",
+                "entries": [
+                    {
+                        "accountId": bank_id,
+                        "amount": "60.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source"
+                    },
+                    {
+                        "accountId": card_id,
+                        "amount": "60.0",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination"
+                    }
+                ],
+                "transferMeta": {
+                    "fromAccountId": bank_id,
+                    "toAccountId": card_id
+                }
+            }),
+        )
+        .await;
+        assert_eq!(repayment_status, StatusCode::CREATED);
+        let repayment_id = repayment_body["data"]["id"]
+            .as_str()
+            .expect("repayment id should be a string");
+        let repayment_group_id = repayment_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("repayment group id should be a string");
+        let (submit_repayment_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/movements/{repayment_id}/submit-review"),
+        )
+        .await;
+        assert_eq!(submit_repayment_status, StatusCode::OK);
+        let (confirm_repayment_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{repayment_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_repayment_status, StatusCode::OK);
+
+        let (_, bank_after) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{bank_id}"),
+        )
+        .await;
+        let (_, card_after) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{card_id}"),
+        )
+        .await;
+        assert_eq!(bank_after["data"]["cashBalances"][0]["amount"], "940.00");
+        assert_eq!(card_after["data"]["cashBalances"][0]["amount"], "-40.00");
+
+        let (_, after_repayment) =
+            request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(
+            after_repayment["data"]["latestSnapshot"]["grossAssets"]["amount"],
+            "940.00"
+        );
+        assert_eq!(
+            after_repayment["data"]["latestSnapshot"]["totalLiabilities"]["amount"],
+            "40.00"
+        );
+        assert_eq!(
+            after_repayment["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "900.00"
+        );
+        assert_eq!(
+            after_repayment["data"]["pendingSummary"]["accountAnomalyCount"],
+            0
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_quote_refresh_revalues_holdings_from_cache() {
         let path = unique_test_ledger_path("quote_refresh_holding");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");

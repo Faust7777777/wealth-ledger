@@ -4788,6 +4788,12 @@ fn movement_from_create_input(
     let settlement = normalized_settlement(object.get("settlement"), &mut errors);
     let transfer_meta = normalized_transfer_meta(object.get("transferMeta"), &mut errors);
 
+    if movement_type.as_deref() == Some("transfer") {
+        validate_simple_transfer(entries.as_deref(), transfer_meta.as_ref(), &mut errors);
+    } else if transfer_meta.is_some() {
+        errors.push("transferMeta is only valid for transfer movements".to_string());
+    }
+
     if !errors.is_empty() {
         return Err(LedgerError::InvalidInput(errors));
     }
@@ -7508,6 +7514,112 @@ fn normalized_transfer_meta(value: Option<&Value>, errors: &mut Vec<String>) -> 
     }
 
     Some(meta)
+}
+
+fn validate_simple_transfer(
+    entries: Option<&[Value]>,
+    transfer_meta: Option<&Value>,
+    errors: &mut Vec<String>,
+) {
+    let Some(entries) = entries else {
+        return;
+    };
+    if entries.len() != 2 {
+        errors.push(
+            "transfer entries must contain exactly one source and one destination".to_string(),
+        );
+        return;
+    }
+
+    let source_entries = entries
+        .iter()
+        .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("source"))
+        .collect::<Vec<_>>();
+    let destination_entries = entries
+        .iter()
+        .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("destination"))
+        .collect::<Vec<_>>();
+    if source_entries.len() != 1 || destination_entries.len() != 1 {
+        errors.push(
+            "transfer entries must contain exactly one source and one destination".to_string(),
+        );
+        return;
+    }
+
+    let source = source_entries[0];
+    let destination = destination_entries[0];
+    if source.get("direction").and_then(Value::as_str) != Some("out") {
+        errors.push("transfer source entry.direction must be out".to_string());
+    }
+    if destination.get("direction").and_then(Value::as_str) != Some("in") {
+        errors.push("transfer destination entry.direction must be in".to_string());
+    }
+
+    let source_account_id = source.get("accountId").and_then(Value::as_str);
+    let destination_account_id = destination.get("accountId").and_then(Value::as_str);
+    if source_account_id.is_some() && source_account_id == destination_account_id {
+        errors.push("transfer source and destination accounts must differ".to_string());
+    }
+
+    let source_currency = source.get("currency").and_then(Value::as_str);
+    let destination_currency = destination.get("currency").and_then(Value::as_str);
+    if source_currency != destination_currency {
+        errors.push("current server mode supports same-currency transfers only".to_string());
+    }
+    let source_amount = source
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    let destination_amount = destination
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    if source_amount != destination_amount {
+        errors.push("same-currency transfer source and destination amounts must match".to_string());
+    }
+
+    let Some(meta) = transfer_meta.and_then(Value::as_object) else {
+        return;
+    };
+    if meta.get("fromAccountId").and_then(Value::as_str) != source_account_id {
+        errors.push("transferMeta.fromAccountId must match the source entry".to_string());
+    }
+    if meta.get("toAccountId").and_then(Value::as_str) != destination_account_id {
+        errors.push("transferMeta.toAccountId must match the destination entry".to_string());
+    }
+    if let Some(from_amount) = meta.get("fromAmount")
+        && !money_matches_entry(from_amount, source)
+    {
+        errors.push("transferMeta.fromAmount must match the source entry".to_string());
+    }
+    if let Some(to_amount) = meta.get("toAmount")
+        && !money_matches_entry(to_amount, destination)
+    {
+        errors.push("transferMeta.toAmount must match the destination entry".to_string());
+    }
+    if ["feeAmount", "lossAmount", "fxRate"]
+        .iter()
+        .any(|key| meta.contains_key(*key))
+    {
+        errors.push(
+            "current server mode does not support transfer fees, losses, or FX conversion"
+                .to_string(),
+        );
+    }
+}
+
+fn money_matches_entry(money: &Value, entry: &Value) -> bool {
+    let money_amount = money
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    let entry_amount = entry
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    money_amount == entry_amount
+        && money.get("currency").and_then(Value::as_str)
+            == entry.get("currency").and_then(Value::as_str)
 }
 
 fn normalized_money(value: Option<&Value>, label: &str, errors: &mut Vec<String>) -> Option<Value> {

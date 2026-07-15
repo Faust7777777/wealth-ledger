@@ -300,6 +300,8 @@ TransferMeta {
 - 用户口述“几小时后到账”时写入 `expectedDelayHours`。
 - 汇损、滑点、平台折损写入 `lossAmount` 或 `feeAmount`。
 - 在途交易进入首页待处理区，不作为消费展示。
+- schema 保留跨币种、手续费和汇损字段，但当前 server mode 只实现同币种同额双分录；
+  未实现的 transfer shape 必须明确拒绝，不得按普通分录直接落账。
 
 ## 7. TransactionAmountBreakdown
 

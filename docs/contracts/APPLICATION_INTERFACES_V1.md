@@ -150,6 +150,9 @@ ConfirmResult {
 - `ledgerWrite` 是前端显示“已入账”和刷新账本派生视图的唯一依据。
 - draft / pending review 不影响正式余额。
 - 已确认记录的修改优先走 correction。
+- 当前 server mode 的 `transfer` 只接受两个不同账户间的同币种同金额分录；来源必须
+  `out/source`、目标必须 `in/destination`；若提供 `transferMeta`，其中的账户与金额
+  必须一致。
 
 ## 5. DcaService
 

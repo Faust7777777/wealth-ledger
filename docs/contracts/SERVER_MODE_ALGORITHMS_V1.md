@@ -25,7 +25,11 @@
 
 ## 3. 转账、投资与更正
 
-- 转账是同一 atomic group 内的多腿 movement；来源腿 out，目标腿 in。
+- 当前服务器自用模式的转账是同一 atomic group 内的两腿 movement：恰好一个
+  `source/out` 和一个 `destination/in`，账户不同、币种相同、十进制定点金额相等。
+- 若提供 `transferMeta`，其 `fromAccountId/toAccountId` 必须与两腿一致；若提供
+  `fromAmount/toAmount`，也必须与对应分录一致。当前不支持转账手续费、汇损或跨币种
+  折算，这些请求会被拒绝，不能以不守恒分录静默改变净资产。
 - 已确认 movement 永不原地改写。
 - 更正由“原 movement 全部腿的反向腿 + 完整 replacement 腿”组成。确认更正前
   余额不变，确认时一次性应用，等价于撤销旧效果再应用新效果。
