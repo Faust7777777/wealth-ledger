@@ -84,7 +84,7 @@ try {
   if ($flutterExitCode -ne 0) {
     throw "Flutter local-server integration tests failed"
   }
-  Write-Host "OK: Flutter local-server integration smoke passed (subscriptions + accounts)"
+  Write-Host "OK: Flutter local-server integration smoke passed (subscriptions + accounts + dca)"
 } catch {
   Write-Host "FAILED: $($_.Exception.Message)"
   foreach ($logPath in @($stdout, $stderr)) {
