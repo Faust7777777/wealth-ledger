@@ -276,7 +276,6 @@ class _AccountRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final v = a.value;
     return PressableScale(
       onTap: () => context.push('/account/${a.id}'),
       child: ListTile(
@@ -284,10 +283,7 @@ class _AccountRow extends StatelessWidget {
         dense: true,
         leading: LeadingAvatar.icon(accountTypeIcon(a.accountType)),
         title: Text(a.displayName, style: AppType.body),
-        trailing: Text(
-          v == null ? '—' : formatValued(v),
-          style: AppType.moneyRow,
-        ),
+        trailing: AccountValueDisplay(account: a),
       ),
     );
   }

@@ -10,7 +10,9 @@ import 'package:finwealth/data/repositories.dart';
 import 'package:finwealth/data/view_models.dart';
 import 'package:finwealth/features/account_form_page.dart';
 import 'package:finwealth/features/account_type_picker.dart';
+import 'package:finwealth/features/accounts_page.dart';
 import 'package:finwealth/features/liabilities_page.dart';
+import 'package:finwealth/features/overview_page.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -149,6 +151,57 @@ void main() {
       expect(find.text('¥500.00'), findsOneWidget);
       expect(find.text('溢缴款'), findsOneWidget);
       expect(find.text('当前欠款'), findsNothing);
+    });
+
+    testWidgets('13. 全部账户页的负债同样不显示账本负号', (tester) async {
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            capabilitiesProvider.overrideWith((ref) async => _caps),
+            accountsProvider.overrideWith(
+              (ref) async => [_liability('-2000.00')],
+            ),
+          ],
+          child: const MaterialApp(home: Scaffold(body: AccountsPage())),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('¥2,000.00'), findsOneWidget);
+      expect(find.text('当前欠款'), findsOneWidget);
+      expect(find.textContaining('-2,000'), findsNothing);
+    });
+
+    testWidgets('14. 首页账户行的负债同样不显示账本负号', (tester) async {
+      const overview = PortfolioOverviewVm(
+        latestSnapshot: NetWorthSnapshotVm(
+          id: 'snap_1',
+          snapshotAt: '2026-07-15T09:00:00+08:00',
+          grossAssets: Money(amount: '1000.00', currency: 'CNY'),
+          totalLiabilities: Money(amount: '2000.00', currency: 'CNY'),
+          netWorth: Money(amount: '-1000.00', currency: 'CNY'),
+          quality: ValueQuality.exact,
+        ),
+        pendingSummary: PendingSummaryVm(),
+        quoteStatusSummary: QuoteStatusSummaryVm(),
+        primaryHoldings: [],
+        recentMovements: [],
+      );
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            capabilitiesProvider.overrideWith((ref) async => _caps),
+            overviewProvider.overrideWith((ref) async => overview),
+            accountsProvider.overrideWith(
+              (ref) async => [_liability('-2000.00')],
+            ),
+          ],
+          child: const MaterialApp(home: Scaffold(body: OverviewPage())),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('¥2,000.00'), findsOneWidget);
+      expect(find.text('当前欠款'), findsOneWidget);
+      expect(find.textContaining('-2,000'), findsNothing);
     });
   });
 

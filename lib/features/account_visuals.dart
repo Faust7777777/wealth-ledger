@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import '../core/format.dart';
 import '../core/types.dart';
 import '../data/view_models.dart';
+import '../theme/app_typography.dart';
 
 String accountTypeLabel(AccountType t) => switch (t) {
   AccountType.bank => '银行账户',
@@ -104,6 +105,42 @@ String liabilityValuedText(ValuedMoney v) => formatValued(
 /// 负债单币种余额文本（账户详情的分币种行）：绝对值，不出现负号。
 String liabilityBalanceText(DecimalString raw, CurrencyCode currency) =>
     formatMoney(Money(amount: absDecimal(raw), currency: currency));
+
+/// 账户列表/首页/负债页共用的金额展示，保证负债语义在所有入口一致。
+class AccountValueDisplay extends StatelessWidget {
+  const AccountValueDisplay({
+    super.key,
+    required this.account,
+    this.amountStyle,
+    this.labelStyle,
+  });
+
+  final AccountVm account;
+  final TextStyle? amountStyle;
+  final TextStyle? labelStyle;
+
+  @override
+  Widget build(BuildContext context) {
+    final value = account.value;
+    final moneyStyle = amountStyle ?? AppType.moneyRow;
+    if (value == null) return Text('—', style: moneyStyle);
+    if (!account.isLiability) {
+      return Text(formatValued(value), style: moneyStyle);
+    }
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      mainAxisAlignment: MainAxisAlignment.center,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        Text(liabilityValuedText(value), style: moneyStyle),
+        Text(
+          liabilityAmountLabel(value.amount),
+          style: labelStyle ?? AppType.caption,
+        ),
+      ],
+    );
+  }
+}
 
 IconData accountTypeIcon(AccountType t) => switch (t) {
   AccountType.bank => Icons.account_balance,

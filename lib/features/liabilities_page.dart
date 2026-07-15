@@ -7,7 +7,6 @@ import 'package:go_router/go_router.dart';
 import '../data/providers.dart';
 import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
-import '../theme/app_typography.dart';
 import 'account_visuals.dart';
 
 class LiabilitiesPage extends ConsumerWidget {
@@ -43,7 +42,6 @@ class LiabilitiesPage extends ConsumerWidget {
           separatorBuilder: (_, _) => const Divider(height: 1),
           itemBuilder: (context, i) {
             final a = items[i];
-            final v = a.value;
             return Reveal(
               delay: Duration(milliseconds: (i * 40).clamp(0, 240)),
               child: PressableScale(
@@ -56,22 +54,7 @@ class LiabilitiesPage extends ConsumerWidget {
                         ? accountTypeLabel(a.accountType)
                         : '${accountTypeLabel(a.accountType)} · ${a.note}',
                   ),
-                  trailing: v == null
-                      ? Text('—', style: AppType.moneyRow)
-                      : Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          crossAxisAlignment: CrossAxisAlignment.end,
-                          children: [
-                            Text(
-                              liabilityValuedText(v),
-                              style: AppType.moneyRow,
-                            ),
-                            Text(
-                              liabilityAmountLabel(v.amount),
-                              style: AppType.caption,
-                            ),
-                          ],
-                        ),
+                  trailing: AccountValueDisplay(account: a),
                 ),
               ),
             );

@@ -59,11 +59,11 @@ void main() {
       expect(card.cashBalances['CNY'], '-2000.00');
 
       // overview 核对（与账本内既有数据解耦，用前后差值）：
-      // 总资产 +100，净资产 -1900，总负债变化幅度 2000。
+      // 总资产 +100，净资产 -1900，总负债 +2000。
       final after = await _totals(client);
       expect(subtractDecimal(after.$1, before.$1), '100.00');
       expect(subtractDecimal(after.$3, before.$3), '-1900.00');
-      expect(absDecimal(subtractDecimal(after.$2, before.$2)), '2000.00');
+      expect(subtractDecimal(after.$2, before.$2), '2000.00');
     },
     skip: _baseUrl.isEmpty
         ? 'Set LOCAL_SERVER_API_BASE through --dart-define; run tools/frontend_local_server_smoke.ps1.'

@@ -995,6 +995,8 @@ class LocalServerMovementRepository implements MovementRepository {
       'transferMeta': {
         'fromAccountId': input.fromAccountId,
         'toAccountId': input.toAccountId,
+        'fromAmount': {'amount': input.amount, 'currency': input.currency},
+        'toAmount': {'amount': input.amount, 'currency': input.currency},
         if (input.note != null && input.note!.isNotEmpty) 'note': input.note,
       },
     });
