@@ -15,7 +15,10 @@ import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/view_models.dart';
 import 'package:finwealth/features/accounts_page.dart';
 import 'package:finwealth/features/ai_review_page.dart';
+import 'package:finwealth/features/account_form_page.dart';
+import 'package:finwealth/features/account_type_picker.dart';
 import 'package:finwealth/features/investment_page.dart';
+import 'package:finwealth/features/liabilities_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/overview_page.dart';
 import 'package:finwealth/features/subscription_detail_page.dart';
@@ -467,6 +470,115 @@ void main() {
     await expectLater(
       find.byType(DueScanResultDialog),
       matchesGoldenFile('goldens/subscription_due_scan_dialog_light.png'),
+    );
+  });
+
+  // —— 负债展示语义 + 账户表单/类型选择器（2026-07-15 账户可用性批）——
+  AccountVm liab(String id, String name, String amount) => AccountVm(
+    id: id,
+    displayName: name,
+    accountType: id.contains('loan')
+        ? AccountType.loan
+        : AccountType.creditCard,
+    isLiability: true,
+    value: ValuedMoney(
+      amount: amount,
+      currency: 'CNY',
+      asOf: '2026-07-15T09:00:00+08:00',
+      quality: ValueQuality.exact,
+    ),
+  );
+
+  Widget liabHost(ThemeData theme, Widget page, List<AccountVm> items) =>
+      ProviderScope(
+        overrides: [
+          capabilitiesProvider.overrideWith(
+            (ref) async => const LedgerCapabilitiesVm(
+              dataSourceMode: 'local_server',
+              canWriteConfirmedLedger: true,
+              canCreateAccount: true,
+              canRecordMovement: true,
+              canConfirmProposal: true,
+              canPersistPendingProposal: true,
+              proposalPersistence: 'file',
+            ),
+          ),
+          liabilitiesProvider.overrideWith((ref) async => items),
+        ],
+        child: MaterialApp(
+          theme: theme,
+          home: Scaffold(body: page),
+        ),
+      );
+
+  testWidgets('liabilities semantic rows · dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 700));
+    await tester.pumpWidget(
+      liabHost(buildDarkTheme(), const LiabilitiesPage(), [
+        liab('cc_owing', '招行信用卡', '-2000.00'),
+        liab('cc_paid', '交行信用卡', '0.00'),
+        liab('cc_over', '广发信用卡', '500.00'),
+        liab('loan_psbc', '邮储助学贷款', '-9620.00'),
+      ]),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(LiabilitiesPage),
+      matchesGoldenFile('goldens/liabilities_semantic_dark.png'),
+    );
+  });
+
+  testWidgets('liabilities empty · dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 700));
+    await tester.pumpWidget(
+      liabHost(buildDarkTheme(), const LiabilitiesPage(), const []),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(LiabilitiesPage),
+      matchesGoldenFile('goldens/liabilities_empty_dark.png'),
+    );
+  });
+
+  testWidgets('account form credit-card · dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 900));
+    await tester.pumpWidget(
+      liabHost(
+        buildDarkTheme(),
+        const AccountFormPage(initialType: AccountType.creditCard),
+        const [],
+      ),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(AccountFormPage),
+      matchesGoldenFile('goldens/account_form_credit_card_dark.png'),
+    );
+  });
+
+  testWidgets('account type picker · dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(500, 760));
+    await tester.pumpWidget(
+      liabHost(
+        buildDarkTheme(),
+        const Center(
+          child: AccountTypePickerDialog(selected: AccountType.creditCard),
+        ),
+        const [],
+      ),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(AccountTypePickerDialog),
+      matchesGoldenFile('goldens/account_type_picker_dark.png'),
     );
   });
 }
