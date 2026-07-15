@@ -6928,6 +6928,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ledger_positive_credit_card_balance_is_an_asset_not_debt() {
+        let path = unique_test_ledger_path("positive_credit_card_balance");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let credit_balance_input = json!({
+            "displayName": "信用卡溢缴款",
+            "accountType": "credit_card",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "liability",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "5.00"}
+            ]
+        });
+        let (account_status, _) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            credit_balance_input,
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+
+        let (overview_status, overview_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_status, StatusCode::OK);
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["grossAssets"]["amount"],
+            "5.00"
+        );
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["totalLiabilities"]["amount"],
+            "0.00"
+        );
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "5.00"
+        );
+        assert_eq!(
+            overview_body["data"]["pendingSummary"]["accountAnomalyCount"],
+            0
+        );
+
+        let (allocation_status, allocation_body) =
+            request_json_from(router, Method::GET, "/v1/portfolio/allocation").await;
+        assert_eq!(allocation_status, StatusCode::OK);
+        assert_eq!(allocation_body["data"]["totalAssets"]["amount"], "5.00");
+        assert_eq!(
+            allocation_body["data"]["totalLiabilities"]["amount"],
+            "0.00"
+        );
+        assert_eq!(allocation_body["data"]["netWorth"]["amount"], "5.00");
+        assert_eq!(allocation_body["data"]["slices"][0]["category"], "其他");
+        assert_eq!(allocation_body["data"]["slices"][0]["percent"], "100.0");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_account_anomalies_use_real_ledger_data() {
         let path = unique_test_ledger_path("account_anomalies");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");

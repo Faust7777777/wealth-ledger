@@ -4022,13 +4022,13 @@ fn summarize_accounts(document: &Value, now: &str) -> io::Result<AccountSummary>
             }
         }));
 
-        if is_liability {
+        if account_total.is_negative() {
             total_liabilities += absolute_decimal(account_total);
-        } else if account_total.is_negative() {
-            account_anomaly_count += 1;
-            total_liabilities += absolute_decimal(account_total);
-            quality = combine_quality(quality, "anomaly");
-        } else {
+            if !is_liability {
+                account_anomaly_count += 1;
+                quality = combine_quality(quality, "anomaly");
+            }
+        } else if account_total > DecimalAmount::ZERO {
             gross_assets += account_total;
             let category = allocation_category(account).to_string();
             *allocation_by_category

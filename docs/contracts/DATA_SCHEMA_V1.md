@@ -108,7 +108,8 @@ AccountCashBalance {
 
 - 多币种账户用 `cashBalances[]` 表示。
 - 用户也可以主动拆成多个账户，但系统不得为了币种自动伪造账户。
-- `loan` / `credit_card` / `liability` 语义账户为负数是正常负债。
+- `loan` / `credit_card` / `liability` 语义账户为负数是正常负债；正余额（例如信用卡
+  溢缴款）仍保持资产语义，不得按绝对值计入负债。
 - `bank` / `wallet` / `cash` 等资产账户出现负数才可能触发 `negative_balance` 异常。
 
 ## 3. Instrument 与 Holding
