@@ -1,9 +1,9 @@
-// Wealth Ledger — 负债页（负债账户；为负=正常负债，不算异常）。
+// Wealth Ledger — 负债页。账本内欠款为负，但界面按语义展示：
+// 欠款显示绝对值+「当前欠款」，0=「已还清」，正数=「溢缴款」，不出现负号。
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import '../core/format.dart';
 import '../data/providers.dart';
 import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
@@ -26,13 +26,13 @@ class LiabilitiesPage extends ConsumerWidget {
         if (items.isEmpty) {
           return EmptyState(
             icon: Icons.account_balance_outlined,
-            title: '没有负债',
-            message: '信用卡、贷款等负债会显示在这里；负债余额为负是正常的。',
+            title: '暂无负债账户',
             action: WriteGate(
               enabled: ref.writeCapabilities.canCreateAccount,
               child: FilledButton(
-                onPressed: () => context.push('/accounts/new'),
-                child: const Text('添加负债账户'),
+                // 从负债页进入时默认选中「信用卡」，不默认银行。
+                onPressed: () => context.push('/accounts/new?type=creditCard'),
+                child: const Text('添加信用卡或贷款'),
               ),
             ),
           );
@@ -56,10 +56,22 @@ class LiabilitiesPage extends ConsumerWidget {
                         ? accountTypeLabel(a.accountType)
                         : '${accountTypeLabel(a.accountType)} · ${a.note}',
                   ),
-                  trailing: Text(
-                    v == null ? '—' : formatValued(v),
-                    style: AppType.moneyRow,
-                  ),
+                  trailing: v == null
+                      ? Text('—', style: AppType.moneyRow)
+                      : Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            Text(
+                              liabilityValuedText(v),
+                              style: AppType.moneyRow,
+                            ),
+                            Text(
+                              liabilityAmountLabel(v.amount),
+                              style: AppType.caption,
+                            ),
+                          ],
+                        ),
                 ),
               ),
             );

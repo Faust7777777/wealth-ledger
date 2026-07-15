@@ -77,7 +77,14 @@ final appRouter = GoRouter(
       builder: (c, s) => const AiImportImagePage(),
     ),
     GoRoute(path: '/ai-import/csv', builder: (c, s) => const AiImportCsvPage()),
-    GoRoute(path: '/accounts/new', builder: (c, s) => const AccountFormPage()),
+    GoRoute(
+      path: '/accounts/new',
+      // ?type=creditCard 等：入口可预选类型（负债页默认信用卡）。
+      builder: (c, s) => AccountFormPage(
+        initialType: AccountType.values
+            .asNameMap()[s.uri.queryParameters['type']],
+      ),
+    ),
     GoRoute(
       path: '/account/:id',
       builder: (c, s) => AccountDetailPage(accountId: s.pathParameters['id']!),

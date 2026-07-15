@@ -1,27 +1,32 @@
 // Wealth Ledger — 账户表单（新建 / 编辑；写真实账本，仅 local_server）。
+// 类型走分组选择器；余额模式为内部概念，由类型自动派生，不在表单暴露。
+// 新建支持期初余额；信用卡/贷款以正数录入「当前欠款」，由表单转为账本负数。
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../core/types.dart';
 import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
+import 'account_form_validation.dart';
+import 'account_type_picker.dart';
 import 'account_visuals.dart';
 
 const List<String> _currencies = ['CNY', 'USD', 'HKD', 'USDT', 'BTC', 'ETH'];
-const Map<String, String> _balanceModes = {
-  'cash_balance': '现金余额',
-  'holdings': '持仓',
-  'liability': '负债',
-  'mixed': '混合',
-};
+
+/// 账户类型字段的稳定 Key（widget 测试打开选择器用）。
+const kAccountTypeFieldKey = ValueKey('account_type_field');
 
 class AccountFormPage extends ConsumerStatefulWidget {
-  const AccountFormPage({super.key, this.existing});
+  const AccountFormPage({super.key, this.existing, this.initialType});
 
   /// 非 null → 编辑模式（PATCH）；null → 新建模式（POST）。
   final AccountVm? existing;
+
+  /// 新建时的默认类型（如从负债页进入默认「信用卡」）。
+  final AccountType? initialType;
 
   @override
   ConsumerState<AccountFormPage> createState() => _AccountFormPageState();
@@ -30,13 +35,22 @@ class AccountFormPage extends ConsumerStatefulWidget {
 class _AccountFormPageState extends ConsumerState<AccountFormPage> {
   final _name = TextEditingController();
   final _institution = TextEditingController();
-  AccountType _type = AccountType.bank;
+  final _openingAmount = TextEditingController();
+  late AccountType _type = widget.initialType ?? AccountType.bank;
   String _currency = 'CNY';
-  String _balanceMode = 'cash_balance';
   bool _includeInNetWorth = true;
   bool _busy = false;
 
   bool get _isEdit => widget.existing != null;
+  bool get _isLiabilityType => isLiabilityAccountType(_type);
+
+  /// 余额模式自动派生：编辑且类型未变 → 保留服务端原值（含历史 mixed）；
+  /// 否则取新类型的默认模式。
+  String get _balanceModeToSend {
+    final e = widget.existing;
+    if (e != null && e.accountType == _type) return e.balanceMode;
+    return defaultBalanceModeFor(_type);
+  }
 
   @override
   void initState() {
@@ -47,7 +61,6 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
       _institution.text = e.institutionName ?? '';
       _type = e.accountType;
       _currency = e.defaultCurrency;
-      _balanceMode = e.balanceMode;
       _includeInNetWorth = e.includeInNetWorth;
     }
   }
@@ -56,12 +69,30 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
   void dispose() {
     _name.dispose();
     _institution.dispose();
+    _openingAmount.dispose();
     super.dispose();
+  }
+
+  Future<void> _pickType() async {
+    final picked = await showAccountTypePicker(context, selected: _type);
+    if (picked != null && mounted) setState(() => _type = picked);
+  }
+
+  /// 期初余额（仅新建）：欠款正数输入 → 账本负数；空/零 → null（发送空数组）。
+  Money? get _openingBalance {
+    if (_isEdit) return null;
+    final normalized = normalizedOpeningAmount(_openingAmount.text);
+    if (normalized == null) return null;
+    return Money(
+      amount: _isLiabilityType ? '-$normalized' : normalized,
+      currency: _currency,
+    );
   }
 
   Future<void> _save() async {
     final name = _name.text.trim();
     if (name.isEmpty || _busy) return;
+    if (openingAmountError(_openingAmount.text) != null) return;
     setState(() => _busy = true);
     final messenger = ScaffoldMessenger.of(context);
     final router = GoRouter.of(context);
@@ -70,11 +101,12 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
       displayName: name,
       accountType: _type,
       defaultCurrency: _currency,
-      balanceMode: _balanceMode,
+      balanceMode: _balanceModeToSend,
       includeInNetWorth: _includeInNetWorth,
       institutionName: _institution.text.trim().isEmpty
           ? null
           : _institution.text.trim(),
+      openingBalance: _openingBalance,
     );
     try {
       if (_isEdit) {
@@ -104,6 +136,7 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
       ..._currencies,
       if (!_currencies.contains(_currency)) _currency,
     ];
+    final openingError = openingAmountError(_openingAmount.text);
     return Scaffold(
       appBar: AppBar(title: Text(_isEdit ? '编辑账户' : '新建账户')),
       body: ContentMaxWidth(
@@ -118,17 +151,30 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
               ),
             ),
             const SizedBox(height: AppSpacing.base),
-            DropdownButtonFormField<AccountType>(
-              initialValue: _type,
-              decoration: const InputDecoration(
-                labelText: '账户类型',
-                border: OutlineInputBorder(),
+            InkWell(
+              key: kAccountTypeFieldKey,
+              borderRadius: BorderRadius.circular(AppRadius.sm),
+              onTap: _pickType,
+              child: InputDecorator(
+                decoration: const InputDecoration(
+                  labelText: '账户类型',
+                  border: OutlineInputBorder(),
+                  suffixIcon: Icon(Icons.arrow_drop_down),
+                ),
+                child: Row(
+                  children: [
+                    Icon(accountTypeIcon(_type), size: 20),
+                    const SizedBox(width: AppSpacing.sm),
+                    Expanded(
+                      child: Text(
+                        '${accountTypeLabel(_type)} · ${accountTypeExample(_type)}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
               ),
-              items: [
-                for (final t in AccountType.values)
-                  DropdownMenuItem(value: t, child: Text(accountTypeLabel(t))),
-              ],
-              onChanged: (v) => setState(() => _type = v ?? _type),
             ),
             const SizedBox(height: AppSpacing.base),
             DropdownButtonFormField<String>(
@@ -143,20 +189,22 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
               ],
               onChanged: (v) => setState(() => _currency = v ?? _currency),
             ),
-            const SizedBox(height: AppSpacing.base),
-            DropdownButtonFormField<String>(
-              initialValue: _balanceMode,
-              decoration: const InputDecoration(
-                labelText: '余额模式',
-                border: OutlineInputBorder(),
+            if (!_isEdit) ...[
+              const SizedBox(height: AppSpacing.base),
+              TextField(
+                controller: _openingAmount,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                onChanged: (_) => setState(() {}),
+                decoration: InputDecoration(
+                  labelText: _isLiabilityType ? '当前欠款（可选）' : '期初余额（可选）',
+                  border: const OutlineInputBorder(),
+                  suffixText: _currency,
+                  errorText: openingError,
+                ),
               ),
-              items: [
-                for (final e in _balanceModes.entries)
-                  DropdownMenuItem(value: e.key, child: Text(e.value)),
-              ],
-              onChanged: (v) =>
-                  setState(() => _balanceMode = v ?? _balanceMode),
-            ),
+            ],
             const SizedBox(height: AppSpacing.base),
             TextField(
               controller: _institution,
