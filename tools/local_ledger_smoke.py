@@ -22,6 +22,7 @@ import urllib.request
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -226,6 +227,173 @@ def create_and_confirm_manual_expense(base: str, account_id: str) -> dict[str, A
     confirmed = unwrap_data(request_json(base, f"/v1/movements/{movement_id}"))
     assert confirmed["status"] == "confirmed"
     return confirmed
+
+
+def cash_balance(account: dict[str, Any], currency: str) -> Decimal:
+    balance = next(
+        item for item in account["cashBalances"] if item["currency"] == currency
+    )
+    return Decimal(balance["amount"])
+
+
+def create_and_confirm_investment_with_fees(
+    base: str, cash_account_id: str, holding_account_id: str
+) -> None:
+    instrument = unwrap_data(
+        request_json(
+            base,
+            "/v1/instruments",
+            method="POST",
+            expected_status=201,
+            body={
+                "id": "inst_smoke_fee_fund",
+                "type": "fund",
+                "symbol": "SMOKE-FEE",
+                "displayName": "Smoke Fee Fund",
+                "quoteCurrency": "CNY",
+                "market": "SMOKE",
+            },
+        )
+    )
+    instrument_id = instrument["id"]
+
+    before_buy = unwrap_data(request_json(base, f"/v1/accounts/{cash_account_id}"))
+    before_buy_cash = cash_balance(before_buy, "CNY")
+    buy = unwrap_data(
+        request_json(
+            base,
+            "/v1/movements/drafts",
+            method="POST",
+            expected_status=201,
+            body={
+                "type": "buy",
+                "occurredAt": "2026-06-27T11:00:00Z",
+                "title": "local smoke fee-aware buy",
+                "entries": [
+                    {
+                        "accountId": cash_account_id,
+                        "amount": "50.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source",
+                    },
+                    {
+                        "accountId": holding_account_id,
+                        "instrumentId": instrument_id,
+                        "amount": "5",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination",
+                    },
+                    {
+                        "accountId": cash_account_id,
+                        "amount": "1.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "fee",
+                    },
+                    {
+                        "accountId": cash_account_id,
+                        "amount": "0.50",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "tax",
+                    },
+                ],
+            },
+        )
+    )
+
+    pending_buy_account = unwrap_data(
+        request_json(base, f"/v1/accounts/{cash_account_id}")
+    )
+    assert cash_balance(pending_buy_account, "CNY") == before_buy_cash
+    pending_holdings = unwrap_data(request_json(base, "/v1/holdings"))
+    assert all(item["instrumentId"] != instrument_id for item in pending_holdings)
+
+    buy_confirmation = unwrap_data(
+        request_json(
+            base,
+            f"/v1/atomic-groups/{buy['atomicGroupId']}/confirm",
+            method="POST",
+        )
+    )
+    assert buy_confirmation["ledgerWrite"] is True
+    after_buy = unwrap_data(request_json(base, f"/v1/accounts/{cash_account_id}"))
+    assert cash_balance(after_buy, "CNY") == before_buy_cash - Decimal("51.50")
+    holdings_after_buy = unwrap_data(request_json(base, "/v1/holdings"))
+    fee_holding = next(
+        item for item in holdings_after_buy if item["instrumentId"] == instrument_id
+    )
+    assert fee_holding["quantity"] == "5"
+    assert fee_holding["costBasisTotal"]["amount"] == "51.50"
+
+    before_sell_cash = cash_balance(after_buy, "CNY")
+    sell = unwrap_data(
+        request_json(
+            base,
+            "/v1/movements/drafts",
+            method="POST",
+            expected_status=201,
+            body={
+                "type": "sell",
+                "occurredAt": "2026-06-27T12:00:00Z",
+                "title": "local smoke fee-aware sell",
+                "entries": [
+                    {
+                        "accountId": holding_account_id,
+                        "instrumentId": instrument_id,
+                        "amount": "2",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source",
+                    },
+                    {
+                        "accountId": cash_account_id,
+                        "amount": "24.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination",
+                    },
+                    {
+                        "accountId": cash_account_id,
+                        "amount": "0.50",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "fee",
+                    },
+                ],
+            },
+        )
+    )
+
+    pending_sell_account = unwrap_data(
+        request_json(base, f"/v1/accounts/{cash_account_id}")
+    )
+    assert cash_balance(pending_sell_account, "CNY") == before_sell_cash
+    pending_sell_holdings = unwrap_data(request_json(base, "/v1/holdings"))
+    pending_fee_holding = next(
+        item for item in pending_sell_holdings if item["instrumentId"] == instrument_id
+    )
+    assert pending_fee_holding["quantity"] == "5"
+    assert pending_fee_holding["costBasisTotal"]["amount"] == "51.50"
+
+    sell_confirmation = unwrap_data(
+        request_json(
+            base,
+            f"/v1/atomic-groups/{sell['atomicGroupId']}/confirm",
+            method="POST",
+        )
+    )
+    assert sell_confirmation["ledgerWrite"] is True
+    after_sell = unwrap_data(request_json(base, f"/v1/accounts/{cash_account_id}"))
+    assert cash_balance(after_sell, "CNY") == before_sell_cash + Decimal("23.50")
+    holdings_after_sell = unwrap_data(request_json(base, "/v1/holdings"))
+    remaining = next(
+        item for item in holdings_after_sell if item["instrumentId"] == instrument_id
+    )
+    assert remaining["quantity"] == "3"
+    assert remaining["costBasisTotal"]["amount"] == "30.90"
 
 
 def create_and_confirm_multileg_correction(
@@ -697,6 +865,8 @@ def run_smoke(base: str, ledger_path: Path) -> None:
 
     allocation = unwrap_data(request_json(base, "/v1/portfolio/allocation"))
     assert allocation["netWorth"]["amount"] == "1325.66", allocation
+
+    create_and_confirm_investment_with_fees(base, cash["id"], brokerage["id"])
 
     subscription_account = create_account(
         base,

@@ -691,6 +691,54 @@ def check_dca_execution_input(doc: dict) -> None:
     ok("DCA real-execution contract and implementation checks passed")
 
 
+def check_investment_fee_semantics(doc: dict) -> None:
+    local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    for snippet in [
+        'Some("fee" | "tax")',
+        '"{movement_type} fee/tax entries must use the principal cash account and currency"',
+        '"sell fee/tax total must not exceed gross proceeds"',
+        "let total_cash_out = cash_amount + fee_total;",
+        "cash_amount - fee_total",
+        "cost_amount: total_cash_out",
+    ]:
+        if snippet not in local_text:
+            fail(f"Investment fee/tax implementation is incomplete: {snippet}")
+
+    rust_tests = RUST_SERVER.read_text(encoding="utf-8")
+    for snippet in [
+        '"role": "fee"',
+        '"role": "tax"',
+        '"103.00"',
+        '"61.80"',
+        '"996.80"',
+    ]:
+        if snippet not in rust_tests:
+            fail(f"Investment fee/tax regression coverage is incomplete: {snippet}")
+
+    http_text = HTTP_MD.read_text(encoding="utf-8")
+    for snippet in [
+        "principal + fee + tax",
+        "gross proceeds - fee - tax",
+        "费用/税费总额不得超过 gross proceeds",
+    ]:
+        if snippet not in http_text:
+            fail(f"HTTP investment fee/tax contract is incomplete: {snippet}")
+
+    draft_description = doc["components"]["schemas"]["CreateMovementDraftInput"].get(
+        "description", ""
+    )
+    for snippet in [
+        "principal cash leg",
+        "optional fee/tax cash outflow legs",
+        "principal + fee + tax",
+        "gross proceeds - fee - tax",
+    ]:
+        if snippet not in draft_description:
+            fail(f"OpenAPI investment fee/tax semantics are incomplete: {snippet}")
+
+    ok("Investment fee/tax accounting checks passed")
+
+
 def check_subscription_due_scan(doc: dict) -> None:
     path = "/subscriptions/charge-proposals/due-scan"
     path_item = doc["paths"].get(path)
@@ -1781,6 +1829,7 @@ def main() -> None:
     ok("Critical AI/DCA invariants are represented")
 
     check_dca_execution_input(doc)
+    check_investment_fee_semantics(doc)
     check_subscription_due_scan(doc)
     check_multileg_correction(doc)
     check_examples()

@@ -308,6 +308,12 @@ confirmAtomicGroup(groupId: ID): ConfirmResult
 4. 事务写入 confirmed movements/entities。
 5. 若为订阅扣费候选，清除 pending 引用、记录本次扣费并推进下次计费日期。
 6. 更新 proposal group 状态。
+
+投资买卖确认时：
+
+- 买入 principal、fee、tax 的现金流出合计计入持仓成本基础。
+- 卖出现金净流入等于 gross proceeds 减 fee/tax，成本基础按出售数量比例减少。
+- fee/tax 必须与 principal 使用同一现金账户和币种；未提供 FX 明细时不得跨币种归集。
 7. 标记快照过期。
 8. 追加 sync outbox。
 

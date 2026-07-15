@@ -8610,58 +8610,97 @@ fn validate_single_cash_movement(
 
 fn validate_buy_or_sell(entries: &[Value], is_buy: bool, errors: &mut Vec<String>) {
     let movement_type = if is_buy { "buy" } else { "sell" };
-    if entries.len() != 2 {
+    if entries.len() < 2 {
         errors.push(format!(
-            "{movement_type} must contain exactly one cash leg and one holding leg"
+            "{movement_type} must contain one principal cash leg and one holding leg"
         ));
         return;
     }
-
-    let source_entries = entries
+    let cash_role = if is_buy { "source" } else { "destination" };
+    let holding_role = if is_buy { "destination" } else { "source" };
+    let cash_direction = if is_buy { "out" } else { "in" };
+    let holding_direction = if is_buy { "in" } else { "out" };
+    let cash_legs = entries
         .iter()
-        .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("source"))
+        .filter(|entry| {
+            entry.get("instrumentId").is_none()
+                && entry.get("role").and_then(Value::as_str) == Some(cash_role)
+        })
         .collect::<Vec<_>>();
-    let destination_entries = entries
+    let holding_legs = entries
         .iter()
-        .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("destination"))
+        .filter(|entry| {
+            entry.get("instrumentId").is_some()
+                && entry.get("role").and_then(Value::as_str) == Some(holding_role)
+        })
         .collect::<Vec<_>>();
-    if source_entries.len() != 1 || destination_entries.len() != 1 {
+    if cash_legs.len() != 1 || holding_legs.len() != 1 {
         errors.push(format!(
-            "{movement_type} must contain exactly one source and one destination"
+            "{movement_type} must contain exactly one principal cash leg and one holding leg"
         ));
         return;
     }
-
-    let source = source_entries[0];
-    let destination = destination_entries[0];
-    let (cash, holding) = if is_buy {
-        (source, destination)
-    } else {
-        (destination, source)
-    };
-    if source.get("direction").and_then(Value::as_str) != Some("out") {
+    let cash = cash_legs[0];
+    let holding = holding_legs[0];
+    if cash.get("direction").and_then(Value::as_str) != Some(cash_direction) {
         errors.push(format!(
-            "{movement_type} source entry.direction must be out"
+            "{movement_type} principal cash entry.direction must be {cash_direction}"
         ));
     }
-    if destination.get("direction").and_then(Value::as_str) != Some("in") {
+    if holding.get("direction").and_then(Value::as_str) != Some(holding_direction) {
         errors.push(format!(
-            "{movement_type} destination entry.direction must be in"
+            "{movement_type} holding entry.direction must be {holding_direction}"
         ));
     }
-    if cash.get("instrumentId").is_some() {
-        errors.push(format!(
-            "{movement_type} cash leg must not contain instrumentId"
-        ));
+    let cash_account = cash.get("accountId").and_then(Value::as_str);
+    let cash_currency = cash.get("currency").and_then(Value::as_str);
+    let mut fee_total = DecimalAmount::ZERO;
+    for entry in entries {
+        if std::ptr::eq(entry, cash) || std::ptr::eq(entry, holding) {
+            continue;
+        }
+        if !matches!(
+            entry.get("role").and_then(Value::as_str),
+            Some("fee" | "tax")
+        ) {
+            errors.push(format!(
+                "{movement_type} additional entries must use fee or tax role"
+            ));
+            continue;
+        }
+        if entry.get("instrumentId").is_some() {
+            errors.push(format!(
+                "{movement_type} fee/tax entries must be cash entries without instrumentId"
+            ));
+        }
+        if entry.get("direction").and_then(Value::as_str) != Some("out") {
+            errors.push(format!(
+                "{movement_type} fee/tax entry.direction must be out"
+            ));
+        }
+        if entry.get("accountId").and_then(Value::as_str) != cash_account
+            || entry.get("currency").and_then(Value::as_str) != cash_currency
+        {
+            errors.push(format!(
+                "{movement_type} fee/tax entries must use the principal cash account and currency"
+            ));
+        }
+        if let Some(amount) = entry
+            .get("amount")
+            .and_then(Value::as_str)
+            .and_then(|amount| parse_decimal(amount).ok())
+        {
+            fee_total += amount;
+        }
     }
-    if holding
-        .get("instrumentId")
-        .and_then(Value::as_str)
-        .is_none()
+    if !is_buy
+        && let Some(proceeds) = cash
+            .get("amount")
+            .and_then(Value::as_str)
+            .and_then(|amount| parse_decimal(amount).ok())
+        && fee_total > proceeds
     {
-        errors.push(format!(
-            "{movement_type} holding leg must contain instrumentId"
-        ));
+        errors.push("sell fee/tax total must not exceed gross proceeds".to_string());
     }
 }
 
@@ -8916,15 +8955,23 @@ fn apply_buy_or_sell_movement(
     is_buy: bool,
     now: &str,
 ) -> Result<(), LedgerError> {
+    let cash_role = if is_buy { "source" } else { "destination" };
+    let holding_role = if is_buy { "destination" } else { "source" };
     let cash = entries
         .iter()
-        .find(|entry| entry.get("instrumentId").is_none())
+        .find(|entry| {
+            entry.get("instrumentId").is_none()
+                && entry.get("role").and_then(Value::as_str) == Some(cash_role)
+        })
         .ok_or_else(|| {
             LedgerError::InvalidInput(vec!["buy/sell cash leg is missing".to_string()])
         })?;
     let holding = entries
         .iter()
-        .find(|entry| entry.get("instrumentId").is_some())
+        .find(|entry| {
+            entry.get("instrumentId").is_some()
+                && entry.get("role").and_then(Value::as_str) == Some(holding_role)
+        })
         .ok_or_else(|| {
             LedgerError::InvalidInput(vec!["buy/sell holding leg is missing".to_string()])
         })?;
@@ -8936,9 +8983,35 @@ fn apply_buy_or_sell_movement(
     let quote_currency = required_entry_string(holding, "currency")?;
     let instrument_id = required_entry_string(holding, "instrumentId")?;
     let quantity = parse_entry_amount(holding)?;
+    let mut fee_total = DecimalAmount::ZERO;
+    for entry in entries.iter().filter(|entry| {
+        matches!(
+            entry.get("role").and_then(Value::as_str),
+            Some("fee" | "tax")
+        )
+    }) {
+        if required_entry_string(entry, "accountId")? != cash_account_id
+            || required_entry_string(entry, "currency")? != cash_currency
+            || required_entry_string(entry, "direction")? != "out"
+            || entry.get("instrumentId").is_some()
+        {
+            return Err(LedgerError::InvalidInput(vec![
+                "buy/sell fee and tax legs must be cash outflows from the principal account and currency"
+                    .to_string(),
+            ]));
+        }
+        fee_total += parse_entry_amount(entry)?;
+    }
 
     if is_buy {
-        apply_account_cash_delta(document, cash_account_id, cash_currency, -cash_amount, now)?;
+        let total_cash_out = cash_amount + fee_total;
+        apply_account_cash_delta(
+            document,
+            cash_account_id,
+            cash_currency,
+            -total_cash_out,
+            now,
+        )?;
         apply_holding_purchase(
             document,
             HoldingPurchase {
@@ -8946,12 +9019,17 @@ fn apply_buy_or_sell_movement(
                 instrument_id,
                 quote_currency,
                 quantity,
-                cost_amount: cash_amount,
+                cost_amount: total_cash_out,
                 cost_currency: cash_currency,
             },
             now,
         )?;
     } else {
+        if fee_total > cash_amount {
+            return Err(LedgerError::InvalidInput(vec![
+                "sell fee/tax total must not exceed gross proceeds".to_string(),
+            ]));
+        }
         apply_holding_sale(
             document,
             holding_account_id,
@@ -8960,7 +9038,13 @@ fn apply_buy_or_sell_movement(
             quantity,
             now,
         )?;
-        apply_account_cash_delta(document, cash_account_id, cash_currency, cash_amount, now)?;
+        apply_account_cash_delta(
+            document,
+            cash_account_id,
+            cash_currency,
+            cash_amount - fee_total,
+            now,
+        )?;
     }
 
     Ok(())

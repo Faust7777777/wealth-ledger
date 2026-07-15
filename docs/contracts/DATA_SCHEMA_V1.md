@@ -273,9 +273,11 @@ MovementEntry {
 - 已确认记录原则上不原地改写；更正优先通过 `correction` 事件表达。
 - 当前 server mode 不把 `MovementType` 仅当展示标签：收入类、支出类、余额校准、买卖、
   贷款放款/还款均有固定分录方向和角色约束；不符合类型语义的 draft 在写入前返回 400。
-- `buy` / `sell` 的现金腿 `amount` 表示总成本/回款，持仓腿 `amount` 表示数量；买入按
-  现金成本累计 `costBasisTotal`，卖出按数量比例减少成本基础，报价估值使用
-  `quantity × price`。费用/税费的多腿成本归属仍需单独扩展，不得静默混入数量。
+- `buy` / `sell` 的 principal 现金腿表示不含费用的成交价款，持仓腿表示数量；可追加
+  `role=fee|tax` 的同账户、同币种现金 `out` 腿。
+- 买入现金实际流出与成本基础增加额均为 `principal + fee + tax`；卖出现金实际流入为
+  `gross proceeds - fee - tax`，成本基础按出售数量比例减少。费用不得混入数量，卖出费用
+  总额不得超过 gross proceeds。报价估值仍使用 `quantity × price`。
 
 ## 6. Transfer / 在途 / 折损
 

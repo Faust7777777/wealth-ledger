@@ -7659,6 +7659,48 @@ mod tests {
         .await;
         assert_eq!(invalid_status, StatusCode::BAD_REQUEST, "{invalid_body}");
 
+        let invalid_fee = json!({
+            "type": "buy",
+            "occurredAt": "2026-07-15T12:00:00Z",
+            "title": "费用账户错误的买入",
+            "entries": [
+                {
+                    "accountId": account_ids[0],
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "instrumentId": "inst_semantic_fund",
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "amount": "2.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "fee"
+                }
+            ]
+        });
+        let (invalid_fee_status, invalid_fee_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            invalid_fee,
+        )
+        .await;
+        assert_eq!(
+            invalid_fee_status,
+            StatusCode::BAD_REQUEST,
+            "{invalid_fee_body}"
+        );
+
         let buy = json!({
             "type": "buy",
             "occurredAt": "2026-07-15T12:00:00Z",
@@ -7678,6 +7720,20 @@ mod tests {
                     "currency": "CNY",
                     "direction": "in",
                     "role": "destination"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "2.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "fee"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "tax"
                 }
             ]
         });
@@ -7695,6 +7751,22 @@ mod tests {
         )
         .await;
         assert_eq!(confirm_buy_status, StatusCode::OK);
+        let (_, cash_after_buy) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        assert_eq!(
+            cash_after_buy["data"]["cashBalances"][0]["amount"],
+            "897.00"
+        );
+        let (_, holdings_after_buy) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(
+            holdings_after_buy["data"][0]["costBasisTotal"]["amount"],
+            "103.00"
+        );
 
         let (correction_status, correction_body) = request_json_body_from(
             router.clone(),
@@ -7718,6 +7790,48 @@ mod tests {
             "{correction_body}"
         );
 
+        let excessive_sell_fee = json!({
+            "type": "sell",
+            "occurredAt": "2026-07-15T13:00:00Z",
+            "title": "费用超过回款的卖出",
+            "entries": [
+                {
+                    "accountId": account_ids[1],
+                    "instrumentId": "inst_semantic_fund",
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "2.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "fee"
+                }
+            ]
+        });
+        let (excessive_fee_status, excessive_fee_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            excessive_sell_fee,
+        )
+        .await;
+        assert_eq!(
+            excessive_fee_status,
+            StatusCode::BAD_REQUEST,
+            "{excessive_fee_body}"
+        );
+
         let sell = json!({
             "type": "sell",
             "occurredAt": "2026-07-15T13:00:00Z",
@@ -7737,6 +7851,20 @@ mod tests {
                     "currency": "CNY",
                     "direction": "in",
                     "role": "destination"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "fee"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "tax"
                 }
             ]
         });
@@ -7759,11 +7887,21 @@ mod tests {
             request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
         assert_eq!(
             overview["data"]["latestSnapshot"]["netWorth"]["amount"],
-            "1000.00"
+            "996.80"
+        );
+        let (_, cash_after_sell) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        assert_eq!(
+            cash_after_sell["data"]["cashBalances"][0]["amount"],
+            "935.00"
         );
         let (_, holdings) = request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
         assert_eq!(holdings["data"][0]["quantity"], "6");
-        assert_eq!(holdings["data"][0]["costBasisTotal"]["amount"], "60.00");
+        assert_eq!(holdings["data"][0]["costBasisTotal"]["amount"], "61.80");
 
         let (refresh_status, refresh_body) = request_json_body_from(
             router.clone(),
@@ -7788,13 +7926,13 @@ mod tests {
         assert_eq!(quoted_holdings["data"][0]["marketValue"]["amount"], "72.00");
         assert_eq!(
             quoted_holdings["data"][0]["unrealizedPnl"]["amount"],
-            "12.00"
+            "10.20"
         );
         let (_, quoted_overview) =
             request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
         assert_eq!(
             quoted_overview["data"]["latestSnapshot"]["netWorth"]["amount"],
-            "1012.00"
+            "1007.00"
         );
 
         let _ = std::fs::remove_file(path);

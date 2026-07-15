@@ -2041,9 +2041,12 @@ components:
         Current server mode validates accounting semantics by movement type.
         Income/dividend/interest are one in/source cash entry; expense/fee are
         one out/source cash entry; adjustment is one adjustment cash entry.
-        Buy/sell use one cash leg whose amount is total consideration and one
-        holding leg whose amount is quantity; cost basis changes from the cash
-        leg and quote valuation uses quantity times price. Loan
+        Buy/sell use one principal cash leg and one holding quantity leg, with
+        optional fee/tax cash outflow legs from the same account and currency.
+        Buy cash outflow and cost basis are principal + fee + tax; sell net
+        cash inflow is gross proceeds - fee - tax while cost basis decreases
+        in proportion to quantity sold. Quote valuation still uses quantity
+        times price. Loan
         disbursement/repayment use equal same-currency legs between liability
         and non-liability accounts. Direct correction drafts are rejected; use
         /movements/corrections.

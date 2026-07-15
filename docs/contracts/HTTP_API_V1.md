@@ -203,7 +203,14 @@ POST  /v1/movements/corrections
 - confirmed movement 的修改优先走 correction。
 - 所有分录币种必须在对应账户的 `supportedCurrencies` 中；带 `instrumentId` 的分录只允许进入 `holdings` / `mixed` 账户。
 - `income` / `dividend` / `interest` 当前为单现金分录 `in/source`；`expense` / `fee` 当前为单现金分录 `out/source`；`adjustment` 为单现金 `adjustment` 分录，方向可进可出。
-- `buy` / `sell` 恰好包含一条现金腿和一条带 `instrumentId` 的持仓腿；现金腿 `amount` 是总成本/回款，持仓腿 `amount` 是数量。买入为现金 `out/source` + 持仓 `in/destination`，卖出方向相反；买入按现金腿增加成本基础，卖出按出售数量比例减少成本基础，报价后按 `quantity × price` 估值。
+- `buy` / `sell` 必须包含一条 principal 现金腿和一条带 `instrumentId` 的数量持仓腿，
+  可额外包含 `role=fee|tax` 的现金 `out` 腿。费用腿必须与 principal 现金腿使用同一账户、
+  同一币种，不允许把费用混入持仓数量。
+- 买入 principal 为现金 `out/source`，持仓为 `in/destination`；现金减少
+  `principal + fee + tax`，同一总额增加 `costBasisTotal`。
+- 卖出持仓为 `out/source`，principal 为现金 `in/destination`；现金增加
+  `gross proceeds - fee - tax`，费用/税费总额不得超过 gross proceeds；成本基础仍按出售
+  数量比例减少。报价后按 `quantity × price` 估值。
 - `loan_disbursement` 必须从负债账户 `out/source` 到非负债账户 `in/destination`；`loan_repayment` 方向相反；两腿同币种同金额且账户不同。
 - 普通 draft 不接受 `type=correction`；更正只能通过 `/v1/movements/corrections` 创建，避免绕过原记录引用与反向分录。
 - 当前不接受含持仓腿的投资 movement 更正；在数量和成本基础的完整 replacement 语义进入契约前，明确返回 400，避免把数量差额误当金额差额。
