@@ -319,6 +319,24 @@ void main() {
       expect(_confirmButton(tester).onPressed, isNotNull);
     });
 
+    testWidgets('7b. 成本币种可修改并进入真实 HTTP body', (tester) async {
+      final h = _capturingRepo();
+      await tester.pumpWidget(_host(dcaRepo: h.repo, accounts: _accounts));
+      await tester.pumpAndSettle();
+      await _openDialog(tester);
+      await _enter(tester, '实际数量', '10');
+      await tester.tap(find.byKey(kDcaCostCurrencyFieldKey));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('USD').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('确认记录'));
+      await tester.pumpAndSettle();
+
+      final body = jsonDecode(h.requests.single.body) as Map<String, dynamic>;
+      expect(body['totalCost'], {'amount': '200.00', 'currency': 'USD'});
+      expect(body['quantity'], '10');
+    });
+
     testWidgets('8. 无可用持仓账户：引导创建、不发请求', (tester) async {
       final h = _capturingRepo();
       await tester.pumpWidget(

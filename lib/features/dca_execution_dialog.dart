@@ -10,6 +10,12 @@ import '../theme/app_dimens.dart';
 import 'subscription_form_validation.dart' show amountError;
 
 const List<String> _currencies = ['CNY', 'USD', 'HKD', 'USDT', 'BTC', 'ETH'];
+const Key kDcaCostCurrencyFieldKey = Key('dca_cost_currency_field');
+
+List<String> _currencyItems(String current) => [
+  ..._currencies,
+  if (!_currencies.contains(current)) current,
+];
 
 /// 打开成交表单；确认返回 DcaExecutionInput，取消返回 null。
 Future<DcaExecutionInput?> showDcaExecutionDialog(
@@ -43,6 +49,7 @@ class _DcaExecutionDialogState extends State<DcaExecutionDialog> {
   late final _cost = TextEditingController(
     text: widget.reminder.plannedAmount.amount,
   );
+  late String _costCurrency = widget.reminder.plannedAmount.currency;
   late String? _accountId = widget.holdingAccounts.isEmpty
       ? null
       : widget.holdingAccounts.first.id;
@@ -79,10 +86,7 @@ class _DcaExecutionDialogState extends State<DcaExecutionDialog> {
       DcaExecutionInput(
         holdingAccountId: _accountId!,
         quantity: _quantity.text.trim(),
-        totalCost: Money(
-          amount: _cost.text.trim(),
-          currency: widget.reminder.plannedAmount.currency,
-        ),
+        totalCost: Money(amount: _cost.text.trim(), currency: _costCurrency),
         quoteCurrency: _quoteCurrency,
         // executedAt 省略：由服务端取当前时间。
       ),
@@ -111,10 +115,8 @@ class _DcaExecutionDialogState extends State<DcaExecutionDialog> {
         ],
       );
     }
-    final quoteItems = [
-      ..._currencies,
-      if (!_currencies.contains(_quoteCurrency)) _quoteCurrency,
-    ];
+    final costItems = _currencyItems(_costCurrency);
+    final quoteItems = _currencyItems(_quoteCurrency);
     return AlertDialog(
       title: const Text('记录本期成交'),
       content: SizedBox(
@@ -169,12 +171,26 @@ class _DcaExecutionDialogState extends State<DcaExecutionDialog> {
                   onChanged: (_) => setState(() {}),
                   decoration: InputDecoration(
                     labelText: '实际总成本',
-                    suffixText: r.plannedAmount.currency,
                     border: const OutlineInputBorder(),
                     errorText: _cost.text.isEmpty
                         ? null
                         : amountError(_cost.text),
                   ),
+                ),
+                const SizedBox(height: AppSpacing.base),
+                DropdownButtonFormField<String>(
+                  key: kDcaCostCurrencyFieldKey,
+                  initialValue: _costCurrency,
+                  decoration: const InputDecoration(
+                    labelText: '成本币种',
+                    border: OutlineInputBorder(),
+                  ),
+                  items: [
+                    for (final c in costItems)
+                      DropdownMenuItem(value: c, child: Text(c)),
+                  ],
+                  onChanged: (value) =>
+                      setState(() => _costCurrency = value ?? _costCurrency),
                 ),
                 const SizedBox(height: AppSpacing.base),
                 DropdownButtonFormField<String>(
