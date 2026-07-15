@@ -201,6 +201,12 @@ POST  /v1/movements/corrections
 - draft / pending review 不影响正式余额。
 - `atomicGroupId` 是最小确认单位。
 - confirmed movement 的修改优先走 correction。
+- 所有分录币种必须在对应账户的 `supportedCurrencies` 中；带 `instrumentId` 的分录只允许进入 `holdings` / `mixed` 账户。
+- `income` / `dividend` / `interest` 当前为单现金分录 `in/source`；`expense` / `fee` 当前为单现金分录 `out/source`；`adjustment` 为单现金 `adjustment` 分录，方向可进可出。
+- `buy` / `sell` 恰好包含一条现金腿和一条带 `instrumentId` 的持仓腿；现金腿 `amount` 是总成本/回款，持仓腿 `amount` 是数量。买入为现金 `out/source` + 持仓 `in/destination`，卖出方向相反；买入按现金腿增加成本基础，卖出按出售数量比例减少成本基础，报价后按 `quantity × price` 估值。
+- `loan_disbursement` 必须从负债账户 `out/source` 到非负债账户 `in/destination`；`loan_repayment` 方向相反；两腿同币种同金额且账户不同。
+- 普通 draft 不接受 `type=correction`；更正只能通过 `/v1/movements/corrections` 创建，避免绕过原记录引用与反向分录。
+- 当前不接受含持仓腿的投资 movement 更正；在数量和成本基础的完整 replacement 语义进入契约前，明确返回 400，避免把数量差额误当金额差额。
 - correction 兼容单分录 `proposedDiffs`，也可提交完整 `replacementEntries` 更正多腿交易。
 - 多腿更正会在同一个 pending correction movement 中逐腿反向原分录并写入完整替换分录；确认前不影响余额，确认时整组原子应用，原 confirmed movement 永不改写。
 - `replacementEntries` 是完整目标状态而非局部 patch；无账本效果变化的 replacement 返回 400，同一原记录已有 pending correction 时返回 409。

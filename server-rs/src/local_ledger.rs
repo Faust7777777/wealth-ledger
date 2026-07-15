@@ -1133,6 +1133,21 @@ pub fn create_correction_proposal(
             )));
         }
 
+        if target
+            .get("entries")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry.get("instrumentId").is_some())
+            })
+        {
+            return Err(LedgerError::InvalidInput(vec![
+                "investment movement correction is not supported until quantity and cost-basis replacement semantics are explicit"
+                    .to_string(),
+            ]));
+        }
+
         if pending_correction_exists(document, &target_movement_id) {
             return Err(LedgerError::Conflict(format!(
                 "target movement already has a pending correction: {target_movement_id}"
@@ -1287,12 +1302,7 @@ pub fn confirm_atomic_group(
         for movement in &candidate_movements {
             match movement.get("status").and_then(Value::as_str) {
                 Some("draft" | "pending_review") => {
-                    let entries = movement
-                        .get("entries")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    apply_movement_entries(document, &entries, now)?;
+                    apply_movement_effect(document, movement, now)?;
                     confirmed_movement_ids.push(
                         movement
                             .get("id")
@@ -4793,6 +4803,9 @@ fn movement_from_create_input(
     } else if transfer_meta.is_some() {
         errors.push("transferMeta is only valid for transfer movements".to_string());
     }
+    if let (Some(movement_type), Some(entries)) = (movement_type.as_deref(), entries.as_deref()) {
+        validate_movement_semantics(document, movement_type, entries, &mut errors);
+    }
 
     if !errors.is_empty() {
         return Err(LedgerError::InvalidInput(errors));
@@ -5867,6 +5880,14 @@ fn project_holding_for_api(document: &Value, holding: &Value) -> Value {
         )
         && let (Ok(market_value), Ok(cost_basis)) =
             (parse_decimal(market_value), parse_decimal(cost_basis))
+        && projected
+            .get("marketValue")
+            .and_then(|value| value.get("currency"))
+            .and_then(Value::as_str)
+            == projected
+                .get("costBasisTotal")
+                .and_then(|value| value.get("currency"))
+                .and_then(Value::as_str)
     {
         let currency = projected
             .get("costBasisTotal")
@@ -7373,6 +7394,31 @@ fn normalized_movement_entries(
                 None
             }
         };
+        let instrument_id = optional_string(item, "instrumentId", errors);
+
+        if let (Some(account_id), Some(currency)) = (account_id.as_deref(), currency.as_deref())
+            && let Some(account) = active_account(document, account_id)
+        {
+            let supports_currency = account
+                .get("supportedCurrencies")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(currency)));
+            if !supports_currency {
+                errors.push(format!(
+                    "entries[{index}].currency is not supported by the account"
+                ));
+            }
+            if instrument_id.is_some()
+                && !matches!(
+                    account.get("balanceMode").and_then(Value::as_str),
+                    Some("holdings" | "mixed")
+                )
+            {
+                errors.push(format!(
+                    "entries[{index}] with instrumentId requires a holdings or mixed account"
+                ));
+            }
+        }
 
         if let (Some(account_id), Some(amount), Some(currency), Some(direction), Some(role)) =
             (account_id, amount, currency, direction, role)
@@ -7386,7 +7432,7 @@ fn normalized_movement_entries(
                 "role": role
             });
 
-            if let Some(instrument_id) = optional_string(item, "instrumentId", errors) {
+            if let Some(instrument_id) = instrument_id {
                 entry["instrumentId"] = json!(instrument_id);
             }
 
@@ -7608,6 +7654,231 @@ fn validate_simple_transfer(
     }
 }
 
+fn validate_movement_semantics(
+    document: &Value,
+    movement_type: &str,
+    entries: &[Value],
+    errors: &mut Vec<String>,
+) {
+    match movement_type {
+        "income" | "dividend" | "interest" => {
+            validate_single_cash_movement(movement_type, entries, "in", "source", errors);
+        }
+        "expense" | "fee" => {
+            validate_single_cash_movement(movement_type, entries, "out", "source", errors);
+        }
+        "adjustment" => {
+            if entries.len() != 1 {
+                errors.push("adjustment must contain exactly one cash entry".to_string());
+                return;
+            }
+            let entry = &entries[0];
+            if entry.get("instrumentId").is_some() {
+                errors.push("adjustment entry must not contain instrumentId".to_string());
+            }
+            if entry.get("role").and_then(Value::as_str) != Some("adjustment") {
+                errors.push("adjustment entry.role must be adjustment".to_string());
+            }
+        }
+        "buy" => validate_buy_or_sell(entries, true, errors),
+        "sell" => validate_buy_or_sell(entries, false, errors),
+        "loan_disbursement" => validate_loan_movement(document, entries, true, errors),
+        "loan_repayment" => validate_loan_movement(document, entries, false, errors),
+        "correction" => errors.push(
+            "correction drafts must be created through /v1/movements/corrections".to_string(),
+        ),
+        "transfer" => {}
+        _ => errors.push(format!(
+            "movement type is not supported by current server semantics: {movement_type}"
+        )),
+    }
+}
+
+fn validate_single_cash_movement(
+    movement_type: &str,
+    entries: &[Value],
+    expected_direction: &str,
+    expected_role: &str,
+    errors: &mut Vec<String>,
+) {
+    if entries.len() != 1 {
+        errors.push(format!(
+            "{movement_type} must contain exactly one cash entry"
+        ));
+        return;
+    }
+    let entry = &entries[0];
+    if entry.get("instrumentId").is_some() {
+        errors.push(format!(
+            "{movement_type} entry must not contain instrumentId"
+        ));
+    }
+    if entry.get("direction").and_then(Value::as_str) != Some(expected_direction) {
+        errors.push(format!(
+            "{movement_type} entry.direction must be {expected_direction}"
+        ));
+    }
+    if entry.get("role").and_then(Value::as_str) != Some(expected_role) {
+        errors.push(format!(
+            "{movement_type} entry.role must be {expected_role}"
+        ));
+    }
+}
+
+fn validate_buy_or_sell(entries: &[Value], is_buy: bool, errors: &mut Vec<String>) {
+    let movement_type = if is_buy { "buy" } else { "sell" };
+    if entries.len() != 2 {
+        errors.push(format!(
+            "{movement_type} must contain exactly one cash leg and one holding leg"
+        ));
+        return;
+    }
+
+    let source_entries = entries
+        .iter()
+        .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("source"))
+        .collect::<Vec<_>>();
+    let destination_entries = entries
+        .iter()
+        .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("destination"))
+        .collect::<Vec<_>>();
+    if source_entries.len() != 1 || destination_entries.len() != 1 {
+        errors.push(format!(
+            "{movement_type} must contain exactly one source and one destination"
+        ));
+        return;
+    }
+
+    let source = source_entries[0];
+    let destination = destination_entries[0];
+    let (cash, holding) = if is_buy {
+        (source, destination)
+    } else {
+        (destination, source)
+    };
+    if source.get("direction").and_then(Value::as_str) != Some("out") {
+        errors.push(format!(
+            "{movement_type} source entry.direction must be out"
+        ));
+    }
+    if destination.get("direction").and_then(Value::as_str) != Some("in") {
+        errors.push(format!(
+            "{movement_type} destination entry.direction must be in"
+        ));
+    }
+    if cash.get("instrumentId").is_some() {
+        errors.push(format!(
+            "{movement_type} cash leg must not contain instrumentId"
+        ));
+    }
+    if holding
+        .get("instrumentId")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        errors.push(format!(
+            "{movement_type} holding leg must contain instrumentId"
+        ));
+    }
+}
+
+fn validate_loan_movement(
+    document: &Value,
+    entries: &[Value],
+    is_disbursement: bool,
+    errors: &mut Vec<String>,
+) {
+    let movement_type = if is_disbursement {
+        "loan_disbursement"
+    } else {
+        "loan_repayment"
+    };
+    if entries.len() != 2 {
+        errors.push(format!(
+            "{movement_type} must contain exactly one source and one destination"
+        ));
+        return;
+    }
+    let source_entries = entries
+        .iter()
+        .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("source"))
+        .collect::<Vec<_>>();
+    let destination_entries = entries
+        .iter()
+        .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("destination"))
+        .collect::<Vec<_>>();
+    if source_entries.len() != 1 || destination_entries.len() != 1 {
+        errors.push(format!(
+            "{movement_type} must contain exactly one source and one destination"
+        ));
+        return;
+    }
+
+    let source = source_entries[0];
+    let destination = destination_entries[0];
+    if source.get("direction").and_then(Value::as_str) != Some("out") {
+        errors.push(format!(
+            "{movement_type} source entry.direction must be out"
+        ));
+    }
+    if destination.get("direction").and_then(Value::as_str) != Some("in") {
+        errors.push(format!(
+            "{movement_type} destination entry.direction must be in"
+        ));
+    }
+    if source.get("instrumentId").is_some() || destination.get("instrumentId").is_some() {
+        errors.push(format!(
+            "{movement_type} entries must be cash/liability entries without instrumentId"
+        ));
+    }
+    let source_account_id = source.get("accountId").and_then(Value::as_str);
+    let destination_account_id = destination.get("accountId").and_then(Value::as_str);
+    if source_account_id.is_some() && source_account_id == destination_account_id {
+        errors.push(format!(
+            "{movement_type} source and destination accounts must differ"
+        ));
+    }
+    let source_is_liability = source_account_id
+        .and_then(|account_id| active_account(document, account_id))
+        .is_some_and(is_liability_account);
+    let destination_is_liability = destination_account_id
+        .and_then(|account_id| active_account(document, account_id))
+        .is_some_and(is_liability_account);
+    if is_disbursement {
+        if !source_is_liability || destination_is_liability {
+            errors.push(
+                "loan_disbursement must flow out of a liability account into a non-liability account"
+                    .to_string(),
+            );
+        }
+    } else if source_is_liability || !destination_is_liability {
+        errors.push(
+            "loan_repayment must flow out of a non-liability account into a liability account"
+                .to_string(),
+        );
+    }
+    if source.get("currency").and_then(Value::as_str)
+        != destination.get("currency").and_then(Value::as_str)
+    {
+        errors.push(format!(
+            "current server mode supports same-currency {movement_type} movements only"
+        ));
+    }
+    let source_amount = source
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    let destination_amount = destination
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    if source_amount != destination_amount {
+        errors.push(format!(
+            "{movement_type} source and destination amounts must match"
+        ));
+    }
+}
+
 fn money_matches_entry(money: &Value, entry: &Value) -> bool {
     let money_amount = money
         .get("amount")
@@ -7695,6 +7966,24 @@ fn subscription_payment_issue(
     (!supports_currency).then_some(SubscriptionPaymentIssue::CurrencyUnsupported)
 }
 
+fn apply_movement_effect(
+    document: &mut Value,
+    movement: &Value,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let entries = movement
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["movement.entries is missing".to_string()])
+        })?;
+    match movement.get("type").and_then(Value::as_str) {
+        Some("buy") => apply_buy_or_sell_movement(document, entries, true, now),
+        Some("sell") => apply_buy_or_sell_movement(document, entries, false, now),
+        _ => apply_movement_entries(document, entries, now),
+    }
+}
+
 fn apply_movement_entries(
     document: &mut Value,
     entries: &[Value],
@@ -7738,6 +8027,74 @@ fn apply_movement_entries(
     Ok(())
 }
 
+fn apply_buy_or_sell_movement(
+    document: &mut Value,
+    entries: &[Value],
+    is_buy: bool,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let cash = entries
+        .iter()
+        .find(|entry| entry.get("instrumentId").is_none())
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["buy/sell cash leg is missing".to_string()])
+        })?;
+    let holding = entries
+        .iter()
+        .find(|entry| entry.get("instrumentId").is_some())
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["buy/sell holding leg is missing".to_string()])
+        })?;
+
+    let cash_account_id = required_entry_string(cash, "accountId")?;
+    let cash_currency = required_entry_string(cash, "currency")?;
+    let cash_amount = parse_entry_amount(cash)?;
+    let holding_account_id = required_entry_string(holding, "accountId")?;
+    let quote_currency = required_entry_string(holding, "currency")?;
+    let instrument_id = required_entry_string(holding, "instrumentId")?;
+    let quantity = parse_entry_amount(holding)?;
+
+    if is_buy {
+        apply_account_cash_delta(document, cash_account_id, cash_currency, -cash_amount, now)?;
+        apply_holding_purchase(
+            document,
+            HoldingPurchase {
+                account_id: holding_account_id,
+                instrument_id,
+                quote_currency,
+                quantity,
+                cost_amount: cash_amount,
+                cost_currency: cash_currency,
+            },
+            now,
+        )?;
+    } else {
+        apply_holding_sale(
+            document,
+            holding_account_id,
+            instrument_id,
+            quote_currency,
+            quantity,
+            now,
+        )?;
+        apply_account_cash_delta(document, cash_account_id, cash_currency, cash_amount, now)?;
+    }
+
+    Ok(())
+}
+
+fn required_entry_string<'a>(entry: &'a Value, key: &str) -> Result<&'a str, LedgerError> {
+    entry
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::InvalidInput(vec![format!("buy/sell entry.{key} is missing")]))
+}
+
+fn parse_entry_amount(entry: &Value) -> Result<DecimalAmount, LedgerError> {
+    parse_decimal(required_entry_string(entry, "amount")?)
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))
+}
+
 fn apply_account_cash_delta(
     document: &mut Value,
     account_id: &str,
@@ -7779,6 +8136,301 @@ fn apply_account_cash_delta(
         }));
     }
     account["updatedAt"] = json!(now);
+    Ok(())
+}
+
+struct HoldingPurchase<'a> {
+    account_id: &'a str,
+    instrument_id: &'a str,
+    quote_currency: &'a str,
+    quantity: DecimalAmount,
+    cost_amount: DecimalAmount,
+    cost_currency: &'a str,
+}
+
+fn apply_holding_purchase(
+    document: &mut Value,
+    purchase: HoldingPurchase<'_>,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let HoldingPurchase {
+        account_id,
+        instrument_id,
+        quote_currency,
+        quantity,
+        cost_amount,
+        cost_currency,
+    } = purchase;
+    if !active_account_exists(document, account_id) {
+        return Err(LedgerError::NotFound(format!(
+            "account does not exist or is archived: {account_id}"
+        )));
+    }
+    ensure_matching_instrument(document, instrument_id, quote_currency)?;
+
+    let existing_index = document["holdings"]
+        .as_array()
+        .expect("validated local ledger holdings should be an array")
+        .iter()
+        .position(|holding| {
+            holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                && holding.get("instrumentId").and_then(Value::as_str) == Some(instrument_id)
+        });
+
+    if let Some(index) = existing_index {
+        let existing = document["holdings"][index].clone();
+        let current_quantity = parse_decimal(
+            existing
+                .get("quantity")
+                .and_then(Value::as_str)
+                .expect("holding quantity should be a string"),
+        )
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+        let next_quantity = current_quantity + quantity;
+
+        let next_cost_basis = add_purchase_value(
+            document,
+            existing.get("costBasisTotal"),
+            current_quantity,
+            cost_amount,
+            cost_currency,
+            now,
+            "holding cost basis",
+        )?;
+        let next_market_value = add_purchase_value(
+            document,
+            existing.get("marketValue"),
+            current_quantity,
+            cost_amount,
+            cost_currency,
+            now,
+            "holding fallback market value",
+        )?;
+
+        let holding = document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .get_mut(index)
+            .expect("holding index should remain valid");
+        holding["quantity"] = json!(next_quantity.decimal_string());
+        if let Some((amount, currency)) = next_cost_basis {
+            holding["costBasisTotal"] = money(amount, &currency);
+        }
+        if let Some((amount, currency)) = next_market_value {
+            holding["marketValue"] = json!({
+                "amount": money_amount(amount),
+                "currency": currency,
+                "asOf": now,
+                "quality": "estimated"
+            });
+        }
+        holding["quoteStatus"] = json!("stale");
+        holding["asOf"] = json!(now);
+        if let Some(object) = holding.as_object_mut() {
+            object.remove("unrealizedPnl");
+            object.remove("unrealizedPnlRate");
+        }
+    } else {
+        document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .push(json!({
+                "id": stable_holding_id(account_id, instrument_id),
+                "accountId": account_id,
+                "instrumentId": instrument_id,
+                "quantity": quantity.decimal_string(),
+                "costBasisTotal": money(cost_amount, cost_currency),
+                "marketValue": {
+                    "amount": money_amount(cost_amount),
+                    "currency": cost_currency,
+                    "asOf": now,
+                    "quality": "estimated"
+                },
+                "quoteStatus": "stale",
+                "asOf": now,
+                "note": "Cost fallback until a quote is available"
+            }));
+    }
+
+    Ok(())
+}
+
+fn add_purchase_value(
+    document: &Value,
+    existing: Option<&Value>,
+    current_quantity: DecimalAmount,
+    purchase_amount: DecimalAmount,
+    purchase_currency: &str,
+    now: &str,
+    label: &str,
+) -> Result<Option<(DecimalAmount, String)>, LedgerError> {
+    let Some(existing) = existing else {
+        return if current_quantity == DecimalAmount::ZERO {
+            Ok(Some((purchase_amount, purchase_currency.to_string())))
+        } else {
+            Ok(None)
+        };
+    };
+    let existing_amount = parse_decimal(
+        existing
+            .get("amount")
+            .and_then(Value::as_str)
+            .ok_or_else(|| LedgerError::InvalidInput(vec![format!("{label}.amount is missing")]))?,
+    )
+    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    let existing_currency = existing
+        .get("currency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::InvalidInput(vec![format!("{label}.currency is missing")]))?;
+    let converted_purchase = convert_amount(
+        document,
+        purchase_amount,
+        purchase_currency,
+        existing_currency,
+        now,
+    )
+    .map(|(amount, _)| amount)
+    .ok_or_else(|| {
+        LedgerError::Conflict(format!(
+            "cannot combine {label} across {purchase_currency} and {existing_currency} without an FX rate"
+        ))
+    })?;
+    Ok(Some((
+        existing_amount + converted_purchase,
+        existing_currency.to_string(),
+    )))
+}
+
+fn apply_holding_sale(
+    document: &mut Value,
+    account_id: &str,
+    instrument_id: &str,
+    quote_currency: &str,
+    quantity: DecimalAmount,
+    now: &str,
+) -> Result<(), LedgerError> {
+    if !active_account_exists(document, account_id) {
+        return Err(LedgerError::NotFound(format!(
+            "account does not exist or is archived: {account_id}"
+        )));
+    }
+    ensure_matching_instrument(document, instrument_id, quote_currency)?;
+    let index = document["holdings"]
+        .as_array()
+        .expect("validated local ledger holdings should be an array")
+        .iter()
+        .position(|holding| {
+            holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                && holding.get("instrumentId").and_then(Value::as_str) == Some(instrument_id)
+        })
+        .ok_or_else(|| {
+            LedgerError::Conflict(format!(
+                "holding does not exist for sell/out entry: {instrument_id}"
+            ))
+        })?;
+    let existing = document["holdings"][index].clone();
+    let current_quantity = parse_decimal(
+        existing
+            .get("quantity")
+            .and_then(Value::as_str)
+            .expect("holding quantity should be a string"),
+    )
+    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    let next_quantity = current_quantity - quantity;
+    if next_quantity < DecimalAmount::ZERO {
+        return Err(LedgerError::Conflict(format!(
+            "holding quantity cannot become negative: {instrument_id}"
+        )));
+    }
+    let next_cost_basis = proportional_remaining_value(
+        existing.get("costBasisTotal"),
+        current_quantity,
+        next_quantity,
+        "holding cost basis",
+    )?;
+    let next_market_value = proportional_remaining_value(
+        existing.get("marketValue"),
+        current_quantity,
+        next_quantity,
+        "holding fallback market value",
+    )?;
+
+    let holding = document["holdings"]
+        .as_array_mut()
+        .expect("validated local ledger holdings should be an array")
+        .get_mut(index)
+        .expect("holding index should remain valid");
+    holding["quantity"] = json!(next_quantity.decimal_string());
+    if let Some((amount, currency)) = next_cost_basis {
+        holding["costBasisTotal"] = money(amount, &currency);
+    }
+    if let Some((amount, currency)) = next_market_value {
+        holding["marketValue"] = json!({
+            "amount": money_amount(amount),
+            "currency": currency,
+            "asOf": now,
+            "quality": "estimated"
+        });
+    }
+    holding["quoteStatus"] = json!("stale");
+    holding["asOf"] = json!(now);
+    if let Some(object) = holding.as_object_mut() {
+        object.remove("unrealizedPnl");
+        object.remove("unrealizedPnlRate");
+    }
+    Ok(())
+}
+
+fn proportional_remaining_value(
+    value: Option<&Value>,
+    current_quantity: DecimalAmount,
+    remaining_quantity: DecimalAmount,
+    label: &str,
+) -> Result<Option<(DecimalAmount, String)>, LedgerError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if current_quantity <= DecimalAmount::ZERO {
+        return Err(LedgerError::Conflict(format!(
+            "cannot reduce {label} from a non-positive holding quantity"
+        )));
+    }
+    let current_amount =
+        parse_decimal(value.get("amount").and_then(Value::as_str).ok_or_else(|| {
+            LedgerError::InvalidInput(vec![format!("{label}.amount is missing")])
+        })?)
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    let currency = value
+        .get("currency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::InvalidInput(vec![format!("{label}.currency is missing")]))?;
+    let remaining_amount = divide_decimal(
+        multiply_decimal(current_amount, remaining_quantity),
+        current_quantity,
+    )
+    .ok_or_else(|| LedgerError::Conflict(format!("cannot calculate remaining {label}")))?;
+    Ok(Some((remaining_amount, currency.to_string())))
+}
+
+fn ensure_matching_instrument(
+    document: &mut Value,
+    instrument_id: &str,
+    quote_currency: &str,
+) -> Result<(), LedgerError> {
+    if let Some(instrument) = document["instruments"]
+        .as_array()
+        .expect("validated local ledger instruments should be an array")
+        .iter()
+        .find(|instrument| instrument.get("id").and_then(Value::as_str) == Some(instrument_id))
+    {
+        if instrument.get("quoteCurrency").and_then(Value::as_str) != Some(quote_currency) {
+            return Err(LedgerError::Conflict(format!(
+                "instrument quote currency does not match holding entry: {instrument_id}"
+            )));
+        }
+    } else {
+        ensure_instrument(document, instrument_id, quote_currency);
+    }
     Ok(())
 }
 
@@ -8825,8 +9477,8 @@ fn confirm_ai_movement_atomic_group(
             )));
         }
 
-        let entries = required_movement_entries(&proposed)?;
-        apply_movement_entries(document, &entries, now)?;
+        required_movement_entries(&proposed)?;
+        apply_movement_effect(document, &proposed, now)?;
 
         let mut movement = proposed.clone();
         movement["atomicGroupId"] = json!(atomic_group_id);

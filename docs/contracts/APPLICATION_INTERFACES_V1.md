@@ -153,6 +153,11 @@ ConfirmResult {
 - 当前 server mode 的 `transfer` 只接受两个不同账户间的同币种同金额分录；来源必须
   `out/source`、目标必须 `in/destination`；若提供 `transferMeta`，其中的账户与金额
   必须一致。
+- 当前 server mode 同时校验 movement 类型语义：收入类为单现金 `in/source`，支出类
+  为单现金 `out/source`，余额校准为单 `adjustment` 分录；买卖由总成本/回款现金腿与
+  数量持仓腿组成；贷款放款/还款必须在负债账户与非负债账户之间同额流转。
+- 每条分录币种必须由账户支持；持仓腿只能进入 `holdings` / `mixed` 账户。普通 draft
+  不得直接声明 `correction`，必须走 `createCorrection`。
 
 ## 5. DcaService
 

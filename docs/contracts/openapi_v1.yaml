@@ -2031,10 +2031,33 @@ components:
             $ref: "#/components/schemas/Movement"
     CreateMovementDraftInput:
       type: object
+      description: >-
+        Current server mode validates accounting semantics by movement type.
+        Income/dividend/interest are one in/source cash entry; expense/fee are
+        one out/source cash entry; adjustment is one adjustment cash entry.
+        Buy/sell use one cash leg whose amount is total consideration and one
+        holding leg whose amount is quantity; cost basis changes from the cash
+        leg and quote valuation uses quantity times price. Loan
+        disbursement/repayment use equal same-currency legs between liability
+        and non-liability accounts. Direct correction drafts are rejected; use
+        /movements/corrections.
       required: [type, occurredAt, title, entries]
       properties:
         type:
           type: string
+          enum:
+            - income
+            - expense
+            - transfer
+            - buy
+            - sell
+            - dividend
+            - interest
+            - fee
+            - adjustment
+            - loan_disbursement
+            - loan_repayment
+            - correction
         occurredAt:
           $ref: "#/components/schemas/ISODateTime"
         title:
@@ -2042,7 +2065,7 @@ components:
         entries:
           type: array
           items:
-            $ref: "#/components/schemas/MovementEntry"
+            $ref: "#/components/schemas/MovementEntryInput"
         categoryId:
           $ref: "#/components/schemas/ID"
         counterpartyId:

@@ -7457,6 +7457,492 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ledger_rejects_directionally_invalid_or_unsupported_cash_movements() {
+        let path = unique_test_ledger_path("movement_semantics");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "语义校验账户",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "CNY", "amount": "100.00"}]
+            }),
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id should be a string");
+
+        let invalid_inputs = [
+            json!({
+                "type": "income",
+                "occurredAt": "2026-07-15T12:00:00Z",
+                "title": "反向收入",
+                "entries": [{
+                    "accountId": account_id,
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }]
+            }),
+            json!({
+                "type": "expense",
+                "occurredAt": "2026-07-15T12:00:00Z",
+                "title": "反向支出",
+                "entries": [{
+                    "accountId": account_id,
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "source"
+                }]
+            }),
+            json!({
+                "type": "adjustment",
+                "occurredAt": "2026-07-15T12:00:00Z",
+                "title": "错误校准角色",
+                "entries": [{
+                    "accountId": account_id,
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "source"
+                }]
+            }),
+            json!({
+                "type": "income",
+                "occurredAt": "2026-07-15T12:00:00Z",
+                "title": "账户不支持的币种",
+                "entries": [{
+                    "accountId": account_id,
+                    "amount": "10.00",
+                    "currency": "USD",
+                    "direction": "in",
+                    "role": "source"
+                }]
+            }),
+            json!({
+                "type": "correction",
+                "occurredAt": "2026-07-15T12:00:00Z",
+                "title": "绕过更正入口",
+                "entries": [{
+                    "accountId": account_id,
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "adjustment"
+                }]
+            }),
+        ];
+
+        for input in invalid_inputs {
+            let (status, body) =
+                request_json_body_from(router.clone(), Method::POST, "/v1/movements/drafts", input)
+                    .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["code"], "invalid_movement_draft_input");
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_buy_and_sell_require_conserved_cash_and_holding_legs() {
+        let path = unique_test_ledger_path("buy_sell_semantics");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let mut account_ids = Vec::new();
+        for (display_name, account_type, balance_mode, amount) in [
+            ("买卖资金账户", "bank", "cash_balance", "1000.00"),
+            ("买卖证券账户", "brokerage", "holdings", "0.00"),
+        ] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/accounts",
+                json!({
+                    "displayName": display_name,
+                    "accountType": account_type,
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": balance_mode,
+                    "openingBalances": [{"currency": "CNY", "amount": amount}]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            account_ids.push(
+                body["data"]["id"]
+                    .as_str()
+                    .expect("account id should be a string")
+                    .to_string(),
+            );
+        }
+
+        let invalid_buy = json!({
+            "type": "buy",
+            "occurredAt": "2026-07-15T12:00:00Z",
+            "title": "缺少持仓标识的买入",
+            "entries": [
+                {
+                    "accountId": account_ids[0],
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        let (invalid_status, invalid_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            invalid_buy,
+        )
+        .await;
+        assert_eq!(invalid_status, StatusCode::BAD_REQUEST, "{invalid_body}");
+
+        let buy = json!({
+            "type": "buy",
+            "occurredAt": "2026-07-15T12:00:00Z",
+            "title": "守恒买入",
+            "entries": [
+                {
+                    "accountId": account_ids[0],
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "instrumentId": "inst_semantic_fund",
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        let (buy_status, buy_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/movements/drafts", buy).await;
+        assert_eq!(buy_status, StatusCode::CREATED, "{buy_body}");
+        let buy_id = buy_body["data"]["id"].as_str().expect("buy movement id");
+        let buy_group = buy_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("buy atomic group id");
+        let (confirm_buy_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{buy_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_buy_status, StatusCode::OK);
+
+        let (correction_status, correction_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": buy_id,
+                "reason": "投资成本更正尚未定义",
+                "proposedDiffs": [{
+                    "fieldPath": "entries[0].amount",
+                    "oldValue": "100.00",
+                    "newValue": "90.00",
+                    "severity": "danger"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            correction_status,
+            StatusCode::BAD_REQUEST,
+            "{correction_body}"
+        );
+
+        let sell = json!({
+            "type": "sell",
+            "occurredAt": "2026-07-15T13:00:00Z",
+            "title": "守恒卖出",
+            "entries": [
+                {
+                    "accountId": account_ids[1],
+                    "instrumentId": "inst_semantic_fund",
+                    "amount": "4.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "40.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        let (sell_status, sell_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/movements/drafts", sell)
+                .await;
+        assert_eq!(sell_status, StatusCode::CREATED, "{sell_body}");
+        let sell_group = sell_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("sell atomic group id");
+        let (confirm_sell_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{sell_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_sell_status, StatusCode::OK);
+
+        let (_, overview) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(
+            overview["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "1000.00"
+        );
+        let (_, holdings) = request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(holdings["data"][0]["quantity"], "6");
+        assert_eq!(holdings["data"][0]["costBasisTotal"]["amount"], "60.00");
+
+        let (refresh_status, refresh_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "quotes": [{
+                    "instrumentId": "inst_semantic_fund",
+                    "price": "12.00",
+                    "currency": "CNY",
+                    "asOf": "2026-07-15T14:00:00Z",
+                    "expiresAt": "2099-01-01T00:00:00Z",
+                    "source": "test"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::OK, "{refresh_body}");
+        let (_, quoted_holdings) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(quoted_holdings["data"][0]["marketValue"]["amount"], "72.00");
+        assert_eq!(
+            quoted_holdings["data"][0]["unrealizedPnl"]["amount"],
+            "12.00"
+        );
+        let (_, quoted_overview) =
+            request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(
+            quoted_overview["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "1012.00"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_loan_disbursement_and_repayment_preserve_accounting_identity() {
+        let path = unique_test_ledger_path("loan_semantics");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let mut account_ids = Vec::new();
+        for (display_name, account_type, balance_mode) in [
+            ("放款银行卡", "bank", "cash_balance"),
+            ("测试贷款", "loan", "liability"),
+        ] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/accounts",
+                json!({
+                    "displayName": display_name,
+                    "accountType": account_type,
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": balance_mode,
+                    "openingBalances": [{"currency": "CNY", "amount": "0.00"}]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            account_ids.push(
+                body["data"]["id"]
+                    .as_str()
+                    .expect("account id should be a string")
+                    .to_string(),
+            );
+        }
+
+        let invalid_disbursement = json!({
+            "type": "loan_disbursement",
+            "occurredAt": "2026-07-15T12:00:00Z",
+            "title": "反向贷款放款",
+            "entries": [
+                {
+                    "accountId": account_ids[0],
+                    "amount": "500.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "amount": "500.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        let (invalid_status, invalid_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            invalid_disbursement,
+        )
+        .await;
+        assert_eq!(invalid_status, StatusCode::BAD_REQUEST, "{invalid_body}");
+
+        let disbursement = json!({
+            "type": "loan_disbursement",
+            "occurredAt": "2026-07-15T12:00:00Z",
+            "title": "贷款放款",
+            "entries": [
+                {
+                    "accountId": account_ids[1],
+                    "amount": "500.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "500.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        let (disbursement_status, disbursement_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            disbursement,
+        )
+        .await;
+        assert_eq!(
+            disbursement_status,
+            StatusCode::CREATED,
+            "{disbursement_body}"
+        );
+        let disbursement_group = disbursement_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("disbursement atomic group id");
+        let (confirm_disbursement_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{disbursement_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_disbursement_status, StatusCode::OK);
+
+        let repayment = json!({
+            "type": "loan_repayment",
+            "occurredAt": "2026-07-15T13:00:00Z",
+            "title": "贷款还款",
+            "entries": [
+                {
+                    "accountId": account_ids[0],
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        let (repayment_status, repayment_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            repayment,
+        )
+        .await;
+        assert_eq!(repayment_status, StatusCode::CREATED, "{repayment_body}");
+        let repayment_group = repayment_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("repayment atomic group id");
+        let (confirm_repayment_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{repayment_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_repayment_status, StatusCode::OK);
+
+        let (_, bank) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        let (_, loan) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[1]),
+        )
+        .await;
+        let (_, overview) = request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(bank["data"]["cashBalances"][0]["amount"], "400.00");
+        assert_eq!(loan["data"]["cashBalances"][0]["amount"], "-400.00");
+        assert_eq!(
+            overview["data"]["latestSnapshot"]["grossAssets"]["amount"],
+            "400.00"
+        );
+        assert_eq!(
+            overview["data"]["latestSnapshot"]["totalLiabilities"]["amount"],
+            "400.00"
+        );
+        assert_eq!(
+            overview["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "0.00"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_credit_card_purchase_and_repayment_preserve_accounting_identity() {
         let path = unique_test_ledger_path("credit_card_repayment");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
@@ -7899,12 +8385,12 @@ mod tests {
         let cash_input = json!({
             "displayName": "现金账户",
             "accountType": "bank",
-            "defaultCurrency": "CNY",
-            "supportedCurrencies": ["CNY"],
+            "defaultCurrency": "USD",
+            "supportedCurrencies": ["USD"],
             "includeInNetWorth": true,
             "balanceMode": "cash_balance",
             "openingBalances": [
-                {"currency": "CNY", "amount": "1000.00"}
+                {"currency": "USD", "amount": "100.00"}
             ]
         });
         let (_, cash_body) =
@@ -7938,8 +8424,8 @@ mod tests {
             "entries": [
                 {
                     "accountId": cash_account_id,
-                    "amount": "100.00",
-                    "currency": "CNY",
+                    "amount": "10.00",
+                    "currency": "USD",
                     "direction": "out",
                     "role": "source"
                 },

@@ -161,6 +161,8 @@ Holding {
 - MVP 收益率口径：
   - `unrealizedPnl = marketValue - costBasisTotal`
   - `unrealizedPnlRate = unrealizedPnl / costBasisTotal`
+- 只有 `marketValue` 与 `costBasisTotal` 币种一致时才计算未实现盈亏；缺少历史成交 FX 时
+  不使用不同币种的裸数字相减，也不伪造换算后的成本。
 - 时间加权收益、区间收益、现金流归因暂缓。
 
 ## 4. LiabilityTerms
@@ -269,6 +271,11 @@ MovementEntry {
 - `pending_review` / `draft` 不影响正式余额和净值。
 - subscription 扣费候选必须同时带 `subscriptionId` 与 `scheduledChargeDate`，并与 subscription 上的 pending 指针双向一致。
 - 已确认记录原则上不原地改写；更正优先通过 `correction` 事件表达。
+- 当前 server mode 不把 `MovementType` 仅当展示标签：收入类、支出类、余额校准、买卖、
+  贷款放款/还款均有固定分录方向和角色约束；不符合类型语义的 draft 在写入前返回 400。
+- `buy` / `sell` 的现金腿 `amount` 表示总成本/回款，持仓腿 `amount` 表示数量；买入按
+  现金成本累计 `costBasisTotal`，卖出按数量比例减少成本基础，报价估值使用
+  `quantity × price`。费用/税费的多腿成本归属仍需单独扩展，不得静默混入数量。
 
 ## 6. Transfer / 在途 / 折损
 
