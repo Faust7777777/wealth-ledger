@@ -149,6 +149,21 @@ DataSourceMode =
 
 AI pending 读取层把 standalone pending movements 按 `atomicGroupId` 分组，动态生成 `proposal_movement_{movementId}` 形式的 proposal 投影；列表、详情和 overview pending count 都包含该投影。确认/拒绝仍直接消费原 movement atomic group；投影不可编辑，处理完成后自然消失。
 
+## 3B. DCA 计划与提醒完整性
+
+`dcaPlans` 与 `dcaReminders` 是提醒排期和真实成交候选的来源，不是券商订单。
+
+- plan/reminder ID 各自唯一；reminder 的 `planId` 必须引用现有 plan。
+- `plannedAmount` 必须是正 decimal string，`nextDueDate` / `dueDate` 必须是 ISO date。
+- plan 的 frequency/status 与 reminder status 必须属于契约枚举。
+- `fundingAccountId` 存在时必须引用账本账户；是否归档和币种能力在生成成交候选时再次检查。
+- 同一 plan 最多有一个 `due|overdue|snoozed` 的开放 reminder；开放 reminder 的名称、计划金额和日期必须与 plan 同步。
+- snoozed reminder 必须带 RFC3339 `snoozedUntil`，其他状态不得残留该字段。
+- 带 `tags=["dca"]` 且 `source.kind=system` 的 movement 必须通过 `source.sourceId` 引用现有 reminder。
+- 同一 reminder 最多一个 `pending_review` DCA movement；`recorded` reminder 必须且只能关联一个 confirmed DCA movement。
+
+这些不变量在启动读取、备份验证和每次原子写盘前统一校验；违反时 fail closed，不自动删除或修补用户数据。
+
 ## 4. 写入原则
 
 正式账本写入必须满足：

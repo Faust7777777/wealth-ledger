@@ -1551,6 +1551,11 @@ pub fn snooze_dca_reminder(
         };
         let mut errors = Vec::new();
         let until = required_string(object, "until", &mut errors);
+        if let Some(until) = until.as_deref()
+            && parse_rfc3339(until).is_none()
+        {
+            errors.push("until must be an RFC3339 timestamp".to_string());
+        }
         if !errors.is_empty() {
             return Err(LedgerError::InvalidInput(errors));
         }
@@ -3022,6 +3027,7 @@ fn validate_document_for_version(
 
     validate_accounts(object.get("accounts"), &mut errors);
     validate_core_ledger_entities(document, &mut errors);
+    validate_dca_entities(document, &mut errors);
     validate_subscriptions(
         object.get("subscriptions"),
         object.get("accounts"),
@@ -3033,6 +3039,307 @@ fn validate_document_for_version(
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+fn validate_dca_entities(document: &Value, errors: &mut Vec<String>) {
+    let Some(plans) = document.get("dcaPlans").and_then(Value::as_array) else {
+        return;
+    };
+    let Some(reminders) = document.get("dcaReminders").and_then(Value::as_array) else {
+        return;
+    };
+
+    let account_ids = document["accounts"]
+        .as_array()
+        .map(|accounts| {
+            accounts
+                .iter()
+                .filter_map(|account| account.get("id").and_then(Value::as_str))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut plan_ids = BTreeSet::new();
+    let mut plan_index = BTreeMap::new();
+
+    for (index, plan) in plans.iter().enumerate() {
+        let Some(plan) = plan.as_object() else {
+            errors.push(format!("dcaPlans[{index}] must be an object"));
+            continue;
+        };
+        let id = plan.get("id").and_then(Value::as_str);
+        match id {
+            Some(id) if !id.is_empty() => {
+                if !plan_ids.insert(id) {
+                    errors.push(format!("duplicate DCA plan id: {id}"));
+                }
+                plan_index.entry(id).or_insert(plan);
+            }
+            _ => errors.push(format!("dcaPlans[{index}].id must be a non-empty string")),
+        }
+        for key in ["displayName", "targetInstrumentId"] {
+            if plan
+                .get(key)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                errors.push(format!(
+                    "dcaPlans[{index}].{key} must be a non-empty string"
+                ));
+            }
+        }
+        if let Some(funding_account_id) = plan.get("fundingAccountId") {
+            match funding_account_id.as_str() {
+                Some(id) if account_ids.contains(id) => {}
+                _ => errors.push(format!(
+                    "dcaPlans[{index}].fundingAccountId must reference an existing account"
+                )),
+            }
+        }
+        validate_positive_money(
+            plan.get("plannedAmount"),
+            &format!("dcaPlans[{index}].plannedAmount"),
+            errors,
+        );
+        if !matches!(
+            plan.get("frequency").and_then(Value::as_str),
+            Some("weekly" | "monthly" | "custom")
+        ) {
+            errors.push(format!("dcaPlans[{index}].frequency is invalid"));
+        }
+        if plan
+            .get("nextDueDate")
+            .and_then(Value::as_str)
+            .is_none_or(|value| Date::parse(value, &Iso8601::DATE).is_err())
+        {
+            errors.push(format!("dcaPlans[{index}].nextDueDate must be an ISO date"));
+        }
+        if !matches!(
+            plan.get("reminderStatus").and_then(Value::as_str),
+            Some("active" | "snoozed" | "paused" | "completed")
+        ) {
+            errors.push(format!("dcaPlans[{index}].reminderStatus is invalid"));
+        }
+        validate_optional_timestamp(
+            plan.get("lastActionAt"),
+            &format!("dcaPlans[{index}].lastActionAt"),
+            errors,
+        );
+        validate_optional_timestamp(
+            plan.get("createdAt"),
+            &format!("dcaPlans[{index}].createdAt"),
+            errors,
+        );
+        validate_optional_timestamp(
+            plan.get("updatedAt"),
+            &format!("dcaPlans[{index}].updatedAt"),
+            errors,
+        );
+        if plan.contains_key("note") && !plan.get("note").is_some_and(Value::is_string) {
+            errors.push(format!("dcaPlans[{index}].note must be a string"));
+        }
+    }
+
+    let mut reminder_ids = BTreeSet::new();
+    let mut open_by_plan = BTreeMap::<&str, usize>::new();
+    let mut reminder_index = BTreeMap::new();
+    for (index, reminder) in reminders.iter().enumerate() {
+        let Some(reminder) = reminder.as_object() else {
+            errors.push(format!("dcaReminders[{index}] must be an object"));
+            continue;
+        };
+        let id = reminder.get("id").and_then(Value::as_str);
+        match id {
+            Some(id) if !id.is_empty() => {
+                if !reminder_ids.insert(id) {
+                    errors.push(format!("duplicate DCA reminder id: {id}"));
+                }
+                reminder_index.entry(id).or_insert(reminder);
+            }
+            _ => errors.push(format!(
+                "dcaReminders[{index}].id must be a non-empty string"
+            )),
+        }
+        let plan_id = reminder.get("planId").and_then(Value::as_str);
+        let plan = match plan_id {
+            Some(plan_id) => match plan_index.get(plan_id) {
+                Some(plan) => Some(*plan),
+                None => {
+                    errors.push(format!(
+                        "dcaReminders[{index}].planId must reference an existing DCA plan"
+                    ));
+                    None
+                }
+            },
+            None => {
+                errors.push(format!(
+                    "dcaReminders[{index}].planId must be a non-empty string"
+                ));
+                None
+            }
+        };
+        if reminder
+            .get("displayName")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!(
+                "dcaReminders[{index}].displayName must be a non-empty string"
+            ));
+        }
+        validate_positive_money(
+            reminder.get("plannedAmount"),
+            &format!("dcaReminders[{index}].plannedAmount"),
+            errors,
+        );
+        if reminder
+            .get("dueDate")
+            .and_then(Value::as_str)
+            .is_none_or(|value| Date::parse(value, &Iso8601::DATE).is_err())
+        {
+            errors.push(format!("dcaReminders[{index}].dueDate must be an ISO date"));
+        }
+        let status = reminder.get("status").and_then(Value::as_str);
+        if !matches!(
+            status,
+            Some("due" | "overdue" | "snoozed" | "recorded" | "skipped")
+        ) {
+            errors.push(format!("dcaReminders[{index}].status is invalid"));
+        }
+        if status == Some("snoozed") {
+            if reminder
+                .get("snoozedUntil")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339)
+                .is_none()
+            {
+                errors.push(format!(
+                    "dcaReminders[{index}].snoozedUntil must be an RFC3339 timestamp when snoozed"
+                ));
+            }
+        } else if reminder.contains_key("snoozedUntil") {
+            errors.push(format!(
+                "dcaReminders[{index}].snoozedUntil is only valid for snoozed reminders"
+            ));
+        }
+        validate_optional_timestamp(
+            reminder.get("updatedAt"),
+            &format!("dcaReminders[{index}].updatedAt"),
+            errors,
+        );
+
+        if matches!(status, Some("due" | "overdue" | "snoozed"))
+            && let Some(plan_id) = plan_id
+        {
+            let count = open_by_plan.entry(plan_id).or_default();
+            *count += 1;
+            if *count > 1 {
+                errors.push(format!(
+                    "DCA plan has more than one open reminder: {plan_id}"
+                ));
+            }
+            if let Some(plan) = plan {
+                for (reminder_key, plan_key) in [
+                    ("displayName", "displayName"),
+                    ("plannedAmount", "plannedAmount"),
+                    ("dueDate", "nextDueDate"),
+                ] {
+                    if reminder.get(reminder_key) != plan.get(plan_key) {
+                        errors.push(format!(
+                            "dcaReminders[{index}].{reminder_key} must match its open DCA plan"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut pending_counts = BTreeMap::<&str, usize>::new();
+    let mut confirmed_counts = BTreeMap::<&str, usize>::new();
+    if let Some(movements) = document.get("movements").and_then(Value::as_array) {
+        for (index, movement) in movements.iter().enumerate() {
+            let is_dca = movement
+                .get("tags")
+                .and_then(Value::as_array)
+                .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some("dca")))
+                && movement
+                    .get("source")
+                    .and_then(|source| source.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("system");
+            if !is_dca {
+                continue;
+            }
+            let Some(reminder_id) = movement
+                .get("source")
+                .and_then(|source| source.get("sourceId"))
+                .and_then(Value::as_str)
+            else {
+                errors.push(format!(
+                    "movements[{index}] DCA source.sourceId must reference a reminder"
+                ));
+                continue;
+            };
+            if !reminder_index.contains_key(reminder_id) {
+                errors.push(format!(
+                    "movements[{index}] DCA source.sourceId must reference an existing reminder"
+                ));
+                continue;
+            }
+            match movement.get("status").and_then(Value::as_str) {
+                Some("pending_review") => *pending_counts.entry(reminder_id).or_default() += 1,
+                Some("confirmed") => *confirmed_counts.entry(reminder_id).or_default() += 1,
+                _ => {}
+            }
+        }
+    }
+    for (reminder_id, count) in pending_counts {
+        if count > 1 {
+            errors.push(format!(
+                "DCA reminder has more than one pending proposal: {reminder_id}"
+            ));
+        }
+    }
+    for (reminder_id, reminder) in reminder_index {
+        let confirmed = confirmed_counts.get(reminder_id).copied().unwrap_or(0);
+        if reminder.get("status").and_then(Value::as_str) == Some("recorded") && confirmed != 1 {
+            errors.push(format!(
+                "recorded DCA reminder must reference exactly one confirmed movement: {reminder_id}"
+            ));
+        }
+    }
+}
+
+fn validate_positive_money(value: Option<&Value>, label: &str, errors: &mut Vec<String>) {
+    let Some(value) = value else {
+        errors.push(format!("{label} is required"));
+        return;
+    };
+    let Some(object) = value.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    if object
+        .get("amount")
+        .and_then(Value::as_str)
+        .is_none_or(|amount| !is_positive_decimal_string(amount))
+    {
+        errors.push(format!("{label}.amount must be a positive decimal string"));
+    }
+    if object
+        .get("currency")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        errors.push(format!("{label}.currency must be a non-empty string"));
+    }
+}
+
+fn validate_optional_timestamp(value: Option<&Value>, label: &str, errors: &mut Vec<String>) {
+    match value {
+        None | Some(Value::Null) => {}
+        Some(Value::String(value)) if parse_rfc3339(value).is_some() => {}
+        _ => errors.push(format!("{label} must be an RFC3339 timestamp")),
     }
 }
 
@@ -5681,6 +5988,14 @@ fn dca_plan_from_create_input(
     }
     let planned_amount =
         normalized_required_money(object.get("plannedAmount"), "plannedAmount", &mut errors);
+    if let Some(amount) = planned_amount
+        .as_ref()
+        .and_then(|money| money.get("amount"))
+        .and_then(Value::as_str)
+        && !is_positive_decimal_string(amount)
+    {
+        errors.push("plannedAmount.amount must be a positive decimal string".to_string());
+    }
     let frequency = required_enum(
         object,
         "frequency",
@@ -5688,6 +6003,11 @@ fn dca_plan_from_create_input(
         &mut errors,
     );
     let next_due_date = required_string(object, "nextDueDate", &mut errors);
+    if let Some(next_due_date) = next_due_date.as_deref()
+        && Date::parse(next_due_date, &Iso8601::DATE).is_err()
+    {
+        errors.push("nextDueDate must be an ISO date".to_string());
+    }
     let note = optional_string(object, "note", &mut errors);
 
     if !errors.is_empty() {
@@ -5763,7 +6083,15 @@ fn apply_dca_plan_patch(plan: &mut Value, patch: &Value, now: &str) -> Result<()
         && let Some(planned_amount) =
             normalized_required_money(Some(value), "plannedAmount", &mut errors)
     {
-        plan["plannedAmount"] = planned_amount;
+        if planned_amount
+            .get("amount")
+            .and_then(Value::as_str)
+            .is_some_and(is_positive_decimal_string)
+        {
+            plan["plannedAmount"] = planned_amount;
+        } else {
+            errors.push("plannedAmount.amount must be a positive decimal string".to_string());
+        }
     }
 
     if let Some(value) = object.get("frequency") {
@@ -5774,7 +6102,10 @@ fn apply_dca_plan_patch(plan: &mut Value, patch: &Value, now: &str) -> Result<()
     }
 
     if let Some(value) = object.get("nextDueDate") {
-        match value.as_str().filter(|value| !value.trim().is_empty()) {
+        match value
+            .as_str()
+            .filter(|value| !value.trim().is_empty() && Date::parse(value, &Iso8601::DATE).is_ok())
+        {
             Some(value) => plan["nextDueDate"] = json!(value),
             None => errors.push("nextDueDate must be a non-empty ISO date".to_string()),
         }
@@ -10666,6 +10997,131 @@ mod tests {
         assert_eq!(document["movements"], json!([]));
         assert_eq!(document["subscriptions"], json!([]));
         assert_eq!(document["aiProposals"], json!([]));
+    }
+
+    fn valid_dca_document() -> Value {
+        let now = "2026-07-16T00:00:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        let account = account_from_create_input(
+            &json!({
+                "displayName": "DCA 资金账户",
+                "accountType": "brokerage",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "mixed",
+                "openingBalances": [{"currency": "CNY", "amount": "1000.00"}]
+            }),
+            "acct_dca_validation",
+            now,
+        )
+        .expect("DCA validation account should be valid");
+        document["accounts"] = json!([account]);
+        document["dcaPlans"] = json!([{
+            "id": "plan_dca_validation",
+            "displayName": "指数基金定投",
+            "targetInstrumentId": "inst_dca_validation",
+            "fundingAccountId": "acct_dca_validation",
+            "plannedAmount": {"amount": "200.00", "currency": "CNY"},
+            "frequency": "monthly",
+            "nextDueDate": "2026-08-01",
+            "reminderStatus": "active",
+            "lastActionAt": null,
+            "createdAt": now,
+            "updatedAt": now
+        }]);
+        document["dcaReminders"] = json!([{
+            "id": "reminder_dca_validation",
+            "planId": "plan_dca_validation",
+            "displayName": "指数基金定投",
+            "plannedAmount": {"amount": "200.00", "currency": "CNY"},
+            "dueDate": "2026-08-01",
+            "status": "due"
+        }]);
+        document
+    }
+
+    #[test]
+    fn validate_document_rejects_malformed_dca_entities_and_links() {
+        validate_document(&valid_dca_document()).expect("valid DCA document should pass");
+
+        let cases: [(&str, &str, fn(&mut Value)); 8] = [
+            (
+                "duplicate plan id",
+                "duplicate DCA plan id",
+                |document: &mut Value| {
+                    let duplicate = document["dcaPlans"][0].clone();
+                    document["dcaPlans"]
+                        .as_array_mut()
+                        .expect("plans")
+                        .push(duplicate);
+                },
+            ),
+            (
+                "dangling reminder plan",
+                "planId must reference an existing DCA plan",
+                |document: &mut Value| {
+                    document["dcaReminders"][0]["planId"] = json!("missing_plan");
+                },
+            ),
+            (
+                "invalid due date",
+                "dueDate must be an ISO date",
+                |document: &mut Value| {
+                    document["dcaReminders"][0]["dueDate"] = json!("not-a-date");
+                },
+            ),
+            (
+                "non-positive plan amount",
+                "plannedAmount.amount must be a positive decimal string",
+                |document: &mut Value| {
+                    document["dcaPlans"][0]["plannedAmount"]["amount"] = json!("0");
+                },
+            ),
+            (
+                "open reminder drift",
+                "plannedAmount must match its open DCA plan",
+                |document: &mut Value| {
+                    document["dcaReminders"][0]["plannedAmount"]["amount"] = json!("300.00");
+                },
+            ),
+            (
+                "multiple open reminders",
+                "more than one open reminder",
+                |document: &mut Value| {
+                    let mut duplicate = document["dcaReminders"][0].clone();
+                    duplicate["id"] = json!("reminder_dca_validation_2");
+                    document["dcaReminders"]
+                        .as_array_mut()
+                        .expect("reminders")
+                        .push(duplicate);
+                },
+            ),
+            (
+                "snoozed without timestamp",
+                "snoozedUntil must be an RFC3339 timestamp",
+                |document: &mut Value| {
+                    document["dcaReminders"][0]["status"] = json!("snoozed");
+                },
+            ),
+            (
+                "recorded without movement",
+                "recorded DCA reminder must reference exactly one confirmed movement",
+                |document: &mut Value| {
+                    document["dcaReminders"][0]["status"] = json!("recorded");
+                },
+            ),
+        ];
+
+        for (label, expected, mutate) in cases {
+            let mut document = valid_dca_document();
+            mutate(&mut document);
+            let errors = validate_document(&document).expect_err(label);
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "{label}: expected {expected:?}, got {errors:?}"
+            );
+        }
     }
 
     #[test]

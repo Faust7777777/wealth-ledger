@@ -671,6 +671,10 @@ def check_dca_execution_input(doc: dict) -> None:
         '"DCA reminder already has a pending execution proposal',
         '"amount": total_cost_amount',
         '"amount": quantity',
+        "validate_dca_entities(document, &mut errors)",
+        '"duplicate DCA plan id:',
+        '"DCA plan has more than one open reminder:',
+        '"recorded DCA reminder must reference exactly one confirmed movement:',
     ]:
         if snippet not in local_text:
             fail(f"Rust DCA execution implementation is incomplete: {snippet}")
