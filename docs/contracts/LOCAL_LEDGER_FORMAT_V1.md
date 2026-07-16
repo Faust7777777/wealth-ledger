@@ -183,6 +183,9 @@ AI pending 读取层把 standalone pending movements 按 `atomicGroupId` 分组�
 - 新确认的 sell movement 可带服务端派生 `saleResult`。其净回款必须等于毛回款减费用，
   平均成本释放额必须与持仓减少一致；`calculated` 状态下已实现盈亏必须守恒。旧账本中
   不含 `saleResult` 的历史 sell 继续兼容读取，不在缺乏历史状态时回填猜测值。
+- `fxRates` 按稳定 ID / 时间点保留历史，同一货币对的新 rate 不覆盖旧时间点。投资成交
+  使用不晚于 `occurredAt` 的最近 rate，并将 `ExecutionFxBasis` 固化到 `costBasisFx` 或
+  `saleResult.fxBasis`；未来时间 rate 不得用于过去成交。
 - 同一 confirmed movement 同时最多有一个 pending correction；账本效果未变化的 replacement 不得落盘。
 - AI approve 必须消费服务端 `ledgerWrite` / `confirmedMovementIds`，前端不得自行猜测“已入账”。
 - 写入后如影响净值/持仓/快照，必须返回或标记 `snapshotInvalidated`。

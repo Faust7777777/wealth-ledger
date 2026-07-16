@@ -218,6 +218,7 @@ Movement {
   settlement?: SettlementInfo;
   transferMeta?: TransferMeta;
   saleResult?: InvestmentSaleResult;
+  costBasisFx?: ExecutionFxBasis;
   subscriptionId?: ID;
   scheduledChargeDate?: ISODate;
   source: DataSourceInfo;
@@ -270,11 +271,25 @@ InvestmentSaleResult {
   feeAndTaxTotal: Money;
   netProceeds: Money;
   costBasisReleased?: Money;
+  netProceedsInCostBasisCurrency?: Money;
   realizedPnl?: Money;
+  fxBasis?: ExecutionFxBasis;
   realizedPnlStatus:
     | "calculated"
+    | "calculated_with_fx"
     | "cost_basis_unavailable"
     | "currency_mismatch";
+}
+
+ExecutionFxBasis {
+  baseCurrency: CurrencyCode;
+  quoteCurrency: CurrencyCode;
+  rate: DecimalString;
+  asOf: ISODateTime;
+  sourceRateId: ID;
+  source: string;
+  sourceUrl?: string;
+  inverted: boolean;
 }
 ```
 
@@ -294,7 +309,10 @@ InvestmentSaleResult {
   总额不得超过 gross proceeds。报价估值仍使用 `quantity × price`。
 - sell 确认时服务端固化 `saleResult`：平均成本法释放本次成本，`netProceeds =
   grossProceeds - feeAndTaxTotal`。只有净回款与释放成本同币种时才写 `realizedPnl =
-  netProceeds - costBasisReleased`；成本未知或币种不一致时写明确状态，不伪造数字。
+  netProceeds - costBasisReleased`。跨币种时只允许使用 `asOf <= occurredAt` 的最近历史
+  FX；找到时固化 `fxBasis` 并计算，找不到时写明确状态，不伪造数字。
+- 已有持仓的买入成本币种不一致时，同样按成交时间选择历史 FX，并把实际换算依据固化到
+  `costBasisFx`；不得用确认当天的新汇率回算历史成交。
 
 ## 6. Transfer / 在途 / 折损
 

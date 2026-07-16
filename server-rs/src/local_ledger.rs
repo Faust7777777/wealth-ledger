@@ -762,8 +762,16 @@ pub fn refresh_quotes(
                 for item in items {
                     match fx_rate_from_refresh_input(item, now) {
                         Ok(rate) => {
-                            upsert_fx_rate(document, rate.clone());
-                            refreshed_fx_rates.push(project_quote_item(&rate, now));
+                            if let Err(error) = upsert_fx_rate(document, rate.clone()) {
+                                errors.push(quote_refresh_error(
+                                    "fx_pair",
+                                    fx_pair_target_id(item).as_deref(),
+                                    &error,
+                                    false,
+                                ));
+                            } else {
+                                refreshed_fx_rates.push(project_quote_item(&rate, now));
+                            }
                         }
                         Err(error) => errors.push(quote_refresh_error(
                             "fx_pair",
@@ -3479,6 +3487,7 @@ fn validate_core_ledger_entities(document: &Value, errors: &mut Vec<String>) {
         })
         .unwrap_or_default();
     let instrument_ids = validate_instruments(document.get("instruments"), errors);
+    validate_fx_rates(document.get("fxRates"), errors);
     validate_holdings(
         document.get("holdings"),
         &account_ids,
@@ -3487,6 +3496,81 @@ fn validate_core_ledger_entities(document: &Value, errors: &mut Vec<String>) {
     );
     let movement_index = validate_movements(document, &account_ids, &instrument_ids, errors);
     validate_movement_entry_index(document.get("movementEntries"), &movement_index, errors);
+}
+
+fn validate_fx_rates(value: Option<&Value>, errors: &mut Vec<String>) {
+    let Some(rates) = value.and_then(Value::as_array) else {
+        return;
+    };
+    let mut ids = BTreeSet::new();
+    let mut time_points = BTreeSet::new();
+    for (index, rate) in rates.iter().enumerate() {
+        let label = format!("fxRates[{index}]");
+        let Some(rate) = rate.as_object() else {
+            errors.push(format!("{label} must be an object"));
+            continue;
+        };
+        match rate.get("id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => {
+                if !ids.insert(id) {
+                    errors.push(format!("duplicate FX rate id: {id}"));
+                }
+            }
+            _ => errors.push(format!("{label}.id must be a non-empty string")),
+        }
+        let base = rate.get("baseCurrency").and_then(Value::as_str);
+        let quote = rate.get("quoteCurrency").and_then(Value::as_str);
+        if base.is_none_or(str::is_empty) {
+            errors.push(format!("{label}.baseCurrency must be a non-empty string"));
+        }
+        if quote.is_none_or(str::is_empty) {
+            errors.push(format!("{label}.quoteCurrency must be a non-empty string"));
+        }
+        if base.is_some() && base == quote {
+            errors.push(format!("{label} must use two different currencies"));
+        }
+        let as_of_text = rate.get("asOf").and_then(Value::as_str);
+        if let (Some(base), Some(quote), Some(as_of)) = (base, quote, as_of_text)
+            && !time_points.insert((base, quote, as_of))
+        {
+            errors.push(format!(
+                "duplicate FX rate time point: {base}/{quote} at {as_of}"
+            ));
+        }
+        if rate
+            .get("rate")
+            .and_then(Value::as_str)
+            .is_none_or(|rate| !is_positive_decimal_string(rate))
+        {
+            errors.push(format!("{label}.rate must be a positive decimal string"));
+        }
+        if as_of_text.and_then(parse_rfc3339).is_none() {
+            errors.push(format!("{label}.asOf must be an RFC3339 timestamp"));
+        }
+        if rate
+            .get("source")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.source must be a non-empty string"));
+        }
+        if !matches!(
+            rate.get("status").and_then(Value::as_str),
+            Some("fresh" | "stale" | "offline_cached" | "incomplete" | "unpriceable" | "error")
+        ) {
+            errors.push(format!("{label}.status is invalid"));
+        }
+        if let Some(expires_at) = rate.get("expiresAt")
+            && expires_at.as_str().and_then(parse_rfc3339).is_none()
+        {
+            errors.push(format!("{label}.expiresAt must be an RFC3339 timestamp"));
+        }
+        if let Some(source_url) = rate.get("sourceUrl")
+            && source_url.as_str().is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.sourceUrl must be a non-empty string"));
+        }
+    }
 }
 
 fn validate_instruments<'a>(
@@ -3751,6 +3835,7 @@ fn validate_movements<'a>(
             }
         }
         validate_investment_sale_result(movement, index, errors);
+        validate_movement_cost_basis_fx(movement, index, errors);
     }
     index_by_id
 }
@@ -3946,6 +4031,78 @@ fn parsed_money_parts<'a>(
     amount.zip(currency)
 }
 
+#[derive(Clone, Copy)]
+struct ParsedExecutionFxBasis<'a> {
+    base_currency: &'a str,
+    quote_currency: &'a str,
+    rate: DecimalAmount,
+}
+
+fn validate_execution_fx_basis<'a>(
+    value: Option<&'a Value>,
+    label: &str,
+    errors: &mut Vec<String>,
+) -> Option<ParsedExecutionFxBasis<'a>> {
+    let Some(value) = value else {
+        errors.push(format!("{label} is required"));
+        return None;
+    };
+    let Some(object) = value.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return None;
+    };
+    let base_currency = object
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let quote_currency = object
+        .get("quoteCurrency")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let rate = object
+        .get("rate")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok())
+        .filter(|value| *value > DecimalAmount::ZERO);
+    if base_currency.is_none() {
+        errors.push(format!("{label}.baseCurrency must be a non-empty string"));
+    }
+    if quote_currency.is_none() {
+        errors.push(format!("{label}.quoteCurrency must be a non-empty string"));
+    }
+    if rate.is_none() {
+        errors.push(format!("{label}.rate must be a positive decimal string"));
+    }
+    if object
+        .get("asOf")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339)
+        .is_none()
+    {
+        errors.push(format!("{label}.asOf must be an RFC3339 timestamp"));
+    }
+    for field in ["sourceRateId", "source"] {
+        if object
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.{field} must be a non-empty string"));
+        }
+    }
+    if !matches!(object.get("inverted"), Some(Value::Bool(_))) {
+        errors.push(format!("{label}.inverted must be a boolean"));
+    }
+    match (base_currency, quote_currency, rate) {
+        (Some(base_currency), Some(quote_currency), Some(rate)) => Some(ParsedExecutionFxBasis {
+            base_currency,
+            quote_currency,
+            rate,
+        }),
+        _ => None,
+    }
+}
+
 fn validate_investment_sale_result(
     movement: &serde_json::Map<String, Value>,
     movement_index: usize,
@@ -3976,7 +4133,7 @@ fn validate_investment_sale_result(
     let status = result.get("realizedPnlStatus").and_then(Value::as_str);
     if !matches!(
         status,
-        Some("calculated" | "cost_basis_unavailable" | "currency_mismatch")
+        Some("calculated" | "calculated_with_fx" | "cost_basis_unavailable" | "currency_mismatch")
     ) {
         errors.push(format!("{label}.realizedPnlStatus is invalid"));
     }
@@ -4032,6 +4189,18 @@ fn validate_investment_sale_result(
     let pnl = result
         .get("realizedPnl")
         .and_then(|value| parsed_money_parts(Some(value), &format!("{label}.realizedPnl"), errors));
+    let converted_net = result
+        .get("netProceedsInCostBasisCurrency")
+        .and_then(|value| {
+            parsed_money_parts(
+                Some(value),
+                &format!("{label}.netProceedsInCostBasisCurrency"),
+                errors,
+            )
+        });
+    let fx_basis = result.get("fxBasis").and_then(|value| {
+        validate_execution_fx_basis(Some(value), &format!("{label}.fxBasis"), errors)
+    });
 
     match status {
         Some("calculated") => {
@@ -4054,16 +4223,57 @@ fn validate_investment_sale_result(
                     "{label}.realizedPnl must equal net proceeds minus released cost basis"
                 ));
             }
+            if converted_net.is_some() || fx_basis.is_some() {
+                errors.push(format!(
+                    "{label} same-currency calculation must not include an FX basis"
+                ));
+            }
+        }
+        Some("calculated_with_fx") => {
+            let (
+                Some((net_amount, net_currency)),
+                Some((released_amount, released_currency)),
+                Some((converted_amount, converted_currency)),
+                Some((pnl_amount, pnl_currency)),
+                Some(fx_basis),
+            ) = (net, released, converted_net, pnl, fx_basis)
+            else {
+                errors.push(format!(
+                    "{label} FX calculation requires net conversion, released cost, realized PnL, and FX basis"
+                ));
+                return;
+            };
+            if net_currency != fx_basis.base_currency
+                || released_currency != fx_basis.quote_currency
+                || converted_currency != released_currency
+                || pnl_currency != released_currency
+            {
+                errors.push(format!(
+                    "{label} FX currencies must connect net proceeds to released cost basis"
+                ));
+            }
+            if multiply_decimal(net_amount, fx_basis.rate) != converted_amount {
+                errors.push(format!(
+                    "{label}.netProceedsInCostBasisCurrency must equal net proceeds times FX rate"
+                ));
+            }
+            if converted_amount - released_amount != pnl_amount {
+                errors.push(format!(
+                    "{label}.realizedPnl must equal converted net proceeds minus released cost basis"
+                ));
+            }
         }
         Some("cost_basis_unavailable") => {
-            if released.is_some() || pnl.is_some() {
+            if released.is_some() || pnl.is_some() || converted_net.is_some() || fx_basis.is_some()
+            {
                 errors.push(format!(
                     "{label} unavailable cost basis must not include released cost or realized PnL"
                 ));
             }
         }
         Some("currency_mismatch") => {
-            if released.is_none() || pnl.is_some() {
+            if released.is_none() || pnl.is_some() || converted_net.is_some() || fx_basis.is_some()
+            {
                 errors.push(format!(
                     "{label} currency mismatch requires released cost and no realized PnL"
                 ));
@@ -4077,6 +4287,50 @@ fn validate_investment_sale_result(
             }
         }
         _ => {}
+    }
+}
+
+fn validate_movement_cost_basis_fx(
+    movement: &serde_json::Map<String, Value>,
+    movement_index: usize,
+    errors: &mut Vec<String>,
+) {
+    let Some(value) = movement.get("costBasisFx") else {
+        return;
+    };
+    let label = format!("movements[{movement_index}].costBasisFx");
+    if movement.get("type").and_then(Value::as_str) != Some("buy") {
+        errors.push(format!("{label} is only valid for buy movements"));
+    }
+    if !matches!(
+        movement.get("status").and_then(Value::as_str),
+        Some("confirmed" | "in_transit" | "reversed")
+    ) {
+        errors.push(format!(
+            "{label} is only valid after a buy movement is confirmed"
+        ));
+    }
+    let parsed = validate_execution_fx_basis(Some(value), &label, errors);
+    let principal_currency = movement
+        .get("entries")
+        .and_then(Value::as_array)
+        .and_then(|entries| {
+            entries.iter().find(|entry| {
+                entry.get("instrumentId").is_none()
+                    && entry.get("role").and_then(Value::as_str) == Some("source")
+            })
+        })
+        .and_then(|entry| entry.get("currency"))
+        .and_then(Value::as_str);
+    if let (Some(parsed), Some(principal_currency)) = (parsed, principal_currency) {
+        if parsed.base_currency != principal_currency {
+            errors.push(format!(
+                "{label}.baseCurrency must match the buy principal currency"
+            ));
+        }
+        if parsed.base_currency == parsed.quote_currency {
+            errors.push(format!("{label} must convert between different currencies"));
+        }
     }
 }
 
@@ -6974,6 +7228,9 @@ fn quote_from_refresh_input(input: &Value, now: &str) -> Result<Value, String> {
     let price = required_positive_decimal_field(object, "price")?;
     let currency = required_non_empty_field(object, "currency")?;
     let as_of = optional_non_empty_field(object, "asOf")?.unwrap_or_else(|| now.to_string());
+    if parse_rfc3339(&as_of).is_none() {
+        return Err("quote.asOf must be an RFC3339 timestamp".to_string());
+    }
     let source =
         optional_non_empty_field(object, "source")?.unwrap_or_else(|| "manual_refresh".to_string());
     let status = optional_status_field(object, "status")?.unwrap_or("fresh");
@@ -7006,6 +7263,9 @@ fn fx_rate_from_refresh_input(input: &Value, now: &str) -> Result<Value, String>
     let quote_currency = required_non_empty_field(object, "quoteCurrency")?;
     let rate = required_positive_decimal_field(object, "rate")?;
     let as_of = optional_non_empty_field(object, "asOf")?.unwrap_or_else(|| now.to_string());
+    if parse_rfc3339(&as_of).is_none() {
+        return Err("FX rate.asOf must be an RFC3339 timestamp".to_string());
+    }
     let source =
         optional_non_empty_field(object, "source")?.unwrap_or_else(|| "manual_refresh".to_string());
     let status = optional_status_field(object, "status")?.unwrap_or("fresh");
@@ -7048,28 +7308,41 @@ fn upsert_quote(document: &mut Value, quote: Value) {
     }
 }
 
-fn upsert_fx_rate(document: &mut Value, rate: Value) {
-    let base_currency = rate
-        .get("baseCurrency")
+fn upsert_fx_rate(document: &mut Value, rate: Value) -> Result<(), String> {
+    let rate_id = rate
+        .get("id")
         .and_then(Value::as_str)
-        .expect("validated FX baseCurrency should be a string")
-        .to_string();
-    let quote_currency = rate
-        .get("quoteCurrency")
-        .and_then(Value::as_str)
-        .expect("validated FX quoteCurrency should be a string")
+        .expect("validated FX rate id should be a string")
         .to_string();
     let rates = document["fxRates"]
         .as_array_mut()
         .expect("validated local ledger fxRates should be an array");
-    if let Some(existing) = rates.iter_mut().find(|item| {
-        item.get("baseCurrency").and_then(Value::as_str) == Some(base_currency.as_str())
-            && item.get("quoteCurrency").and_then(Value::as_str) == Some(quote_currency.as_str())
-    }) {
+    if let Some(existing) = rates
+        .iter_mut()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(rate_id.as_str()))
+    {
+        for field in ["baseCurrency", "quoteCurrency", "asOf"] {
+            if existing.get(field) != rate.get(field) {
+                return Err(format!("FX rate id cannot change {field}: {rate_id}"));
+            }
+        }
         *existing = rate;
     } else {
+        let base_currency = rate.get("baseCurrency");
+        let quote_currency = rate.get("quoteCurrency");
+        let as_of = rate.get("asOf");
+        if rates.iter().any(|existing| {
+            existing.get("baseCurrency") == base_currency
+                && existing.get("quoteCurrency") == quote_currency
+                && existing.get("asOf") == as_of
+        }) {
+            return Err(format!(
+                "FX rate pair/asOf already exists with a different id: {rate_id}"
+            ));
+        }
         rates.push(rate);
     }
+    Ok(())
 }
 
 fn quoted_holding_market_value(document: &Value, holding: &Value) -> Option<(Value, &'static str)> {
@@ -7133,24 +7406,92 @@ fn fx_rate_between(
     to_currency: &str,
     now: &str,
 ) -> Option<(DecimalAmount, &'static str)> {
-    for rate in document["fxRates"]
+    let (rate, inverted) = fx_rate_at_or_before(document, from_currency, to_currency, now)?;
+    let parsed = parse_decimal(rate.get("rate")?.as_str()?).ok()?;
+    let status = effective_quote_status(rate, now);
+    if inverted {
+        divide_decimal(DecimalAmount::ONE, parsed).map(|inverse| (inverse, status))
+    } else {
+        Some((parsed, status))
+    }
+}
+
+fn fx_rate_at_or_before<'a>(
+    document: &'a Value,
+    from_currency: &str,
+    to_currency: &str,
+    at: &str,
+) -> Option<(&'a Value, bool)> {
+    let cutoff = parse_rfc3339(at)?;
+    document["fxRates"]
         .as_array()
         .expect("validated local ledger fxRates should be an array")
         .iter()
-        .rev()
-    {
-        let base = rate.get("baseCurrency").and_then(Value::as_str)?;
-        let quote = rate.get("quoteCurrency").and_then(Value::as_str)?;
-        let parsed = parse_decimal(rate.get("rate")?.as_str()?).ok()?;
-        let status = effective_quote_status(rate, now);
-        if base == from_currency && quote == to_currency {
-            return Some((parsed, status));
-        }
-        if base == to_currency && quote == from_currency {
-            return divide_decimal(DecimalAmount::ONE, parsed).map(|inverse| (inverse, status));
-        }
+        .filter_map(|rate| {
+            let base = rate.get("baseCurrency").and_then(Value::as_str)?;
+            let quote = rate.get("quoteCurrency").and_then(Value::as_str)?;
+            let inverted = if base == from_currency && quote == to_currency {
+                false
+            } else if base == to_currency && quote == from_currency {
+                true
+            } else {
+                return None;
+            };
+            let as_of = parse_rfc3339(rate.get("asOf")?.as_str()?)?;
+            (as_of <= cutoff).then_some((as_of, rate, inverted))
+        })
+        .max_by_key(|(as_of, _, _)| *as_of)
+        .map(|(_, rate, inverted)| (rate, inverted))
+}
+
+struct ExecutionFxConversion {
+    amount: DecimalAmount,
+    basis: Value,
+}
+
+fn convert_execution_amount(
+    document: &Value,
+    amount: DecimalAmount,
+    from_currency: &str,
+    to_currency: &str,
+    occurred_at: &str,
+) -> Option<ExecutionFxConversion> {
+    if from_currency == to_currency {
+        return Some(ExecutionFxConversion {
+            amount,
+            basis: Value::Null,
+        });
     }
-    None
+    let (source_rate, inverted) =
+        fx_rate_at_or_before(document, from_currency, to_currency, occurred_at)?;
+    if matches!(
+        source_rate.get("status").and_then(Value::as_str),
+        Some("incomplete" | "unpriceable" | "error")
+    ) {
+        return None;
+    }
+    let stored_rate = parse_decimal(source_rate.get("rate")?.as_str()?).ok()?;
+    let applied_rate = if inverted {
+        divide_decimal(DecimalAmount::ONE, stored_rate)?
+    } else {
+        stored_rate
+    };
+    let mut basis = json!({
+        "baseCurrency": from_currency,
+        "quoteCurrency": to_currency,
+        "rate": applied_rate.decimal_string(),
+        "asOf": source_rate.get("asOf")?.clone(),
+        "sourceRateId": source_rate.get("id")?.clone(),
+        "source": source_rate.get("source")?.clone(),
+        "inverted": inverted
+    });
+    if let Some(source_url) = source_rate.get("sourceUrl") {
+        basis["sourceUrl"] = source_url.clone();
+    }
+    Some(ExecutionFxConversion {
+        amount: multiply_decimal(amount, applied_rate),
+        basis,
+    })
 }
 
 fn effective_quote_status(item: &Value, now: &str) -> &'static str {
@@ -9162,6 +9503,12 @@ fn apply_buy_or_sell_movement(
     let quote_currency = required_entry_string(holding, "currency")?;
     let instrument_id = required_entry_string(holding, "instrumentId")?;
     let quantity = parse_entry_amount(holding)?;
+    let occurred_at = movement
+        .get("occurredAt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["movement.occurredAt is missing".to_string()])
+        })?;
     let mut fee_total = DecimalAmount::ZERO;
     for entry in entries.iter().filter(|entry| {
         matches!(
@@ -9191,7 +9538,7 @@ fn apply_buy_or_sell_movement(
             -total_cash_out,
             now,
         )?;
-        apply_holding_purchase(
+        let cost_basis_fx = apply_holding_purchase(
             document,
             HoldingPurchase {
                 account_id: holding_account_id,
@@ -9201,8 +9548,12 @@ fn apply_buy_or_sell_movement(
                 cost_amount: total_cash_out,
                 cost_currency: cash_currency,
             },
+            occurred_at,
             now,
         )?;
+        if let Some(cost_basis_fx) = cost_basis_fx {
+            record_movement_cost_basis_fx(document, movement, cost_basis_fx)?;
+        }
     } else {
         if fee_total > cash_amount {
             return Err(LedgerError::InvalidInput(vec![
@@ -9222,37 +9573,46 @@ fn apply_buy_or_sell_movement(
         record_investment_sale_result(
             document,
             movement,
-            cash_amount,
-            fee_total,
-            net_proceeds,
-            cash_currency,
-            released_cost_basis,
+            InvestmentSaleInputs {
+                gross_proceeds: cash_amount,
+                fee_and_tax_total: fee_total,
+                net_proceeds,
+                cash_currency,
+                released_cost_basis,
+                occurred_at,
+            },
         )?;
     }
 
     Ok(())
 }
 
-fn record_investment_sale_result(
-    document: &mut Value,
-    movement: &Value,
+struct InvestmentSaleInputs<'a> {
     gross_proceeds: DecimalAmount,
     fee_and_tax_total: DecimalAmount,
     net_proceeds: DecimalAmount,
-    cash_currency: &str,
+    cash_currency: &'a str,
     released_cost_basis: Option<(DecimalAmount, String)>,
+    occurred_at: &'a str,
+}
+
+fn record_investment_sale_result(
+    document: &mut Value,
+    movement: &Value,
+    inputs: InvestmentSaleInputs<'_>,
 ) -> Result<(), LedgerError> {
+    let InvestmentSaleInputs {
+        gross_proceeds,
+        fee_and_tax_total,
+        net_proceeds,
+        cash_currency,
+        released_cost_basis,
+        occurred_at,
+    } = inputs;
     let movement_id = movement
         .get("id")
         .and_then(Value::as_str)
         .ok_or_else(|| LedgerError::InvalidInput(vec!["movement.id is missing".to_string()]))?;
-    let stored = document["movements"]
-        .as_array_mut()
-        .expect("validated local ledger movements should be an array")
-        .iter_mut()
-        .find(|stored| stored.get("id").and_then(Value::as_str) == Some(movement_id))
-        .ok_or_else(|| LedgerError::NotFound(format!("movement does not exist: {movement_id}")))?;
-
     let mut result = json!({
         "costBasisMethod": "average_cost",
         "grossProceeds": money(gross_proceeds, cash_currency),
@@ -9265,11 +9625,47 @@ fn record_investment_sale_result(
         if released_currency == cash_currency {
             result["realizedPnl"] = money(net_proceeds - released_amount, cash_currency);
             result["realizedPnlStatus"] = json!("calculated");
+        } else if let Some(conversion) = convert_execution_amount(
+            document,
+            net_proceeds,
+            cash_currency,
+            &released_currency,
+            occurred_at,
+        ) {
+            result["netProceedsInCostBasisCurrency"] = money(conversion.amount, &released_currency);
+            result["realizedPnl"] = money(conversion.amount - released_amount, &released_currency);
+            result["fxBasis"] = conversion.basis;
+            result["realizedPnlStatus"] = json!("calculated_with_fx");
         } else {
             result["realizedPnlStatus"] = json!("currency_mismatch");
         }
     }
+    let stored = document["movements"]
+        .as_array_mut()
+        .expect("validated local ledger movements should be an array")
+        .iter_mut()
+        .find(|stored| stored.get("id").and_then(Value::as_str) == Some(movement_id))
+        .ok_or_else(|| LedgerError::NotFound(format!("movement does not exist: {movement_id}")))?;
     stored["saleResult"] = result;
+    Ok(())
+}
+
+fn record_movement_cost_basis_fx(
+    document: &mut Value,
+    movement: &Value,
+    cost_basis_fx: Value,
+) -> Result<(), LedgerError> {
+    let movement_id = movement
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::InvalidInput(vec!["movement.id is missing".to_string()]))?;
+    let stored = document["movements"]
+        .as_array_mut()
+        .expect("validated local ledger movements should be an array")
+        .iter_mut()
+        .find(|stored| stored.get("id").and_then(Value::as_str) == Some(movement_id))
+        .ok_or_else(|| LedgerError::NotFound(format!("movement does not exist: {movement_id}")))?;
+    stored["costBasisFx"] = cost_basis_fx;
     Ok(())
 }
 
@@ -9341,8 +9737,9 @@ struct HoldingPurchase<'a> {
 fn apply_holding_purchase(
     document: &mut Value,
     purchase: HoldingPurchase<'_>,
+    occurred_at: &str,
     now: &str,
-) -> Result<(), LedgerError> {
+) -> Result<Option<Value>, LedgerError> {
     let HoldingPurchase {
         account_id,
         instrument_id,
@@ -9367,6 +9764,7 @@ fn apply_holding_purchase(
                 && holding.get("instrumentId").and_then(Value::as_str) == Some(instrument_id)
         });
 
+    let mut cost_basis_fx = None;
     if let Some(index) = existing_index {
         let existing = document["holdings"][index].clone();
         let current_quantity = parse_decimal(
@@ -9378,13 +9776,35 @@ fn apply_holding_purchase(
         .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
         let next_quantity = current_quantity + quantity;
 
+        if let Some(existing_cost_basis) = existing.get("costBasisTotal")
+            && let Some(existing_currency) =
+                existing_cost_basis.get("currency").and_then(Value::as_str)
+            && existing_currency != cost_currency
+        {
+            cost_basis_fx = Some(
+                convert_execution_amount(
+                    document,
+                    cost_amount,
+                    cost_currency,
+                    existing_currency,
+                    occurred_at,
+                )
+                .ok_or_else(|| {
+                    LedgerError::Conflict(format!(
+                        "cannot combine holding cost basis across {cost_currency} and {existing_currency} without an FX rate at or before {occurred_at}"
+                    ))
+                })?
+                .basis,
+            );
+        }
+
         let next_cost_basis = add_purchase_value(
             document,
             existing.get("costBasisTotal"),
             current_quantity,
             cost_amount,
             cost_currency,
-            now,
+            occurred_at,
             "holding cost basis",
         )?;
         let next_market_value = add_purchase_value(
@@ -9393,7 +9813,7 @@ fn apply_holding_purchase(
             current_quantity,
             cost_amount,
             cost_currency,
-            now,
+            occurred_at,
             "holding fallback market value",
         )?;
 
@@ -9442,7 +9862,7 @@ fn apply_holding_purchase(
             }));
     }
 
-    Ok(())
+    Ok(cost_basis_fx)
 }
 
 fn add_purchase_value(
@@ -9451,7 +9871,7 @@ fn add_purchase_value(
     current_quantity: DecimalAmount,
     purchase_amount: DecimalAmount,
     purchase_currency: &str,
-    now: &str,
+    occurred_at: &str,
     label: &str,
 ) -> Result<Option<(DecimalAmount, String)>, LedgerError> {
     let Some(existing) = existing else {
@@ -9472,17 +9892,17 @@ fn add_purchase_value(
         .get("currency")
         .and_then(Value::as_str)
         .ok_or_else(|| LedgerError::InvalidInput(vec![format!("{label}.currency is missing")]))?;
-    let converted_purchase = convert_amount(
+    let converted_purchase = convert_execution_amount(
         document,
         purchase_amount,
         purchase_currency,
         existing_currency,
-        now,
+        occurred_at,
     )
-    .map(|(amount, _)| amount)
+    .map(|conversion| conversion.amount)
     .ok_or_else(|| {
         LedgerError::Conflict(format!(
-            "cannot combine {label} across {purchase_currency} and {existing_currency} without an FX rate"
+            "cannot combine {label} across {purchase_currency} and {existing_currency} without an FX rate at or before {occurred_at}"
         ))
     })?;
     Ok(Some((
@@ -12426,6 +12846,7 @@ mod tests {
         let movement = json!({
             "id": "mov_sale_fx",
             "type": "sell",
+            "occurredAt": "2026-07-16T00:00:00Z",
             "entries": [
                 {
                     "accountId": "acct_sale_holding",
@@ -12460,6 +12881,122 @@ mod tests {
         assert_eq!(result["netProceeds"]["currency"], "CNY");
         assert_eq!(result["realizedPnlStatus"], "currency_mismatch");
         assert!(result.get("realizedPnl").is_none());
+
+        document["fxRates"] = json!([
+            {
+                "id": "fx_cny_usd_historical",
+                "baseCurrency": "CNY",
+                "quoteCurrency": "USD",
+                "rate": "1",
+                "asOf": "2026-07-15T00:00:00Z",
+                "source": "historical_test",
+                "status": "stale"
+            },
+            {
+                "id": "fx_cny_usd_future",
+                "baseCurrency": "CNY",
+                "quoteCurrency": "USD",
+                "rate": "2",
+                "asOf": "2026-07-17T00:00:00Z",
+                "source": "future_test",
+                "status": "fresh"
+            }
+        ]);
+        let historical_movement = json!({
+            "id": "mov_sale_fx_historical",
+            "type": "sell",
+            "occurredAt": "2026-07-16T00:00:00Z",
+            "entries": [
+                {
+                    "accountId": "acct_sale_holding",
+                    "instrumentId": "inst_sale_fx",
+                    "amount": "1",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": "acct_sale_cash",
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        document["movements"]
+            .as_array_mut()
+            .expect("movements")
+            .push(historical_movement.clone());
+        apply_buy_or_sell_movement(
+            &mut document,
+            &historical_movement,
+            historical_movement["entries"]
+                .as_array()
+                .expect("historical entries"),
+            false,
+            now,
+        )
+        .expect("historical FX sale should calculate PnL");
+        let historical_result = &document["movements"][1]["saleResult"];
+        assert_eq!(historical_result["realizedPnlStatus"], "calculated_with_fx");
+        assert_eq!(
+            historical_result["netProceedsInCostBasisCurrency"],
+            json!({"amount": "10.00", "currency": "USD"})
+        );
+        assert_eq!(
+            historical_result["realizedPnl"],
+            json!({"amount": "0.00", "currency": "USD"})
+        );
+        assert_eq!(
+            historical_result["fxBasis"]["sourceRateId"],
+            "fx_cny_usd_historical"
+        );
+        assert_eq!(historical_result["fxBasis"]["rate"], "1");
+
+        let historical_buy = json!({
+            "id": "mov_buy_fx_historical",
+            "type": "buy",
+            "occurredAt": "2026-07-16T00:00:00Z",
+            "entries": [
+                {
+                    "accountId": "acct_sale_cash",
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": "acct_sale_holding",
+                    "instrumentId": "inst_sale_fx",
+                    "amount": "1",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        document["movements"]
+            .as_array_mut()
+            .expect("movements")
+            .push(historical_buy.clone());
+        apply_buy_or_sell_movement(
+            &mut document,
+            &historical_buy,
+            historical_buy["entries"].as_array().expect("buy entries"),
+            true,
+            now,
+        )
+        .expect("historical FX buy should preserve its basis");
+        assert_eq!(document["holdings"][0]["quantity"], "6");
+        assert_eq!(
+            document["holdings"][0]["costBasisTotal"],
+            json!({"amount": "60.00", "currency": "USD"})
+        );
+        assert_eq!(
+            document["movements"][2]["costBasisFx"]["sourceRateId"],
+            "fx_cny_usd_historical"
+        );
     }
 
     #[test]
@@ -12480,6 +13017,59 @@ mod tests {
             money_amount(parse_decimal("-2.34567890").expect("signed precision")),
             "-2.3456789"
         );
+    }
+
+    #[test]
+    fn fx_history_rejects_duplicate_ids_and_identity_changes() {
+        let rate = json!({
+            "id": "fx_history_1",
+            "baseCurrency": "USD",
+            "quoteCurrency": "CNY",
+            "rate": "7.00",
+            "asOf": "2026-07-01T00:00:00Z",
+            "source": "test",
+            "status": "stale"
+        });
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["fxRates"] = json!([rate.clone(), rate.clone()]);
+        let errors = validate_document(&document).expect_err("duplicate FX ids must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("duplicate FX rate id"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("duplicate FX rate time point"))
+        );
+
+        document["fxRates"] = json!([rate]);
+        let changed_identity = json!({
+            "id": "fx_history_1",
+            "baseCurrency": "USD",
+            "quoteCurrency": "CNY",
+            "rate": "7.10",
+            "asOf": "2026-07-02T00:00:00Z",
+            "source": "test",
+            "status": "fresh"
+        });
+        let error = upsert_fx_rate(&mut document, changed_identity)
+            .expect_err("same FX id cannot change its time point");
+        assert!(error.contains("cannot change asOf"));
+
+        let duplicate_time = json!({
+            "id": "fx_history_other_id",
+            "baseCurrency": "USD",
+            "quoteCurrency": "CNY",
+            "rate": "7.20",
+            "asOf": "2026-07-01T00:00:00Z",
+            "source": "test",
+            "status": "fresh"
+        });
+        let error = upsert_fx_rate(&mut document, duplicate_time)
+            .expect_err("same pair/time cannot use another id");
+        assert!(error.contains("pair/asOf already exists"));
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

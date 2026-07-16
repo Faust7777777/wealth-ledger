@@ -8891,6 +8891,61 @@ mod tests {
         assert_eq!(rates_body["data"][0]["baseCurrency"], "USD");
         assert_eq!(rates_body["data"][0]["quoteCurrency"], "CNY");
 
+        for rate in ["7.10", "7.20"] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/quotes/refresh",
+                json!({
+                    "mode": "manual",
+                    "fxRates": [{
+                        "baseCurrency": "USD",
+                        "quoteCurrency": "CNY",
+                        "rate": rate,
+                        "asOf": "2026-06-29T09:30:00Z",
+                        "source": "history_test"
+                    }]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["data"]["status"], "success");
+        }
+        let (_, historical_rates) =
+            request_json_from(router.clone(), Method::GET, "/v1/fx-rates").await;
+        assert_eq!(historical_rates["data"].as_array().expect("rates").len(), 2);
+        let (_, account_with_latest_rate) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(account_with_latest_rate["data"]["value"]["amount"], "72.00");
+
+        let (invalid_time_status, invalid_time_body) = request_json_body_from(
+            router,
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "fxRates": [{
+                    "baseCurrency": "USD",
+                    "quoteCurrency": "CNY",
+                    "rate": "7.30",
+                    "asOf": "not-a-time",
+                    "source": "invalid_time_test"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(invalid_time_status, StatusCode::OK, "{invalid_time_body}");
+        assert_eq!(invalid_time_body["data"]["status"], "offline");
+        assert!(
+            invalid_time_body["data"]["errors"][0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("RFC3339"))
+        );
+
         let _ = std::fs::remove_file(path);
     }
 

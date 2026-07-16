@@ -1906,6 +1906,31 @@ components:
           $ref: "#/components/schemas/Money"
         benefitSource:
           enum: [coupon, platform_subsidy, merchant_discount, free_order, other]
+    ExecutionFxBasis:
+      type: object
+      additionalProperties: false
+      required: [baseCurrency, quoteCurrency, rate, asOf, sourceRateId, source, inverted]
+      description: >-
+        Immutable FX basis actually used for an investment cost or proceeds
+        conversion. The selected source rate is the latest rate whose asOf is not
+        later than the movement occurredAt.
+      properties:
+        baseCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        quoteCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        rate:
+          $ref: "#/components/schemas/DecimalString"
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+        sourceRateId:
+          $ref: "#/components/schemas/ID"
+        source:
+          type: string
+        sourceUrl:
+          type: string
+        inverted:
+          type: boolean
     InvestmentSaleResult:
       type: object
       additionalProperties: false
@@ -1932,8 +1957,12 @@ components:
           $ref: "#/components/schemas/Money"
         realizedPnl:
           $ref: "#/components/schemas/Money"
+        netProceedsInCostBasisCurrency:
+          $ref: "#/components/schemas/Money"
+        fxBasis:
+          $ref: "#/components/schemas/ExecutionFxBasis"
         realizedPnlStatus:
-          enum: [calculated, cost_basis_unavailable, currency_mismatch]
+          enum: [calculated, calculated_with_fx, cost_basis_unavailable, currency_mismatch]
     SettlementInfo:
       type: object
       required: [status]
@@ -2041,6 +2070,8 @@ components:
           $ref: "#/components/schemas/TransferMeta"
         saleResult:
           $ref: "#/components/schemas/InvestmentSaleResult"
+        costBasisFx:
+          $ref: "#/components/schemas/ExecutionFxBasis"
         source:
           $ref: "#/components/schemas/DataSourceInfo"
         createdAt:

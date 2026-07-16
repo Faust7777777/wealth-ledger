@@ -213,7 +213,10 @@ POST  /v1/movements/corrections
   数量比例减少。报价后按 `quantity × price` 估值。
 - sell 确认后 movement 增加只读 `saleResult`。服务端按平均成本法固化
   `costBasisReleased`；同币种时计算 `realizedPnl = netProceeds - costBasisReleased`，成本
-  未知或币种不一致时分别标记 `cost_basis_unavailable` / `currency_mismatch`，不裸数相减。
+  未知时标记 `cost_basis_unavailable`。跨币种时只使用不晚于 `occurredAt` 的最近 FX rate，
+  固化 `fxBasis` 并标记 `calculated_with_fx`；无历史 rate 时标记 `currency_mismatch`。
+- 跨币种买入叠加既有成本基础时也使用同一历史选择规则，所用 rate 固化为 `costBasisFx`；
+  不得因用户稍后确认一笔旧成交而使用确认当天的新汇率。
 - `loan_disbursement` 必须从负债账户 `out/source` 到非负债账户 `in/destination`；`loan_repayment` 方向相反；两腿同币种同金额且账户不同。
 - 普通 draft 不接受 `type=correction`；更正只能通过 `/v1/movements/corrections` 创建，避免绕过原记录引用与反向分录。
 - 当前不接受含持仓腿的投资 movement 更正；在数量和成本基础的完整 replacement 语义进入契约前，明确返回 400，避免把数量差额误当金额差额。

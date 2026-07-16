@@ -411,6 +411,142 @@ def create_and_confirm_investment_with_fees(
     assert sale_result["realizedPnlStatus"] == "calculated"
 
 
+def create_and_confirm_cross_currency_investment(
+    base: str, usd_account_id: str, holding_account_id: str
+) -> None:
+    refresh = unwrap_data(
+        request_json(
+            base,
+            "/v1/quotes/refresh",
+            method="POST",
+            body={
+                "mode": "manual",
+                "fxRates": [
+                    {
+                        "id": "fx_smoke_usd_cny_historical",
+                        "baseCurrency": "USD",
+                        "quoteCurrency": "CNY",
+                        "rate": "7",
+                        "asOf": "2026-06-26T00:00:00Z",
+                        "source": "local_smoke_history",
+                        "status": "stale",
+                    },
+                    {
+                        "id": "fx_smoke_usd_cny_future",
+                        "baseCurrency": "USD",
+                        "quoteCurrency": "CNY",
+                        "rate": "9",
+                        "asOf": "2026-06-28T00:00:00Z",
+                        "source": "local_smoke_future",
+                        "status": "fresh",
+                    },
+                ],
+            },
+        )
+    )
+    assert len(refresh["fxRates"]) == 2
+
+    buy = unwrap_data(
+        request_json(
+            base,
+            "/v1/movements/drafts",
+            method="POST",
+            expected_status=201,
+            body={
+                "type": "buy",
+                "occurredAt": "2026-06-27T00:00:00Z",
+                "title": "local smoke historical FX buy",
+                "entries": [
+                    {
+                        "accountId": usd_account_id,
+                        "amount": "10.00",
+                        "currency": "USD",
+                        "direction": "out",
+                        "role": "source",
+                    },
+                    {
+                        "accountId": holding_account_id,
+                        "instrumentId": "inst_smoke_fee_fund",
+                        "amount": "1",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination",
+                    },
+                ],
+            },
+        )
+    )
+    unwrap_data(
+        request_json(
+            base,
+            f"/v1/atomic-groups/{buy['atomicGroupId']}/confirm",
+            method="POST",
+        )
+    )
+    confirmed_buy = unwrap_data(request_json(base, f"/v1/movements/{buy['id']}"))
+    assert confirmed_buy["costBasisFx"]["sourceRateId"] == "fx_smoke_usd_cny_historical"
+    assert confirmed_buy["costBasisFx"]["rate"] == "7"
+    holdings = unwrap_data(request_json(base, "/v1/holdings"))
+    holding = next(
+        item for item in holdings if item["instrumentId"] == "inst_smoke_fee_fund"
+    )
+    assert holding["quantity"] == "4"
+    assert holding["costBasisTotal"] == {"amount": "100.90", "currency": "CNY"}
+
+    sell = unwrap_data(
+        request_json(
+            base,
+            "/v1/movements/drafts",
+            method="POST",
+            expected_status=201,
+            body={
+                "type": "sell",
+                "occurredAt": "2026-06-27T12:00:00Z",
+                "title": "local smoke historical FX sell",
+                "entries": [
+                    {
+                        "accountId": holding_account_id,
+                        "instrumentId": "inst_smoke_fee_fund",
+                        "amount": "1",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source",
+                    },
+                    {
+                        "accountId": usd_account_id,
+                        "amount": "11.00",
+                        "currency": "USD",
+                        "direction": "in",
+                        "role": "destination",
+                    },
+                ],
+            },
+        )
+    )
+    unwrap_data(
+        request_json(
+            base,
+            f"/v1/atomic-groups/{sell['atomicGroupId']}/confirm",
+            method="POST",
+        )
+    )
+    confirmed_sell = unwrap_data(request_json(base, f"/v1/movements/{sell['id']}"))
+    sale_result = confirmed_sell["saleResult"]
+    assert sale_result["realizedPnlStatus"] == "calculated_with_fx"
+    assert sale_result["fxBasis"]["sourceRateId"] == "fx_smoke_usd_cny_historical"
+    assert sale_result["netProceedsInCostBasisCurrency"] == {
+        "amount": "77.00",
+        "currency": "CNY",
+    }
+    assert sale_result["costBasisReleased"] == {
+        "amount": "25.225",
+        "currency": "CNY",
+    }
+    assert sale_result["realizedPnl"] == {"amount": "51.775", "currency": "CNY"}
+    usd_account = unwrap_data(request_json(base, f"/v1/accounts/{usd_account_id}"))
+    assert cash_balance(usd_account, "USD") == Decimal("81.00")
+
+
 def create_and_confirm_multileg_correction(
     base: str, source_account_id: str, destination_account_id: str
 ) -> None:
@@ -894,6 +1030,9 @@ def run_smoke(base: str, ledger_path: Path) -> None:
         base, subscription_account["id"], ledger_path
     )
     assert subscription_result["confirmed"]["lastChargeDate"] == "2026-01-31"
+    create_and_confirm_cross_currency_investment(
+        base, subscription_account["id"], brokerage["id"]
+    )
 
     movements = unwrap_data(request_json(base, "/v1/movements"))
     confirmed_ids = {item["id"] for item in movements if item["status"] == "confirmed"}

@@ -744,6 +744,23 @@ def check_investment_sale_result(doc: dict) -> None:
     if schemas.get("DecimalString", {}).get("pattern") != r"^-?[0-9]+(\.[0-9]{1,8})?$":
         fail("DecimalString must enforce at most eight decimal places")
     result = schemas.get("InvestmentSaleResult", {})
+    fx_basis_schema = schemas.get("ExecutionFxBasis", {})
+    fx_required = {
+        "baseCurrency",
+        "quoteCurrency",
+        "rate",
+        "asOf",
+        "sourceRateId",
+        "source",
+        "inverted",
+    }
+    if (
+        fx_basis_schema.get("type") != "object"
+        or fx_basis_schema.get("additionalProperties") is not False
+        or set(fx_basis_schema.get("required", [])) != fx_required
+        or set(fx_basis_schema.get("properties", {})) != fx_required | {"sourceUrl"}
+    ):
+        fail("ExecutionFxBasis schema drifted")
     required = {
         "costBasisMethod",
         "grossProceeds",
@@ -756,16 +773,29 @@ def check_investment_sale_result(doc: dict) -> None:
         fail("InvestmentSaleResult must be a closed object")
     if set(result.get("required", [])) != required:
         fail("InvestmentSaleResult required fields drifted")
-    if set(properties) != required | {"costBasisReleased", "realizedPnl"}:
+    if set(properties) != required | {
+        "costBasisReleased",
+        "realizedPnl",
+        "netProceedsInCostBasisCurrency",
+        "fxBasis",
+    }:
         fail("InvestmentSaleResult properties drifted")
     if properties.get("costBasisMethod", {}).get("const") != "average_cost":
         fail("InvestmentSaleResult must use average_cost")
     statuses = set(properties.get("realizedPnlStatus", {}).get("enum", []))
-    if statuses != {"calculated", "cost_basis_unavailable", "currency_mismatch"}:
+    if statuses != {
+        "calculated",
+        "calculated_with_fx",
+        "cost_basis_unavailable",
+        "currency_mismatch",
+    }:
         fail("InvestmentSaleResult status values drifted")
     movement_ref = schemas["Movement"]["properties"].get("saleResult", {}).get("$ref")
     if movement_ref != "#/components/schemas/InvestmentSaleResult":
         fail("Movement.saleResult must reference InvestmentSaleResult")
+    cost_fx_ref = schemas["Movement"]["properties"].get("costBasisFx", {}).get("$ref")
+    if cost_fx_ref != "#/components/schemas/ExecutionFxBasis":
+        fail("Movement.costBasisFx must reference ExecutionFxBasis")
 
     local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
     for snippet in [
@@ -773,6 +803,14 @@ def check_investment_sale_result(doc: dict) -> None:
         '"realizedPnlStatus": "cost_basis_unavailable"',
         'result["realizedPnlStatus"] = json!("calculated")',
         'result["realizedPnlStatus"] = json!("currency_mismatch")',
+        'result["realizedPnlStatus"] = json!("calculated_with_fx")',
+        "fx_rate_at_or_before",
+        "as_of <= cutoff",
+        'stored["costBasisFx"] = cost_basis_fx',
+        '"duplicate FX rate id',
+        '"duplicate FX rate time point',
+        '"FX rate id cannot change {field}',
+        '"FX rate pair/asOf already exists with a different id',
         '"realizedPnl must equal net proceeds minus released cost basis"',
         "while keep > 2",
         'parse_decimal("0.00000001")',
@@ -787,6 +825,8 @@ def check_investment_sale_result(doc: dict) -> None:
         'sale_result["realizedPnl"]["amount"], "-3.20"',
         'sale_result["realizedPnlStatus"], "calculated"',
         '"10.12345677"',
+        '"not-a-time"',
+        'historical_rates["data"].as_array().expect("rates").len(), 2',
     ]:
         if snippet not in rust_tests:
             fail(f"Investment sale-result API regression is incomplete: {snippet}")
@@ -797,14 +837,29 @@ def check_investment_sale_result(doc: dict) -> None:
         '"amount": "20.60"',
         'sale_result["realizedPnl"]',
         '"amount": "2.90"',
+        'confirmed_buy["costBasisFx"]["sourceRateId"]',
+        '"fx_smoke_usd_cny_historical"',
+        'sale_result["realizedPnlStatus"] == "calculated_with_fx"',
+        '"amount": "51.775"',
     ]:
         if snippet not in smoke_text:
             fail(f"Investment sale-result smoke is incomplete: {snippet}")
 
     http_text = HTTP_MD.read_text(encoding="utf-8")
-    for snippet in ["saleResult", "costBasisReleased", "currency_mismatch"]:
+    for snippet in [
+        "saleResult",
+        "costBasisReleased",
+        "calculated_with_fx",
+        "costBasisFx",
+        "occurredAt",
+    ]:
         if snippet not in http_text:
             fail(f"HTTP investment sale-result contract is incomplete: {snippet}")
+
+    quote_text = (CONTRACTS / "QUOTE_RATE_CONTRACT_V1.md").read_text(encoding="utf-8")
+    for snippet in ["不同 `asOf` 不得互相覆盖", "按成交时间选择历史 rate"]:
+        if snippet not in quote_text:
+            fail(f"FX history contract is incomplete: {snippet}")
 
     ok("Investment realized-PnL sale-result checks passed")
 
