@@ -7,6 +7,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:finwealth/app/app.dart';
 import 'package:finwealth/core/env.dart';
@@ -18,7 +19,12 @@ import 'package:finwealth/features/ai_review_page.dart';
 import 'package:finwealth/features/account_form_page.dart';
 import 'package:finwealth/features/account_type_picker.dart';
 import 'package:finwealth/features/dca_execution_dialog.dart';
+import 'package:finwealth/data/api_mock_repositories.dart'
+    show parseMovementData;
+import 'package:finwealth/data/repositories.dart';
 import 'package:finwealth/features/investment_page.dart';
+import 'package:finwealth/features/investment_trade_page.dart';
+import 'package:finwealth/features/movement_detail_page.dart';
 import 'package:finwealth/features/liabilities_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/overview_page.dart';
@@ -630,4 +636,383 @@ void main() {
       matchesGoldenFile('goldens/dca_execution_dialog_dark.png'),
     );
   });
+  // —— 手动投资成交（2026-07-17 批）——
+  const tradeCaps = LedgerCapabilitiesVm(
+    dataSourceMode: 'local_server',
+    canWriteConfirmedLedger: true,
+    canCreateAccount: true,
+    canRecordMovement: true,
+    canConfirmProposal: true,
+    canPersistPendingProposal: true,
+    proposalPersistence: 'file',
+  );
+  const tradeAccounts = [
+    AccountVm(
+      id: 'a_cash',
+      displayName: '招行储蓄卡',
+      accountType: AccountType.bank,
+      isLiability: false,
+      balanceMode: 'cash_balance',
+      defaultCurrency: 'CNY',
+      supportedCurrencies: ['CNY'],
+    ),
+    AccountVm(
+      id: 'a_hold',
+      displayName: 'A股券商',
+      accountType: AccountType.brokerage,
+      isLiability: false,
+      balanceMode: 'holdings',
+      defaultCurrency: 'CNY',
+      supportedCurrencies: ['CNY'],
+    ),
+  ];
+  const tradeInstruments = [
+    InstrumentVm(
+      id: 'inst_300',
+      type: InstrumentType.fund,
+      symbol: '510300',
+      displayName: '沪深300ETF',
+      quoteCurrency: 'CNY',
+    ),
+    InstrumentVm(
+      id: 'inst_500',
+      type: InstrumentType.fund,
+      symbol: '510500',
+      displayName: '中证500ETF',
+      quoteCurrency: 'CNY',
+    ),
+  ];
+
+  Widget tradeHost(ThemeData theme) => ProviderScope(
+    overrides: [
+      capabilitiesProvider.overrideWith((ref) async => tradeCaps),
+      accountsProvider.overrideWith((ref) async => tradeAccounts),
+      instrumentsProvider.overrideWith((ref) async => tradeInstruments),
+      portfolioRepositoryProvider.overrideWithValue(
+        const _PreviewPortfolioRepo(),
+      ),
+    ],
+    // _submit 依赖 GoRouter；预览用最小路由环境。
+    child: MaterialApp.router(
+      theme: theme,
+      routerConfig: GoRouter(
+        routes: [
+          GoRoute(path: '/', builder: (_, _) => const InvestmentTradePage()),
+        ],
+      ),
+    ),
+  );
+
+  Future<void> pickField(WidgetTester tester, Key key, String option) async {
+    await tester.tap(find.byKey(key));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(option).last);
+    await tester.pumpAndSettle();
+  }
+
+  Future<void> fillBuy(WidgetTester tester) async {
+    await pickField(tester, kTradeCashAccountFieldKey, '招行储蓄卡');
+    await pickField(tester, kTradeHoldingAccountFieldKey, 'A股券商');
+    await pickField(tester, kTradeInstrumentFieldKey, '沪深300ETF · 510300');
+    await tester.enterText(find.widgetWithText(TextField, '成交数量'), '10');
+    await tester.enterText(find.widgetWithText(TextField, '成交价款'), '4128.00');
+    // 等 label 浮动动画完成，避免文字与标签叠印。
+    await tester.pumpAndSettle();
+  }
+
+  testWidgets('trade form buy - phone dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(360, 800));
+    await tester.pumpWidget(tradeHost(buildDarkTheme()));
+    await _settleEntrance(tester);
+    await fillBuy(tester);
+    await expectLater(
+      find.byType(InvestmentTradePage),
+      matchesGoldenFile('goldens/trade_form_buy_phone_dark.png'),
+    );
+  });
+
+  testWidgets(
+    'trade form sell over-quantity - phone dark',
+    skip: !_previewEnabled,
+    (tester) async {
+      await sized(tester, const Size(360, 800));
+      await tester.pumpWidget(tradeHost(buildDarkTheme()));
+      await _settleEntrance(tester);
+      await tester.tap(find.text('卖出'));
+      await tester.pumpAndSettle();
+      await pickField(tester, kTradeCashAccountFieldKey, '招行储蓄卡');
+      await pickField(tester, kTradeHoldingAccountFieldKey, 'A股券商');
+      await pickField(tester, kTradeInstrumentFieldKey, '沪深300ETF · 510300');
+      await tester.enterText(find.widgetWithText(TextField, '成交数量'), '7');
+      await tester.enterText(
+        find.widgetWithText(TextField, '卖出毛回款'),
+        '2900.00',
+      );
+      await tester.pump();
+      // 滚到底部展示跨字段错误与禁用按钮。
+      await tester.drag(find.byType(ListView), const Offset(0, -600));
+      await tester.pumpAndSettle();
+      await expectLater(
+        find.byType(InvestmentTradePage),
+        matchesGoldenFile('goldens/trade_form_sell_error_phone_dark.png'),
+      );
+    },
+  );
+
+  testWidgets('trade form buy - desktop light', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(1200, 800));
+    await tester.pumpWidget(tradeHost(buildLightTheme()));
+    await _settleEntrance(tester);
+    await fillBuy(tester);
+    await expectLater(
+      find.byType(InvestmentTradePage),
+      matchesGoldenFile('goldens/trade_form_buy_desktop_light.png'),
+    );
+  });
+
+  testWidgets('trade confirm buy - light', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(420, 800));
+    await tester.pumpWidget(tradeHost(buildLightTheme()));
+    await _settleEntrance(tester);
+    await fillBuy(tester);
+    await tester.enterText(find.widgetWithText(TextField, '手续费（可选）'), '2.00');
+    await tester.pump();
+    await tester.drag(find.byType(ListView), const Offset(0, -600));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, '确认买入'));
+    await tester.pumpAndSettle();
+    await expectLater(
+      find.byKey(kTradeConfirmDialogKey),
+      matchesGoldenFile('goldens/trade_confirm_buy_light.png'),
+    );
+  });
+
+  testWidgets('trade confirm sell - dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(420, 800));
+    await tester.pumpWidget(tradeHost(buildDarkTheme()));
+    await _settleEntrance(tester);
+    await tester.tap(find.text('卖出'));
+    await tester.pumpAndSettle();
+    await pickField(tester, kTradeCashAccountFieldKey, '招行储蓄卡');
+    await pickField(tester, kTradeHoldingAccountFieldKey, 'A股券商');
+    await pickField(tester, kTradeInstrumentFieldKey, '沪深300ETF · 510300');
+    await tester.enterText(find.widgetWithText(TextField, '成交数量'), '4');
+    await tester.enterText(find.widgetWithText(TextField, '卖出毛回款'), '1660.00');
+    await tester.pump();
+    await tester.enterText(find.widgetWithText(TextField, '手续费（可选）'), '1.00');
+    await tester.enterText(find.widgetWithText(TextField, '税费（可选）'), '1.66');
+    await tester.pump();
+    await tester.drag(find.byType(ListView), const Offset(0, -600));
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, '确认卖出'));
+    await tester.pumpAndSettle();
+    await expectLater(
+      find.byKey(kTradeConfirmDialogKey),
+      matchesGoldenFile('goldens/trade_confirm_sell_dark.png'),
+    );
+  });
+
+  // —— 成交详情：同币种盈利 / 跨币种亏损 + 换算依据 ——
+  Widget detailHost(ThemeData theme, MovementVm movement) => ProviderScope(
+    overrides: [
+      capabilitiesProvider.overrideWith((ref) async => tradeCaps),
+      accountsProvider.overrideWith((ref) async => tradeAccounts),
+      movementRepositoryProvider.overrideWithValue(
+        _PreviewMovementRepo(movement),
+      ),
+    ],
+    child: MaterialApp(
+      theme: theme,
+      home: const MovementDetailPage(movementId: 'mov_preview'),
+    ),
+  );
+
+  final profitSale = parseMovementData({
+    'id': 'mov_preview',
+    'atomicGroupId': 'ag_preview',
+    'type': 'sell',
+    'status': 'confirmed',
+    'title': '卖出 沪深300ETF',
+    'occurredAt': '2026-07-16T10:30:00Z',
+    'entries': [
+      {
+        'accountId': 'a_hold',
+        'instrumentId': 'inst_300',
+        'amount': '4',
+        'currency': 'CNY',
+        'direction': 'out',
+        'role': 'source',
+      },
+      {
+        'accountId': 'a_cash',
+        'amount': '1660.00',
+        'currency': 'CNY',
+        'direction': 'in',
+        'role': 'destination',
+      },
+    ],
+    'saleResult': {
+      'costBasisMethod': 'average_cost',
+      'grossProceeds': {'amount': '1660.00', 'currency': 'CNY'},
+      'feeAndTaxTotal': {'amount': '2.66', 'currency': 'CNY'},
+      'netProceeds': {'amount': '1657.34', 'currency': 'CNY'},
+      'costBasisReleased': {'amount': '1651.20', 'currency': 'CNY'},
+      'realizedPnl': {'amount': '6.14', 'currency': 'CNY'},
+      'realizedPnlStatus': 'calculated',
+    },
+  });
+
+  final fxLossSale = parseMovementData({
+    'id': 'mov_preview',
+    'atomicGroupId': 'ag_preview',
+    'type': 'sell',
+    'status': 'confirmed',
+    'title': '卖出 纳指ETF',
+    'occurredAt': '2026-07-16T00:00:00Z',
+    'entries': [
+      {
+        'accountId': 'a_hold',
+        'instrumentId': 'inst_ndx',
+        'amount': '2',
+        'currency': 'USD',
+        'direction': 'out',
+        'role': 'source',
+      },
+      {
+        'accountId': 'a_cash',
+        'amount': '20.00',
+        'currency': 'CNY',
+        'direction': 'in',
+        'role': 'destination',
+      },
+    ],
+    'saleResult': {
+      'costBasisMethod': 'average_cost',
+      'grossProceeds': {'amount': '20.00', 'currency': 'CNY'},
+      'feeAndTaxTotal': {'amount': '0', 'currency': 'CNY'},
+      'netProceeds': {'amount': '20.00', 'currency': 'CNY'},
+      'costBasisReleased': {'amount': '20.00', 'currency': 'USD'},
+      'realizedPnl': {'amount': '-17.20', 'currency': 'USD'},
+      'netProceedsInCostBasisCurrency': {'amount': '2.80', 'currency': 'USD'},
+      'fxBasis': {
+        'baseCurrency': 'CNY',
+        'quoteCurrency': 'USD',
+        'rate': '0.14',
+        'asOf': '2026-07-15T00:00:00Z',
+        'sourceRateId': 'fx_internal_preview',
+        'source': 'manual',
+        'inverted': false,
+      },
+      'realizedPnlStatus': 'calculated_with_fx',
+    },
+  });
+
+  testWidgets('trade detail profit - dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 800));
+    await tester.pumpWidget(detailHost(buildDarkTheme(), profitSale));
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(MovementDetailPage),
+      matchesGoldenFile('goldens/trade_detail_profit_dark.png'),
+    );
+  });
+
+  testWidgets('trade detail fx loss - dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 860));
+    await tester.pumpWidget(detailHost(buildDarkTheme(), fxLossSale));
+    await _settleEntrance(tester);
+    // 展开换算依据（默认折叠）。
+    await tester.tap(find.text('换算依据'));
+    await tester.pumpAndSettle();
+    await expectLater(
+      find.byType(MovementDetailPage),
+      matchesGoldenFile('goldens/trade_detail_fx_loss_dark.png'),
+    );
+  });
+
+  testWidgets('trade detail fx loss - desktop light', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(1440, 900));
+    await tester.pumpWidget(detailHost(buildLightTheme(), fxLossSale));
+    await _settleEntrance(tester);
+    await tester.tap(find.text('换算依据'));
+    await tester.pumpAndSettle();
+    await expectLater(
+      find.byType(MovementDetailPage),
+      matchesGoldenFile('goldens/trade_detail_fx_loss_desktop_light.png'),
+    );
+  });
+}
+
+/// 预览用只读 movement 仓库。
+class _PreviewMovementRepo implements MovementRepository {
+  const _PreviewMovementRepo(this.movement);
+  final MovementVm movement;
+  @override
+  Future<MovementVm?> getMovement(Id id) async => movement;
+  @override
+  Future<List<MovementVm>> listRecentMovements({int limit = 20}) async =>
+      const [];
+  @override
+  Future<ConfirmResultVm> createManualRecord(ManualRecordInput input) =>
+      throw UnsupportedError('preview');
+  @override
+  Future<ConfirmResultVm> createTransfer(TransferInput input) =>
+      throw UnsupportedError('preview');
+  @override
+  Future<ConfirmResultVm> reconcileBalance(ReconcileInput input) =>
+      throw UnsupportedError('preview');
+  @override
+  Future<void> createCorrectionProposal(CreateCorrectionInput input) =>
+      throw UnsupportedError('preview');
+  @override
+  Future<ConfirmResultVm> createInvestmentTrade(InvestmentTradeInput input) =>
+      throw UnsupportedError('preview');
+}
+
+/// 预览用持仓仓库（卖出选择：沪深300ETF 持有 6）。
+class _PreviewPortfolioRepo implements PortfolioRepository {
+  const _PreviewPortfolioRepo();
+  @override
+  Future<PortfolioOverviewVm> getOverview() async => const PortfolioOverviewVm(
+    pendingSummary: PendingSummaryVm(),
+    quoteStatusSummary: QuoteStatusSummaryVm(),
+    primaryHoldings: [],
+    recentMovements: [],
+  );
+  @override
+  Future<List<HoldingVm>> listHoldings() async => const [];
+  @override
+  Future<List<HoldingVm>> listHoldingsByAccount(Id accountId) async => const [
+    HoldingVm(
+      id: 'h_300',
+      accountId: 'a_hold',
+      instrumentId: 'inst_300',
+      symbol: '510300',
+      displayName: '沪深300ETF',
+      quantity: '6',
+      quoteStatus: QuoteStatus.fresh,
+    ),
+  ];
+  @override
+  Future<AssetAllocationVm> getAssetAllocation() async =>
+      const AssetAllocationVm(
+        slices: [],
+        totalAssets: Money(amount: '0', currency: 'CNY'),
+        totalLiabilities: Money(amount: '0', currency: 'CNY'),
+        netWorth: Money(amount: '0', currency: 'CNY'),
+      );
 }
