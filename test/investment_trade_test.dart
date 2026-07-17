@@ -253,7 +253,6 @@ Future<void> _fillSell(
   await _enter(tester, '卖出毛回款', gross);
   if (fee.isNotEmpty) await _enter(tester, '手续费（可选）', fee);
   if (tax.isNotEmpty) await _enter(tester, '税费（可选）', tax);
-  await _enter(tester, '摘要', '卖出 沪深300ETF');
 }
 
 FilledButton _submitButton(WidgetTester tester, String label) =>
@@ -536,7 +535,7 @@ void main() {
     test('11. 400/409/403 抛出异常，不返回伪造的确认结果', () async {
       await expectLater(
         _tradeRepo(failStatus: 400).repo.createInvestmentTrade(_buyInput),
-        throwsA(isA<Exception>()),
+        throwsA(isA<ApiValidationException>()),
       );
       await expectLater(
         _tradeRepo(failStatus: 403).repo.createInvestmentTrade(_buyInput),
@@ -628,7 +627,6 @@ void main() {
       await _pick(tester, kTradeInstrumentFieldKey, '沪深300ETF · 510300');
       await _enter(tester, '成交数量', '10');
       await _enter(tester, '成交价款', '100.00');
-      await _enter(tester, '摘要', '买入 沪深300ETF');
       await tester.tap(find.text('确认买入').last);
       await tester.pumpAndSettle();
       await tester.tap(
@@ -639,9 +637,11 @@ void main() {
       );
       await tester.pumpAndSettle();
       // instrumentId 来自选择器，不是用户输入。
-      final entries = (_draftBody(h.requests)['entries'] as List)
-          .cast<Map<String, dynamic>>();
+      final body = _draftBody(h.requests);
+      final entries = (body['entries'] as List).cast<Map<String, dynamic>>();
       expect(entries[1]['instrumentId'], 'inst_pos');
+      // 摘要未填 → 自动生成"买入 <标的名称>"。
+      expect(body['title'], '买入 沪深300ETF');
     });
 
     testWidgets('9b. 买入标的报价币种不被持仓账户支持时不可提交', (tester) async {
@@ -653,7 +653,6 @@ void main() {
       await _pick(tester, kTradeInstrumentFieldKey, 'NVIDIA · NVDA');
       await _enter(tester, '成交数量', '1');
       await _enter(tester, '成交价款', '100.00');
-      await _enter(tester, '摘要', '买入 NVDA');
       expect(find.textContaining('持仓账户不支持该标的的报价币种'), findsOneWidget);
       expect(_submitButton(tester, '确认买入').onPressed, isNull);
       // 换成 CNY 标的即可提交。
@@ -676,9 +675,50 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(find.text('已入账'), findsNothing);
-      expect(find.textContaining('服务端拒绝（409）'), findsOneWidget);
+      expect(find.textContaining('数据已发生变化'), findsOneWidget);
       // 表单仍在（未 pop），用户输入未丢。
       expect(find.byType(InvestmentTradePage), findsOneWidget);
+    });
+
+    testWidgets('11N. 网络错误：表单保留并提示重试', (tester) async {
+      final repo = _ThrowingTradeRepo(
+        http.ClientException('connection refused'),
+      );
+      await _pumpForm(tester, repo);
+      await _fillSell(tester);
+      await tester.tap(find.text('确认卖出').last);
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.descendant(
+          of: find.byKey(kTradeConfirmDialogKey),
+          matching: find.widgetWithText(FilledButton, '确认卖出'),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.textContaining('网络连接失败'), findsOneWidget);
+      expect(find.text('已入账'), findsNothing);
+      // 表单与输入保留。
+      expect(find.byType(InvestmentTradePage), findsOneWidget);
+      expect(find.text('4'), findsOneWidget);
+    });
+
+    testWidgets('11F. 403：提示无记账权限', (tester) async {
+      final repo = _ThrowingTradeRepo(
+        ApiForbiddenException('/v1/movements/drafts'),
+      );
+      await _pumpForm(tester, repo);
+      await _fillSell(tester);
+      await tester.tap(find.text('确认卖出').last);
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.descendant(
+          of: find.byKey(kTradeConfirmDialogKey),
+          matching: find.widgetWithText(FilledButton, '确认卖出'),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.textContaining('没有记账权限'), findsOneWidget);
+      expect(find.text('已入账'), findsNothing);
     });
 
     testWidgets('12. ledgerWrite=false 不显示「已入账」', (tester) async {
@@ -695,7 +735,10 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(find.text('已入账'), findsNothing);
-      expect(find.text('已提交候选，尚未入账'), findsOneWidget);
+      expect(find.text('已提交为待确认候选，尚未入账'), findsOneWidget);
+      expect(find.text('前往审核'), findsOneWidget);
+      // 未真正入账：不当作完成，表单保留。
+      expect(find.byType(InvestmentTradePage), findsOneWidget);
     });
 
     testWidgets('16. 360/1200/1440 无 overflow；桌面表单宽度受限', (tester) async {
@@ -846,4 +889,30 @@ void main() {
       expect(find.text('成本换算依据'), findsNothing);
     });
   });
+}
+
+/// 只用于错误路径的 fake：createInvestmentTrade 固定抛出给定异常。
+class _ThrowingTradeRepo implements MovementRepository {
+  _ThrowingTradeRepo(this.error);
+  final Object error;
+  @override
+  Future<ConfirmResultVm> createInvestmentTrade(InvestmentTradeInput input) =>
+      Future.error(error);
+  @override
+  Future<List<MovementVm>> listRecentMovements({int limit = 20}) async =>
+      const [];
+  @override
+  Future<MovementVm?> getMovement(Id id) async => null;
+  @override
+  Future<ConfirmResultVm> createManualRecord(ManualRecordInput input) =>
+      throw UnsupportedError('unused');
+  @override
+  Future<ConfirmResultVm> createTransfer(TransferInput input) =>
+      throw UnsupportedError('unused');
+  @override
+  Future<ConfirmResultVm> reconcileBalance(ReconcileInput input) =>
+      throw UnsupportedError('unused');
+  @override
+  Future<void> createCorrectionProposal(CreateCorrectionInput input) =>
+      throw UnsupportedError('unused');
 }

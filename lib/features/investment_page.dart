@@ -43,7 +43,7 @@ class InvestmentPage extends ConsumerWidget {
               semanticLabel: '开始你的投资记录',
             ),
             title: '还没有投资持仓',
-            message: '可以先记录一笔成交，或创建定投计划。这里只展示事实统计，非投资建议。',
+            message: '记录第一笔成交，或创建定投计划。',
             action: Wrap(
               spacing: AppSpacing.sm,
               runSpacing: AppSpacing.xs,

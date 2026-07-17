@@ -51,18 +51,6 @@ String? sellQuantityError({
   return null;
 }
 
-/// 成交日期（可选）：YYYY-MM-DD 本地日历；空视为"用当前时间"。
-String? occurredDateError(String raw) {
-  final s = raw.trim();
-  if (s.isEmpty) return null;
-  if (!RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(s)) {
-    return '日期格式应为 YYYY-MM-DD';
-  }
-  final parsed = DateTime.tryParse(s);
-  if (parsed == null) return '日期不存在';
-  return null;
-}
-
 /// 现金合计支出（买入 = 价款 + 手续费 + 税费）；同币种字符串精确相加。
 String buyTotalCashOut({
   required String principal,

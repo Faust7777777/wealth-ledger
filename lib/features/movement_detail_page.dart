@@ -154,7 +154,30 @@ class _SaleResultSection extends StatelessWidget {
         _moneyKv(context, '毛回款', r.grossProceeds),
         _moneyKv(context, '手续费与税费', r.feeAndTaxTotal),
         _moneyKv(context, '现金净入账', r.netProceeds),
-        if (released != null) _moneyKv(context, '释放成本（平均成本法）', released),
+        if (released != null)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: AppSpacing.xxs),
+            child: Row(
+              children: [
+                Text('本次成本', style: AppType.body),
+                const SizedBox(width: AppSpacing.xs),
+                // 算法说明收进 tooltip，不常驻正文。
+                Tooltip(
+                  message: '按平均成本法，从该持仓的总成本中按本次卖出数量比例计算',
+                  child: Icon(
+                    Icons.info_outline,
+                    size: 15,
+                    color: Theme.of(context).textTheme.bodySmall?.color,
+                  ),
+                ),
+                const Spacer(),
+                Text(
+                  formatMoney(released, withCode: true),
+                  style: AppType.moneyRow,
+                ),
+              ],
+            ),
+          ),
         switch (r.realizedPnlStatus) {
           RealizedPnlStatus.calculated ||
           RealizedPnlStatus.calculatedWithFx when pnl != null => Padding(

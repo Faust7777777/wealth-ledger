@@ -40,6 +40,21 @@ class ApiConflictException implements Exception {
       message ?? '操作冲突（409${code == null ? '' : ' · $code'}）：$path';
 }
 
+/// 请求校验失败（400）：携带服务端 message 与 details.errors。
+/// UI 用 [userMessage] 呈现具体校验原因，不展示裸 HTTP 细节。
+class ApiValidationException implements Exception {
+  ApiValidationException(this.path, {this.message, this.details = const []});
+  final String path;
+  final String? message;
+  final List<String> details;
+
+  String get userMessage =>
+      details.isNotEmpty ? details.first : (message ?? '提交内容未通过校验');
+
+  @override
+  String toString() => '提交内容未通过校验（400）：$userMessage';
+}
+
 class DevApiClient {
   DevApiClient(
     this.baseUrl, {
@@ -93,6 +108,13 @@ class DevApiClient {
         message: _errorField(res, 'message'),
       );
     }
+    if (res.statusCode == 400) {
+      throw ApiValidationException(
+        path,
+        message: _errorField(res, 'message'),
+        details: _errorDetails(res),
+      );
+    }
     if (res.statusCode >= 400) {
       final message = _errorField(res, 'message');
       throw Exception(
@@ -108,6 +130,20 @@ class DevApiClient {
       return body.containsKey('data') ? body['data'] : body;
     }
     return body;
+  }
+
+  /// 读取错误信封 error.details.errors（服务端校验失败的逐条原因）。
+  List<String> _errorDetails(http.Response res) {
+    try {
+      final body = jsonDecode(utf8.decode(res.bodyBytes));
+      final error = body is Map ? body['error'] : null;
+      final details = error is Map ? error['details'] : null;
+      final errors = details is Map ? details['errors'] : details;
+      if (errors is List) return [for (final e in errors) '$e'];
+    } catch (_) {
+      // 信封不完整时回落到 message。
+    }
+    return const [];
   }
 
   /// 读取错误信封 {ok:false, error:{code, message}} 的字段（供 409 等使用）。

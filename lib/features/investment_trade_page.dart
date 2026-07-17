@@ -1,11 +1,16 @@
 // Wealth Ledger — 手动投资成交（买入/卖出；写真实账本，仅 local_server）。
 // 候选 → 确认：确认摘要后走「草稿 → 复核 → 入账」流水线；不下单、不连券商。
 // 是否已入账只凭服务端 ledgerWrite；金额与数量全程十进制字符串，不经 double。
+import 'dart:io' show SocketException;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import 'package:http/http.dart' show ClientException;
 
 import '../core/format.dart';
+import '../data/api_mock_repositories.dart'
+    show ApiConflictException, ApiForbiddenException, ApiValidationException;
 import '../core/types.dart';
 import '../data/providers.dart';
 import '../data/view_models.dart';
@@ -14,6 +19,7 @@ import '../theme/app_dimens.dart';
 import 'investment_trade_validation.dart';
 
 const Key kTradeCashAccountFieldKey = Key('trade_cash_account_field');
+const Key kTradeOccurredAtFieldKey = Key('trade_occurred_at_field');
 const Key kTradeHoldingAccountFieldKey = Key('trade_holding_account_field');
 const Key kTradeInstrumentFieldKey = Key('trade_instrument_field');
 const Key kTradeCashCurrencyFieldKey = Key('trade_cash_currency_field');
@@ -52,9 +58,11 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
   final _principal = TextEditingController();
   final _fee = TextEditingController();
   final _tax = TextEditingController();
-  final _date = TextEditingController();
   final _title = TextEditingController();
   final _note = TextEditingController();
+
+  /// 成交时间：null = 现在（请求省略该字段，由服务端取当前时间）。
+  DateTime? _occurredAt;
 
   TradeSide _side = TradeSide.buy;
   Id? _cashAccountId;
@@ -72,7 +80,6 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
     _principal.dispose();
     _fee.dispose();
     _tax.dispose();
-    _date.dispose();
     _title.dispose();
     _note.dispose();
     super.dispose();
@@ -87,7 +94,13 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
       requiredDecimalError(_principal.text, _principalLabel);
   String? get _feeError => optionalNonNegativeError(_fee.text, '手续费');
   String? get _taxError => optionalNonNegativeError(_tax.text, '税费');
-  String? get _dateError => occurredDateError(_date.text);
+
+  /// 摘要留空时自动生成（“买入/卖出 <标的名称>”），用户可覆盖。
+  String get _autoTitle {
+    final inst = _instrument;
+    if (inst == null) return '';
+    return '${_isBuy ? '买入' : '卖出'} ${inst.displayName}';
+  }
 
   /// 卖出跨字段校验：费用不超毛回款、数量不超持仓。
   String? get _sellCrossError {
@@ -129,9 +142,7 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
       _principalError == null &&
       _feeError == null &&
       _taxError == null &&
-      _dateError == null &&
-      _sellCrossError == null &&
-      _title.text.trim().isNotEmpty;
+      _sellCrossError == null;
 
   // —— 账户/标的选择规则（任务 §7）——
   List<AccountVm> _cashAccounts(List<AccountVm> accounts) => [
@@ -165,24 +176,10 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
     return options.toList();
   }
 
-  /// 卖出可选标的：所选持仓账户中数量 > 0 的实际持仓（按 instrumentId 关联标的）。
-  List<(HoldingVm, InstrumentVm)> _sellableHoldings(
-    List<HoldingVm> holdings,
-    List<InstrumentVm> instruments,
-  ) {
-    final byId = {for (final i in instruments) i.id: i};
-    return [
-      for (final h in holdings)
-        if (decimalSign(h.quantity) > 0 && byId.containsKey(h.instrumentId))
-          (h, byId[h.instrumentId]!),
-    ];
-  }
-
   // —— 选择弹窗（受限尺寸，不占满桌面）——
   Future<T?> _showPicker<T>({
     required String title,
     required List<Widget> Function(BuildContext dialogCtx) tiles,
-    Widget? footer,
   }) {
     final maxHeight = (MediaQuery.sizeOf(context).height * 0.6).clamp(
       240.0,
@@ -207,8 +204,6 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
           ),
         ),
         actions: [
-          if (footer != null)
-            Align(alignment: Alignment.centerLeft, child: footer),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx),
             child: const Text('取消'),
@@ -261,67 +256,26 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
     });
   }
 
-  Future<void> _pickBuyInstrument(List<InstrumentVm> instruments) async {
-    final picked = await _showPicker<InstrumentVm>(
-      title: '选择投资标的',
-      tiles: (dialogCtx) => [
-        if (instruments.isEmpty)
-          const Padding(
-            padding: EdgeInsets.all(AppSpacing.base),
-            child: Text('还没有投资标的，先添加一个。'),
-          ),
-        for (final i in instruments)
-          ListTile(
-            title: Text(_instrumentLabel(i)),
-            subtitle: Text(
-              '${_instrumentTypeLabel(i.type)} · ${i.quoteCurrency}',
-            ),
-            onTap: () => Navigator.pop(dialogCtx, i),
-          ),
-      ],
-      footer: Builder(
-        builder: (footerCtx) => TextButton.icon(
-          onPressed: () async {
-            final created = await _createInstrument();
-            if (created != null && footerCtx.mounted) {
-              Navigator.pop(footerCtx, created);
-            }
-          },
-          icon: const Icon(Icons.add, size: 18),
-          label: const Text('添加标的'),
-        ),
+  /// 标的选择：买入从服务端标的中选（可新建）；卖出只从所选账户正数量持仓中选。
+  /// 加载/失败/重试三态由弹窗内部处理。
+  Future<void> _pickInstrument() async {
+    final sellAccountId = _isBuy ? null : _holdingAccountId;
+    final picked = await showDialog<Object>(
+      context: context,
+      builder: (_) => _InstrumentPickerDialog(
+        sellAccountId: sellAccountId,
+        onCreate: _isBuy ? _createInstrument : null,
       ),
     );
-    if (picked == null) return;
+    if (!mounted || picked == null) return;
     setState(() {
-      _instrument = picked;
-      _heldQuantity = null;
-    });
-  }
-
-  Future<void> _pickSellInstrument(
-    List<(HoldingVm, InstrumentVm)> sellable,
-  ) async {
-    final picked = await _showPicker<(HoldingVm, InstrumentVm)>(
-      title: '选择卖出标的',
-      tiles: (dialogCtx) => [
-        if (sellable.isEmpty)
-          const Padding(
-            padding: EdgeInsets.all(AppSpacing.base),
-            child: Text('该持仓账户暂无可卖出的持仓。'),
-          ),
-        for (final entry in sellable)
-          ListTile(
-            title: Text(_instrumentLabel(entry.$2)),
-            subtitle: Text('持有 ${entry.$1.quantity}'),
-            onTap: () => Navigator.pop(dialogCtx, entry),
-          ),
-      ],
-    );
-    if (picked == null) return;
-    setState(() {
-      _instrument = picked.$2;
-      _heldQuantity = picked.$1.quantity;
+      if (picked is InstrumentVm) {
+        _instrument = picked;
+        _heldQuantity = null;
+      } else if (picked is (HoldingVm, InstrumentVm)) {
+        _instrument = picked.$2;
+        _heldQuantity = picked.$1.quantity;
+      }
     });
   }
 
@@ -445,13 +399,40 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
     }
   }
 
-  /// 成交时间：空 → null（服务端取当前时间）；填了按本地正午换算 UTC 瞬时，
-  /// 避免时区把日期挪走。
-  IsoDateTime? _occurredAtIso() {
-    final s = _date.text.trim();
-    if (s.isEmpty) return null;
-    final d = DateTime.parse(s);
-    return DateTime(d.year, d.month, d.day, 12).toUtc().toIso8601String();
+  /// 成交时间：界面显示本地时间；请求转换为 RFC3339 UTC。
+  /// 未修改（null）时省略该字段，由服务端取当前时间。
+  IsoDateTime? _occurredAtIso() => _occurredAt?.toUtc().toIso8601String();
+
+  String _formatLocal(DateTime t) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${t.year}-${two(t.month)}-${two(t.day)} ${two(t.hour)}:${two(t.minute)}';
+  }
+
+  /// 日期 + 时间选择器（本地时区）。
+  Future<void> _pickOccurredAt() async {
+    final now = DateTime.now();
+    final initial = _occurredAt ?? now;
+    final date = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(2000),
+      lastDate: now,
+    );
+    if (date == null || !mounted) return;
+    final time = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(initial),
+    );
+    if (time == null) return;
+    setState(() {
+      _occurredAt = DateTime(
+        date.year,
+        date.month,
+        date.day,
+        time.hour,
+        time.minute,
+      );
+    });
   }
 
   Future<void> _submit(List<AccountVm> accounts) async {
@@ -529,7 +510,9 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
               feeAmount: fee.isEmpty ? null : fee,
               taxAmount: tax.isEmpty ? null : tax,
               occurredAt: _occurredAtIso(),
-              title: _title.text.trim(),
+              title: _title.text.trim().isEmpty
+                  ? _autoTitle
+                  : _title.text.trim(),
               note: _note.text.trim().isEmpty ? null : _note.text.trim(),
             ),
           );
@@ -538,15 +521,52 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
         result,
         holdingAccountId: holdingAccount.id,
       );
+      if (result.ledgerWrite) {
+        messenger.showSnackBar(const SnackBar(content: Text('已入账')));
+        if (mounted) router.pop();
+      } else {
+        // 未真正写入账本：留在表单，引导去审核确认，不表现为已完成。
+        messenger.showSnackBar(
+          SnackBar(
+            content: const Text('已提交为待确认候选，尚未入账'),
+            action: SnackBarAction(
+              label: '前往审核',
+              onPressed: () => router.push('/ai-review'),
+            ),
+          ),
+        );
+      }
+    } on ApiValidationException catch (e) {
       messenger.showSnackBar(
-        SnackBar(content: Text(result.ledgerWrite ? '已入账' : '已提交候选，尚未入账')),
+        SnackBar(content: Text('记录未通过校验：${e.userMessage}')),
       );
-      if (mounted) router.pop();
+    } on ApiForbiddenException {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('当前账号没有记账权限，请重新登录后再试')),
+      );
+    } on ApiConflictException {
+      messenger.showSnackBar(
+        SnackBar(
+          content: const Text('数据已发生变化，请重新加载后再试'),
+          action: SnackBarAction(label: '重新加载', onPressed: _reloadInputs),
+        ),
+      );
     } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
+      final isNetwork = e is SocketException || e is ClientException;
+      messenger.showSnackBar(
+        SnackBar(content: Text(isNetwork ? '网络连接失败，表单已保留，请稍后重试' : '$e')),
+      );
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  /// 409 后的恢复：重取账户、标的与持仓（表单输入保留）。
+  void _reloadInputs() {
+    ref.invalidate(accountsProvider);
+    ref.invalidate(instrumentsProvider);
+    final id = _holdingAccountId;
+    if (id != null) ref.invalidate(holdingsByAccountProvider(id));
   }
 
   Widget _summaryRow(String k, String v) => Padding(
@@ -585,11 +605,33 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
     ),
   );
 
+  /// 窄屏（<480 逻辑宽）纵向排列成对字段；宽屏并列两列，校验文案互不挤压。
+  Widget _pairFields(Widget a, Widget b, {int flexA = 1, int flexB = 1}) =>
+      LayoutBuilder(
+        builder: (context, constraints) {
+          if (constraints.maxWidth < 480) {
+            return Column(
+              children: [
+                a,
+                const SizedBox(height: AppSpacing.base),
+                b,
+              ],
+            );
+          }
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(flex: flexA, child: a),
+              const SizedBox(width: AppSpacing.sm),
+              Expanded(flex: flexB, child: b),
+            ],
+          );
+        },
+      );
+
   @override
   Widget build(BuildContext context) {
     final accountsAsync = ref.watch(accountsProvider);
-    final instruments =
-        ref.watch(instrumentsProvider).asData?.value ?? const <InstrumentVm>[];
     return Scaffold(
       appBar: AppBar(title: const Text('投资成交')),
       body: accountsAsync.when(
@@ -598,16 +640,12 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
           message: '$e',
           onRetry: () => ref.invalidate(accountsProvider),
         ),
-        data: (accounts) => _form(context, accounts, instruments),
+        data: (accounts) => _form(context, accounts),
       ),
     );
   }
 
-  Widget _form(
-    BuildContext context,
-    List<AccountVm> accounts,
-    List<InstrumentVm> instruments,
-  ) {
+  Widget _form(BuildContext context, List<AccountVm> accounts) {
     final cashAccounts = _cashAccounts(accounts);
     final holdingAccounts = _holdingAccounts(accounts);
     if (cashAccounts.isEmpty || holdingAccounts.isEmpty) {
@@ -637,18 +675,6 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
     final holdingAccount = _byId(holdingAccounts, _holdingAccountId);
     final currencyOptions = _currencyOptions(cashAccount);
     final canRecord = ref.writeCapabilities.canRecordMovement;
-
-    // 卖出：所选账户的正数量持仓（provider family 只在选定账户后 watch）。
-    var sellable = const <(HoldingVm, InstrumentVm)>[];
-    if (!_isBuy && holdingAccount != null) {
-      final holdings =
-          ref
-              .watch(holdingsByAccountProvider(holdingAccount.id))
-              .asData
-              ?.value ??
-          const <HoldingVm>[];
-      sellable = _sellableHoldings(holdings, instruments);
-    }
 
     final crossError =
         _sellCrossError ?? _buyInstrumentCurrencyError(holdingAccount);
@@ -707,11 +733,7 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
                   ? _instrumentLabel(_instrument!)
                   : '${_instrumentLabel(_instrument!)} · 持有 $_heldQuantity',
               emptyHint: _isBuy ? '选择或添加标的' : '从当前持仓中选择',
-              onTap: !_isBuy && holdingAccount == null
-                  ? null
-                  : () => _isBuy
-                        ? _pickBuyInstrument(instruments)
-                        : _pickSellInstrument(sellable),
+              onTap: !_isBuy && holdingAccount == null ? null : _pickInstrument,
             ),
             if (!_isBuy && holdingAccount == null)
               Padding(
@@ -722,44 +744,34 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
                 ),
               ),
             const SizedBox(height: AppSpacing.base),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Expanded(
-                  flex: 2,
-                  child: TextField(
-                    controller: _quantity,
-                    keyboardType: const TextInputType.numberWithOptions(
-                      decimal: true,
-                    ),
-                    onChanged: (_) => setState(() {}),
-                    decoration: InputDecoration(
-                      labelText: '成交数量',
-                      hintText: '如 10 或 0.5',
-                      border: const OutlineInputBorder(),
-                      errorText: _quantity.text.isEmpty ? null : _quantityError,
-                    ),
-                  ),
+            _pairFields(
+              TextField(
+                controller: _quantity,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
                 ),
-                const SizedBox(width: AppSpacing.sm),
-                Expanded(
-                  flex: 3,
-                  child: TextField(
-                    controller: _principal,
-                    keyboardType: const TextInputType.numberWithOptions(
-                      decimal: true,
-                    ),
-                    onChanged: (_) => setState(() {}),
-                    decoration: InputDecoration(
-                      labelText: _principalLabel,
-                      border: const OutlineInputBorder(),
-                      errorText: _principal.text.isEmpty
-                          ? null
-                          : _principalError,
-                    ),
-                  ),
+                onChanged: (_) => setState(() {}),
+                decoration: InputDecoration(
+                  labelText: '成交数量',
+                  hintText: '如 10 或 0.5',
+                  border: const OutlineInputBorder(),
+                  errorText: _quantity.text.isEmpty ? null : _quantityError,
                 ),
-              ],
+              ),
+              TextField(
+                controller: _principal,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                onChanged: (_) => setState(() {}),
+                decoration: InputDecoration(
+                  labelText: _principalLabel,
+                  border: const OutlineInputBorder(),
+                  errorText: _principal.text.isEmpty ? null : _principalError,
+                ),
+              ),
+              flexA: 2,
+              flexB: 3,
             ),
             const SizedBox(height: AppSpacing.base),
             DropdownButtonFormField<CurrencyCode>(
@@ -776,58 +788,49 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
               onChanged: (v) => setState(() => _cashCurrency = v),
             ),
             const SizedBox(height: AppSpacing.base),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _fee,
-                    keyboardType: const TextInputType.numberWithOptions(
-                      decimal: true,
-                    ),
-                    onChanged: (_) => setState(() {}),
-                    decoration: InputDecoration(
-                      labelText: '手续费（可选）',
-                      border: const OutlineInputBorder(),
-                      errorText: _fee.text.isEmpty ? null : _feeError,
-                    ),
-                  ),
+            _pairFields(
+              TextField(
+                controller: _fee,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
                 ),
-                const SizedBox(width: AppSpacing.sm),
-                Expanded(
-                  child: TextField(
-                    controller: _tax,
-                    keyboardType: const TextInputType.numberWithOptions(
-                      decimal: true,
-                    ),
-                    onChanged: (_) => setState(() {}),
-                    decoration: InputDecoration(
-                      labelText: '税费（可选）',
-                      border: const OutlineInputBorder(),
-                      errorText: _tax.text.isEmpty ? null : _taxError,
-                    ),
-                  ),
+                onChanged: (_) => setState(() {}),
+                decoration: InputDecoration(
+                  labelText: '手续费（可选）',
+                  border: const OutlineInputBorder(),
+                  errorText: _fee.text.isEmpty ? null : _feeError,
                 ),
-              ],
+              ),
+              TextField(
+                controller: _tax,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                onChanged: (_) => setState(() {}),
+                decoration: InputDecoration(
+                  labelText: '税费（可选）',
+                  border: const OutlineInputBorder(),
+                  errorText: _tax.text.isEmpty ? null : _taxError,
+                ),
+              ),
             ),
             const SizedBox(height: AppSpacing.base),
-            TextField(
-              controller: _date,
-              onChanged: (_) => setState(() {}),
-              decoration: InputDecoration(
-                labelText: '成交时间（可选）',
-                hintText: 'YYYY-MM-DD，留空为当前时间',
-                border: const OutlineInputBorder(),
-                errorText: _date.text.isEmpty ? null : _dateError,
-              ),
+            _pickerField(
+              key: kTradeOccurredAtFieldKey,
+              label: '成交时间',
+              value: _occurredAt == null ? '现在' : _formatLocal(_occurredAt!),
+              emptyHint: '现在',
+              onTap: _pickOccurredAt,
             ),
             const SizedBox(height: AppSpacing.base),
             TextField(
               controller: _title,
               onChanged: (_) => setState(() {}),
               decoration: InputDecoration(
-                labelText: '摘要',
-                hintText: _isBuy ? '例如：买入 沪深300ETF' : '例如：卖出 沪深300ETF',
+                labelText: '摘要（可选）',
+                hintText: _autoTitle.isEmpty
+                    ? (_isBuy ? '默认：买入 <标的名称>' : '默认：卖出 <标的名称>')
+                    : '默认：$_autoTitle',
                 border: const OutlineInputBorder(),
               ),
             ),
@@ -864,6 +867,150 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// 卖出可选标的：持仓数量 > 0 且能按 instrumentId 关联到标的。
+List<(HoldingVm, InstrumentVm)> _sellableHoldings(
+  List<HoldingVm> holdings,
+  List<InstrumentVm> instruments,
+) {
+  final byId = {for (final i in instruments) i.id: i};
+  return [
+    for (final h in holdings)
+      if (decimalSign(h.quantity) > 0 && byId.containsKey(h.instrumentId))
+        (h, byId[h.instrumentId]!),
+  ];
+}
+
+/// 标的选择弹窗：内部处理加载 / 失败重试 / 空态；
+/// 买入列出服务端全部标的（可新建），卖出只列所选账户的正数量持仓。
+class _InstrumentPickerDialog extends ConsumerWidget {
+  const _InstrumentPickerDialog({required this.sellAccountId, this.onCreate});
+
+  /// 卖出模式的持仓账户；null = 买入模式。
+  final Id? sellAccountId;
+
+  /// 买入模式的「添加标的」入口；创建成功后作为选中项返回。
+  final Future<InstrumentVm?> Function()? onCreate;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final maxHeight = (MediaQuery.sizeOf(context).height * 0.6).clamp(
+      240.0,
+      460.0,
+    );
+    final instrumentsAsync = ref.watch(instrumentsProvider);
+    final holdingsAsync = sellAccountId == null
+        ? null
+        : ref.watch(holdingsByAccountProvider(sellAccountId!));
+
+    void retry() {
+      ref.invalidate(instrumentsProvider);
+      if (sellAccountId != null) {
+        ref.invalidate(holdingsByAccountProvider(sellAccountId!));
+      }
+    }
+
+    Widget body;
+    if (instrumentsAsync.isLoading || (holdingsAsync?.isLoading ?? false)) {
+      body = const Padding(
+        padding: EdgeInsets.all(AppSpacing.lg),
+        child: Center(child: CircularProgressIndicator()),
+      );
+    } else if (instrumentsAsync.hasError ||
+        (holdingsAsync?.hasError ?? false)) {
+      body = Padding(
+        padding: const EdgeInsets.all(AppSpacing.base),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('标的加载失败，请重试。'),
+            const SizedBox(height: AppSpacing.sm),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: OutlinedButton(onPressed: retry, child: const Text('重试')),
+            ),
+          ],
+        ),
+      );
+    } else if (sellAccountId == null) {
+      final instruments = instrumentsAsync.value ?? const <InstrumentVm>[];
+      body = instruments.isEmpty
+          ? const Padding(
+              padding: EdgeInsets.all(AppSpacing.base),
+              child: Text('还没有投资标的，先添加一个。'),
+            )
+          : Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (final i in instruments)
+                  ListTile(
+                    title: Text(_instrumentLabel(i)),
+                    subtitle: Text(
+                      '${_instrumentTypeLabel(i.type)} · ${i.quoteCurrency}',
+                    ),
+                    onTap: () => Navigator.pop(context, i),
+                  ),
+              ],
+            );
+    } else {
+      final sellable = _sellableHoldings(
+        holdingsAsync!.value ?? const <HoldingVm>[],
+        instrumentsAsync.value ?? const <InstrumentVm>[],
+      );
+      body = sellable.isEmpty
+          ? const Padding(
+              padding: EdgeInsets.all(AppSpacing.base),
+              child: Text('该持仓账户暂无可卖出的持仓。'),
+            )
+          : Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (final entry in sellable)
+                  ListTile(
+                    title: Text(_instrumentLabel(entry.$2)),
+                    subtitle: Text('持有 ${entry.$1.quantity}'),
+                    onTap: () => Navigator.pop(context, entry),
+                  ),
+              ],
+            );
+    }
+
+    return AlertDialog(
+      title: Text(sellAccountId == null ? '选择投资标的' : '选择卖出标的'),
+      contentPadding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
+      content: SizedBox(
+        width: 420,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: maxHeight),
+          child: SingleChildScrollView(child: body),
+        ),
+      ),
+      actions: [
+        if (onCreate != null)
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: () async {
+                final created = await onCreate!();
+                if (created != null && context.mounted) {
+                  Navigator.pop(context, created);
+                }
+              },
+              icon: const Icon(Icons.add, size: 18),
+              label: const Text('添加标的'),
+            ),
+          ),
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+      ],
     );
   }
 }
