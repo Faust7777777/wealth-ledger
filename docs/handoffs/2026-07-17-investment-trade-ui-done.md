@@ -9,8 +9,13 @@
 `C:\Users\15892\projects\finwealth-investment-trade-ui`。
 `git diff dc8c36c..HEAD -- server-rs docs/contracts tools/contract_check.py
 tools/local_ledger_smoke.py` 为空（后端投资成交 replacement correction 与
-`InvestmentReplacement` 契约完整保留，未回退）；`git diff --check` 零输出；
+`InvestmentReplacement` 契约完整保留，未回退）；
 `fixture_repositories.dart` 已恢复 LF，分支 diff 仅 42 行真实修改。
+
+集成复核补记：Codex 从基线执行范围门禁时发现两个新增文件仍以 CRLF 存入提交，
+导致 `git diff --check dc8c36c..HEAD` 报每行尾随空白。后续提交通过精确
+`.gitattributes` 规则和 `git add --renormalize` 将它们改为 LF；业务内容未变。
+修正后范围门禁和普通门禁均为零输出。
 
 ## 1. 提交列表（基线之上，回执提交另计）
 

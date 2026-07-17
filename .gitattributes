@@ -4,3 +4,7 @@
 windows/flutter/generated_plugin_registrant.cc text eol=lf
 windows/flutter/generated_plugin_registrant.h text eol=lf
 windows/flutter/generated_plugins.cmake text eol=lf
+
+# Keep hand-written investment trade sources stable across Windows worktrees.
+lib/features/investment_trade_validation.dart text eol=lf
+test/investment_trade_test.dart text eol=lf
