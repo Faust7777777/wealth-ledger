@@ -1963,6 +1963,28 @@ components:
           $ref: "#/components/schemas/ExecutionFxBasis"
         realizedPnlStatus:
           enum: [calculated, calculated_with_fx, cost_basis_unavailable, currency_mismatch]
+    InvestmentReplacement:
+      type: object
+      additionalProperties: false
+      required: [targetType, targetOccurredAt, replacementEntries]
+      description: >-
+        Immutable audit metadata for replacing the latest confirmed buy or sell
+        affecting one holding. Confirmation reverses the original frozen cash,
+        quantity, and cost-basis effect before applying these complete entries.
+      properties:
+        targetType:
+          enum: [buy, sell]
+        targetOccurredAt:
+          $ref: "#/components/schemas/ISODateTime"
+        replacementEntries:
+          type: array
+          minItems: 2
+          items:
+            $ref: "#/components/schemas/MovementEntryInput"
+        saleResult:
+          $ref: "#/components/schemas/InvestmentSaleResult"
+        costBasisFx:
+          $ref: "#/components/schemas/ExecutionFxBasis"
     SettlementInfo:
       type: object
       required: [status]
@@ -2072,6 +2094,8 @@ components:
           $ref: "#/components/schemas/InvestmentSaleResult"
         costBasisFx:
           $ref: "#/components/schemas/ExecutionFxBasis"
+        investmentReplacement:
+          $ref: "#/components/schemas/InvestmentReplacement"
         source:
           $ref: "#/components/schemas/DataSourceInfo"
         createdAt:
@@ -2154,7 +2178,10 @@ components:
         replacementEntries for a complete multi-leg replacement. The server
         creates one correction movement containing reversals of every original
         entry followed by the complete replacement entries. The original
-        confirmed movement is never modified.
+        confirmed movement is never modified. Buy/sell corrections require
+        replacementEntries and are limited to the latest confirmed trade for the
+        affected holding; targets with later trades or missing frozen sale cost
+        basis are rejected rather than guessed.
       anyOf:
         - required: [proposedDiffs]
         - required: [replacementEntries]

@@ -7954,6 +7954,284 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ledger_investment_replacement_correction_preserves_cost_basis() {
+        let path = unique_test_ledger_path("investment_replacement_correction");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let mut account_ids = Vec::new();
+        for (display_name, account_type, balance_mode, amount) in [
+            ("更正资金账户", "bank", "cash_balance", "1000.00"),
+            ("更正证券账户", "brokerage", "holdings", "0.00"),
+        ] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/accounts",
+                json!({
+                    "displayName": display_name,
+                    "accountType": account_type,
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": balance_mode,
+                    "openingBalances": [{"currency": "CNY", "amount": amount}]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            account_ids.push(body["data"]["id"].as_str().unwrap().to_string());
+        }
+
+        let (buy_status, buy_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            json!({
+                "type": "buy",
+                "occurredAt": "2026-07-16T10:00:00Z",
+                "title": "待更正买入",
+                "entries": [
+                    {"accountId": account_ids[0], "amount": "100.00", "currency": "CNY", "direction": "out", "role": "source"},
+                    {"accountId": account_ids[1], "instrumentId": "inst_correction_fund", "amount": "10", "currency": "CNY", "direction": "in", "role": "destination"},
+                    {"accountId": account_ids[0], "amount": "2.00", "currency": "CNY", "direction": "out", "role": "fee"},
+                    {"accountId": account_ids[0], "amount": "1.00", "currency": "CNY", "direction": "out", "role": "tax"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(buy_status, StatusCode::CREATED, "{buy_body}");
+        let buy_id = buy_body["data"]["id"].as_str().unwrap().to_string();
+        let buy_group = buy_body["data"]["atomicGroupId"].as_str().unwrap();
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{buy_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+
+        let replacement_buy = json!({
+            "targetMovementId": buy_id,
+            "reason": "成交回单显示数量和费用录入错误",
+            "replacementEntries": [
+                {"accountId": account_ids[0], "amount": "120.00", "currency": "CNY", "direction": "out", "role": "source"},
+                {"accountId": account_ids[1], "instrumentId": "inst_correction_fund", "amount": "12", "currency": "CNY", "direction": "in", "role": "destination"},
+                {"accountId": account_ids[0], "amount": "4.00", "currency": "CNY", "direction": "out", "role": "fee"},
+                {"accountId": account_ids[0], "amount": "1.00", "currency": "CNY", "direction": "out", "role": "tax"}
+            ]
+        });
+        let (correction_status, correction_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            replacement_buy.clone(),
+        )
+        .await;
+        assert_eq!(correction_status, StatusCode::OK, "{correction_body}");
+        let buy_correction_id = correction_body["data"]["proposedMovements"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let correction_group = correction_body["data"]["id"].as_str().unwrap();
+
+        let (_, pending_cash) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        let (_, pending_holdings) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(pending_cash["data"]["cashBalances"][0]["amount"], "897.00");
+        assert_eq!(pending_holdings["data"][0]["quantity"], "10");
+        assert_eq!(
+            pending_holdings["data"][0]["costBasisTotal"]["amount"],
+            "103.00"
+        );
+
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{correction_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+        let (_, corrected_cash) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        let (_, corrected_holdings) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(
+            corrected_cash["data"]["cashBalances"][0]["amount"],
+            "875.00"
+        );
+        assert_eq!(corrected_holdings["data"][0]["quantity"], "12");
+        assert_eq!(
+            corrected_holdings["data"][0]["costBasisTotal"]["amount"],
+            "125.00"
+        );
+        let (_, original_buy) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/movements/{buy_id}"),
+        )
+        .await;
+        assert_eq!(original_buy["data"]["entries"][0]["amount"], "100.00");
+        let (_, confirmed_correction) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/movements/{buy_correction_id}"),
+        )
+        .await;
+        assert_eq!(
+            confirmed_correction["data"]["investmentReplacement"]["targetType"],
+            "buy"
+        );
+
+        let (duplicate_status, duplicate_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            replacement_buy,
+        )
+        .await;
+        assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate_body}");
+
+        let (correction_target_status, correction_target_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": buy_correction_id,
+                "reason": "不得把投资 correction 当普通 adjustment 再更正",
+                "replacementEntries": [
+                    {"accountId": account_ids[0], "amount": "125.00", "currency": "CNY", "direction": "out", "role": "source"},
+                    {"accountId": account_ids[1], "instrumentId": "inst_correction_fund", "amount": "12", "currency": "CNY", "direction": "in", "role": "destination"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            correction_target_status,
+            StatusCode::BAD_REQUEST,
+            "{correction_target_body}"
+        );
+
+        let (sell_status, sell_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            json!({
+                "type": "sell",
+                "occurredAt": "2026-07-16T11:00:00Z",
+                "title": "待更正卖出",
+                "entries": [
+                    {"accountId": account_ids[1], "instrumentId": "inst_correction_fund", "amount": "2", "currency": "CNY", "direction": "out", "role": "source"},
+                    {"accountId": account_ids[0], "amount": "30.00", "currency": "CNY", "direction": "in", "role": "destination"},
+                    {"accountId": account_ids[0], "amount": "1.00", "currency": "CNY", "direction": "out", "role": "fee"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(sell_status, StatusCode::CREATED, "{sell_body}");
+        let sell_id = sell_body["data"]["id"].as_str().unwrap().to_string();
+        let sell_group = sell_body["data"]["atomicGroupId"].as_str().unwrap();
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{sell_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+
+        let (stale_status, stale_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": buy_id,
+                "reason": "后续成交后不得回改旧买入",
+                "replacementEntries": [
+                    {"accountId": account_ids[0], "amount": "110.00", "currency": "CNY", "direction": "out", "role": "source"},
+                    {"accountId": account_ids[1], "instrumentId": "inst_correction_fund", "amount": "11", "currency": "CNY", "direction": "in", "role": "destination"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(stale_status, StatusCode::CONFLICT, "{stale_body}");
+
+        let (sell_correction_status, sell_correction_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": sell_id,
+                "reason": "卖出数量和回款更正",
+                "replacementEntries": [
+                    {"accountId": account_ids[1], "instrumentId": "inst_correction_fund", "amount": "3", "currency": "CNY", "direction": "out", "role": "source"},
+                    {"accountId": account_ids[0], "amount": "45.00", "currency": "CNY", "direction": "in", "role": "destination"},
+                    {"accountId": account_ids[0], "amount": "1.00", "currency": "CNY", "direction": "out", "role": "fee"},
+                    {"accountId": account_ids[0], "amount": "1.00", "currency": "CNY", "direction": "out", "role": "tax"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            sell_correction_status,
+            StatusCode::OK,
+            "{sell_correction_body}"
+        );
+        let sell_correction_id = sell_correction_body["data"]["proposedMovements"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sell_correction_group = sell_correction_body["data"]["id"].as_str().unwrap();
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{sell_correction_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+
+        let (_, final_cash) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        let (_, final_holdings) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(final_cash["data"]["cashBalances"][0]["amount"], "918.00");
+        assert_eq!(final_holdings["data"][0]["quantity"], "9");
+        assert_eq!(
+            final_holdings["data"][0]["costBasisTotal"]["amount"],
+            "93.75"
+        );
+        let (_, final_correction) = request_json_from(
+            router,
+            Method::GET,
+            &format!("/v1/movements/{sell_correction_id}"),
+        )
+        .await;
+        let result = &final_correction["data"]["investmentReplacement"]["saleResult"];
+        assert_eq!(result["grossProceeds"]["amount"], "45.00");
+        assert_eq!(result["feeAndTaxTotal"]["amount"], "2.00");
+        assert_eq!(result["netProceeds"]["amount"], "43.00");
+        assert_eq!(result["costBasisReleased"]["amount"], "31.25");
+        assert_eq!(result["realizedPnl"]["amount"], "11.75");
+        assert_eq!(result["realizedPnlStatus"], "calculated");
+
+        local_ledger::validate_supported_ledger(&path)
+            .expect("corrected investment ledger should remain valid");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_loan_disbursement_and_repayment_preserve_accounting_identity() {
         let path = unique_test_ledger_path("loan_semantics");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");

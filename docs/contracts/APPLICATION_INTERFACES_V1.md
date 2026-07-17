@@ -136,6 +136,7 @@ CreateMovementDraftInput {
   transferMeta?: TransferMeta;
   saleResult?: InvestmentSaleResult; // sell 确认时由服务端生成，客户端不可提交
   costBasisFx?: ExecutionFxBasis;     // 跨币种买入成本换算时由服务端生成
+  investmentReplacement?: InvestmentReplacement; // 投资 correction 的完整替代与派生结果
 }
 
 ConfirmResult {

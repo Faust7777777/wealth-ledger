@@ -187,6 +187,10 @@ AI pending 读取层把 standalone pending movements 按 `atomicGroupId` 分组�
   使用不晚于 `occurredAt` 的最近 rate，并将 `ExecutionFxBasis` 固化到 `costBasisFx` 或
   `saleResult.fxBasis`；未来时间 rate 不得用于过去成交。
 - 同一 confirmed movement 同时最多有一个 pending correction；账本效果未变化的 replacement 不得落盘。
+- 投资 correction 必须持久化 `investmentReplacement`，且只替换同一持仓最后一笔 confirmed
+  buy/sell。确认时使用原 movement 的现金腿、费用腿、`costBasisFx` 或
+  `saleResult.costBasisReleased` 精确撤销，再应用完整 replacement；不得按普通 adjustment
+  数量差额处理。目标已有后续成交、已有 confirmed correction 或缺少可逆成本依据时拒绝。
 - AI approve 必须消费服务端 `ledgerWrite` / `confirmedMovementIds`，前端不得自行猜测“已入账”。
 - 写入后如影响净值/持仓/快照，必须返回或标记 `snapshotInvalidated`。
 

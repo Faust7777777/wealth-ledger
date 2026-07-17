@@ -219,6 +219,7 @@ Movement {
   transferMeta?: TransferMeta;
   saleResult?: InvestmentSaleResult;
   costBasisFx?: ExecutionFxBasis;
+  investmentReplacement?: InvestmentReplacement;
   subscriptionId?: ID;
   scheduledChargeDate?: ISODate;
   source: DataSourceInfo;
@@ -291,6 +292,14 @@ ExecutionFxBasis {
   sourceUrl?: string;
   inverted: boolean;
 }
+
+InvestmentReplacement {
+  targetType: "buy" | "sell";
+  targetOccurredAt: ISODateTime;
+  replacementEntries: MovementEntry[];
+  saleResult?: InvestmentSaleResult;
+  costBasisFx?: ExecutionFxBasis;
+}
 ```
 
 规则：
@@ -313,6 +322,9 @@ ExecutionFxBasis {
   FX；找到时固化 `fxBasis` 并计算，找不到时写明确状态，不伪造数字。
 - 已有持仓的买入成本币种不一致时，同样按成交时间选择历史 FX，并把实际换算依据固化到
   `costBasisFx`；不得用确认当天的新汇率回算历史成交。
+- `investmentReplacement` 只允许出现在 correction movement，保存被替代成交类型、原成交
+  时间、完整 replacement entries，以及确认后重新派生的 `saleResult` / `costBasisFx`。投资
+  更正只作用于同一持仓最后一笔已确认成交，旧 sell 没有固化释放成本时不得猜测更正。
 
 ## 6. Transfer / 在途 / 折损
 

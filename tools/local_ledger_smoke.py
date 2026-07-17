@@ -410,6 +410,98 @@ def create_and_confirm_investment_with_fees(
     assert sale_result["realizedPnl"] == {"amount": "2.90", "currency": "CNY"}
     assert sale_result["realizedPnlStatus"] == "calculated"
 
+    correction = unwrap_data(
+        request_json(
+            base,
+            "/v1/movements/corrections",
+            method="POST",
+            body={
+                "targetMovementId": sell["id"],
+                "reason": "local smoke replaces the latest investment sale",
+                "replacementEntries": [
+                    {
+                        "accountId": holding_account_id,
+                        "instrumentId": instrument_id,
+                        "amount": "1",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source",
+                    },
+                    {
+                        "accountId": cash_account_id,
+                        "amount": "13.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination",
+                    },
+                    {
+                        "accountId": cash_account_id,
+                        "amount": "0.50",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "fee",
+                    },
+                ],
+            },
+        )
+    )
+    pending_correction_account = unwrap_data(
+        request_json(base, f"/v1/accounts/{cash_account_id}")
+    )
+    pending_correction_holdings = unwrap_data(request_json(base, "/v1/holdings"))
+    pending_remaining = next(
+        item
+        for item in pending_correction_holdings
+        if item["instrumentId"] == instrument_id
+    )
+    assert cash_balance(pending_correction_account, "CNY") == before_sell_cash + Decimal(
+        "23.50"
+    )
+    assert pending_remaining["quantity"] == "3"
+    assert pending_remaining["costBasisTotal"]["amount"] == "30.90"
+
+    correction_confirmation = unwrap_data(
+        request_json(
+            base,
+            f"/v1/atomic-groups/{correction['id']}/confirm",
+            method="POST",
+        )
+    )
+    assert correction_confirmation["ledgerWrite"] is True
+    corrected_account = unwrap_data(
+        request_json(base, f"/v1/accounts/{cash_account_id}")
+    )
+    corrected_holdings = unwrap_data(request_json(base, "/v1/holdings"))
+    corrected_remaining = next(
+        item for item in corrected_holdings if item["instrumentId"] == instrument_id
+    )
+    assert cash_balance(corrected_account, "CNY") == before_sell_cash + Decimal("12.50")
+    assert corrected_remaining["quantity"] == "4"
+    assert corrected_remaining["costBasisTotal"]["amount"] == "41.20"
+    corrected_movement = unwrap_data(
+        request_json(
+            base,
+            f"/v1/movements/{correction['proposedMovements'][0]['id']}",
+        )
+    )
+    replacement_result = corrected_movement["investmentReplacement"]["saleResult"]
+    assert replacement_result["grossProceeds"] == {
+        "amount": "13.00",
+        "currency": "CNY",
+    }
+    assert replacement_result["netProceeds"] == {
+        "amount": "12.50",
+        "currency": "CNY",
+    }
+    assert replacement_result["costBasisReleased"] == {
+        "amount": "10.30",
+        "currency": "CNY",
+    }
+    assert replacement_result["realizedPnl"] == {
+        "amount": "2.20",
+        "currency": "CNY",
+    }
+
 
 def create_and_confirm_cross_currency_investment(
     base: str, usd_account_id: str, holding_account_id: str
@@ -486,12 +578,56 @@ def create_and_confirm_cross_currency_investment(
     confirmed_buy = unwrap_data(request_json(base, f"/v1/movements/{buy['id']}"))
     assert confirmed_buy["costBasisFx"]["sourceRateId"] == "fx_smoke_usd_cny_historical"
     assert confirmed_buy["costBasisFx"]["rate"] == "7"
+    buy_correction = unwrap_data(
+        request_json(
+            base,
+            "/v1/movements/corrections",
+            method="POST",
+            body={
+                "targetMovementId": buy["id"],
+                "reason": "local smoke replaces the latest cross-currency buy",
+                "replacementEntries": [
+                    {
+                        "accountId": usd_account_id,
+                        "amount": "12.00",
+                        "currency": "USD",
+                        "direction": "out",
+                        "role": "source",
+                    },
+                    {
+                        "accountId": holding_account_id,
+                        "instrumentId": "inst_smoke_fee_fund",
+                        "amount": "1.5",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination",
+                    },
+                ],
+            },
+        )
+    )
+    unwrap_data(
+        request_json(
+            base,
+            f"/v1/atomic-groups/{buy_correction['id']}/confirm",
+            method="POST",
+        )
+    )
+    confirmed_buy_correction = unwrap_data(
+        request_json(
+            base,
+            f"/v1/movements/{buy_correction['proposedMovements'][0]['id']}",
+        )
+    )
+    replacement_fx = confirmed_buy_correction["investmentReplacement"]["costBasisFx"]
+    assert replacement_fx["sourceRateId"] == "fx_smoke_usd_cny_historical"
+    assert replacement_fx["rate"] == "7"
     holdings = unwrap_data(request_json(base, "/v1/holdings"))
     holding = next(
         item for item in holdings if item["instrumentId"] == "inst_smoke_fee_fund"
     )
-    assert holding["quantity"] == "4"
-    assert holding["costBasisTotal"] == {"amount": "100.90", "currency": "CNY"}
+    assert holding["quantity"] == "5.5"
+    assert holding["costBasisTotal"] == {"amount": "125.20", "currency": "CNY"}
 
     sell = unwrap_data(
         request_json(
@@ -539,12 +675,15 @@ def create_and_confirm_cross_currency_investment(
         "currency": "CNY",
     }
     assert sale_result["costBasisReleased"] == {
-        "amount": "25.225",
+        "amount": "22.76363636",
         "currency": "CNY",
     }
-    assert sale_result["realizedPnl"] == {"amount": "51.775", "currency": "CNY"}
+    assert sale_result["realizedPnl"] == {
+        "amount": "54.23636364",
+        "currency": "CNY",
+    }
     usd_account = unwrap_data(request_json(base, f"/v1/accounts/{usd_account_id}"))
-    assert cash_balance(usd_account, "USD") == Decimal("81.00")
+    assert cash_balance(usd_account, "USD") == Decimal("79.00")
 
 
 def create_and_confirm_multileg_correction(

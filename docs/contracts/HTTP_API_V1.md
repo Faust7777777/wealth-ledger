@@ -219,10 +219,17 @@ POST  /v1/movements/corrections
   不得因用户稍后确认一笔旧成交而使用确认当天的新汇率。
 - `loan_disbursement` 必须从负债账户 `out/source` 到非负债账户 `in/destination`；`loan_repayment` 方向相反；两腿同币种同金额且账户不同。
 - 普通 draft 不接受 `type=correction`；更正只能通过 `/v1/movements/corrections` 创建，避免绕过原记录引用与反向分录。
-- 当前不接受含持仓腿的投资 movement 更正；在数量和成本基础的完整 replacement 语义进入契约前，明确返回 400，避免把数量差额误当金额差额。
+- 投资 movement 更正必须提交完整 `replacementEntries`，不接受只给金额 diff。当前只允许更正
+  同一持仓最后一笔已确认的 buy/sell：确认时先按原成交固化的现金、数量、成本基础精确撤销，
+  再以原 `occurredAt` 应用完整 replacement。若该持仓已有后续已确认成交、目标已被更正，或旧
+  sell 缺少 `saleResult.costBasisReleased`，返回 409，不猜测历史成本。
 - correction 兼容单分录 `proposedDiffs`，也可提交完整 `replacementEntries` 更正多腿交易。
 - 多腿更正会在同一个 pending correction movement 中逐腿反向原分录并写入完整替换分录；确认前不影响余额，确认时整组原子应用，原 confirmed movement 永不改写。
-- `replacementEntries` 是完整目标状态而非局部 patch；无账本效果变化的 replacement 返回 400，同一原记录已有 pending correction 时返回 409。
+- `replacementEntries` 是完整目标状态而非局部 patch；完全不改变分录语义或账本效果的
+  replacement 返回 400，同一原记录已有 pending correction 时返回 409。投资成交即使净现金
+  与数量不变，只要 principal/fee/tax 构成变化，仍属于有效 replacement。
+- 投资 replacement 的派生结果保存在 correction movement 的 `investmentReplacement` 中；原
+  buy/sell movement、原 entries、原 `saleResult` 均保持不可变。
 
 ## 7. DCA
 

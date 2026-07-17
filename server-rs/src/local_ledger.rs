@@ -1141,19 +1141,32 @@ pub fn create_correction_proposal(
             )));
         }
 
-        if target
-            .get("entries")
-            .and_then(Value::as_array)
-            .is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| entry.get("instrumentId").is_some())
-            })
-        {
+        let target_type = target.get("type").and_then(Value::as_str).ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["target movement.type is missing".to_string()])
+        })?;
+        let is_investment = matches!(target_type, "buy" | "sell");
+        let has_holding_entry =
+            target
+                .get("entries")
+                .and_then(Value::as_array)
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| entry.get("instrumentId").is_some())
+                });
+        if has_holding_entry && !is_investment {
             return Err(LedgerError::InvalidInput(vec![
-                "investment movement correction is not supported until quantity and cost-basis replacement semantics are explicit"
-                    .to_string(),
+                "holding-entry corrections may only target a confirmed buy or sell".to_string(),
             ]));
+        }
+        if is_investment && replacement_entries.is_none() {
+            return Err(LedgerError::InvalidInput(vec![
+                "investment correction requires complete replacementEntries".to_string(),
+            ]));
+        }
+        if is_investment {
+            ensure_investment_correction_target_is_latest(document, &target)?;
+            ensure_investment_target_has_reversible_basis(&target)?;
         }
 
         if pending_correction_exists(document, &target_movement_id) {
@@ -1162,18 +1175,37 @@ pub fn create_correction_proposal(
             )));
         }
 
+        let mut normalized_replacement = None;
         let correction_entries = if let Some(replacement_entries) = replacement_entries {
-            let (entries, normalized_replacement) = correction_entries_for_replacement(
+            let (entries, replacement) = correction_entries_for_replacement(
                 document,
                 &target,
                 replacement_entries,
                 movement_id,
             )?;
+            if is_investment {
+                let mut replacement_errors = Vec::new();
+                validate_movement_semantics(
+                    document,
+                    target_type,
+                    &replacement,
+                    &mut replacement_errors,
+                );
+                if !replacement_errors.is_empty() {
+                    return Err(LedgerError::InvalidInput(
+                        replacement_errors
+                            .into_iter()
+                            .map(|error| format!("replacementEntries: {error}"))
+                            .collect(),
+                    ));
+                }
+                normalized_replacement = Some(replacement.clone());
+            }
             if proposed_diffs.is_empty() {
                 proposed_diffs.push(json!({
                     "fieldPath": "entries",
                     "oldValue": target["entries"],
-                    "newValue": normalized_replacement,
+                    "newValue": replacement,
                     "severity": "danger",
                     "reason": reason
                 }));
@@ -1209,6 +1241,14 @@ pub fn create_correction_proposal(
             "createdAt": now,
             "updatedAt": now
         });
+        let mut movement = movement;
+        if let Some(replacement_entries) = normalized_replacement {
+            movement["investmentReplacement"] = json!({
+                "targetType": target_type,
+                "targetOccurredAt": target.get("occurredAt").cloned().unwrap_or(Value::Null),
+                "replacementEntries": replacement_entries
+            });
+        }
 
         document["movements"]
             .as_array_mut()
@@ -3836,8 +3876,147 @@ fn validate_movements<'a>(
         }
         validate_investment_sale_result(movement, index, errors);
         validate_movement_cost_basis_fx(movement, index, errors);
+        validate_investment_replacement(movement, document, index, errors);
     }
     index_by_id
+}
+
+fn validate_investment_replacement(
+    movement: &serde_json::Map<String, Value>,
+    document: &Value,
+    movement_index: usize,
+    errors: &mut Vec<String>,
+) {
+    let Some(replacement) = movement.get("investmentReplacement") else {
+        return;
+    };
+    let label = format!("movements[{movement_index}].investmentReplacement");
+    if movement.get("type").and_then(Value::as_str) != Some("correction") {
+        errors.push(format!("{label} is only valid for correction movements"));
+    }
+    let Some(replacement) = replacement.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    let target_type = replacement.get("targetType").and_then(Value::as_str);
+    if !matches!(target_type, Some("buy" | "sell")) {
+        errors.push(format!("{label}.targetType must be buy or sell"));
+    }
+    if replacement
+        .get("targetOccurredAt")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339)
+        .is_none()
+    {
+        errors.push(format!(
+            "{label}.targetOccurredAt must be an RFC3339 timestamp"
+        ));
+    }
+    let Some(entries) = replacement
+        .get("replacementEntries")
+        .and_then(Value::as_array)
+        .filter(|entries| !entries.is_empty())
+    else {
+        errors.push(format!(
+            "{label}.replacementEntries must be a non-empty array"
+        ));
+        return;
+    };
+    if let Some(target_type) = target_type {
+        let before = errors.len();
+        validate_movement_semantics(document, target_type, entries, errors);
+        for error in errors.iter_mut().skip(before) {
+            *error = format!("{label}: {error}");
+        }
+    }
+
+    let target_id = movement
+        .get("source")
+        .and_then(|source| source.get("sourceId"))
+        .and_then(Value::as_str);
+    let target = target_id.and_then(|target_id| {
+        document["movements"].as_array().and_then(|movements| {
+            movements
+                .iter()
+                .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(target_id))
+        })
+    });
+    match target {
+        Some(target) => {
+            if target.get("type").and_then(Value::as_str) != target_type {
+                errors.push(format!("{label}.targetType must match the target movement"));
+            }
+            if target.get("occurredAt").and_then(Value::as_str)
+                != replacement.get("targetOccurredAt").and_then(Value::as_str)
+            {
+                errors.push(format!(
+                    "{label}.targetOccurredAt must match the target movement"
+                ));
+            }
+            if !matches!(
+                target.get("status").and_then(Value::as_str),
+                Some("confirmed" | "in_transit")
+            ) {
+                errors.push(format!(
+                    "{label} must reference a confirmed target movement"
+                ));
+            }
+        }
+        None => errors.push(format!(
+            "{label} must reference its target through source.sourceId"
+        )),
+    }
+    if let Some(target_id) = target_id {
+        let confirmed_replacements = document["movements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|candidate| {
+                candidate.get("type").and_then(Value::as_str) == Some("correction")
+                    && candidate.get("investmentReplacement").is_some()
+                    && matches!(
+                        candidate.get("status").and_then(Value::as_str),
+                        Some("confirmed" | "in_transit")
+                    )
+                    && candidate
+                        .get("source")
+                        .and_then(|source| source.get("sourceId"))
+                        .and_then(Value::as_str)
+                        == Some(target_id)
+            })
+            .count();
+        if confirmed_replacements > 1 {
+            errors.push(format!(
+                "{label} target must not have multiple confirmed investment replacements"
+            ));
+        }
+    }
+
+    let mut derived = serde_json::Map::new();
+    derived.insert("type".to_string(), json!(target_type));
+    derived.insert(
+        "status".to_string(),
+        movement.get("status").cloned().unwrap_or(Value::Null),
+    );
+    derived.insert("entries".to_string(), json!(entries));
+    if let Some(value) = replacement.get("saleResult") {
+        derived.insert("saleResult".to_string(), value.clone());
+    }
+    if let Some(value) = replacement.get("costBasisFx") {
+        derived.insert("costBasisFx".to_string(), value.clone());
+    }
+    validate_investment_sale_result(&derived, movement_index, errors);
+    validate_movement_cost_basis_fx(&derived, movement_index, errors);
+    if matches!(
+        movement.get("status").and_then(Value::as_str),
+        Some("confirmed" | "in_transit")
+    ) && target_type == Some("sell")
+        && replacement.get("saleResult").is_none()
+    {
+        errors.push(format!(
+            "{label}.saleResult is required after a replacement sell is confirmed"
+        ));
+    }
 }
 
 fn validate_stored_movement_entries<'a>(
@@ -6277,9 +6456,16 @@ fn correction_entries_for_replacement(
                 "target movement must have entries for replacement correction".to_string(),
             ])
         })?;
-    if movement_entry_effects(target_entries)? == movement_entry_effects(&replacement_entries)? {
+    let target_type = target.get("type").and_then(Value::as_str);
+    let is_noop = if matches!(target_type, Some("buy" | "sell")) {
+        movement_entry_semantics(target_entries)? == movement_entry_semantics(&replacement_entries)?
+    } else {
+        movement_entry_effects(target_entries)? == movement_entry_effects(&replacement_entries)?
+    };
+    if is_noop {
         return Err(LedgerError::InvalidInput(vec![
-            "replacementEntries must change the target movement ledger effect".to_string(),
+            "replacementEntries must change the target movement semantics or ledger effect"
+                .to_string(),
         ]));
     }
 
@@ -6362,6 +6548,29 @@ fn movement_entry_effects(
     Ok(effects)
 }
 
+fn movement_entry_semantics(
+    entries: &[Value],
+) -> Result<BTreeMap<String, DecimalAmount>, LedgerError> {
+    let mut semantics = BTreeMap::new();
+    for entry in entries {
+        let account_id = required_entry_string(entry, "accountId")?;
+        let currency = required_entry_string(entry, "currency")?;
+        let direction = required_entry_string(entry, "direction")?;
+        let role = required_entry_string(entry, "role")?;
+        let instrument_id = entry
+            .get("instrumentId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let amount = parse_entry_amount(entry)?;
+        let key = format!(
+            "{account_id}\u{1f}{currency}\u{1f}{instrument_id}\u{1f}{direction}\u{1f}{role}"
+        );
+        *semantics.entry(key).or_insert(DecimalAmount::ZERO) += amount;
+    }
+    semantics.retain(|_, amount| *amount != DecimalAmount::ZERO);
+    Ok(semantics)
+}
+
 fn pending_correction_exists(document: &Value, target_movement_id: &str) -> bool {
     document["movements"]
         .as_array()
@@ -6376,6 +6585,109 @@ fn pending_correction_exists(document: &Value, target_movement_id: &str) -> bool
                     .and_then(Value::as_str)
                     == Some(target_movement_id)
         })
+}
+
+fn investment_holding_key(movement: &Value) -> Option<(&str, &str)> {
+    movement
+        .get("entries")?
+        .as_array()?
+        .iter()
+        .find_map(|entry| {
+            Some((
+                entry.get("accountId")?.as_str()?,
+                entry.get("instrumentId")?.as_str()?,
+            ))
+        })
+}
+
+fn ensure_investment_correction_target_is_latest(
+    document: &Value,
+    target: &Value,
+) -> Result<(), LedgerError> {
+    let target_id = target.get("id").and_then(Value::as_str).ok_or_else(|| {
+        LedgerError::InvalidInput(vec!["target movement.id is missing".to_string()])
+    })?;
+    let (account_id, instrument_id) = investment_holding_key(target).ok_or_else(|| {
+        LedgerError::InvalidInput(vec![
+            "investment target must contain one holding entry".to_string(),
+        ])
+    })?;
+    let movements = document["movements"]
+        .as_array()
+        .expect("validated local ledger movements should be an array");
+    let target_confirm_order =
+        movement_confirmation_order(document, target_id).ok_or_else(|| {
+            LedgerError::Conflict(format!(
+                "cannot establish confirmation order for investment movement: {target_id}"
+            ))
+        })?;
+
+    if movements.iter().any(|movement| {
+        movement.get("type").and_then(Value::as_str) == Some("correction")
+            && matches!(
+                movement.get("status").and_then(Value::as_str),
+                Some("confirmed" | "in_transit")
+            )
+            && movement
+                .get("source")
+                .and_then(|source| source.get("sourceId"))
+                .and_then(Value::as_str)
+                == Some(target_id)
+    }) {
+        return Err(LedgerError::Conflict(format!(
+            "investment movement already has a confirmed correction: {target_id}"
+        )));
+    }
+
+    let later_exists = movements.iter().any(|movement| {
+        let candidate_id = movement.get("id").and_then(Value::as_str);
+        let applied_later = candidate_id
+            .and_then(|candidate_id| movement_confirmation_order(document, candidate_id))
+            .is_some_and(|order| order > target_confirm_order);
+        applied_later
+            && matches!(
+                movement.get("status").and_then(Value::as_str),
+                Some("confirmed" | "in_transit")
+            )
+            && matches!(
+                movement.get("type").and_then(Value::as_str),
+                Some("buy" | "sell")
+            )
+            && investment_holding_key(movement) == Some((account_id, instrument_id))
+    });
+    if later_exists {
+        return Err(LedgerError::Conflict(format!(
+            "investment movement is not the latest confirmed trade for holding {account_id}/{instrument_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn movement_confirmation_order(document: &Value, movement_id: &str) -> Option<usize> {
+    document["syncChanges"]
+        .as_array()?
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, change)| {
+            (change.get("entityType").and_then(Value::as_str) == Some("movement")
+                && change.get("entityId").and_then(Value::as_str) == Some(movement_id))
+            .then_some(index)
+        })
+}
+
+fn ensure_investment_target_has_reversible_basis(target: &Value) -> Result<(), LedgerError> {
+    if target.get("type").and_then(Value::as_str) == Some("sell")
+        && target
+            .get("saleResult")
+            .and_then(|result| result.get("costBasisReleased"))
+            .is_none()
+    {
+        return Err(LedgerError::Conflict(
+            "sell correction requires a persisted costBasisReleased result".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn diff_value_as_decimal(value: Option<&Value>) -> Option<DecimalAmount> {
@@ -9421,7 +9733,188 @@ fn apply_movement_effect(
     match movement.get("type").and_then(Value::as_str) {
         Some("buy") => apply_buy_or_sell_movement(document, movement, entries, true, now),
         Some("sell") => apply_buy_or_sell_movement(document, movement, entries, false, now),
+        Some("correction") if movement.get("investmentReplacement").is_some() => {
+            apply_investment_replacement_correction(document, movement, now)
+        }
         _ => apply_movement_entries(document, entries, now),
+    }
+}
+
+fn apply_investment_replacement_correction(
+    document: &mut Value,
+    correction: &Value,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let target_id = correction
+        .get("source")
+        .and_then(|source| source.get("sourceId"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "investment correction source.sourceId is missing".to_string(),
+            ])
+        })?;
+    let target = document["movements"]
+        .as_array()
+        .expect("validated local ledger movements should be an array")
+        .iter()
+        .find(|movement| movement.get("id").and_then(Value::as_str) == Some(target_id))
+        .cloned()
+        .ok_or_else(|| {
+            LedgerError::NotFound(format!("target movement does not exist: {target_id}"))
+        })?;
+    ensure_investment_correction_target_is_latest(document, &target)?;
+    ensure_investment_target_has_reversible_basis(&target)?;
+
+    reverse_investment_movement_effect(document, &target, now)?;
+
+    let replacement = correction
+        .get("investmentReplacement")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "investment correction metadata is missing".to_string(),
+            ])
+        })?;
+    let target_type = replacement
+        .get("targetType")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "investment correction targetType is missing".to_string(),
+            ])
+        })?;
+    let replacement_entries = replacement
+        .get("replacementEntries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "investment correction replacementEntries are missing".to_string(),
+            ])
+        })?;
+    let replacement_movement = json!({
+        "id": correction.get("id").cloned().unwrap_or(Value::Null),
+        "type": target_type,
+        "occurredAt": replacement
+            .get("targetOccurredAt")
+            .cloned()
+            .unwrap_or_else(|| target.get("occurredAt").cloned().unwrap_or(Value::Null)),
+        "entries": replacement_entries
+    });
+    apply_buy_or_sell_movement(
+        document,
+        &replacement_movement,
+        replacement_entries,
+        target_type == "buy",
+        now,
+    )
+}
+
+fn reverse_investment_movement_effect(
+    document: &mut Value,
+    target: &Value,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let entries = target
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| LedgerError::InvalidInput(vec!["target entries are missing".to_string()]))?;
+    let is_buy = target.get("type").and_then(Value::as_str) == Some("buy");
+    let cash_role = if is_buy { "source" } else { "destination" };
+    let holding_role = if is_buy { "destination" } else { "source" };
+    let cash = entries
+        .iter()
+        .find(|entry| {
+            entry.get("instrumentId").is_none()
+                && entry.get("role").and_then(Value::as_str) == Some(cash_role)
+        })
+        .ok_or_else(|| LedgerError::InvalidInput(vec!["target cash leg is missing".to_string()]))?;
+    let holding = entries
+        .iter()
+        .find(|entry| {
+            entry.get("instrumentId").is_some()
+                && entry.get("role").and_then(Value::as_str) == Some(holding_role)
+        })
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["target holding leg is missing".to_string()])
+        })?;
+    let cash_account_id = required_entry_string(cash, "accountId")?;
+    let cash_currency = required_entry_string(cash, "currency")?;
+    let principal = parse_entry_amount(cash)?;
+    let holding_account_id = required_entry_string(holding, "accountId")?;
+    let instrument_id = required_entry_string(holding, "instrumentId")?;
+    let quote_currency = required_entry_string(holding, "currency")?;
+    let quantity = parse_entry_amount(holding)?;
+    let fees = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.get("role").and_then(Value::as_str),
+                Some("fee" | "tax")
+            )
+        })
+        .try_fold(DecimalAmount::ZERO, |total, entry| {
+            parse_entry_amount(entry).map(|amount| total + amount)
+        })?;
+
+    if is_buy {
+        let total_cost = principal + fees;
+        apply_account_cash_delta(document, cash_account_id, cash_currency, total_cost, now)?;
+        reverse_holding_purchase_exact(
+            document,
+            target,
+            ReverseHoldingPurchase {
+                account_id: holding_account_id,
+                instrument_id,
+                quote_currency,
+                quantity,
+                original_cost: total_cost,
+                original_cost_currency: cash_currency,
+            },
+            now,
+        )
+    } else {
+        let net_proceeds = principal - fees;
+        apply_account_cash_delta(document, cash_account_id, cash_currency, -net_proceeds, now)?;
+        let released = target
+            .get("saleResult")
+            .and_then(|result| result.get("costBasisReleased"))
+            .ok_or_else(|| {
+                LedgerError::Conflict(
+                    "sell correction requires persisted costBasisReleased".to_string(),
+                )
+            })?;
+        let released_amount = parse_decimal(
+            released
+                .get("amount")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    LedgerError::InvalidInput(vec![
+                        "saleResult.costBasisReleased.amount is missing".to_string(),
+                    ])
+                })?,
+        )
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+        let released_currency = released
+            .get("currency")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![
+                    "saleResult.costBasisReleased.currency is missing".to_string(),
+                ])
+            })?;
+        restore_holding_sale_exact(
+            document,
+            RestoreHoldingSale {
+                account_id: holding_account_id,
+                instrument_id,
+                quote_currency,
+                quantity,
+                released_cost: released_amount,
+                released_currency,
+            },
+            now,
+        )
     }
 }
 
@@ -9646,7 +10139,13 @@ fn record_investment_sale_result(
         .iter_mut()
         .find(|stored| stored.get("id").and_then(Value::as_str) == Some(movement_id))
         .ok_or_else(|| LedgerError::NotFound(format!("movement does not exist: {movement_id}")))?;
-    stored["saleResult"] = result;
+    if stored.get("type").and_then(Value::as_str) == Some("correction")
+        && stored.get("investmentReplacement").is_some()
+    {
+        stored["investmentReplacement"]["saleResult"] = result;
+    } else {
+        stored["saleResult"] = result;
+    }
     Ok(())
 }
 
@@ -9665,7 +10164,13 @@ fn record_movement_cost_basis_fx(
         .iter_mut()
         .find(|stored| stored.get("id").and_then(Value::as_str) == Some(movement_id))
         .ok_or_else(|| LedgerError::NotFound(format!("movement does not exist: {movement_id}")))?;
-    stored["costBasisFx"] = cost_basis_fx;
+    if stored.get("type").and_then(Value::as_str) == Some("correction")
+        && stored.get("investmentReplacement").is_some()
+    {
+        stored["investmentReplacement"]["costBasisFx"] = cost_basis_fx;
+    } else {
+        stored["costBasisFx"] = cost_basis_fx;
+    }
     Ok(())
 }
 
@@ -9732,6 +10237,232 @@ struct HoldingPurchase<'a> {
     quantity: DecimalAmount,
     cost_amount: DecimalAmount,
     cost_currency: &'a str,
+}
+
+struct ReverseHoldingPurchase<'a> {
+    account_id: &'a str,
+    instrument_id: &'a str,
+    quote_currency: &'a str,
+    quantity: DecimalAmount,
+    original_cost: DecimalAmount,
+    original_cost_currency: &'a str,
+}
+
+fn reverse_holding_purchase_exact(
+    document: &mut Value,
+    target: &Value,
+    purchase: ReverseHoldingPurchase<'_>,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let ReverseHoldingPurchase {
+        account_id,
+        instrument_id,
+        quote_currency,
+        quantity,
+        original_cost,
+        original_cost_currency,
+    } = purchase;
+    ensure_matching_instrument(document, instrument_id, quote_currency)?;
+    let index = document["holdings"]
+        .as_array()
+        .expect("validated local ledger holdings should be an array")
+        .iter()
+        .position(|holding| {
+            holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                && holding.get("instrumentId").and_then(Value::as_str) == Some(instrument_id)
+        })
+        .ok_or_else(|| {
+            LedgerError::Conflict(format!(
+                "holding does not exist for corrected buy: {instrument_id}"
+            ))
+        })?;
+    let existing = document["holdings"][index].clone();
+    let current_quantity = parse_decimal(
+        existing
+            .get("quantity")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["holding quantity is missing".to_string()])
+            })?,
+    )
+    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    let next_quantity = current_quantity - quantity;
+    if next_quantity < DecimalAmount::ZERO {
+        return Err(LedgerError::Conflict(format!(
+            "corrected buy quantity exceeds current holding: {instrument_id}"
+        )));
+    }
+    let current_cost = existing.get("costBasisTotal").ok_or_else(|| {
+        LedgerError::Conflict("corrected buy requires an existing cost basis".to_string())
+    })?;
+    let current_cost_amount = parse_decimal(
+        current_cost
+            .get("amount")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["holding cost basis amount is missing".to_string()])
+            })?,
+    )
+    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    let current_cost_currency = current_cost
+        .get("currency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["holding cost basis currency is missing".to_string()])
+        })?;
+    let contribution = if current_cost_currency == original_cost_currency {
+        original_cost
+    } else {
+        let basis = target.get("costBasisFx").ok_or_else(|| {
+            LedgerError::Conflict(
+                "corrected cross-currency buy requires persisted costBasisFx".to_string(),
+            )
+        })?;
+        if basis.get("baseCurrency").and_then(Value::as_str) != Some(original_cost_currency)
+            || basis.get("quoteCurrency").and_then(Value::as_str) != Some(current_cost_currency)
+        {
+            return Err(LedgerError::Conflict(
+                "corrected buy costBasisFx currencies do not match current holding".to_string(),
+            ));
+        }
+        let rate = parse_decimal(basis.get("rate").and_then(Value::as_str).ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["costBasisFx.rate is missing".to_string()])
+        })?)
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+        multiply_decimal(original_cost, rate)
+    };
+    let next_cost = current_cost_amount - contribution;
+    if next_cost < DecimalAmount::ZERO {
+        return Err(LedgerError::Conflict(
+            "corrected buy cost exceeds current holding cost basis".to_string(),
+        ));
+    }
+
+    let holding = document["holdings"]
+        .as_array_mut()
+        .expect("validated local ledger holdings should be an array")
+        .get_mut(index)
+        .expect("holding index should remain valid");
+    holding["quantity"] = json!(next_quantity.decimal_string());
+    holding["costBasisTotal"] = money(next_cost, current_cost_currency);
+    adjust_estimated_market_value(holding, -contribution, current_cost_currency, now)?;
+    mark_holding_stale(holding, now);
+    Ok(())
+}
+
+struct RestoreHoldingSale<'a> {
+    account_id: &'a str,
+    instrument_id: &'a str,
+    quote_currency: &'a str,
+    quantity: DecimalAmount,
+    released_cost: DecimalAmount,
+    released_currency: &'a str,
+}
+
+fn restore_holding_sale_exact(
+    document: &mut Value,
+    sale: RestoreHoldingSale<'_>,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let RestoreHoldingSale {
+        account_id,
+        instrument_id,
+        quote_currency,
+        quantity,
+        released_cost,
+        released_currency,
+    } = sale;
+    ensure_matching_instrument(document, instrument_id, quote_currency)?;
+    let index = document["holdings"]
+        .as_array()
+        .expect("validated local ledger holdings should be an array")
+        .iter()
+        .position(|holding| {
+            holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                && holding.get("instrumentId").and_then(Value::as_str) == Some(instrument_id)
+        });
+    if let Some(index) = index {
+        let holding = document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .get_mut(index)
+            .expect("holding index should remain valid");
+        let current_quantity = parse_decimal(
+            holding
+                .get("quantity")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    LedgerError::InvalidInput(vec!["holding quantity is missing".to_string()])
+                })?,
+        )
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+        holding["quantity"] = json!((current_quantity + quantity).decimal_string());
+        let current_currency = holding
+            .get("costBasisTotal")
+            .and_then(|value| value.get("currency"))
+            .and_then(Value::as_str)
+            .unwrap_or(released_currency);
+        if current_currency != released_currency {
+            return Err(LedgerError::Conflict(
+                "released cost basis currency does not match current holding".to_string(),
+            ));
+        }
+        apply_holding_money_delta(holding, "costBasisTotal", released_currency, released_cost)?;
+        adjust_estimated_market_value(holding, released_cost, released_currency, now)?;
+        mark_holding_stale(holding, now);
+    } else {
+        document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .push(json!({
+                "id": stable_holding_id(account_id, instrument_id),
+                "accountId": account_id,
+                "instrumentId": instrument_id,
+                "quantity": quantity.decimal_string(),
+                "costBasisTotal": money(released_cost, released_currency),
+                "marketValue": {
+                    "amount": money_amount(released_cost),
+                    "currency": released_currency,
+                    "asOf": now,
+                    "quality": "estimated"
+                },
+                "quoteStatus": "stale",
+                "asOf": now,
+                "note": "Restored cost basis for corrected sale"
+            }));
+    }
+    Ok(())
+}
+
+fn adjust_estimated_market_value(
+    holding: &mut Value,
+    delta: DecimalAmount,
+    currency: &str,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let is_estimated = holding
+        .get("marketValue")
+        .and_then(|value| value.get("quality"))
+        .and_then(Value::as_str)
+        == Some("estimated");
+    let same_currency = holding
+        .get("marketValue")
+        .and_then(|value| value.get("currency"))
+        .and_then(Value::as_str)
+        == Some(currency);
+    if is_estimated && same_currency {
+        apply_holding_valued_money_delta(holding, "marketValue", currency, delta, now)?;
+    }
+    Ok(())
+}
+
+fn mark_holding_stale(holding: &mut Value, now: &str) {
+    holding["quoteStatus"] = json!("stale");
+    holding["asOf"] = json!(now);
+    if let Some(object) = holding.as_object_mut() {
+        object.remove("unrealizedPnl");
+        object.remove("unrealizedPnlRate");
+    }
 }
 
 fn apply_holding_purchase(
@@ -13016,6 +13747,68 @@ mod tests {
         assert_eq!(
             money_amount(parse_decimal("-2.34567890").expect("signed precision")),
             "-2.3456789"
+        );
+    }
+
+    #[test]
+    fn investment_replacement_distinguishes_principal_and_fee_semantics() {
+        let original = json!([
+            {
+                "accountId": "cash",
+                "amount": "100.00",
+                "currency": "CNY",
+                "direction": "out",
+                "role": "source"
+            },
+            {
+                "accountId": "holding",
+                "instrumentId": "instrument",
+                "amount": "10",
+                "currency": "CNY",
+                "direction": "in",
+                "role": "destination"
+            },
+            {
+                "accountId": "cash",
+                "amount": "2.00",
+                "currency": "CNY",
+                "direction": "out",
+                "role": "fee"
+            }
+        ]);
+        let replacement = json!([
+            {
+                "accountId": "cash",
+                "amount": "101.00",
+                "currency": "CNY",
+                "direction": "out",
+                "role": "source"
+            },
+            {
+                "accountId": "holding",
+                "instrumentId": "instrument",
+                "amount": "10",
+                "currency": "CNY",
+                "direction": "in",
+                "role": "destination"
+            },
+            {
+                "accountId": "cash",
+                "amount": "1.00",
+                "currency": "CNY",
+                "direction": "out",
+                "role": "fee"
+            }
+        ]);
+        let original = original.as_array().expect("original entries");
+        let replacement = replacement.as_array().expect("replacement entries");
+        assert_eq!(
+            movement_entry_effects(original).expect("original effects"),
+            movement_entry_effects(replacement).expect("replacement effects")
+        );
+        assert_ne!(
+            movement_entry_semantics(original).expect("original semantics"),
+            movement_entry_semantics(replacement).expect("replacement semantics")
         );
     }
 

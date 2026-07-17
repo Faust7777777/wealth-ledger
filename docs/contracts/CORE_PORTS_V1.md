@@ -341,6 +341,8 @@ createCorrection(input: CreateCorrectionInput): AiAtomicGroup
 - 对 confirmed movement 的修改默认产生 correction proposal。
 - correction proposal 必须包含 old → new diff。
 - 用户确认后写入新 Movement，不覆盖原 Movement。
+- 投资更正必须是完整 replacement，并且只能更正该持仓最后一笔 confirmed buy/sell；确认时
+  精确撤销原现金、数量和成本基础后再应用 replacement，不能把数量差额当金额 adjustment。
 
 ### Mark DCA executed
 

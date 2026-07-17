@@ -840,7 +840,7 @@ def check_investment_sale_result(doc: dict) -> None:
         'confirmed_buy["costBasisFx"]["sourceRateId"]',
         '"fx_smoke_usd_cny_historical"',
         'sale_result["realizedPnlStatus"] == "calculated_with_fx"',
-        '"amount": "51.775"',
+        '"amount": "54.23636364"',
     ]:
         if snippet not in smoke_text:
             fail(f"Investment sale-result smoke is incomplete: {snippet}")
@@ -1132,15 +1132,36 @@ def check_multileg_correction(doc: dict) -> None:
         fail("MovementEntryInput must require the five ledger entry fields")
     if "id" in entry_input.get("properties", {}):
         fail("MovementEntryInput must not accept a persisted entry id")
+    investment_replacement = schemas.get("InvestmentReplacement", {})
+    if set(investment_replacement.get("required", [])) != {
+        "targetType",
+        "targetOccurredAt",
+        "replacementEntries",
+    }:
+        fail("InvestmentReplacement must require type, original time, and complete entries")
+    movement_replacement = (
+        schemas.get("Movement", {})
+        .get("properties", {})
+        .get("investmentReplacement", {})
+        .get("$ref")
+    )
+    if movement_replacement != "#/components/schemas/InvestmentReplacement":
+        fail("Movement must expose InvestmentReplacement audit metadata")
 
     local_ledger_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
     required_implementation = [
         "correction_entries_for_replacement(",
         "movement_entry_effects(",
         "pending_correction_exists(",
-        '"replacementEntries must change the target movement ledger effect"',
+        '"replacementEntries must change the target movement semantics or ledger effect"',
         '"target movement already has a pending correction',
         '"entry_{movement_id}_reversal_{index}"',
+        "apply_investment_replacement_correction(",
+        "reverse_holding_purchase_exact(",
+        "restore_holding_sale_exact(",
+        '"investment correction requires complete replacementEntries"',
+        '"investment movement is not the latest confirmed trade',
+        '"sell correction requires a persisted costBasisReleased result"',
     ]
     missing = [item for item in required_implementation if item not in local_ledger_text]
     if missing:
@@ -1151,6 +1172,7 @@ def check_multileg_correction(doc: dict) -> None:
         "def create_and_confirm_multileg_correction(",
         '"replacementEntries": [',
         "create_and_confirm_multileg_correction(base, cash[\"id\"], reserve[\"id\"])",
+        'corrected_movement["investmentReplacement"]["saleResult"]',
     ]
     missing = [item for item in required_smoke if item not in smoke_text]
     if missing:
@@ -1159,6 +1181,8 @@ def check_multileg_correction(doc: dict) -> None:
     http_text = HTTP_MD.read_text(encoding="utf-8")
     if "完整 `replacementEntries` 更正多腿交易" not in http_text:
         fail("HTTP contract must document complete multi-leg replacement correction")
+    if "同一持仓最后一笔已确认的 buy/sell" not in http_text:
+        fail("HTTP contract must document the safe investment correction boundary")
     ok("Multi-leg correction contract and implementation checks passed")
 
 
