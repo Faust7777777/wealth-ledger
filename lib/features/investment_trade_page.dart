@@ -107,6 +107,17 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
     return null;
   }
 
+  /// 买入：持仓腿币种=标的报价币种，必须在所选持仓账户支持币种内（服务端硬校验）。
+  String? _buyInstrumentCurrencyError(AccountVm? holdingAccount) {
+    final inst = _instrument;
+    if (!_isBuy || holdingAccount == null || inst == null) return null;
+    final supported = holdingAccount.supportedCurrencies;
+    if (supported.isNotEmpty && !supported.contains(inst.quoteCurrency)) {
+      return '持仓账户不支持该标的的报价币种（${inst.quoteCurrency}），请换持仓账户或标的';
+    }
+    return null;
+  }
+
   bool get _canSubmit =>
       !_busy &&
       ref.writeCapabilities.canRecordMovement &&
@@ -639,7 +650,8 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
       sellable = _sellableHoldings(holdings, instruments);
     }
 
-    final crossError = _sellCrossError;
+    final crossError =
+        _sellCrossError ?? _buyInstrumentCurrencyError(holdingAccount);
     return Center(
       child: ConstrainedBox(
         constraints: const BoxConstraints(maxWidth: kTradeFormMaxWidth),
@@ -836,7 +848,9 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
             ],
             const SizedBox(height: AppSpacing.base),
             FilledButton(
-              onPressed: _canSubmit ? () => _submit(accounts) : null,
+              onPressed: _canSubmit && crossError == null
+                  ? () => _submit(accounts)
+                  : null,
               child: Text(_busy ? '提交中…' : (_isBuy ? '确认买入' : '确认卖出')),
             ),
             if (!canRecord)

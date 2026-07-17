@@ -94,7 +94,10 @@ class DevApiClient {
       );
     }
     if (res.statusCode >= 400) {
-      throw Exception('HTTP ${res.statusCode} · $path');
+      final message = _errorField(res, 'message');
+      throw Exception(
+        'HTTP ${res.statusCode} · $path${message == null ? '' : ' · $message'}',
+      );
     }
     if (res.statusCode == 204 || res.bodyBytes.isEmpty) {
       return null; // 如 AI reject 返回 204
