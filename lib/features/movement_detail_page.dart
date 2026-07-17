@@ -70,6 +70,120 @@ Widget _entryRow(
   );
 }
 
+/// 已实现盈亏金额：符号 + 语义色（盈利收益色 / 亏损亏损色 / 零中性）。
+/// 金额与颜色只来自服务端固化结果，前端不重算、不用当前汇率折算。
+Widget _pnlText(BuildContext context, Money pnl) {
+  final dark = Theme.of(context).brightness == Brightness.dark;
+  final sign = decimalSign(pnl.amount);
+  final abs = absDecimal(pnl.amount);
+  final color = switch (sign) {
+    > 0 => dark ? AppColors.positive : AppColorsLight.positive,
+    < 0 => dark ? AppColors.negative : AppColorsLight.negative,
+    _ => null,
+  };
+  final prefix = switch (sign) {
+    > 0 => '+',
+    < 0 => '−',
+    _ => '',
+  };
+  return Text(
+    '$prefix${formatMoney(Money(amount: abs, currency: pnl.currency), withCode: true)}',
+    style: AppType.moneyRow.copyWith(color: color),
+  );
+}
+
+Widget _moneyKv(BuildContext context, String k, Money v) => Padding(
+  padding: const EdgeInsets.symmetric(vertical: AppSpacing.xxs),
+  child: Row(
+    children: [
+      Expanded(child: Text(k, style: AppType.body)),
+      Text(formatMoney(v, withCode: true), style: AppType.moneyRow),
+    ],
+  ),
+);
+
+/// 换算依据（服务端固化的成交时汇率）；不展示内部 rate ID。
+class _FxBasisTile extends StatelessWidget {
+  const _FxBasisTile({required this.title, required this.fx});
+  final String title;
+  final ExecutionFxBasisVm fx;
+
+  @override
+  Widget build(BuildContext context) {
+    Widget kv(String k, String v) => Padding(
+      padding: const EdgeInsets.symmetric(vertical: AppSpacing.xxs),
+      child: Row(
+        children: [
+          Expanded(child: Text(k, style: AppType.body)),
+          Flexible(child: Text(v, style: AppType.caption)),
+        ],
+      ),
+    );
+    return ExpansionTile(
+      tilePadding: EdgeInsets.zero,
+      childrenPadding: const EdgeInsets.only(
+        left: AppSpacing.sm,
+        right: AppSpacing.sm,
+        bottom: AppSpacing.xs,
+      ),
+      title: Text(title, style: AppType.body),
+      children: [
+        kv('汇率', '1 ${fx.baseCurrency} = ${fx.rate} ${fx.quoteCurrency}'),
+        kv('汇率时间', fx.asOf.replaceFirst('T', ' ').split('.').first),
+        kv('来源', fx.source),
+      ],
+    );
+  }
+}
+
+/// 卖出成交结果（服务端按平均成本法固化；四种盈亏状态按用户语言展示）。
+class _SaleResultSection extends StatelessWidget {
+  const _SaleResultSection({required this.r});
+  final InvestmentSaleResultVm r;
+
+  @override
+  Widget build(BuildContext context) {
+    final pnl = r.realizedPnl;
+    final released = r.costBasisReleased;
+    final convertedNet = r.netProceedsInCostBasisCurrency;
+    final fx = r.fxBasis;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const SectionHeader(title: '成交结果'),
+        _moneyKv(context, '毛回款', r.grossProceeds),
+        _moneyKv(context, '手续费与税费', r.feeAndTaxTotal),
+        _moneyKv(context, '现金净入账', r.netProceeds),
+        if (released != null) _moneyKv(context, '释放成本（平均成本法）', released),
+        switch (r.realizedPnlStatus) {
+          RealizedPnlStatus.calculated ||
+          RealizedPnlStatus.calculatedWithFx when pnl != null => Padding(
+            padding: const EdgeInsets.symmetric(vertical: AppSpacing.xxs),
+            child: Row(
+              children: [
+                Expanded(child: Text('已实现盈亏', style: AppType.body)),
+                _pnlText(context, pnl),
+              ],
+            ),
+          ),
+          RealizedPnlStatus.currencyMismatch => Padding(
+            padding: const EdgeInsets.only(top: AppSpacing.xs),
+            child: Text('缺少成交时汇率', style: AppType.caption),
+          ),
+          _ => Padding(
+            padding: const EdgeInsets.only(top: AppSpacing.xs),
+            child: Text('盈亏暂不可计算', style: AppType.caption),
+          ),
+        },
+        if (r.realizedPnlStatus == RealizedPnlStatus.calculatedWithFx) ...[
+          if (convertedNet != null) _moneyKv(context, '折算净回款', convertedNet),
+          if (fx != null) _FxBasisTile(title: '换算依据', fx: fx),
+        ],
+      ],
+    );
+  }
+}
+
 class MovementDetailPage extends ConsumerWidget {
   const MovementDetailPage({super.key, required this.movementId});
   final String movementId;
@@ -153,6 +267,11 @@ class MovementDetailPage extends ConsumerWidget {
                     ),
                   ),
                 ],
+                // 卖出成交结果 / 跨币种买入成本换算依据：服务端固化，只读展示；
+                // 旧记录缺失字段时不渲染该区块。
+                if (m.saleResult != null) _SaleResultSection(r: m.saleResult!),
+                if (m.costBasisFx != null)
+                  _FxBasisTile(title: '成本换算依据', fx: m.costBasisFx!),
                 // 更正=生成候选：不适用的记录（多腿/更正本身）直接隐藏动作；
                 // capability 缺失时保留禁用态 + 简短恢复提示。
                 if (canCorrect) ...[
