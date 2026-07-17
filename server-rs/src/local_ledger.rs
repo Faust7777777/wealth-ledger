@@ -505,6 +505,9 @@ where
         let data = mutation(&mut document)?;
         let response = successful_idempotent_response(status_code, data);
         store_idempotency_response(&mut document, request, &response);
+        if let Err(errors) = validate_document(&document) {
+            return Err(LedgerError::InvalidInput(errors));
+        }
         write_document(path, &document)?;
         Ok(response)
     })
@@ -3075,6 +3078,8 @@ fn validate_document_for_version(
 
     validate_accounts(object.get("accounts"), &mut errors);
     validate_core_ledger_entities(document, &mut errors);
+    validate_taxonomy_entities(document, &mut errors);
+    validate_quote_entities(document, &mut errors);
     validate_dca_entities(document, &mut errors);
     validate_subscriptions(
         object.get("subscriptions"),
@@ -3654,8 +3659,293 @@ fn validate_instruments<'a>(
         ) {
             errors.push(format!("instruments[{index}].type is invalid"));
         }
+        for key in ["symbol", "market", "sourceRef"] {
+            if let Some(value) = instrument.get(key)
+                && value.as_str().is_none_or(|value| value.trim().is_empty())
+            {
+                errors.push(format!(
+                    "instruments[{index}].{key} must be a non-empty string when present"
+                ));
+            }
+        }
     }
     ids
+}
+
+fn validate_taxonomy_entities(document: &Value, errors: &mut Vec<String>) {
+    let Some(categories) = document.get("categories").and_then(Value::as_array) else {
+        return;
+    };
+    let mut category_ids = BTreeSet::new();
+    let mut parent_by_id = BTreeMap::new();
+    for (index, category) in categories.iter().enumerate() {
+        let label = format!("categories[{index}]");
+        let Some(category) = category.as_object() else {
+            errors.push(format!("{label} must be an object"));
+            continue;
+        };
+        let id = category.get("id").and_then(Value::as_str);
+        match id {
+            Some(id) if !id.is_empty() => {
+                if !category_ids.insert(id) {
+                    errors.push(format!("duplicate category id: {id}"));
+                }
+                if let Some(parent_id) = category.get("parentId").and_then(Value::as_str) {
+                    parent_by_id.insert(id, parent_id);
+                }
+            }
+            _ => errors.push(format!("{label}.id must be a non-empty string")),
+        }
+        if category
+            .get("displayName")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            errors.push(format!("{label}.displayName must be a non-empty string"));
+        }
+        if !matches!(
+            category.get("kind").and_then(Value::as_str),
+            Some("income" | "expense" | "transfer" | "investment" | "liability" | "system")
+        ) {
+            errors.push(format!("{label}.kind is invalid"));
+        }
+        if category.get("isSystem").and_then(Value::as_bool).is_none() {
+            errors.push(format!("{label}.isSystem must be a boolean"));
+        }
+        if let Some(parent_id) = category.get("parentId")
+            && parent_id
+                .as_str()
+                .is_none_or(|parent_id| parent_id.trim().is_empty())
+        {
+            errors.push(format!(
+                "{label}.parentId must be a non-empty string when present"
+            ));
+        }
+        if let Some(description) = category.get("aiDescription")
+            && description
+                .as_str()
+                .is_none_or(|description| description.trim().is_empty())
+        {
+            errors.push(format!(
+                "{label}.aiDescription must be a non-empty string when present"
+            ));
+        }
+    }
+
+    for (id, parent_id) in &parent_by_id {
+        if id == parent_id {
+            errors.push(format!("category parent must not reference itself: {id}"));
+        } else if !category_ids.contains(parent_id) {
+            errors.push(format!(
+                "category parentId must reference an existing category: {id} -> {parent_id}"
+            ));
+        }
+        let mut visited = BTreeSet::new();
+        let mut cursor = *id;
+        while let Some(parent) = parent_by_id.get(cursor) {
+            if !visited.insert(cursor) {
+                errors.push(format!("category parent cycle detected at: {cursor}"));
+                break;
+            }
+            cursor = parent;
+        }
+    }
+
+    let Some(counterparties) = document.get("counterparties").and_then(Value::as_array) else {
+        return;
+    };
+    let mut counterparty_ids = BTreeSet::new();
+    for (index, counterparty) in counterparties.iter().enumerate() {
+        let label = format!("counterparties[{index}]");
+        let Some(counterparty) = counterparty.as_object() else {
+            errors.push(format!("{label} must be an object"));
+            continue;
+        };
+        match counterparty.get("id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => {
+                if !counterparty_ids.insert(id) {
+                    errors.push(format!("duplicate counterparty id: {id}"));
+                }
+            }
+            _ => errors.push(format!("{label}.id must be a non-empty string")),
+        }
+        if counterparty
+            .get("displayName")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            errors.push(format!("{label}.displayName must be a non-empty string"));
+        }
+        if let Some(normalized_name) = counterparty.get("normalizedName")
+            && normalized_name
+                .as_str()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            errors.push(format!(
+                "{label}.normalizedName must be a non-empty string when present"
+            ));
+        }
+        let Some(aliases) = counterparty.get("aliases").and_then(Value::as_array) else {
+            errors.push(format!("{label}.aliases must be a string array"));
+            continue;
+        };
+        let mut unique_aliases = BTreeSet::new();
+        for (alias_index, alias) in aliases.iter().enumerate() {
+            match alias.as_str().filter(|alias| !alias.trim().is_empty()) {
+                Some(alias) => {
+                    if !unique_aliases.insert(alias) {
+                        errors.push(format!("{label}.aliases contains duplicate: {alias}"));
+                    }
+                }
+                None => errors.push(format!(
+                    "{label}.aliases[{alias_index}] must be a non-empty string"
+                )),
+            }
+        }
+        if counterparty
+            .get("isUserMerged")
+            .and_then(Value::as_bool)
+            .is_none()
+        {
+            errors.push(format!("{label}.isUserMerged must be a boolean"));
+        }
+        if let Some(category_id) = counterparty.get("categoryHintId") {
+            match category_id.as_str() {
+                Some(category_id) if category_ids.contains(category_id) => {}
+                _ => errors.push(format!(
+                    "{label}.categoryHintId must reference an existing category"
+                )),
+            }
+        }
+    }
+}
+
+fn validate_quote_entities(document: &Value, errors: &mut Vec<String>) {
+    let instrument_currency = document["instruments"]
+        .as_array()
+        .map(|instruments| {
+            instruments
+                .iter()
+                .filter_map(|instrument| {
+                    Some((
+                        instrument.get("id")?.as_str()?,
+                        instrument.get("quoteCurrency")?.as_str()?,
+                    ))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let Some(quotes) = document.get("quotes").and_then(Value::as_array) else {
+        return;
+    };
+    let mut ids = BTreeSet::new();
+    let mut quoted_instruments = BTreeSet::new();
+    for (index, quote) in quotes.iter().enumerate() {
+        let label = format!("quotes[{index}]");
+        let Some(quote) = quote.as_object() else {
+            errors.push(format!("{label} must be an object"));
+            continue;
+        };
+        match quote.get("id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => {
+                if !ids.insert(id) {
+                    errors.push(format!("duplicate quote id: {id}"));
+                }
+            }
+            _ => errors.push(format!("{label}.id must be a non-empty string")),
+        }
+        let instrument_id = quote.get("instrumentId").and_then(Value::as_str);
+        match instrument_id {
+            Some(instrument_id) if instrument_currency.contains_key(instrument_id) => {
+                if !quoted_instruments.insert(instrument_id) {
+                    errors.push(format!(
+                        "duplicate current quote for instrument: {instrument_id}"
+                    ));
+                }
+                if quote.get("currency").and_then(Value::as_str)
+                    != instrument_currency.get(instrument_id).copied()
+                {
+                    errors.push(format!(
+                        "{label}.currency must match the instrument quoteCurrency"
+                    ));
+                }
+            }
+            _ => errors.push(format!(
+                "{label}.instrumentId must reference an existing instrument"
+            )),
+        }
+        if quote
+            .get("price")
+            .and_then(Value::as_str)
+            .is_none_or(|price| !is_positive_decimal_string(price))
+        {
+            errors.push(format!("{label}.price must be a positive decimal string"));
+        }
+        if quote
+            .get("currency")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.currency must be a non-empty string"));
+        }
+        if quote
+            .get("asOf")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339)
+            .is_none()
+        {
+            errors.push(format!("{label}.asOf must be an RFC3339 timestamp"));
+        }
+        if let Some(expires_at) = quote.get("expiresAt")
+            && expires_at.as_str().and_then(parse_rfc3339).is_none()
+        {
+            errors.push(format!("{label}.expiresAt must be an RFC3339 timestamp"));
+        }
+        if quote
+            .get("source")
+            .and_then(Value::as_str)
+            .is_none_or(|source| source.trim().is_empty())
+        {
+            errors.push(format!("{label}.source must be a non-empty string"));
+        }
+        if !matches!(
+            quote.get("status").and_then(Value::as_str),
+            Some("fresh" | "stale" | "offline_cached" | "incomplete" | "unpriceable" | "error")
+        ) {
+            errors.push(format!("{label}.status is invalid"));
+        }
+        if let Some(source_url) = quote.get("sourceUrl")
+            && source_url.as_str().is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.sourceUrl must be a non-empty string"));
+        }
+    }
+
+    for (movement_index, movement) in document["movements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for (entry_index, entry) in movement
+            .get("entries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let Some(instrument_id) = entry.get("instrumentId").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(expected_currency) = instrument_currency.get(instrument_id)
+                && entry.get("currency").and_then(Value::as_str) != Some(*expected_currency)
+            {
+                errors.push(format!(
+                    "movements[{movement_index}].entries[{entry_index}].currency must match the instrument quoteCurrency"
+                ));
+            }
+        }
+    }
 }
 
 fn validate_holdings(
@@ -12735,10 +13025,150 @@ mod tests {
                 .any(|error| error.contains("duplicate instrument id"))
         );
 
+        let mut wrong_instrument_currency = document.clone();
+        wrong_instrument_currency["movements"][0]["entries"][0]["currency"] = json!("USD");
+        let errors = validate_document(&wrong_instrument_currency)
+            .expect_err("holding entry currency mismatch must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must match the instrument quoteCurrency"))
+        );
+
         let mut broken_index = document;
         broken_index["movementEntries"][0]["movementId"] = json!("movement_missing");
         let errors = validate_document(&broken_index).expect_err("broken entry index must fail");
         assert!(errors.iter().any(|error| error.contains("movementId")));
+    }
+
+    #[test]
+    fn validate_document_rejects_malformed_taxonomy_and_quotes() {
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["instruments"] = json!([{
+            "id": "inst_validation_quote",
+            "type": "equity",
+            "symbol": "VALID",
+            "displayName": "Validation Equity",
+            "quoteCurrency": "USD",
+            "market": "US"
+        }]);
+        document["quotes"] = json!([{
+            "id": "quote_validation",
+            "instrumentId": "inst_validation_quote",
+            "price": "12.34",
+            "currency": "USD",
+            "asOf": "2026-07-17T00:00:00Z",
+            "expiresAt": "2026-07-18T00:00:00Z",
+            "source": "validation_test",
+            "status": "fresh"
+        }]);
+        document["categories"] = json!([
+            {
+                "id": "cat_validation_parent",
+                "displayName": "投资",
+                "kind": "investment",
+                "isSystem": true
+            },
+            {
+                "id": "cat_validation_child",
+                "displayName": "股票",
+                "parentId": "cat_validation_parent",
+                "kind": "investment",
+                "isSystem": false,
+                "aiDescription": "股票买卖"
+            }
+        ]);
+        document["counterparties"] = json!([{
+            "id": "cp_validation",
+            "displayName": "示例券商",
+            "aliases": ["示例证券"],
+            "normalizedName": "示例券商",
+            "categoryHintId": "cat_validation_child",
+            "isUserMerged": false
+        }]);
+        validate_document(&document).expect("valid taxonomy and quote document should pass");
+
+        let mut optional_normalized_name = document.clone();
+        optional_normalized_name["counterparties"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("normalizedName");
+        validate_document(&optional_normalized_name)
+            .expect("normalizedName remains optional in the v1 schema");
+
+        let cases: Vec<(&str, &str, Box<dyn Fn(&mut Value)>)> = vec![
+            (
+                "duplicate category",
+                "duplicate category id",
+                Box::new(|document| {
+                    let duplicate = document["categories"][0].clone();
+                    document["categories"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(duplicate);
+                }),
+            ),
+            (
+                "category cycle",
+                "category parent cycle",
+                Box::new(|document| {
+                    document["categories"][0]["parentId"] = json!("cat_validation_child");
+                }),
+            ),
+            (
+                "dangling category hint",
+                "categoryHintId must reference",
+                Box::new(|document| {
+                    document["counterparties"][0]["categoryHintId"] = json!("cat_missing");
+                }),
+            ),
+            (
+                "duplicate alias",
+                "aliases contains duplicate",
+                Box::new(|document| {
+                    document["counterparties"][0]["aliases"] = json!(["示例证券", "示例证券"]);
+                }),
+            ),
+            (
+                "quote instrument missing",
+                "instrumentId must reference",
+                Box::new(|document| {
+                    document["quotes"][0]["instrumentId"] = json!("inst_missing");
+                }),
+            ),
+            (
+                "quote currency mismatch",
+                "currency must match the instrument quoteCurrency",
+                Box::new(|document| {
+                    document["quotes"][0]["currency"] = json!("CNY");
+                }),
+            ),
+            (
+                "duplicate current quote",
+                "duplicate current quote for instrument",
+                Box::new(|document| {
+                    let mut duplicate = document["quotes"][0].clone();
+                    duplicate["id"] = json!("quote_validation_duplicate");
+                    document["quotes"].as_array_mut().unwrap().push(duplicate);
+                }),
+            ),
+            (
+                "invalid quote timestamp",
+                "asOf must be an RFC3339 timestamp",
+                Box::new(|document| {
+                    document["quotes"][0]["asOf"] = json!("not-a-time");
+                }),
+            ),
+        ];
+        for (label, expected, mutate) in cases {
+            let mut candidate = document.clone();
+            mutate(&mut candidate);
+            let errors = validate_document(&candidate).expect_err(label);
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "{label}: expected {expected:?}, got {errors:?}"
+            );
+        }
     }
 
     #[test]

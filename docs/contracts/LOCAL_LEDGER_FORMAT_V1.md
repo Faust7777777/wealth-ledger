@@ -164,6 +164,16 @@ AI pending 读取层把 standalone pending movements 按 `atomicGroupId` 分组�
 
 这些不变量在启动读取、备份验证和每次原子写盘前统一校验；违反时 fail closed，不自动删除或修补用户数据。
 
+## 3C. 分类、对手方、标的与报价完整性
+
+- `categories`、`counterparties`、`instruments`、`quotes` 各自 ID 唯一。
+- 分类名称非空，kind/isSystem 类型合法；`parentId` 必须引用现有分类，分类树不可自指或成环。
+- 对手方名称和 aliases 必须是非空字符串，规范化名称存在时必须非空；aliases 内不得重复；`categoryHintId` 必须引用现有分类。
+- Instrument 的可选 `symbol`、`market`、`sourceRef` 存在时必须非空。
+- Quote 必须引用现有 Instrument；币种等于 Instrument `quoteCurrency`；价格为正 decimal string；时间、来源和状态合法；每个标的最多一条当前 quote。
+- movement entry 带 `instrumentId` 时，其 `currency` 必须等于对应 Instrument `quoteCurrency`。
+- 所有本地账本写事务在业务变更和幂等结果加入内存 document 后、原子写盘前运行完整 document 校验。任何新增悬空引用、环、重复 ID 或币种冲突均返回 400，失败事务不得写入业务数据或幂等记录，磁盘文件保持不变。
+
 ## 4. 写入原则
 
 正式账本写入必须满足：

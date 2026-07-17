@@ -691,6 +691,35 @@ def check_dca_execution_input(doc: dict) -> None:
     ok("DCA real-execution contract and implementation checks passed")
 
 
+def check_local_ledger_reference_integrity() -> None:
+    local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    for snippet in [
+        "validate_taxonomy_entities(document, &mut errors)",
+        "validate_quote_entities(document, &mut errors)",
+        "category parent cycle detected at:",
+        "categoryHintId must reference an existing category",
+        "duplicate current quote for instrument:",
+        "currency must match the instrument quoteCurrency",
+        "if let Err(errors) = validate_document(&document)",
+    ]:
+        if snippet not in local_text:
+            fail(f"Local-ledger reference integrity is incomplete: {snippet}")
+
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    if "local_ledger_integrity_failures_return_400_without_changing_the_document" not in rust_text:
+        fail("Rust HTTP tests must verify integrity failures leave the ledger unchanged")
+
+    local_contract = LOCAL_LEDGER_FORMAT.read_text(encoding="utf-8")
+    for phrase in [
+        "分类、对手方、标的与报价完整性",
+        "磁盘文件保持不变",
+    ]:
+        if phrase not in local_contract:
+            fail(f"Local-ledger integrity contract is incomplete: {phrase}")
+
+    ok("Local-ledger taxonomy and quote integrity checks passed")
+
+
 def check_investment_fee_semantics(doc: dict) -> None:
     local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
     for snippet in [
@@ -1978,6 +2007,7 @@ def main() -> None:
     ok("Critical AI/DCA invariants are represented")
 
     check_dca_execution_input(doc)
+    check_local_ledger_reference_integrity()
     check_investment_fee_semantics(doc)
     check_investment_sale_result(doc)
     check_subscription_due_scan(doc)

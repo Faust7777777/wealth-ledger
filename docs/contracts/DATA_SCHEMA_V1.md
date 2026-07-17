@@ -418,6 +418,9 @@ Counterparty {
 - “瑞幸咖啡”可以是 Counterparty。
 - “咖啡”更像 Category/Tag，不应自动归并到瑞幸。
 - AI 可以提出合并建议，用户确认后才合并。
+- Category ID 必须唯一；`displayName` 非空，`parentId` 必须引用现有分类且分类树不得自指或成环。
+- Counterparty ID 必须唯一；`displayName` 和 alias 不得为空，规范化名称存在时不得为空，单个对手方的 alias 不得重复。
+- `categoryHintId` 存在时必须引用现有 Category；删除或修改分类不得留下悬空提示。
 
 ## 9. DCA Plan
 
@@ -581,6 +584,10 @@ FXRate {
 
 规则：
 
+- Quote ID 必须唯一；每个 instrument 在当前 `quotes[]` 中最多保存一条当前报价。
+- `instrumentId` 必须引用现有 Instrument，`currency` 必须等于该标的的 `quoteCurrency`，`price` 必须为正 decimal string。
+- `asOf` / `expiresAt` 必须是 RFC3339，`source` 非空，`status` 必须属于 `QuoteStatus`。
+- 修改 Instrument 的 `quoteCurrency` 时必须同时满足现有报价和带该 `instrumentId` 的 movement entry 币种一致；不允许留下历史引用冲突。
 - 断网时保留上次报价/汇率，标为 `offline_cached` 或 `stale`。
 - 使用缓存估值时净值质量为 `estimated`，UI 显示 `≈` 和 as-of。
 - 无法估值时不得按 0 计入。

@@ -177,6 +177,8 @@ QuoteStorePort {
 
 - `unpriceable` 不写成 0。
 - 缓存报价必须保留 `asOf` 与 `status`。
+- Quote 必须引用现有 Instrument，币种匹配 `quoteCurrency`，且同一标的最多一条当前报价。
+- Quote 与分类/对手方等写入必须在持久化前通过完整 document 校验；失败时不得留下部分写入或幂等记录。
 
 ### SnapshotStorePort
 

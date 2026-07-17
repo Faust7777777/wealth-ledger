@@ -9757,6 +9757,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ledger_integrity_failures_return_400_without_changing_the_document() {
+        let path = unique_test_ledger_path("integrity_fail_closed");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let unchanged_empty = std::fs::read(&path).expect("empty ledger should be readable");
+        let (parent_status, parent_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/categories",
+            json!({
+                "displayName": "悬空分类",
+                "kind": "expense",
+                "parentId": "cat_missing"
+            }),
+        )
+        .await;
+        assert_eq!(parent_status, StatusCode::BAD_REQUEST, "{parent_body}");
+        assert_eq!(parent_body["error"]["code"], "invalid_category_input");
+        assert_eq!(
+            std::fs::read(&path).expect("ledger should remain readable"),
+            unchanged_empty
+        );
+
+        let (hint_status, hint_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/counterparties",
+            json!({
+                "displayName": "悬空对手方",
+                "aliases": [],
+                "categoryHintId": "cat_missing"
+            }),
+        )
+        .await;
+        assert_eq!(hint_status, StatusCode::BAD_REQUEST, "{hint_body}");
+        assert_eq!(hint_body["error"]["code"], "invalid_counterparty_input");
+        assert_eq!(
+            std::fs::read(&path).expect("ledger should remain readable"),
+            unchanged_empty
+        );
+
+        let (instrument_status, instrument_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            json!({
+                "id": "inst_integrity",
+                "type": "equity",
+                "symbol": "SAFE",
+                "displayName": "Integrity Equity",
+                "quoteCurrency": "USD",
+                "market": "US"
+            }),
+        )
+        .await;
+        assert_eq!(instrument_status, StatusCode::CREATED, "{instrument_body}");
+
+        let before_invalid_quote = std::fs::read(&path).expect("ledger should be readable");
+        let (quote_status, quote_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "quotes": [{
+                    "instrumentId": "inst_integrity",
+                    "price": "12.34",
+                    "currency": "CNY",
+                    "asOf": "2026-07-17T00:00:00Z",
+                    "source": "integrity_test"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(quote_status, StatusCode::BAD_REQUEST, "{quote_body}");
+        assert_eq!(
+            std::fs::read(&path).expect("ledger should remain readable"),
+            before_invalid_quote
+        );
+
+        let (valid_quote_status, valid_quote_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "quotes": [{
+                    "instrumentId": "inst_integrity",
+                    "price": "12.34",
+                    "currency": "USD",
+                    "asOf": "2026-07-17T00:00:00Z",
+                    "source": "integrity_test"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(valid_quote_status, StatusCode::OK, "{valid_quote_body}");
+
+        let before_invalid_patch = std::fs::read(&path).expect("ledger should be readable");
+        let (patch_status, patch_body) = request_json_body_from(
+            router,
+            Method::PATCH,
+            "/v1/instruments/inst_integrity",
+            json!({"quoteCurrency": "CNY"}),
+        )
+        .await;
+        assert_eq!(patch_status, StatusCode::BAD_REQUEST, "{patch_body}");
+        assert_eq!(patch_body["error"]["code"], "invalid_instrument_patch");
+        assert_eq!(
+            std::fs::read(&path).expect("ledger should remain readable"),
+            before_invalid_patch
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_counterparty_merge_proposal_requires_confirmation() {
         let path = unique_test_ledger_path("counterparty_merge");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
