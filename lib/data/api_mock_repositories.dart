@@ -432,6 +432,9 @@ AccountVm _account(Map<String, dynamic> j) {
     includeInNetWorth: j['includeInNetWorth'] as bool? ?? true,
     institutionName: j['institutionName'] as String?,
     cashBalances: _cashBalances(j['cashBalances']),
+    supportedCurrencies: [
+      for (final c in _list(j['supportedCurrencies'])) '$c',
+    ],
     isArchived: j['status'] == 'archived' || j['visibility'] == 'archived',
   );
 }
@@ -461,6 +464,7 @@ HoldingVm _holding(Map<String, dynamic> j) {
   return HoldingVm(
     id: '${j['id']}',
     accountId: '${j['accountId']}',
+    instrumentId: '${j['instrumentId'] ?? inst['id'] ?? ''}',
     symbol: '${inst['symbol'] ?? j['symbol'] ?? ''}',
     displayName:
         '${inst['displayName'] ?? j['displayName'] ?? inst['symbol'] ?? ''}',
@@ -500,6 +504,47 @@ List<MovementEntryVm> _entries(Object? v) {
   ];
 }
 
+RealizedPnlStatus _pnlStatus(Object? s) => switch (s) {
+  'calculated' => RealizedPnlStatus.calculated,
+  'calculated_with_fx' => RealizedPnlStatus.calculatedWithFx,
+  'currency_mismatch' => RealizedPnlStatus.currencyMismatch,
+  // 未知状态按"暂不可计算"兜底：宁可少展示，也不给出错误盈亏。
+  _ => RealizedPnlStatus.costBasisUnavailable,
+};
+
+ExecutionFxBasisVm? _fxBasis(Object? o) {
+  if (o is! Map) return null;
+  final j = _m(o);
+  return ExecutionFxBasisVm(
+    baseCurrency: '${j['baseCurrency']}',
+    quoteCurrency: '${j['quoteCurrency']}',
+    rate: '${j['rate']}',
+    asOf: '${j['asOf']}',
+    sourceRateId: '${j['sourceRateId']}',
+    source: '${j['source']}',
+    sourceUrl: j['sourceUrl'] as String?,
+    inverted: _bool(j['inverted']),
+  );
+}
+
+InvestmentSaleResultVm? _saleResult(Object? o) {
+  if (o is! Map) return null;
+  final j = _m(o);
+  return InvestmentSaleResultVm(
+    costBasisMethod: '${j['costBasisMethod']}',
+    grossProceeds: _money(j['grossProceeds']),
+    feeAndTaxTotal: _money(j['feeAndTaxTotal']),
+    netProceeds: _money(j['netProceeds']),
+    costBasisReleased: _moneyOrNull(j['costBasisReleased']),
+    realizedPnl: _moneyOrNull(j['realizedPnl']),
+    netProceedsInCostBasisCurrency: _moneyOrNull(
+      j['netProceedsInCostBasisCurrency'],
+    ),
+    fxBasis: _fxBasis(j['fxBasis']),
+    realizedPnlStatus: _pnlStatus(j['realizedPnlStatus']),
+  );
+}
+
 MovementVm _movement(Map<String, dynamic> j) {
   final settlement = j['settlement'] is Map
       ? _m(j['settlement'])
@@ -529,8 +574,42 @@ MovementVm _movement(Map<String, dynamic> j) {
     entries: _entries(j['entries']),
     categoryId: j['categoryId'] as String?,
     counterpartyId: j['counterpartyId'] as String?,
+    saleResult: _saleResult(j['saleResult']),
+    costBasisFx: _fxBasis(j['costBasisFx']),
   );
 }
+
+/// 公开以便单测直接喂 Movement JSON（saleResult/costBasisFx 映射与缺失兼容）。
+MovementVm parseMovementData(Map<String, dynamic> j) => _movement(j);
+
+InstrumentType _instType(Object? s) => switch (s) {
+  'cash' => InstrumentType.cash,
+  'equity' => InstrumentType.equity,
+  'fund' => InstrumentType.fund,
+  'crypto' => InstrumentType.crypto,
+  'fx_cash' => InstrumentType.fxCash,
+  'receivable' => InstrumentType.receivable,
+  _ => InstrumentType.other,
+};
+
+String _instTypeWire(InstrumentType t) => switch (t) {
+  InstrumentType.cash => 'cash',
+  InstrumentType.equity => 'equity',
+  InstrumentType.fund => 'fund',
+  InstrumentType.crypto => 'crypto',
+  InstrumentType.fxCash => 'fx_cash',
+  InstrumentType.receivable => 'receivable',
+  InstrumentType.other => 'other',
+};
+
+InstrumentVm _instrumentVm(Map<String, dynamic> j) => InstrumentVm(
+  id: '${j['id']}',
+  type: _instType(j['type']),
+  symbol: j['symbol'] as String?,
+  displayName: '${j['displayName']}',
+  quoteCurrency: '${j['quoteCurrency']}',
+  market: j['market'] as String?,
+);
 
 DcaReminderVm _reminder(Map<String, dynamic> j) => DcaReminderVm(
   id: '${j['id']}',
@@ -1044,6 +1123,55 @@ class LocalServerMovementRepository implements MovementRepository {
     );
   }
 
+  @override
+  Future<ConfirmResultVm> createInvestmentTrade(
+    InvestmentTradeInput input,
+  ) async {
+    final isBuy = input.side == TradeSide.buy;
+    // 空值或纯零 fee/tax 不发送对应腿（服务端禁止零金额腿）。
+    bool hasValue(DecimalString? v) =>
+        v != null && v.trim().isNotEmpty && decimalSign(v) > 0;
+    Map<String, Object?> cashLeg(
+      DecimalString amount,
+      String direction,
+      String role,
+    ) => {
+      'accountId': input.cashAccountId,
+      'amount': amount,
+      'currency': input.cashCurrency,
+      'direction': direction,
+      'role': role,
+    };
+    return _recordViaPipeline({
+      'type': isBuy ? 'buy' : 'sell',
+      'occurredAt':
+          input.occurredAt ?? DateTime.now().toUtc().toIso8601String(),
+      'title': input.title,
+      if (input.note != null && input.note!.isNotEmpty)
+        'description': input.note,
+      'entries': [
+        // 现金主腿：买入付款（out/source），卖出毛回款（in/destination）。
+        cashLeg(
+          input.principalAmount,
+          isBuy ? 'out' : 'in',
+          isBuy ? 'source' : 'destination',
+        ),
+        // 持仓数量腿：金额=数量、币种=标的报价币种、必须带 instrumentId。
+        {
+          'accountId': input.holdingAccountId,
+          'instrumentId': input.instrumentId,
+          'amount': input.quantity,
+          'currency': input.holdingCurrency,
+          'direction': isBuy ? 'in' : 'out',
+          'role': isBuy ? 'destination' : 'source',
+        },
+        // 费用/税费：始终为现金流出，且与主腿同账户同币种。
+        if (hasValue(input.feeAmount)) cashLeg(input.feeAmount!, 'out', 'fee'),
+        if (hasValue(input.taxAmount)) cashLeg(input.taxAmount!, 'out', 'tax'),
+      ],
+    });
+  }
+
   // 候选 → 确认：草稿 → 提交复核 → 确认入账（均为用户主动发起的合法写路径）。
   // 返回服务端 confirm 结果；是否"已入账"由 ledgerWrite 决定，前端不猜测。
   Future<ConfirmResultVm> _recordViaPipeline(Map<String, Object?> body) async {
@@ -1054,6 +1182,32 @@ class LocalServerMovementRepository implements MovementRepository {
     return _confirmResult(
       _m(await _c.postData('/v1/atomic-groups/$groupId/confirm')),
     );
+  }
+}
+
+class LocalServerInstrumentRepository implements InstrumentRepository {
+  LocalServerInstrumentRepository(this._c);
+  final DevApiClient _c;
+
+  @override
+  Future<List<InstrumentVm>> listInstruments() async => [
+    for (final i in _list(await _c.getData('/v1/instruments')))
+      _instrumentVm(_m(i)),
+  ];
+
+  @override
+  Future<InstrumentVm> createInstrument(CreateInstrumentInput input) async {
+    final d = await _c.postData(
+      '/v1/instruments',
+      body: {
+        'type': _instTypeWire(input.type),
+        'displayName': input.displayName,
+        'quoteCurrency': input.quoteCurrency,
+        if (input.symbol != null && input.symbol!.isNotEmpty)
+          'symbol': input.symbol,
+      },
+    );
+    return _instrumentVm(_m(d));
   }
 }
 

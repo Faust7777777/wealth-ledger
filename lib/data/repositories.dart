@@ -63,6 +63,16 @@ abstract interface class MovementRepository {
 
   /// 已确认记录更正：只生成 correction 候选；确认前不改原记录、不影响余额。
   Future<void> createCorrectionProposal(CreateCorrectionInput input);
+
+  /// 手动投资成交（买入/卖出多腿：现金腿 + 持仓腿 + 可选费用/税费腿）。
+  /// 走草稿 → 复核 → 确认流水线；仅 local_server。是否已入账以 ledgerWrite 为准。
+  Future<ConfirmResultVm> createInvestmentTrade(InvestmentTradeInput input);
+}
+
+/// 投资标的：买入只能从服务端已有标的中选择（可紧凑新建），不手填 wire ID。
+abstract interface class InstrumentRepository {
+  Future<List<InstrumentVm>> listInstruments();
+  Future<InstrumentVm> createInstrument(CreateInstrumentInput input);
 }
 
 abstract interface class DcaRepository {

@@ -111,6 +111,20 @@ class RealLocalMovementRepository implements MovementRepository {
   @override
   Future<void> createCorrectionProposal(CreateCorrectionInput input) async =>
       throw UnsupportedError('real_local 暂不支持发起更正；请用 local_server');
+
+  @override
+  Future<ConfirmResultVm> createInvestmentTrade(
+    InvestmentTradeInput input,
+  ) async => throw UnsupportedError('real_local 暂不支持记录投资成交；请用 local_server');
+}
+
+class RealLocalInstrumentRepository implements InstrumentRepository {
+  const RealLocalInstrumentRepository();
+  @override
+  Future<List<InstrumentVm>> listInstruments() async => const [];
+  @override
+  Future<InstrumentVm> createInstrument(CreateInstrumentInput input) async =>
+      throw UnsupportedError('real_local 暂不支持创建标的；请用 local_server');
 }
 
 class RealLocalDcaRepository implements DcaRepository {

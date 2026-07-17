@@ -237,6 +237,14 @@ final dcaRepositoryProvider = Provider<DcaRepository>(
     api: () => LocalServerDcaRepository(ref.watch(devApiClientProvider)),
   ),
 );
+final instrumentRepositoryProvider = Provider<InstrumentRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalInstrumentRepository(),
+    fixture: () => const FixtureInstrumentRepository(),
+    api: () => LocalServerInstrumentRepository(ref.watch(devApiClientProvider)),
+  ),
+);
 final quoteRepositoryProvider = Provider<QuoteRepository>(
   (ref) => _pick(
     ref,
@@ -294,6 +302,9 @@ final aiPendingProvider = FutureProvider<List<AiProposalVm>>(
 );
 final recentMovementsProvider = FutureProvider<List<MovementVm>>(
   (ref) => ref.watch(movementRepositoryProvider).listRecentMovements(),
+);
+final instrumentsProvider = FutureProvider<List<InstrumentVm>>(
+  (ref) => ref.watch(instrumentRepositoryProvider).listInstruments(),
 );
 final snapshotsProvider = FutureProvider<List<NetWorthSnapshotVm>>(
   (ref) => ref.watch(snapshotRepositoryProvider).listSnapshots(),
@@ -364,6 +375,31 @@ extension SubscriptionRefreshX on WidgetRef {
     refreshSubscriptions();
     invalidate(aiPendingProvider);
     invalidate(overviewProvider);
+  }
+}
+
+extension InvestmentTradeRefreshX on WidgetRef {
+  /// 投资成交确认成功后的刷新范围：账户/持仓/首页/构成/流水/该 movement 详情；
+  /// 快照与异常遵循现有 snapshotInvalidated 语义（ledgerWrite 视为等效信号）。
+  void refreshAfterInvestmentTrade(
+    ConfirmResultVm result, {
+    String? holdingAccountId,
+  }) {
+    invalidate(recentMovementsProvider);
+    invalidate(overviewProvider);
+    invalidate(accountsProvider);
+    invalidate(holdingsProvider);
+    invalidate(allocationProvider);
+    for (final id in result.confirmedMovementIds) {
+      invalidate(movementByIdProvider(id));
+    }
+    if (holdingAccountId != null) {
+      invalidate(holdingsByAccountProvider(holdingAccountId));
+    }
+    if (result.ledgerWrite || result.snapshotInvalidated) {
+      invalidate(snapshotsProvider);
+      invalidate(anomaliesProvider);
+    }
   }
 }
 

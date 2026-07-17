@@ -63,6 +63,19 @@ DecimalString absDecimal(DecimalString raw) {
   return s;
 }
 
+/// 精确十进制相加(a + b)：对 b 取反后走 [subtractDecimal]，同样不经 double。
+DecimalString addDecimal(DecimalString a, DecimalString b) {
+  var t = b.trim();
+  if (t.startsWith('+')) t = t.substring(1);
+  return t.startsWith('-')
+      ? subtractDecimal(a, t.substring(1))
+      : subtractDecimal(a, '-$t');
+}
+
+/// 精确十进制比较：a<b → -1，a==b → 0，a>b → 1（纯字符串，不经 double）。
+int compareDecimal(DecimalString a, DecimalString b) =>
+    decimalSign(subtractDecimal(a, b));
+
 /// 精确十进制相减(a - b)，走 BigInt 缩放整数，绝不经过 double。保留两者中较多的小数位。
 DecimalString subtractDecimal(DecimalString a, DecimalString b) {
   (BigInt, int) parse(String s) {

@@ -96,6 +96,7 @@ class AccountVm {
     this.includeInNetWorth = true,
     this.institutionName,
     this.cashBalances = const {},
+    this.supportedCurrencies = const [],
   });
   final Id id;
   final String displayName;
@@ -109,6 +110,9 @@ class AccountVm {
   final bool includeInNetWorth;
   final String? institutionName;
   final Map<CurrencyCode, DecimalString> cashBalances; // 各币种现金余额（local_server）
+
+  /// 账户可持有的现金币种（服务端 supportedCurrencies；缺失时按默认币种）。
+  final List<CurrencyCode> supportedCurrencies;
 }
 
 /// 创建账户输入（对齐 APPLICATION_INTERFACES_V1.CreateAccountInput）。
@@ -330,6 +334,7 @@ class HoldingVm {
     required this.displayName,
     required this.quantity,
     required this.quoteStatus,
+    this.instrumentId = '',
     this.costBasisTotal,
     this.marketValue,
     this.dayChange,
@@ -338,6 +343,9 @@ class HoldingVm {
   });
   final Id id;
   final Id accountId;
+
+  /// 持仓对应的标的 ID（卖出腿必须回填；缺失时为空串）。
+  final Id instrumentId;
   final String symbol;
   final String displayName;
   final DecimalString quantity;
@@ -376,6 +384,8 @@ class MovementVm {
     this.entries = const [],
     this.categoryId,
     this.counterpartyId,
+    this.saleResult,
+    this.costBasisFx,
   });
   final Id id;
   final Id atomicGroupId;
@@ -390,6 +400,134 @@ class MovementVm {
   final List<MovementEntryVm> entries;
   final Id? categoryId;
   final Id? counterpartyId;
+
+  /// 卖出确认后服务端固化的成交结果（只读；旧记录可缺失）。
+  final InvestmentSaleResultVm? saleResult;
+
+  /// 跨币种买入固化的成本换算依据（只读；旧记录可缺失）。
+  final ExecutionFxBasisVm? costBasisFx;
+}
+
+/// 已实现盈亏状态（wire: calculated / calculated_with_fx /
+/// cost_basis_unavailable / currency_mismatch）。
+enum RealizedPnlStatus {
+  calculated,
+  calculatedWithFx,
+  costBasisUnavailable,
+  currencyMismatch,
+}
+
+/// 成交时实际使用的汇率依据（服务端固化，不可变；前端只展示不重算）。
+class ExecutionFxBasisVm {
+  const ExecutionFxBasisVm({
+    required this.baseCurrency,
+    required this.quoteCurrency,
+    required this.rate,
+    required this.asOf,
+    required this.sourceRateId,
+    required this.source,
+    this.sourceUrl,
+    required this.inverted,
+  });
+  final CurrencyCode baseCurrency;
+  final CurrencyCode quoteCurrency;
+  final DecimalString rate;
+  final IsoDateTime asOf;
+  final Id sourceRateId; // 内部 ID，仅供调试/测试；UI 不展示
+  final String source;
+  final String? sourceUrl;
+  final bool inverted;
+}
+
+/// 卖出成交结果（服务端按平均成本法固化；前端禁止重算或用浮点推导）。
+class InvestmentSaleResultVm {
+  const InvestmentSaleResultVm({
+    required this.costBasisMethod,
+    required this.grossProceeds,
+    required this.feeAndTaxTotal,
+    required this.netProceeds,
+    this.costBasisReleased,
+    this.realizedPnl,
+    this.netProceedsInCostBasisCurrency,
+    this.fxBasis,
+    required this.realizedPnlStatus,
+  });
+  final String costBasisMethod; // average_cost
+  final Money grossProceeds;
+  final Money feeAndTaxTotal;
+  final Money netProceeds;
+  final Money? costBasisReleased;
+  final Money? realizedPnl;
+  final Money? netProceedsInCostBasisCurrency;
+  final ExecutionFxBasisVm? fxBasis;
+  final RealizedPnlStatus realizedPnlStatus;
+}
+
+/// 投资标的（服务端 Instrument 投影；买入只能从中选择，不手填 wire ID）。
+class InstrumentVm {
+  const InstrumentVm({
+    required this.id,
+    required this.type,
+    this.symbol,
+    required this.displayName,
+    required this.quoteCurrency,
+    this.market,
+  });
+  final Id id;
+  final InstrumentType type;
+  final String? symbol;
+  final String displayName;
+  final CurrencyCode quoteCurrency;
+  final String? market;
+}
+
+/// 新建标的输入（POST /v1/instruments；仅登记标的，不连券商、不同步行情）。
+class CreateInstrumentInput {
+  const CreateInstrumentInput({
+    required this.type,
+    required this.displayName,
+    required this.quoteCurrency,
+    this.symbol,
+  });
+  final InstrumentType type;
+  final String displayName;
+  final CurrencyCode quoteCurrency;
+  final String? symbol;
+}
+
+enum TradeSide { buy, sell }
+
+/// 手动投资成交输入。买入 principal=成交价款，卖出 principal=毛回款；
+/// 现金实际变动与成本增减由服务端按 principal±fee±tax 计算，前端不推导。
+class InvestmentTradeInput {
+  const InvestmentTradeInput({
+    required this.side,
+    required this.cashAccountId,
+    required this.holdingAccountId,
+    required this.instrumentId,
+    required this.quantity,
+    required this.principalAmount,
+    required this.cashCurrency,
+    required this.holdingCurrency,
+    this.feeAmount,
+    this.taxAmount,
+    this.occurredAt,
+    required this.title,
+    this.note,
+  });
+  final TradeSide side;
+  final Id cashAccountId;
+  final Id holdingAccountId;
+  final Id instrumentId;
+  final DecimalString quantity;
+  final DecimalString principalAmount;
+  final CurrencyCode cashCurrency;
+  final CurrencyCode holdingCurrency; // 标的报价币种（由所选标的派生）
+  final DecimalString? feeAmount; // 空或 0 → 不发送费用腿
+  final DecimalString? taxAmount; // 空或 0 → 不发送税费腿
+  final IsoDateTime? occurredAt; // null → 仓库用当前时间
+  final String title;
+  final String? note;
 }
 
 /// 分录（双分录账本的一条腿）：方向 in/out、角色、所属账户。

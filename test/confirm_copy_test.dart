@@ -25,6 +25,10 @@ class _FakeMovementRepo implements MovementRepository {
   @override
   Future<void> createCorrectionProposal(CreateCorrectionInput input) async {}
   @override
+  Future<ConfirmResultVm> createInvestmentTrade(
+    InvestmentTradeInput input,
+  ) async => result;
+  @override
   Future<List<MovementVm>> listRecentMovements({int limit = 20}) async =>
       const [];
   @override

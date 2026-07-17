@@ -63,6 +63,7 @@ const List<HoldingVm> _holdings = [
   HoldingVm(
     id: 'holding_nvda',
     accountId: 'acct_us_broker',
+    instrumentId: 'inst_nvda',
     symbol: 'NVDA',
     displayName: 'NVIDIA',
     quantity: '12',
@@ -81,6 +82,7 @@ const List<HoldingVm> _holdings = [
   HoldingVm(
     id: 'holding_aapl',
     accountId: 'acct_us_broker',
+    instrumentId: 'inst_aapl',
     symbol: 'AAPL',
     displayName: 'Apple',
     quantity: '20',
@@ -99,6 +101,7 @@ const List<HoldingVm> _holdings = [
   HoldingVm(
     id: 'holding_btc',
     accountId: 'acct_crypto',
+    instrumentId: 'inst_btc',
     symbol: 'BTC',
     displayName: 'Bitcoin',
     quantity: '0.0300',
@@ -422,6 +425,45 @@ class FixtureMovementRepository implements MovementRepository {
   Future<void> createCorrectionProposal(CreateCorrectionInput input) async {
     /* DEMO：模拟生成更正候选，演示数据不变 */
   }
+
+  @override
+  Future<ConfirmResultVm> createInvestmentTrade(
+    InvestmentTradeInput input,
+  ) async => throw UnsupportedError('DEMO 演示只读，不支持记录投资成交；请用 local_server');
+}
+
+/// DEMO 标的：与演示持仓一致，仅供选择器展示；创建标的不可用。
+const List<InstrumentVm> _instruments = [
+  InstrumentVm(
+    id: 'inst_nvda',
+    type: InstrumentType.equity,
+    symbol: 'NVDA',
+    displayName: 'NVIDIA',
+    quoteCurrency: 'USD',
+  ),
+  InstrumentVm(
+    id: 'inst_aapl',
+    type: InstrumentType.equity,
+    symbol: 'AAPL',
+    displayName: 'Apple',
+    quoteCurrency: 'USD',
+  ),
+  InstrumentVm(
+    id: 'inst_btc',
+    type: InstrumentType.crypto,
+    symbol: 'BTC',
+    displayName: 'Bitcoin',
+    quoteCurrency: 'USDT',
+  ),
+];
+
+class FixtureInstrumentRepository implements InstrumentRepository {
+  const FixtureInstrumentRepository();
+  @override
+  Future<List<InstrumentVm>> listInstruments() async => _instruments;
+  @override
+  Future<InstrumentVm> createInstrument(CreateInstrumentInput input) async =>
+      throw UnsupportedError('DEMO 演示只读，不支持创建标的；请用 local_server');
 }
 
 class FixtureTaxonomyRepository implements TaxonomyRepository {
