@@ -49,6 +49,14 @@ Future<void> showRecordSheet(BuildContext context, LedgerCapabilitiesVm caps) {
             _RecordTile(
               sheetCtx: sheetCtx,
               pageCtx: context,
+              icon: Icons.candlestick_chart_outlined,
+              label: '投资成交',
+              route: '/investment/trade/new',
+              enabled: canRecord,
+            ),
+            _RecordTile(
+              sheetCtx: sheetCtx,
+              pageCtx: context,
               icon: Icons.fact_check_outlined,
               label: '余额观察',
               route: '/record/reconcile',

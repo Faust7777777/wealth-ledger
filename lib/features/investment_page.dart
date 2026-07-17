@@ -33,6 +33,7 @@ class InvestmentPage extends ConsumerWidget {
       data: (hs) {
         final rs = reminders.asData?.value ?? const <DcaReminderVm>[];
         final canPropose = ref.writeCapabilities.canPersistPendingProposal;
+        final canRecord = ref.writeCapabilities.canRecordMovement;
         if (hs.isEmpty && rs.isEmpty && plans.isEmpty) {
           return EmptyState(
             illustration: Image.asset(
@@ -42,29 +43,55 @@ class InvestmentPage extends ConsumerWidget {
               semanticLabel: '开始你的投资记录',
             ),
             title: '还没有投资持仓',
-            message: '可以先创建定投计划，或添加券商 / 交易所账户与持仓。这里只展示事实统计，非投资建议。',
-            action: WriteGate(
-              enabled: canPropose,
-              child: FilledButton(
-                onPressed: () => context.push('/investment/dca/new'),
-                child: const Text('新建定投计划'),
-              ),
+            message: '可以先记录一笔成交，或创建定投计划。这里只展示事实统计，非投资建议。',
+            action: Wrap(
+              spacing: AppSpacing.sm,
+              runSpacing: AppSpacing.xs,
+              alignment: WrapAlignment.center,
+              children: [
+                WriteGate(
+                  enabled: canRecord,
+                  child: FilledButton(
+                    onPressed: () => context.push('/investment/trade/new'),
+                    child: const Text('投资成交'),
+                  ),
+                ),
+                WriteGate(
+                  enabled: canPropose,
+                  child: OutlinedButton(
+                    onPressed: () => context.push('/investment/dca/new'),
+                    child: const Text('新建定投计划'),
+                  ),
+                ),
+              ],
             ),
           );
         }
         return ListView(
           padding: const EdgeInsets.all(AppSpacing.base),
           children: [
-            Align(
-              alignment: Alignment.centerLeft,
-              child: WriteGate(
-                enabled: canPropose,
-                child: FilledButton.icon(
-                  onPressed: () => context.push('/investment/dca/new'),
-                  icon: const Icon(Icons.add),
-                  label: const Text('新建定投计划'),
+            // 主要操作区：真实成交入口 + 定投计划入口。
+            Wrap(
+              spacing: AppSpacing.sm,
+              runSpacing: AppSpacing.xs,
+              children: [
+                WriteGate(
+                  enabled: canRecord,
+                  child: FilledButton.icon(
+                    onPressed: () => context.push('/investment/trade/new'),
+                    icon: const Icon(Icons.candlestick_chart_outlined),
+                    label: const Text('投资成交'),
+                  ),
                 ),
-              ),
+                WriteGate(
+                  enabled: canPropose,
+                  child: OutlinedButton.icon(
+                    onPressed: () => context.push('/investment/dca/new'),
+                    icon: const Icon(Icons.add),
+                    label: const Text('新建定投计划'),
+                  ),
+                ),
+              ],
             ),
             const SizedBox(height: AppSpacing.base),
             if (hs.isNotEmpty) ...[

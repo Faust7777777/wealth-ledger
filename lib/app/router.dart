@@ -18,6 +18,7 @@ import '../features/anomalies_page.dart';
 import '../features/correction_page.dart';
 import '../features/dca_plan_form_page.dart';
 import '../features/investment_page.dart';
+import '../features/investment_trade_page.dart';
 import '../features/liabilities_page.dart';
 import '../features/manual_record_page.dart';
 import '../features/movement_detail_page.dart';
@@ -101,6 +102,10 @@ final appRouter = GoRouter(
     GoRoute(
       path: '/record/reconcile',
       builder: (c, s) => const ReconcilePage(),
+    ),
+    GoRoute(
+      path: '/investment/trade/new',
+      builder: (c, s) => const InvestmentTradePage(),
     ),
     GoRoute(
       path: '/investment/dca/new',
