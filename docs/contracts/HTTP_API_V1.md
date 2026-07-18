@@ -324,7 +324,8 @@ POST /v1/ai/atomic-groups/{atomicGroupId}/edit
 - approve 前必须校验。
 - 修改已有记录必须返回 old → new diff。
 - full ledger context 只用于生成候选，不授权 AI 写账。
-- 文本整理 provider 默认关闭。显式设置 `FINWEALTH_AI_PROVIDER=openai_responses` 后，服务端使用 Responses API Structured Outputs；请求固定 `store=false`，只发送原始文本和最小账户选择上下文。模型输出仍由服务端重新校验账户、币种、正金额、时间和 movement 方向。
+- 文本与图片整理 provider 默认关闭。显式设置 `FINWEALTH_AI_PROVIDER=openai_responses` 后，服务端使用 Responses API Structured Outputs；请求固定 `store=false`，只发送当前输入和最小账户选择上下文。模型输出仍由服务端重新校验账户、币种、正金额、时间和 movement 方向。
+- 图片请求体使用 `fileName`、`mimeType`、`imageBase64`；仅接受 PNG、JPEG、WEBP，解码后不超过 10 MiB。服务端校验 Base64、MIME 与文件头；原始图片不写入账本、响应、evidence 摘要或日志。
 - provider 配置要求 `FINWEALTH_AI_MODEL`、`FINWEALTH_AI_API_KEY`，`FINWEALTH_AI_BASE_URL` 默认官方 `/v1`，只允许 HTTPS 或回环 HTTP。API key 不写账本、不进入响应、不进入日志。
 - provider refusal、incomplete、非 2xx、非法 JSON 或 schema/账本校验失败都 fail closed，不创建可确认 movement；幂等重放必须在联网前返回已保存结果。
 - `movements` 中按 atomic group 持久化的 standalone `pending_review` 候选会动态投影到 pending AI Review；投影 ID 为 `proposal_movement_{movementId}`，不会在 `aiProposals` 中再保存一份副本。

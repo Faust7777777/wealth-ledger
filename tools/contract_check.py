@@ -871,7 +871,7 @@ def check_loan_interest_slice(doc: dict) -> None:
     ok("Loan terms, projected payment split, and reviewed interest passed")
 
 
-def check_ai_text_provider() -> None:
+def check_ai_provider(doc: dict) -> None:
     rust_text = RUST_SERVER.read_text(encoding="utf-8")
     for snippet in [
         'env::var("FINWEALTH_AI_PROVIDER")',
@@ -881,16 +881,29 @@ def check_ai_text_provider() -> None:
         '"type": "json_schema"',
         '"strict": true',
         "organize_ai_text_with_provider",
+        "organize_ai_image_with_provider",
+        "validated_ai_image_data_url",
+        '"type": "input_image"',
         "ai_provider_movement_input",
         "local_ledger::replay_idempotency(path, &idempotency)",
         "openai_responses_provider_returns_a_valid_review_only_movement",
+        "openai_responses_provider_organizes_validated_image_evidence",
     ]:
         if snippet not in rust_text:
-            fail(f"AI text provider implementation is incomplete: {snippet}")
+            fail(f"AI provider implementation is incomplete: {snippet}")
+    image_schema = doc["components"]["schemas"]["AiImageInput"]
+    if image_schema.get("required") != ["fileName", "mimeType", "imageBase64"]:
+        fail("AI image input contract must require the wire fields used by Flutter")
+    if image_schema["properties"]["mimeType"].get("enum") != [
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+    ]:
+        fail("AI image input contract must stay aligned with validated provider formats")
     if "FINWEALTH_AI_PROVIDER=none" not in DEPLOY_ENV_EXAMPLE.read_text(encoding="utf-8"):
         fail("AI provider deploy default must remain disabled")
 
-    ok("Opt-in structured AI text provider passed")
+    ok("Opt-in structured AI text/image provider passed")
 
 
 def check_valuation_issue_projection(doc: dict) -> None:
@@ -2222,7 +2235,7 @@ def main() -> None:
     check_public_quote_provider()
     check_yield_interest_slice(doc)
     check_loan_interest_slice(doc)
-    check_ai_text_provider()
+    check_ai_provider(doc)
     check_valuation_issue_projection(doc)
     check_investment_fee_semantics(doc)
     check_investment_sale_result(doc)

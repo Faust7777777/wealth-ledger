@@ -14912,7 +14912,12 @@ fn ai_import_proposal_from_groups(
         if let Some(model) = provider.get("model").and_then(Value::as_str) {
             proposal["source"]["modelName"] = json!(model);
         }
-        proposal["source"]["promptVersion"] = json!("finwealth_cash_movement_v1");
+        proposal["source"]["promptVersion"] = json!(
+            provider
+                .get("promptVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("finwealth_cash_movement_v1")
+        );
     }
     proposal
 }
@@ -15441,7 +15446,12 @@ fn edited_ai_atomic_group_from_patch(
 fn ai_evidence_ref(source_kind: &str, proposal_id: &str, input: &Value) -> Value {
     let mut evidence = json!({
         "id": format!("ev_{proposal_id}"),
-        "kind": source_kind,
+        "type": match source_kind {
+            "user_text" => "text",
+            "user_image" => "image",
+            "csv_import" => "file",
+            _ => "text"
+        },
         "label": ai_source_label(source_kind, input)
     });
     if let Some(preview) = ai_input_preview(input) {

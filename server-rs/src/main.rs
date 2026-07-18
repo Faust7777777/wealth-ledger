@@ -4,13 +4,16 @@ use argon2::{
 };
 use axum::{
     Extension, Json, Router,
-    extract::{Json as JsonExtractor, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Json as JsonExtractor, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get, patch, post},
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 mod ledger_lease;
 mod ledger_migrations;
 mod local_ledger;
@@ -1267,7 +1270,10 @@ fn app_with_state(state: AppState) -> Router {
             post(create_subscription_charge_proposal),
         )
         .route("/v1/ai/proposals/from-text", post(ai_proposal_from_text))
-        .route("/v1/ai/proposals/from-image", post(ai_proposal_from_image))
+        .route(
+            "/v1/ai/proposals/from-image",
+            post(ai_proposal_from_image).layer(DefaultBodyLimit::max(15 * 1024 * 1024)),
+        )
         .route("/v1/ai/proposals/from-csv", post(ai_proposal_from_csv))
         .route("/v1/ai/proposals/pending", get(ai_pending))
         .route("/v1/ai/proposals/{proposal_id}", get(ai_proposal))
@@ -2373,14 +2379,40 @@ async fn create_ai_import_proposal(
             Ok(None) => {}
             Err(error) => return local_ledger_error(error, "ai_import_idempotency_failed"),
         }
-        let input = if source_kind == "user_text" {
+        let input = if matches!(source_kind, "user_text" | "user_image") {
+            let image_url = if source_kind == "user_image" {
+                match validated_ai_image_data_url(&input) {
+                    Ok(image_url) => Some(image_url),
+                    Err(failure) => {
+                        return bad_request(
+                            failure.code,
+                            failure.message,
+                            json!({"source": "user_image"}),
+                        );
+                    }
+                }
+            } else {
+                None
+            };
             match ai_provider_config() {
                 Ok(Some(config)) => {
                     let accounts = match local_ledger::list_accounts(path) {
                         Ok(accounts) => accounts,
                         Err(error) => return ledger_io_error(error),
                     };
-                    match organize_ai_text_with_provider(&config, input, &accounts, &now).await {
+                    let organized = if source_kind == "user_text" {
+                        organize_ai_text_with_provider(&config, input, &accounts, &now).await
+                    } else {
+                        organize_ai_image_with_provider(
+                            &config,
+                            input,
+                            image_url.expect("validated image URL"),
+                            &accounts,
+                            &now,
+                        )
+                        .await
+                    };
+                    match organized {
                         Ok(input) => input,
                         Err(failure) => {
                             return service_unavailable(
@@ -2569,6 +2601,205 @@ async fn organize_ai_text_with_provider(
             }
         }
     });
+    let response = request_ai_structured_output(config, &body).await?;
+    apply_ai_provider_output(
+        &mut input,
+        config,
+        response,
+        &account_context,
+        now,
+        "finwealth_cash_movement_text_v1",
+    )?;
+    Ok(input)
+}
+
+async fn organize_ai_image_with_provider(
+    config: &AiProviderConfig,
+    mut input: Value,
+    image_url: String,
+    accounts: &Value,
+    now: &str,
+) -> Result<Value, AiProviderFailure> {
+    let account_context = ai_provider_account_context(accounts);
+    let account_ids = account_context
+        .iter()
+        .filter_map(|account| account.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let currencies = account_context
+        .iter()
+        .filter_map(|account| account.get("supportedCurrencies").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if account_ids.is_empty() || currencies.is_empty() {
+        return Err(AiProviderFailure {
+            code: "ai_context_unavailable",
+            message: "No active cash account is available for AI organization.",
+            retryable: false,
+        });
+    }
+    let schema = ai_text_organization_schema(&account_ids, &currencies);
+    let context = format!(
+        "Current timestamp: {now}\nAccounts: {}\nExtract at most one completed cash transaction from this image.",
+        serde_json::to_string(&account_context).expect("account context should serialize")
+    );
+    let body = json!({
+        "model": config.model,
+        "store": false,
+        "max_output_tokens": 1200,
+        "instructions": concat!(
+            "Read one receipt, payment screenshot, or transaction image and return at most one cash movement. ",
+            "Return usable=false and movement=null unless amount, direction, currency, and a matching account are supported by visible evidence. ",
+            "Never invent an account, amount, merchant, currency, or date. Use the supplied timestamp only when the image omits a date. ",
+            "Income means cash in; expense means cash out. Keep the title short and factual."
+        ),
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": context},
+                {"type": "input_image", "image_url": image_url, "detail": "high"}
+            ]
+        }],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "finwealth_cash_movement",
+                "strict": true,
+                "schema": schema
+            }
+        }
+    });
+    let response = request_ai_structured_output(config, &body).await?;
+    apply_ai_provider_output(
+        &mut input,
+        config,
+        response,
+        &account_context,
+        now,
+        "finwealth_cash_movement_image_v1",
+    )?;
+    Ok(input)
+}
+
+fn validated_ai_image_data_url(input: &Value) -> Result<String, AiProviderFailure> {
+    const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+    const MAX_ENCODED_BYTES: usize = 14 * 1024 * 1024;
+    let object = input.as_object().ok_or(AiProviderFailure {
+        code: "ai_image_input_invalid",
+        message: "Image input is invalid.",
+        retryable: false,
+    })?;
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "fileName" | "mimeType" | "imageBase64" | "contextScope" | "selectedAccountIds"
+        )
+    }) {
+        return Err(AiProviderFailure {
+            code: "ai_image_input_invalid",
+            message: "Image input contains unsupported fields.",
+            retryable: false,
+        });
+    }
+    let _file_name = object
+        .get("fileName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.chars().count() <= 255
+                && !value.chars().any(char::is_control)
+        })
+        .ok_or(AiProviderFailure {
+            code: "ai_image_input_file_name_invalid",
+            message: "Image file name is missing or invalid.",
+            retryable: false,
+        })?;
+    let mime_type = input
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .ok_or(AiProviderFailure {
+            code: "ai_image_input_mime_invalid",
+            message: "Choose a PNG, JPEG, or WEBP image.",
+            retryable: false,
+        })?;
+    if !matches!(mime_type, "image/png" | "image/jpeg" | "image/webp") {
+        return Err(AiProviderFailure {
+            code: "ai_image_input_mime_invalid",
+            message: "Choose a PNG, JPEG, or WEBP image.",
+            retryable: false,
+        });
+    }
+    let encoded = input
+        .get("imageBase64")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_ENCODED_BYTES)
+        .ok_or(AiProviderFailure {
+            code: "ai_image_input_data_invalid",
+            message: "Image data is missing or invalid.",
+            retryable: false,
+        })?;
+    let bytes = STANDARD.decode(encoded).map_err(|_| AiProviderFailure {
+        code: "ai_image_input_data_invalid",
+        message: "Image data is missing or invalid.",
+        retryable: false,
+    })?;
+    if bytes.is_empty()
+        || bytes.len() > MAX_IMAGE_BYTES
+        || !ai_image_magic_matches(mime_type, &bytes)
+    {
+        return Err(AiProviderFailure {
+            code: if bytes.len() > MAX_IMAGE_BYTES {
+                "ai_image_input_too_large"
+            } else {
+                "ai_image_input_data_invalid"
+            },
+            message: if bytes.len() > MAX_IMAGE_BYTES {
+                "Image exceeds the 10 MiB limit."
+            } else {
+                "Image data does not match its declared format."
+            },
+            retryable: false,
+        });
+    }
+    Ok(format!("data:{mime_type};base64,{encoded}"))
+}
+
+fn ai_image_magic_matches(mime_type: &str, bytes: &[u8]) -> bool {
+    match mime_type {
+        "image/png" => {
+            bytes.len() >= 24
+                && bytes.starts_with(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+                && bytes[16..20] != [0, 0, 0, 0]
+                && bytes[20..24] != [0, 0, 0, 0]
+        }
+        "image/jpeg" => {
+            bytes.len() >= 4
+                && bytes.starts_with(&[0xff, 0xd8, 0xff])
+                && bytes.ends_with(&[0xff, 0xd9])
+        }
+        "image/webp" => {
+            bytes.len() >= 16
+                && bytes.starts_with(b"RIFF")
+                && &bytes[8..12] == b"WEBP"
+                && matches!(&bytes[12..16], b"VP8 " | b"VP8L" | b"VP8X")
+                && u32::from_le_bytes(bytes[4..8].try_into().expect("WEBP size bytes")) as usize + 8
+                    == bytes.len()
+        }
+        _ => false,
+    }
+}
+
+async fn request_ai_structured_output(
+    config: &AiProviderConfig,
+    body: &Value,
+) -> Result<Value, AiProviderFailure> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(45))
         .redirect(reqwest::redirect::Policy::none())
@@ -2629,19 +2860,31 @@ async fn organize_ai_text_with_provider(
             message: "AI provider returned an invalid response.",
             retryable: true,
         })?;
+    Ok(response)
+}
+
+fn apply_ai_provider_output(
+    input: &mut Value,
+    config: &AiProviderConfig,
+    response: Value,
+    account_context: &[Value],
+    now: &str,
+    prompt_version: &str,
+) -> Result<(), AiProviderFailure> {
     let structured = ai_structured_output(&response)?;
     if structured.get("usable").and_then(Value::as_bool) == Some(true) {
-        let movement = ai_provider_movement_input(&structured, &account_context, now)?;
+        let movement = ai_provider_movement_input(&structured, account_context, now)?;
         input["movement"] = movement;
     }
     input["_aiProvider"] = json!({
         "kind": "openai_responses",
         "model": config.model,
+        "promptVersion": prompt_version,
         "responseId": response.get("id").cloned().unwrap_or(Value::Null),
         "usable": structured.get("usable").cloned().unwrap_or(json!(false)),
         "confidence": structured.get("confidence").cloned().unwrap_or(json!(0))
     });
-    Ok(input)
+    Ok(())
 }
 
 fn ai_provider_account_context(accounts: &Value) -> Vec<Value> {
@@ -11226,8 +11469,109 @@ mod tests {
         task.abort();
     }
 
+    #[tokio::test]
+    async fn openai_responses_provider_organizes_validated_image_evidence() {
+        let captured = Arc::new(Mutex::new(Value::Null));
+        let captured_for_route = captured.clone();
+        let provider = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_for_route.clone();
+                async move {
+                    *captured.lock().expect("capture lock") = body;
+                    Json(json!({
+                        "id": "resp_test_image_001",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "content": [{
+                                "type": "output_text",
+                                "text": serde_json::to_string(&json!({
+                                    "usable": true,
+                                    "reason": "票据金额和账户明确",
+                                    "confidence": 0.96,
+                                    "movement": {
+                                        "type": "expense",
+                                        "occurredAt": "2026-07-19T09:15:00+08:00",
+                                        "title": "便利店",
+                                        "accountId": "acct_ai_cash",
+                                        "amount": "26.50",
+                                        "currency": "CNY"
+                                    }
+                                })).expect("structured output")
+                            }]
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("provider listener");
+        let address = listener.local_addr().expect("provider address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, provider)
+                .await
+                .expect("provider server");
+        });
+        let config = AiProviderConfig {
+            endpoint: format!("http://{address}/v1/responses"),
+            api_key: "test-only-key".to_string(),
+            model: "test-vision-model".to_string(),
+        };
+        let accounts = json!([{
+            "id": "acct_ai_cash",
+            "displayName": "日常账户",
+            "accountType": "bank",
+            "balanceMode": "cash_balance",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "status": "active",
+            "cashBalances": [{"currency": "CNY", "amount": "100"}]
+        }]);
+        let png =
+            STANDARD.encode(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01");
+        let image_url = format!("data:image/png;base64,{png}");
+        let enriched = organize_ai_image_with_provider(
+            &config,
+            json!({
+                "fileName": "receipt.png",
+                "mimeType": "image/png",
+                "imageBase64": png
+            }),
+            image_url,
+            &accounts,
+            "2026-07-19T10:00:00+08:00",
+        )
+        .await
+        .expect("image provider enrichment");
+        assert_eq!(enriched["movement"]["type"], "expense");
+        assert_eq!(enriched["movement"]["entries"][0]["amount"], "26.50");
+        assert_eq!(enriched["_aiProvider"]["responseId"], "resp_test_image_001");
+        assert_eq!(
+            enriched["_aiProvider"]["promptVersion"],
+            "finwealth_cash_movement_image_v1"
+        );
+        let request = captured.lock().expect("captured request").clone();
+        assert_eq!(request["store"], false);
+        assert_eq!(request["input"][0]["content"][1]["type"], "input_image");
+        assert!(
+            request["input"][0]["content"][1]["image_url"]
+                .as_str()
+                .expect("image data URL")
+                .starts_with("data:image/png;base64,")
+        );
+        assert!(
+            !request["input"][0]["content"][0]["text"]
+                .as_str()
+                .expect("provider context")
+                .contains("cashBalances")
+        );
+        task.abort();
+    }
+
     #[test]
-    fn openai_responses_provider_detects_refusal_and_invalid_decimals() {
+    fn openai_responses_provider_detects_refusal_invalid_decimals_and_images() {
         let refusal = json!({
             "status": "completed",
             "output": [{"content": [{"type": "refusal", "refusal": "no"}]}]
@@ -11239,6 +11583,32 @@ mod tests {
         assert!(!local_decimal_is_positive("1e3"));
         assert!(!local_decimal_is_positive("-1"));
         assert!(!local_decimal_is_positive("1.123456789"));
+        let png =
+            STANDARD.encode(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01");
+        assert!(
+            validated_ai_image_data_url(&json!({
+                "fileName": "receipt.png",
+                "mimeType": "image/png",
+                "imageBase64": png
+            }))
+            .is_ok()
+        );
+        assert!(
+            validated_ai_image_data_url(&json!({
+                "fileName": "receipt.heic",
+                "mimeType": "image/heic",
+                "imageBase64": "AAAA"
+            }))
+            .is_err()
+        );
+        assert!(
+            validated_ai_image_data_url(&json!({
+                "fileName": "receipt.png",
+                "mimeType": "image/png",
+                "imageBase64": STANDARD.encode(b"not a png")
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -14797,6 +15167,29 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn local_ledger_image_import_rejects_mismatched_evidence_before_persistence() {
+        let path = unique_test_ledger_path("invalid_image_import");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+        let (status, body) = request_json_body_from(
+            router,
+            Method::POST,
+            "/v1/ai/proposals/from-image",
+            json!({
+                "fileName": "receipt.png",
+                "mimeType": "image/png",
+                "imageBase64": STANDARD.encode(b"not a png")
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "ai_image_input_data_invalid");
+        let persisted = local_ledger::read_document(&path).expect("ledger should remain readable");
+        assert_eq!(persisted["aiProposals"], json!([]));
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

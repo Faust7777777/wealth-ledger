@@ -16,7 +16,7 @@
 8. 已持久化在 `movements` 的 standalone `pending_review` 候选只做读取投影，不得为了进入 AI Review 再复制成 `aiProposals` 记录。
 9. 远端模型只返回受限结构化草稿；服务端必须再次执行正式 movement 校验，provider 成功不能绕过审核。
 
-### 0.1 文本整理 provider
+### 0.1 文本与图片整理 provider
 
 - 默认 `FINWEALTH_AI_PROVIDER=none`，原始文本进入待补全候选。
 - `openai_responses` 使用 Responses API 的 strict JSON Schema；schema 根为 object，字段全部 required，所有 object 均 `additionalProperties=false`。
@@ -25,6 +25,9 @@
 - `usable=false` 不生成 movement；refusal、incomplete、网络/API 错误和非法结构 fail closed。
 - provider 返回的账户 ID、币种、金额、RFC3339 时间和方向由服务端重新校验并规范化。
 - 成功 proposal 的 source 可记录 `modelName` 与固定 `promptVersion`，但不记录 API key 或完整 provider 响应。
+- 图片输入只接受 PNG、JPEG、WEBP，解码后上限 10 MiB；服务端校验 Base64、MIME 和文件头后才调用 provider。
+- 图片以 Responses API `input_image` data URL 发送，请求固定 `store=false`。原始图片和 data URL 不写入账本、响应、evidence 摘要或日志。
+- 图片阶段仍只生成单账户现金 `income|expense`，与文本整理共用结构化输出和账本复验规则。
 
 ## 1. 顶层结构
 
@@ -58,7 +61,7 @@ AiProposalStatus =
 
 ```ts
 AiProposalSource {
-  kind: "user_text" | "image" | "csv" | "manual_import" | "web_lookup";
+  kind: "user_text" | "user_image" | "csv_import" | "manual_import" | "web_lookup";
   evidenceRefs: EvidenceRef[];
   modelName?: string;
   promptVersion?: string;

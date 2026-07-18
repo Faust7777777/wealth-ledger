@@ -3302,7 +3302,7 @@ components:
       required: [kind, evidenceRefs]
       properties:
         kind:
-          enum: [user_text, image, csv, manual_import, web_lookup]
+          enum: [user_text, user_image, csv_import, manual_import, web_lookup]
         evidenceRefs:
           type: array
           items:
@@ -3430,10 +3430,20 @@ components:
             $ref: "#/components/schemas/ID"
     AiImageInput:
       type: object
-      required: [imageRef, contextScope]
+      additionalProperties: false
+      required: [fileName, mimeType, imageBase64]
       properties:
-        imageRef:
-          $ref: "#/components/schemas/EvidenceRef"
+        fileName:
+          type: string
+          minLength: 1
+          maxLength: 255
+        mimeType:
+          type: string
+          enum: [image/png, image/jpeg, image/webp]
+        imageBase64:
+          type: string
+          contentEncoding: base64
+          maxLength: 14680064
         contextScope:
           enum: [selected_accounts, full_ledger]
         selectedAccountIds:

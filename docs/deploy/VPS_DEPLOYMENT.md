@@ -100,7 +100,7 @@ FINWEALTH_AI_PROVIDER=none
 Do not put plaintext passwords in this file. Keep `FINWEALTH_QUOTE_PROVIDER=none`
 unless you explicitly accept outbound ticker/FX lookup requests from the VPS; set
 it to `yahoo` only after that opt-in. Keep `FINWEALTH_AI_PROVIDER=none` unless
-you explicitly accept sending text-import content and the minimal account
+you explicitly accept sending text/image-import content and the minimal account
 selection context to an AI provider. To enable Responses-compatible structured
 organization, set `FINWEALTH_AI_PROVIDER=openai_responses`,
 `FINWEALTH_AI_MODEL`, `FINWEALTH_AI_BASE_URL`, and `FINWEALTH_AI_API_KEY` in
