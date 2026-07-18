@@ -529,6 +529,30 @@ class FixtureDcaRepository implements DcaRepository {
   }
 }
 
+class FixtureLoanRepository implements LoanRepository {
+  const FixtureLoanRepository();
+  @override
+  Future<List<LiabilityPositionVm>> listLiabilityPositions({
+    IsoDate? throughDate,
+  }) async => const [];
+  @override
+  Future<LoanRepaymentScheduleVm> getRepaymentSchedule(
+    Id accountId, {
+    int limit = 24,
+  }) async => throw UnsupportedError('DEMO 演示只读，不支持还款计划；请用 local_server');
+  @override
+  Future<AccountVm> updateLiabilityTerms(
+    Id accountId,
+    LiabilityTermsInput input,
+  ) async => throw UnsupportedError('DEMO 演示只读，不支持贷款条款；请用 local_server');
+  @override
+  Future<AiAtomicGroupVm> proposeLoanInterest(
+    Id accountId, {
+    required IsoDate throughDate,
+    String? note,
+  }) async => throw UnsupportedError('DEMO 演示只读，不支持记录利息；请用 local_server');
+}
+
 class FixtureQuoteRepository implements QuoteRepository {
   const FixtureQuoteRepository();
   @override

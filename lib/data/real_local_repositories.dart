@@ -157,6 +157,30 @@ class RealLocalDcaRepository implements DcaRepository {
       throw UnsupportedError('real_local 暂不支持暂缓定投提醒；请用 local_server');
 }
 
+class RealLocalLoanRepository implements LoanRepository {
+  const RealLocalLoanRepository();
+  @override
+  Future<List<LiabilityPositionVm>> listLiabilityPositions({
+    IsoDate? throughDate,
+  }) async => const [];
+  @override
+  Future<LoanRepaymentScheduleVm> getRepaymentSchedule(
+    Id accountId, {
+    int limit = 24,
+  }) async => throw UnsupportedError('real_local 暂不支持还款计划；请用 local_server');
+  @override
+  Future<AccountVm> updateLiabilityTerms(
+    Id accountId,
+    LiabilityTermsInput input,
+  ) async => throw UnsupportedError('real_local 暂不支持贷款条款；请用 local_server');
+  @override
+  Future<AiAtomicGroupVm> proposeLoanInterest(
+    Id accountId, {
+    required IsoDate throughDate,
+    String? note,
+  }) async => throw UnsupportedError('real_local 暂不支持记录利息；请用 local_server');
+}
+
 class RealLocalQuoteRepository implements QuoteRepository {
   const RealLocalQuoteRepository();
   @override
