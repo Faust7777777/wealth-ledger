@@ -190,6 +190,8 @@ class _GroupBlock extends ConsumerWidget {
       // 该组可能是订阅扣费候选：确认或拒绝后订阅 pending/nextCharge 都会变，一并刷新。
       ref.invalidate(subscriptionsProvider);
       ref.invalidate(upcomingSubscriptionsProvider);
+      // 也可能是贷款利息候选：确认/拒绝都会改变 pending 指针与应计口径。
+      ref.invalidate(liabilityPositionsProvider);
       final shouldRefreshLedgerViews =
           result?.ledgerWrite == true || result?.snapshotInvalidated == true;
       if (shouldRefreshLedgerViews) {

@@ -13,6 +13,7 @@ import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
 import 'account_visuals.dart';
 import 'holding_adjustment_dialog.dart';
+import 'loan_section.dart';
 
 class AccountDetailPage extends ConsumerWidget {
   const AccountDetailPage({super.key, required this.accountId});
@@ -95,6 +96,7 @@ class AccountDetailPage extends ConsumerWidget {
                             ),
                     ),
                 ],
+                if (a.isLiability) LoanSection(account: a),
                 if (holdingsCapable || holdings.isNotEmpty) ...[
                   SectionHeader(
                     title: '持仓',

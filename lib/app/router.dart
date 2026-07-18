@@ -20,6 +20,7 @@ import '../features/dca_plan_form_page.dart';
 import '../features/investment_page.dart';
 import '../features/investment_trade_page.dart';
 import '../features/liabilities_page.dart';
+import '../features/liability_terms_page.dart';
 import '../features/manual_record_page.dart';
 import '../features/movement_detail_page.dart';
 import '../features/overview_page.dart';
@@ -89,6 +90,10 @@ final appRouter = GoRouter(
     GoRoute(
       path: '/account/:id',
       builder: (c, s) => AccountDetailPage(accountId: s.pathParameters['id']!),
+    ),
+    GoRoute(
+      path: '/account/:id/liability-terms',
+      builder: (c, s) => LiabilityTermsPage(accountId: s.pathParameters['id']!),
     ),
     GoRoute(
       path: '/account/:id/edit',
