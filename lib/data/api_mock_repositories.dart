@@ -1043,6 +1043,24 @@ class LocalServerPortfolioRepository implements PortfolioRepository {
       parseAssetAllocationData(
         _m(await _c.getData('/v1/portfolio/allocation')),
       );
+
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingAdjustment(
+    Id accountId,
+    HoldingAdjustmentInput input,
+  ) async => _group(
+    _m(
+      await _c.postData(
+        '/v1/accounts/$accountId/holding-adjustment-proposals',
+        body: {
+          'instrumentId': input.instrumentId,
+          'targetQuantity': input.targetQuantity,
+          if (input.asOf != null) 'asOf': input.asOf,
+          if (input.note != null && input.note!.isNotEmpty) 'note': input.note,
+        },
+      ),
+    ),
+  );
 }
 
 class LocalServerMovementRepository implements MovementRepository {

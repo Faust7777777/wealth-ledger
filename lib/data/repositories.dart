@@ -44,6 +44,13 @@ abstract interface class PortfolioRepository {
   Future<List<HoldingVm>> listHoldings();
   Future<List<HoldingVm>> listHoldingsByAccount(Id accountId);
   Future<AssetAllocationVm> getAssetAllocation();
+
+  /// 持仓导入/数量校准：只生成待确认调整（进 AI 审核），确认前不动持仓。
+  /// 同一持仓已有待确认调整时服务端返回 409。仅 local_server。
+  Future<AiAtomicGroupVm> proposeHoldingAdjustment(
+    Id accountId,
+    HoldingAdjustmentInput input,
+  );
 }
 
 abstract interface class MovementRepository {

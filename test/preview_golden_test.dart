@@ -1015,4 +1015,9 @@ class _PreviewPortfolioRepo implements PortfolioRepository {
         totalLiabilities: Money(amount: '0', currency: 'CNY'),
         netWorth: Money(amount: '0', currency: 'CNY'),
       );
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingAdjustment(
+    Id accountId,
+    HoldingAdjustmentInput input,
+  ) => throw UnsupportedError('unused');
 }

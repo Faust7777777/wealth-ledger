@@ -14,6 +14,16 @@ String? openingAmountError(String raw) {
   return null;
 }
 
+/// 持仓校准目标数量：必填、非负（0 = 清零）、≤8 位小数，纯字符串不经 double。
+String? targetQuantityError(String raw) {
+  final s = raw.trim();
+  if (s.isEmpty) return '请填写目标数量';
+  if (!RegExp(r'^\d+(\.\d+)?$').hasMatch(s)) return '数量格式不正确';
+  final dot = s.indexOf('.');
+  if (dot >= 0 && s.length - dot - 1 > 8) return '数量最多 8 位小数';
+  return null;
+}
+
 /// 归一化期初金额：空串、非法或纯零（0、0.00…）→ null。
 /// null 表示不发送期初余额（openingBalances: []）；该行为固定并有测试。
 String? normalizedOpeningAmount(String raw) {

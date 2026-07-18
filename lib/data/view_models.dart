@@ -495,6 +495,21 @@ class CreateInstrumentInput {
   final String? symbol;
 }
 
+/// 持仓导入/数量校准输入（POST /v1/accounts/{id}/holding-adjustment-proposals）。
+/// 只生成待确认调整，target 为期望的当前数量（可为 0 = 清零）。
+class HoldingAdjustmentInput {
+  const HoldingAdjustmentInput({
+    required this.instrumentId,
+    required this.targetQuantity,
+    this.asOf,
+    this.note,
+  });
+  final Id instrumentId;
+  final DecimalString targetQuantity; // 非负，≤8 位小数
+  final IsoDateTime? asOf;
+  final String? note;
+}
+
 enum TradeSide { buy, sell }
 
 /// 手动投资成交输入。买入 principal=成交价款，卖出 principal=毛回款；
