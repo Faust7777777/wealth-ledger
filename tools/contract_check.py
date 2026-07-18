@@ -794,6 +794,25 @@ def check_multi_hop_valuation() -> None:
     ok("Multi-hop holding valuation and FX target inference passed")
 
 
+def check_public_quote_provider() -> None:
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    for snippet in [
+        'Some("public")',
+        "async fn enrich_quote_refresh_with_public(",
+        "https://api.coingecko.com/api/v3/simple/price",
+        "https://api.frankfurter.app/latest",
+        "public_provider_maps_crypto_quotes_and_fiat_rates_without_fabrication",
+        '"historical_prices_provider_unsupported"',
+    ]:
+        if snippet not in rust_text:
+            fail(f"Public quote provider is incomplete: {snippet}")
+    cargo_text = (ROOT / "server-rs" / "Cargo.toml").read_text(encoding="utf-8")
+    if 'reqwest = { version = "0.13"' not in cargo_text:
+        fail("Public quote provider must use the pinned reqwest 0.13 client")
+
+    ok("Opt-in public crypto and FX provider passed")
+
+
 def check_valuation_issue_projection(doc: dict) -> None:
     operation = doc["paths"]["/portfolio/valuation-issues"]["get"]
     schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
@@ -2116,6 +2135,7 @@ def main() -> None:
     check_quote_problem_summary(doc)
     check_holding_adjustment_proposal(doc)
     check_multi_hop_valuation()
+    check_public_quote_provider()
     check_valuation_issue_projection(doc)
     check_investment_fee_semantics(doc)
     check_investment_sale_result(doc)

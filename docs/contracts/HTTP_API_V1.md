@@ -182,6 +182,7 @@ GET /v1/portfolio/allocation
 - 该入口用于导入或校准交易所/券商当前持仓，不伪造现金买入。成本未知时不生成成本基础；原始 quantity 始终保留，缺报价时不得按 0 估值。
 - 持仓估值允许使用最多三跳的 FX 路径，例如 `BTC quantity × BTC/USDT quote × USDT/USD × USD/CNY`；每一段必须来自已保存的有效 Quote/FXRate，结果质量取整条路径中最差状态。
 - `valuation-issues` 是估值问题的权威逐资产读模型，返回账户、资产、原始数量、状态和结构化 reason；不返回面向用户的解释文案。它与 overview 的 `quoteProblemCount` 使用相同估值路径，前端不得再用直连汇率自行推断多跳路径是否缺失。
+- 最新估值刷新可显式配置 `FINWEALTH_QUOTE_PROVIDER=public`：BTC/ETH/USDT 使用 CoinGecko，传统法币 FX 使用 Frankfurter/ECB；默认 `none` 不联网。`public` 不提供历史行情，历史价格仍只在 Yahoo provider 下可用。
 
 ## 6. Movements
 

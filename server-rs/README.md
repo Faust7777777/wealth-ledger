@@ -53,7 +53,8 @@ cargo run --manifest-path server-rs/Cargo.toml -- --port 8791 --ledger-path .\tm
   tokens are used only when auth env vars are absent
 - no model-backed AI; import routes create reviewable proposals only
 - outbound quote/FX/historical-price fetches are disabled by default; set
-  `FINWEALTH_QUOTE_PROVIDER=yahoo` to opt in when symbols are configured
+  `FINWEALTH_QUOTE_PROVIDER=public` for BTC/ETH/USDT plus fiat FX, or use
+  `FINWEALTH_QUOTE_PROVIDER=yahoo` for Yahoo-backed quotes and history
 - validated local sync log/outbox and HTTP push/pull/ack shapes; authenticated
   inbound account/create is applied atomically and idempotently, but there is
   no general remote coordinator or background transport

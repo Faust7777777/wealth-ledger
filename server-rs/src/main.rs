@@ -914,7 +914,7 @@ async fn main() {
     println!("finwealth rust server listening on http://{addr}");
     if local_ledger_enabled {
         println!(
-            "dev server: real_local JSON persistence enabled; configurable auth and Yahoo quotes available; no real AI or sync merge effects"
+            "dev server: real_local JSON persistence enabled; configurable auth and opt-in quote providers available; no real AI or sync merge effects"
         );
     } else {
         println!(
@@ -991,9 +991,9 @@ fn production_config_errors(
     }
     if !matches!(
         quote_provider.map(str::trim),
-        None | Some("") | Some("none") | Some("yahoo")
+        None | Some("") | Some("none") | Some("yahoo") | Some("public")
     ) {
-        errors.push("FINWEALTH_QUOTE_PROVIDER must be none or yahoo".to_string());
+        errors.push("FINWEALTH_QUOTE_PROVIDER must be none, yahoo, or public".to_string());
     }
     errors
 }
@@ -2723,11 +2723,15 @@ async fn enrich_quote_refresh_with_yahoo(
             "fxRates": [],
             "errors": [{
                 "targetType": "request",
-                "message": "quote provider is disabled; set FINWEALTH_QUOTE_PROVIDER=yahoo to opt in, or pass quotes/fxRates payload",
+                "message": "quote provider is disabled; explicitly configure public or yahoo, or pass quotes/fxRates payload",
                 "retryable": false
             }],
             "completedAt": now
         }));
+    }
+
+    if quote_provider_public() {
+        return enrich_quote_refresh_with_public(input, quote_targets, fx_targets, now).await;
     }
 
     let provider = match yahoo::YahooConnector::new() {
@@ -2823,7 +2827,386 @@ fn quote_provider_disabled() -> bool {
 }
 
 fn quote_provider_disabled_value(value: Option<&str>) -> bool {
-    !value.is_some_and(|value| value.trim().eq_ignore_ascii_case("yahoo"))
+    !value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "yahoo" | "public"
+        )
+    })
+}
+
+fn quote_provider_public() -> bool {
+    env::var("FINWEALTH_QUOTE_PROVIDER")
+        .ok()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("public"))
+}
+
+fn quote_provider_yahoo() -> bool {
+    env::var("FINWEALTH_QUOTE_PROVIDER")
+        .ok()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("yahoo"))
+}
+
+async fn enrich_quote_refresh_with_public(
+    mut input: Value,
+    quote_targets: Vec<Value>,
+    fx_targets: Vec<Value>,
+    now: &str,
+) -> Result<Value, Value> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("finwealth/0.1 self-use quote refresh")
+        .build()
+        .map_err(|error| public_provider_failure(now, format!("HTTP client failed: {error}")))?;
+    let needs_coingecko = quote_targets.iter().any(public_crypto_coin_id_for_target)
+        || fx_targets.iter().any(public_fx_uses_coingecko);
+    let coingecko = if needs_coingecko {
+        match fetch_coingecko_prices(&client).await {
+            Ok(value) => Some(value),
+            Err(error) => {
+                let mut errors = Vec::new();
+                for target in &quote_targets {
+                    if public_crypto_coin_id_for_target(target) {
+                        errors.push(public_provider_error(
+                            "instrument",
+                            target.get("instrumentId").and_then(Value::as_str),
+                            &error,
+                            true,
+                        ));
+                    }
+                }
+                for target in &fx_targets {
+                    if public_fx_uses_coingecko(target) {
+                        errors.push(public_provider_error(
+                            "fx_pair",
+                            public_fx_target_id(target).as_deref(),
+                            &error,
+                            true,
+                        ));
+                    }
+                }
+                if let Some(object) = input.as_object_mut() {
+                    object.insert("_providerErrors".to_string(), json!(errors));
+                }
+                return Ok(input);
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut quotes = Vec::new();
+    let mut fx_rates = Vec::new();
+    let mut errors = Vec::new();
+    for target in &quote_targets {
+        match public_latest_quote(target, coingecko.as_ref(), now) {
+            Ok(quote) => quotes.push(quote),
+            Err(message) => errors.push(public_provider_error(
+                "instrument",
+                target.get("instrumentId").and_then(Value::as_str),
+                &message,
+                false,
+            )),
+        }
+    }
+    for target in &fx_targets {
+        let result = if public_fx_uses_coingecko(target) {
+            public_crypto_fx_rate(target, coingecko.as_ref(), now)
+        } else {
+            public_fiat_fx_rate(&client, target, now).await
+        };
+        match result {
+            Ok(rate) => fx_rates.push(rate),
+            Err(message) => errors.push(public_provider_error(
+                "fx_pair",
+                public_fx_target_id(target).as_deref(),
+                &message,
+                true,
+            )),
+        }
+    }
+
+    if let Some(object) = input.as_object_mut() {
+        if !quotes.is_empty() {
+            object.insert("quotes".to_string(), json!(quotes));
+        }
+        if !fx_rates.is_empty() {
+            object.insert("fxRates".to_string(), json!(fx_rates));
+        }
+        if !errors.is_empty() {
+            object.insert("_providerErrors".to_string(), json!(errors));
+        }
+    }
+    Ok(input)
+}
+
+fn public_provider_failure(now: &str, message: String) -> Value {
+    json!({
+        "status": "offline",
+        "quotes": [],
+        "fxRates": [],
+        "errors": [{
+            "targetType": "request",
+            "message": message,
+            "retryable": true
+        }],
+        "completedAt": now
+    })
+}
+
+fn public_provider_error(
+    target_type: &str,
+    target_id: Option<&str>,
+    message: &str,
+    retryable: bool,
+) -> Value {
+    let mut error = json!({
+        "targetType": target_type,
+        "message": message,
+        "retryable": retryable
+    });
+    if let Some(target_id) = target_id {
+        error["targetId"] = json!(target_id);
+    }
+    error
+}
+
+async fn fetch_coingecko_prices(client: &reqwest::Client) -> Result<Value, String> {
+    client
+        .get("https://api.coingecko.com/api/v3/simple/price")
+        .query(&[
+            ("ids", "bitcoin,ethereum,tether"),
+            ("vs_currencies", "usd,cny"),
+            ("include_last_updated_at", "true"),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("CoinGecko request failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("CoinGecko returned an error: {error}"))?
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("CoinGecko response was invalid: {error}"))
+}
+
+fn public_crypto_coin_id_for_target(target: &Value) -> bool {
+    target
+        .get("symbol")
+        .and_then(Value::as_str)
+        .and_then(public_coin_id_for_symbol)
+        .is_some()
+}
+
+fn public_coin_id_for_symbol(symbol: &str) -> Option<&'static str> {
+    let asset = symbol
+        .split(['-', '/', '_'])
+        .next()
+        .unwrap_or(symbol)
+        .to_ascii_uppercase();
+    match asset.as_str() {
+        "BTC" => Some("bitcoin"),
+        "ETH" => Some("ethereum"),
+        "USDT" => Some("tether"),
+        _ => None,
+    }
+}
+
+fn public_latest_quote(
+    target: &Value,
+    coingecko: Option<&Value>,
+    now: &str,
+) -> Result<Value, String> {
+    let instrument_id = target
+        .get("instrumentId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "quote target has no instrumentId".to_string())?;
+    let symbol = target
+        .get("symbol")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "instrument has no public-provider symbol".to_string())?;
+    let coin_id = public_coin_id_for_symbol(symbol)
+        .ok_or_else(|| format!("public provider does not support instrument symbol: {symbol}"))?;
+    let quote_currency = target
+        .get("quoteCurrency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "quote target has no quoteCurrency".to_string())?;
+    let data = coingecko.ok_or_else(|| "CoinGecko data is unavailable".to_string())?;
+    let price = public_coin_price(data, coin_id, quote_currency)?;
+    let price = provider_decimal_string(price)?;
+    let as_of = public_coin_as_of(data, coin_id).unwrap_or_else(|| now.to_string());
+    let expires_at = (OffsetDateTime::now_utc() + Duration::minutes(5))
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
+    Ok(json!({
+        "instrumentId": instrument_id,
+        "price": price,
+        "currency": quote_currency,
+        "asOf": as_of,
+        "source": "coingecko",
+        "sourceUrl": "https://www.coingecko.com/",
+        "status": "fresh",
+        "expiresAt": expires_at
+    }))
+}
+
+fn public_coin_price(data: &Value, coin_id: &str, quote_currency: &str) -> Result<f64, String> {
+    let direct_currency = quote_currency.to_ascii_lowercase();
+    let price = if matches!(direct_currency.as_str(), "usd" | "cny") {
+        data.get(coin_id)
+            .and_then(|coin| coin.get(&direct_currency))
+            .and_then(Value::as_f64)
+    } else if direct_currency == "usdt" {
+        let asset_usd = data
+            .get(coin_id)
+            .and_then(|coin| coin.get("usd"))
+            .and_then(Value::as_f64);
+        let tether_usd = data
+            .get("tether")
+            .and_then(|coin| coin.get("usd"))
+            .and_then(Value::as_f64);
+        asset_usd
+            .zip(tether_usd)
+            .map(|(asset, tether)| asset / tether)
+    } else {
+        None
+    }
+    .filter(|price| price.is_finite() && *price > 0.0)
+    .ok_or_else(|| format!("CoinGecko has no usable {coin_id}/{quote_currency} price"))?;
+    Ok(price)
+}
+
+fn public_coin_as_of(data: &Value, coin_id: &str) -> Option<String> {
+    let timestamp = data.get(coin_id)?.get("last_updated_at")?.as_i64()?;
+    OffsetDateTime::from_unix_timestamp(timestamp)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
+}
+
+fn public_fx_uses_coingecko(target: &Value) -> bool {
+    let base = target.get("baseCurrency").and_then(Value::as_str);
+    let quote = target.get("quoteCurrency").and_then(Value::as_str);
+    matches!(base, Some("USDT")) || matches!(quote, Some("USDT"))
+}
+
+fn public_fx_target_id(target: &Value) -> Option<String> {
+    Some(format!(
+        "{}/{}",
+        target.get("baseCurrency")?.as_str()?,
+        target.get("quoteCurrency")?.as_str()?
+    ))
+}
+
+fn public_crypto_fx_rate(
+    target: &Value,
+    coingecko: Option<&Value>,
+    now: &str,
+) -> Result<Value, String> {
+    let base = target
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "FX target has no baseCurrency".to_string())?;
+    let quote = target
+        .get("quoteCurrency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "FX target has no quoteCurrency".to_string())?;
+    let data = coingecko.ok_or_else(|| "CoinGecko data is unavailable".to_string())?;
+    let (currency, inverted) = if base == "USDT" {
+        (quote, false)
+    } else if quote == "USDT" {
+        (base, true)
+    } else {
+        return Err(format!("unsupported crypto FX pair: {base}/{quote}"));
+    };
+    let direct = public_coin_price(data, "tether", currency)?;
+    let rate = if inverted { 1.0 / direct } else { direct };
+    let rate = provider_decimal_string(rate)?;
+    let as_of = public_coin_as_of(data, "tether").unwrap_or_else(|| now.to_string());
+    let expires_at = (OffsetDateTime::now_utc() + Duration::minutes(5))
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
+    Ok(json!({
+        "baseCurrency": base,
+        "quoteCurrency": quote,
+        "rate": rate,
+        "asOf": as_of,
+        "source": "coingecko",
+        "sourceUrl": "https://www.coingecko.com/",
+        "status": "fresh",
+        "expiresAt": expires_at
+    }))
+}
+
+async fn public_fiat_fx_rate(
+    client: &reqwest::Client,
+    target: &Value,
+    _now: &str,
+) -> Result<Value, String> {
+    let base = target
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "FX target has no baseCurrency".to_string())?;
+    let quote = target
+        .get("quoteCurrency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "FX target has no quoteCurrency".to_string())?;
+    let response = client
+        .get("https://api.frankfurter.app/latest")
+        .query(&[("from", base), ("to", quote)])
+        .send()
+        .await
+        .map_err(|error| format!("Frankfurter request failed for {base}/{quote}: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Frankfurter returned an error for {base}/{quote}: {error}"))?
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Frankfurter response was invalid: {error}"))?;
+    public_fiat_fx_rate_from_response(base, quote, &response)
+}
+
+fn public_fiat_fx_rate_from_response(
+    base: &str,
+    quote: &str,
+    response: &Value,
+) -> Result<Value, String> {
+    let rate = response
+        .get("rates")
+        .and_then(|rates| rates.get(quote))
+        .and_then(Value::as_f64)
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .ok_or_else(|| format!("Frankfurter has no usable {base}/{quote} rate"))?;
+    let rate = provider_decimal_string(rate)?;
+    let date = response
+        .get("date")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Frankfurter response has no date".to_string())?;
+    let as_of = format!("{date}T00:00:00Z");
+    let expires_at = (OffsetDateTime::now_utc() + Duration::hours(24))
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
+    Ok(json!({
+        "baseCurrency": base,
+        "quoteCurrency": quote,
+        "rate": rate,
+        "asOf": as_of,
+        "source": "frankfurter_ecb",
+        "sourceUrl": "https://frankfurter.app/",
+        "status": "fresh",
+        "expiresAt": expires_at
+    }))
+}
+
+fn provider_decimal_string(value: f64) -> Result<String, String> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err("provider value must be finite and positive".to_string());
+    }
+    let fixed = format!("{value:.8}");
+    let normalized = fixed.trim_end_matches('0').trim_end_matches('.');
+    if normalized.is_empty() || normalized == "0" {
+        Err("provider value is below ledger precision".to_string())
+    } else {
+        Ok(normalized.to_string())
+    }
 }
 
 async fn yahoo_latest_quote(
@@ -3468,6 +3851,14 @@ async fn historical_prices(
         return service_unavailable(
             "quote_provider_disabled",
             "Quote provider is disabled; historical prices require a configured provider.",
+            json!({ "instrumentId": instrument_id, "symbol": symbol }),
+            false,
+        );
+    }
+    if !quote_provider_yahoo() {
+        return service_unavailable(
+            "historical_prices_provider_unsupported",
+            "The configured quote provider does not supply historical prices.",
             json!({ "instrumentId": instrument_id, "symbol": symbol }),
             false,
         );
@@ -5331,6 +5722,14 @@ mod tests {
             Some("none"),
         );
         assert!(valid.is_empty(), "{valid:?}");
+        let public_provider = production_config_errors(
+            &secure,
+            "127.0.0.1:8790".parse().expect("test address"),
+            &["127.0.0.1".to_string(), "api.example.com".to_string()],
+            false,
+            Some("public"),
+        );
+        assert!(public_provider.is_empty(), "{public_provider:?}");
 
         let open = AuthConfig {
             username: None,
@@ -9202,7 +9601,7 @@ mod tests {
         assert_eq!(refresh_body["data"]["quotes"], json!([]));
         assert_eq!(
             refresh_body["data"]["errors"][0]["message"],
-            "quote provider is disabled; set FINWEALTH_QUOTE_PROVIDER=yahoo to opt in, or pass quotes/fxRates payload"
+            "quote provider is disabled; explicitly configure public or yahoo, or pass quotes/fxRates payload"
         );
 
         let persisted = local_ledger::read_document(&path).expect("ledger should be readable");
@@ -9411,6 +9810,73 @@ mod tests {
         assert!(quote_provider_disabled_value(Some("unknown")));
         assert!(!quote_provider_disabled_value(Some("yahoo")));
         assert!(!quote_provider_disabled_value(Some(" Yahoo ")));
+        assert!(!quote_provider_disabled_value(Some("public")));
+    }
+
+    #[test]
+    fn public_provider_maps_crypto_quotes_and_fiat_rates_without_fabrication() {
+        let now = "2026-07-18T03:30:00Z";
+        let prices = json!({
+            "bitcoin": {"usd": 64000.0, "cny": 433000.0, "last_updated_at": 1784376947},
+            "ethereum": {"usd": 1800.0, "cny": 12174.0, "last_updated_at": 1784376948},
+            "tether": {"usd": 0.999, "cny": 6.77, "last_updated_at": 1784376935}
+        });
+        let quote = public_latest_quote(
+            &json!({
+                "instrumentId": "inst_btc_usdt",
+                "symbol": "BTC-USDT",
+                "quoteCurrency": "USDT"
+            }),
+            Some(&prices),
+            now,
+        )
+        .expect("BTC/USDT quote should map");
+        assert_eq!(quote["instrumentId"], "inst_btc_usdt");
+        assert_eq!(quote["currency"], "USDT");
+        assert_eq!(quote["source"], "coingecko");
+        assert!(
+            quote["price"]
+                .as_str()
+                .and_then(|value| value.parse::<f64>().ok())
+                .is_some_and(|value| value > 64_000.0)
+        );
+
+        let stablecoin_rate = public_crypto_fx_rate(
+            &json!({"baseCurrency": "USDT", "quoteCurrency": "USD"}),
+            Some(&prices),
+            now,
+        )
+        .expect("USDT/USD should map");
+        assert_eq!(stablecoin_rate["rate"], "0.999");
+
+        let fiat_rate = public_fiat_fx_rate_from_response(
+            "USD",
+            "CNY",
+            &json!({"date": "2026-07-17", "rates": {"CNY": 6.7775}}),
+        )
+        .expect("USD/CNY should map");
+        assert_eq!(fiat_rate["rate"], "6.7775");
+        assert_eq!(fiat_rate["asOf"], "2026-07-17T00:00:00Z");
+        assert_eq!(fiat_rate["source"], "frankfurter_ecb");
+        assert_eq!(
+            provider_decimal_string(1.234567891).expect("provider decimal"),
+            "1.23456789"
+        );
+        assert!(provider_decimal_string(0.000000001).is_err());
+
+        assert!(
+            public_latest_quote(
+                &json!({
+                    "instrumentId": "inst_unknown",
+                    "symbol": "UNKNOWN-USD",
+                    "quoteCurrency": "USD"
+                }),
+                Some(&prices),
+                now,
+            )
+            .is_err(),
+            "unknown symbols must not receive a fabricated price"
+        );
     }
 
     #[tokio::test]
