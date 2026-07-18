@@ -9575,6 +9575,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ledger_multi_hop_fx_values_a_usdt_quoted_crypto_holding() {
+        let path = unique_test_ledger_path("multi_hop_crypto_valuation");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "OKX",
+                "accountType": "exchange",
+                "defaultCurrency": "USDT",
+                "supportedCurrencies": ["USDT"],
+                "includeInNetWorth": true,
+                "balanceMode": "holdings",
+                "openingBalances": []
+            }),
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED, "{account_body}");
+        let account_id = account_body["data"]["id"].as_str().expect("account id");
+
+        let (instrument_status, instrument_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            json!({
+                "id": "inst_btc_usdt_multihop",
+                "type": "crypto",
+                "symbol": "BTC-USDT",
+                "displayName": "Bitcoin",
+                "quoteCurrency": "USDT",
+                "market": "CRYPTO"
+            }),
+        )
+        .await;
+        assert_eq!(instrument_status, StatusCode::CREATED, "{instrument_body}");
+
+        let endpoint = format!("/v1/accounts/{account_id}/holding-adjustment-proposals");
+        let (proposal_status, proposal_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt_multihop",
+                "targetQuantity": "0.05",
+                "asOf": "2026-07-18T03:30:00Z"
+            }),
+        )
+        .await;
+        assert_eq!(proposal_status, StatusCode::OK, "{proposal_body}");
+        let group_id = proposal_body["data"]["id"].as_str().expect("group id");
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+
+        let (refresh_status, refresh_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "quotes": [{
+                    "instrumentId": "inst_btc_usdt_multihop",
+                    "price": "100",
+                    "currency": "USDT",
+                    "asOf": "2026-07-18T03:30:00Z",
+                    "expiresAt": "2099-01-01T00:00:00Z",
+                    "source": "test"
+                }],
+                "fxRates": [
+                    {
+                        "baseCurrency": "USDT",
+                        "quoteCurrency": "USD",
+                        "rate": "1",
+                        "asOf": "2026-07-18T03:30:00Z",
+                        "expiresAt": "2099-01-01T00:00:00Z",
+                        "source": "test"
+                    },
+                    {
+                        "baseCurrency": "USD",
+                        "quoteCurrency": "CNY",
+                        "rate": "7.2",
+                        "asOf": "2026-07-18T03:30:00Z",
+                        "expiresAt": "2099-01-01T00:00:00Z",
+                        "source": "test"
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::OK, "{refresh_body}");
+        assert_eq!(refresh_body["data"]["status"], "success");
+
+        let (holdings_status, holdings_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(holdings_status, StatusCode::OK, "{holdings_body}");
+        assert_eq!(holdings_body["data"][0]["quantity"], "0.05");
+        assert_eq!(holdings_body["data"][0]["marketValue"]["amount"], "36.00");
+        assert_eq!(holdings_body["data"][0]["marketValue"]["currency"], "CNY");
+        assert_eq!(holdings_body["data"][0]["quoteStatus"], "fresh");
+
+        let (account_after_status, account_after_body) =
+            request_json_from(router, Method::GET, &format!("/v1/accounts/{account_id}")).await;
+        assert_eq!(account_after_status, StatusCode::OK, "{account_after_body}");
+        assert_eq!(account_after_body["data"]["value"]["amount"], "36.00");
+        assert_eq!(account_after_body["data"]["value"]["currency"], "CNY");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_quote_problem_count_includes_stale_fx_valuation() {
         let path = unique_test_ledger_path("stale_fx_problem_count");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");

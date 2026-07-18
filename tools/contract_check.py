@@ -776,6 +776,24 @@ def check_holding_adjustment_proposal(doc: dict) -> None:
     ok("Holding adjustment proposal contract and implementation passed")
 
 
+def check_multi_hop_valuation() -> None:
+    local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    for snippet in [
+        "fn yahoo_fx_path(",
+        "fn yahoo_fx_symbol(",
+        "fn direct_fx_rate_between(",
+        "for _ in 0..3",
+        "valuation_uses_multi_hop_fx_and_refresh_targets_include_holding_currencies",
+    ]:
+        if snippet not in local_text:
+            fail(f"Multi-hop valuation implementation is incomplete: {snippet}")
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    if "local_ledger_multi_hop_fx_values_a_usdt_quoted_crypto_holding" not in rust_text:
+        fail("Multi-hop crypto valuation HTTP regression is missing")
+
+    ok("Multi-hop holding valuation and FX target inference passed")
+
+
 def check_investment_fee_semantics(doc: dict) -> None:
     local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
     for snippet in [
@@ -2076,6 +2094,7 @@ def main() -> None:
     check_local_ledger_reference_integrity()
     check_quote_problem_summary(doc)
     check_holding_adjustment_proposal(doc)
+    check_multi_hop_valuation()
     check_investment_fee_semantics(doc)
     check_investment_sale_result(doc)
     check_subscription_due_scan(doc)

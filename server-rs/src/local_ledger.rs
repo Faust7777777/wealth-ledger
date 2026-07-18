@@ -912,7 +912,7 @@ pub fn fx_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value>> 
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| {
-            document["accounts"]
+            let mut pairs = document["accounts"]
                 .as_array()
                 .expect("validated local ledger accounts should be an array")
                 .iter()
@@ -928,27 +928,86 @@ pub fn fx_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value>> 
                         .map(|currency| (currency.to_string(), base_currency.clone()))
                         .collect::<Vec<_>>()
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            for holding in document["holdings"]
+                .as_array()
+                .expect("validated local ledger holdings should be an array")
+                .iter()
+                .filter(|holding| {
+                    holding
+                        .get("quantity")
+                        .and_then(Value::as_str)
+                        .and_then(|value| parse_decimal(value).ok())
+                        .is_some_and(|quantity| quantity > DecimalAmount::ZERO)
+                })
+            {
+                let Some(instrument_id) = holding.get("instrumentId").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(quote_currency) = document["instruments"]
+                    .as_array()
+                    .expect("validated local ledger instruments should be an array")
+                    .iter()
+                    .find(|instrument| {
+                        instrument.get("id").and_then(Value::as_str) == Some(instrument_id)
+                    })
+                    .and_then(|instrument| instrument.get("quoteCurrency"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                if quote_currency != base_currency {
+                    pairs.push((quote_currency.to_string(), base_currency.clone()));
+                }
+            }
+            pairs
         });
 
     let mut targets = Vec::new();
     for (base, quote) in requested_pairs {
-        if base == quote
-            || targets.iter().any(|target: &Value| {
-                target.get("baseCurrency").and_then(Value::as_str) == Some(base.as_str())
-                    && target.get("quoteCurrency").and_then(Value::as_str) == Some(quote.as_str())
-            })
-        {
-            continue;
+        for (base, quote) in yahoo_fx_path(&base, &quote) {
+            if base == quote
+                || targets.iter().any(|target: &Value| {
+                    target.get("baseCurrency").and_then(Value::as_str) == Some(base.as_str())
+                        && target.get("quoteCurrency").and_then(Value::as_str)
+                            == Some(quote.as_str())
+                })
+            {
+                continue;
+            }
+            targets.push(json!({
+                "baseCurrency": base,
+                "quoteCurrency": quote,
+                "symbol": yahoo_fx_symbol(&base, &quote)
+            }));
         }
-        targets.push(json!({
-            "baseCurrency": base,
-            "quoteCurrency": quote,
-            "symbol": format!("{}{}=X", base, quote)
-        }));
     }
 
     Ok(targets)
+}
+
+fn yahoo_fx_path(from_currency: &str, to_currency: &str) -> Vec<(String, String)> {
+    if is_yahoo_crypto_currency(from_currency) && from_currency != "USD" && to_currency != "USD" {
+        vec![
+            (from_currency.to_string(), "USD".to_string()),
+            ("USD".to_string(), to_currency.to_string()),
+        ]
+    } else {
+        vec![(from_currency.to_string(), to_currency.to_string())]
+    }
+}
+
+fn yahoo_fx_symbol(base_currency: &str, quote_currency: &str) -> String {
+    if is_yahoo_crypto_currency(base_currency) || is_yahoo_crypto_currency(quote_currency) {
+        format!("{base_currency}-{quote_currency}")
+    } else {
+        format!("{base_currency}{quote_currency}=X")
+    }
+}
+
+fn is_yahoo_crypto_currency(currency: &str) -> bool {
+    matches!(currency, "BTC" | "ETH" | "USDT" | "USDC")
 }
 
 pub fn create_account(
@@ -8292,9 +8351,76 @@ fn fx_rate_between(
     to_currency: &str,
     now: &str,
 ) -> Option<(DecimalAmount, &'static str)> {
+    if let Some(direct) = direct_fx_rate_between(document, from_currency, to_currency, now) {
+        return Some(direct);
+    }
+
+    let mut currencies = BTreeSet::new();
+    for rate in document["fxRates"]
+        .as_array()
+        .expect("validated local ledger fxRates should be an array")
+    {
+        if let Some(currency) = rate.get("baseCurrency").and_then(Value::as_str) {
+            currencies.insert(currency.to_string());
+        }
+        if let Some(currency) = rate.get("quoteCurrency").and_then(Value::as_str) {
+            currencies.insert(currency.to_string());
+        }
+    }
+
+    let mut frontier = vec![(
+        from_currency.to_string(),
+        DecimalAmount::ONE,
+        "fresh",
+        BTreeSet::from([from_currency.to_string()]),
+    )];
+    for _ in 0..3 {
+        let mut next_frontier = Vec::new();
+        let mut completed = Vec::new();
+        for (currency, accumulated_rate, accumulated_status, visited) in frontier {
+            for next_currency in &currencies {
+                if visited.contains(next_currency) {
+                    continue;
+                }
+                let Some((edge_rate, edge_status)) =
+                    direct_fx_rate_between(document, &currency, next_currency, now)
+                else {
+                    continue;
+                };
+                let next_rate = multiply_decimal(accumulated_rate, edge_rate);
+                let next_status = combine_quote_status(accumulated_status, edge_status);
+                if next_currency == to_currency {
+                    completed.push((next_rate, next_status));
+                    continue;
+                }
+                let mut next_visited = visited.clone();
+                next_visited.insert(next_currency.clone());
+                next_frontier.push((next_currency.clone(), next_rate, next_status, next_visited));
+            }
+        }
+        if let Some(best) = completed
+            .into_iter()
+            .min_by_key(|(_, status)| quote_status_rank(status))
+        {
+            return Some(best);
+        }
+        frontier = next_frontier;
+    }
+    None
+}
+
+fn direct_fx_rate_between(
+    document: &Value,
+    from_currency: &str,
+    to_currency: &str,
+    now: &str,
+) -> Option<(DecimalAmount, &'static str)> {
     let (rate, inverted) = fx_rate_at_or_before(document, from_currency, to_currency, now)?;
-    let parsed = parse_decimal(rate.get("rate")?.as_str()?).ok()?;
     let status = effective_quote_status(rate, now);
+    if matches!(status, "incomplete" | "unpriceable" | "error") {
+        return None;
+    }
+    let parsed = parse_decimal(rate.get("rate")?.as_str()?).ok()?;
     if inverted {
         divide_decimal(DecimalAmount::ONE, parsed).map(|inverse| (inverse, status))
     } else {
@@ -8412,20 +8538,21 @@ fn is_expired(expires_at: Option<&str>, now: &str) -> bool {
 }
 
 fn combine_quote_status(left: &'static str, right: &'static str) -> &'static str {
-    fn rank(status: &str) -> u8 {
-        match status {
-            "fresh" => 0,
-            "stale" => 1,
-            "offline_cached" => 2,
-            "incomplete" | "unpriceable" => 3,
-            "error" => 4,
-            _ => 4,
-        }
-    }
-    if rank(right) > rank(left) {
+    if quote_status_rank(right) > quote_status_rank(left) {
         right
     } else {
         left
+    }
+}
+
+fn quote_status_rank(status: &str) -> u8 {
+    match status {
+        "fresh" => 0,
+        "stale" => 1,
+        "offline_cached" => 2,
+        "incomplete" | "unpriceable" => 3,
+        "error" => 4,
+        _ => 4,
     }
 }
 
@@ -14792,6 +14919,89 @@ mod tests {
             .remove("holdingAdjustment");
         let errors = validate_document(&missing_metadata).expect_err("missing metadata must fail");
         assert!(errors.iter().any(|error| error.contains("is required")));
+    }
+
+    #[test]
+    fn valuation_uses_multi_hop_fx_and_refresh_targets_include_holding_currencies() {
+        let now = "2026-07-18T03:30:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["fxRates"] = json!([
+            {
+                "id": "fx_usdt_usd",
+                "baseCurrency": "USDT",
+                "quoteCurrency": "USD",
+                "rate": "1",
+                "asOf": now,
+                "source": "test",
+                "status": "fresh"
+            },
+            {
+                "id": "fx_usd_cny",
+                "baseCurrency": "USD",
+                "quoteCurrency": "CNY",
+                "rate": "7.2",
+                "asOf": now,
+                "source": "test",
+                "status": "stale"
+            }
+        ]);
+        assert_eq!(
+            fx_rate_between(&document, "USDT", "CNY", now),
+            Some((DecimalAmount::parse("7.2").expect("rate"), "stale"))
+        );
+
+        document["accounts"] = json!([account_from_create_input(
+            &json!({
+                "displayName": "OKX",
+                "accountType": "exchange",
+                "defaultCurrency": "USDT",
+                "supportedCurrencies": ["USDT"],
+                "includeInNetWorth": true,
+                "balanceMode": "holdings",
+                "openingBalances": []
+            }),
+            "acct_okx_fx",
+            now,
+        )
+        .expect("holding account")]);
+        document["instruments"] = json!([{
+            "id": "inst_btc_usdt_fx",
+            "type": "crypto",
+            "displayName": "Bitcoin",
+            "quoteCurrency": "USDT"
+        }]);
+        document["holdings"] = json!([{
+            "id": "holding_btc_usdt_fx",
+            "accountId": "acct_okx_fx",
+            "instrumentId": "inst_btc_usdt_fx",
+            "quantity": "0.5",
+            "quoteStatus": "unpriceable",
+            "asOf": now
+        }]);
+        let path = unique_temp_path("holding_fx_targets");
+        load_or_initialize(&path).expect("ledger should initialize");
+        write_document(&path, &document).expect("ledger should persist");
+        let targets = fx_refresh_targets(&path, &json!({"mode": "manual"}))
+            .expect("FX targets should derive from holdings");
+        assert_eq!(
+            targets,
+            json!([
+                {
+                    "baseCurrency": "USDT",
+                    "quoteCurrency": "USD",
+                    "symbol": "USDT-USD"
+                },
+                {
+                    "baseCurrency": "USD",
+                    "quoteCurrency": "CNY",
+                    "symbol": "USDCNY=X"
+                }
+            ])
+            .as_array()
+            .expect("target array")
+            .clone()
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {
