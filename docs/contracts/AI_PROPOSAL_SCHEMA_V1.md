@@ -2,7 +2,7 @@
 
 状态：草案冻结给前端 AI Review 使用。  
 用途：定义 AI 导入、AI 修改、AI 更正、AI 归档建议的候选数据结构与审批边界。  
-非用途：不定义具体模型供应商、不定义 prompt、不允许 AI 直接写账。
+非用途：不允许 AI 直接写账；具体 provider 凭据不属于账本契约。
 
 ## 0. 强约束
 
@@ -14,6 +14,17 @@
 6. 修改 confirmed 记录时，默认生成更正事件；除非用户显式选择“修改原记录”。
 7. confidence 不作为盲签依据；证据、diff、警告必须可见。
 8. 已持久化在 `movements` 的 standalone `pending_review` 候选只做读取投影，不得为了进入 AI Review 再复制成 `aiProposals` 记录。
+9. 远端模型只返回受限结构化草稿；服务端必须再次执行正式 movement 校验，provider 成功不能绕过审核。
+
+### 0.1 文本整理 provider
+
+- 默认 `FINWEALTH_AI_PROVIDER=none`，原始文本进入待补全候选。
+- `openai_responses` 使用 Responses API 的 strict JSON Schema；schema 根为 object，字段全部 required，所有 object 均 `additionalProperties=false`。
+- 第一阶段只整理单账户现金 `income|expense`，不让模型生成转账、投资买卖、贷款、订阅或直接写账动作。
+- 输入只包含用户文本、当前时间和可选账户的 ID/名称/类型/币种，不发送余额、完整流水或完整账本。
+- `usable=false` 不生成 movement；refusal、incomplete、网络/API 错误和非法结构 fail closed。
+- provider 返回的账户 ID、币种、金额、RFC3339 时间和方向由服务端重新校验并规范化。
+- 成功 proposal 的 source 可记录 `modelName` 与固定 `promptVersion`，但不记录 API key 或完整 provider 响应。
 
 ## 1. 顶层结构
 

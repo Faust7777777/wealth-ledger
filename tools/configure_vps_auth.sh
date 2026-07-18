@@ -69,6 +69,7 @@ trap cleanup EXIT
   printf 'FINWEALTH_RS_ADDR=127.0.0.1:8790\n'
   printf 'FINWEALTH_ALLOWED_HOSTS=%s\n' "$ALLOWED_HOST"
   printf 'FINWEALTH_QUOTE_PROVIDER=none\n'
+  printf 'FINWEALTH_AI_PROVIDER=none\n'
 } >"$TEMP_ENV"
 chown root:root "$TEMP_ENV"
 chmod 0600 "$TEMP_ENV"

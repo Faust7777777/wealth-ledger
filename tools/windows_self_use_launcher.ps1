@@ -222,7 +222,11 @@ $environmentNames = @(
   "FINWEALTH_AUTH_USERNAME",
   "FINWEALTH_AUTH_PASSWORD_HASH",
   "FINWEALTH_ALLOWED_HOSTS",
-  "FINWEALTH_QUOTE_PROVIDER"
+  "FINWEALTH_QUOTE_PROVIDER",
+  "FINWEALTH_AI_PROVIDER",
+  "FINWEALTH_AI_MODEL",
+  "FINWEALTH_AI_BASE_URL",
+  "FINWEALTH_AI_API_KEY"
 )
 $oldEnvironment = @{}
 foreach ($name in $environmentNames) {
@@ -235,6 +239,10 @@ try {
   [Environment]::SetEnvironmentVariable("FINWEALTH_AUTH_PASSWORD_HASH", [string]$config.passwordHash, "Process")
   [Environment]::SetEnvironmentVariable("FINWEALTH_ALLOWED_HOSTS", "127.0.0.1,localhost", "Process")
   [Environment]::SetEnvironmentVariable("FINWEALTH_QUOTE_PROVIDER", "none", "Process")
+  [Environment]::SetEnvironmentVariable("FINWEALTH_AI_PROVIDER", "none", "Process")
+  [Environment]::SetEnvironmentVariable("FINWEALTH_AI_MODEL", $null, "Process")
+  [Environment]::SetEnvironmentVariable("FINWEALTH_AI_BASE_URL", $null, "Process")
+  [Environment]::SetEnvironmentVariable("FINWEALTH_AI_API_KEY", $null, "Process")
 
   $server = Start-Process `
     -FilePath $ServerExe `

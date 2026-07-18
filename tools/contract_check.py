@@ -871,6 +871,28 @@ def check_loan_interest_slice(doc: dict) -> None:
     ok("Loan terms, projected payment split, and reviewed interest passed")
 
 
+def check_ai_text_provider() -> None:
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    for snippet in [
+        'env::var("FINWEALTH_AI_PROVIDER")',
+        'env::var("FINWEALTH_AI_API_KEY")',
+        'env::var("FINWEALTH_AI_MODEL")',
+        '"store": false',
+        '"type": "json_schema"',
+        '"strict": true',
+        "organize_ai_text_with_provider",
+        "ai_provider_movement_input",
+        "local_ledger::replay_idempotency(path, &idempotency)",
+        "openai_responses_provider_returns_a_valid_review_only_movement",
+    ]:
+        if snippet not in rust_text:
+            fail(f"AI text provider implementation is incomplete: {snippet}")
+    if "FINWEALTH_AI_PROVIDER=none" not in DEPLOY_ENV_EXAMPLE.read_text(encoding="utf-8"):
+        fail("AI provider deploy default must remain disabled")
+
+    ok("Opt-in structured AI text provider passed")
+
+
 def check_valuation_issue_projection(doc: dict) -> None:
     operation = doc["paths"]["/portfolio/valuation-issues"]["get"]
     schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
@@ -1501,6 +1523,8 @@ def check_deploy_security_defaults() -> None:
     env_text = DEPLOY_ENV_EXAMPLE.read_text(encoding="utf-8")
     if "FINWEALTH_QUOTE_PROVIDER=none" not in env_text:
         fail("Deploy env example must default FINWEALTH_QUOTE_PROVIDER to none")
+    if "FINWEALTH_AI_PROVIDER=none" not in env_text:
+        fail("Deploy env example must default FINWEALTH_AI_PROVIDER to none")
 
     install_text = VPS_INSTALL.read_text(encoding="utf-8")
     if "--check-production-config" not in install_text or "EnvironmentFile" not in install_text:
@@ -1802,6 +1826,8 @@ def check_release_packaging() -> None:
         "FINWEALTH_REQUIRE_AUTH",
         "FINWEALTH_AUTH_PASSWORD_HASH",
         "FINWEALTH_QUOTE_PROVIDER",
+        "FINWEALTH_AI_PROVIDER",
+        "FINWEALTH_AI_API_KEY",
         "Get-FileHash",
         "serverSha256",
         "clientSha256",
@@ -2196,6 +2222,7 @@ def main() -> None:
     check_public_quote_provider()
     check_yield_interest_slice(doc)
     check_loan_interest_slice(doc)
+    check_ai_text_provider()
     check_valuation_issue_projection(doc)
     check_investment_fee_semantics(doc)
     check_investment_sale_result(doc)

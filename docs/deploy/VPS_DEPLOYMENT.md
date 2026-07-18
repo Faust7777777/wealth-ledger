@@ -94,11 +94,17 @@ FINWEALTH_AUTH_PASSWORD_HASH=$argon2id$...
 FINWEALTH_RS_ADDR=127.0.0.1:8790
 FINWEALTH_ALLOWED_HOSTS=api.example.com
 FINWEALTH_QUOTE_PROVIDER=none
+FINWEALTH_AI_PROVIDER=none
 ```
 
 Do not put plaintext passwords in this file. Keep `FINWEALTH_QUOTE_PROVIDER=none`
 unless you explicitly accept outbound ticker/FX lookup requests from the VPS; set
-it to `yahoo` only after that opt-in.
+it to `yahoo` only after that opt-in. Keep `FINWEALTH_AI_PROVIDER=none` unless
+you explicitly accept sending text-import content and the minimal account
+selection context to an AI provider. To enable Responses-compatible structured
+organization, set `FINWEALTH_AI_PROVIDER=openai_responses`,
+`FINWEALTH_AI_MODEL`, `FINWEALTH_AI_BASE_URL`, and `FINWEALTH_AI_API_KEY` in
+this root-only file. The base URL must use HTTPS, except for loopback testing.
 
 `FINWEALTH_ALLOWED_HOSTS` is required when a reverse proxy preserves the public
 Host header. For local-only use, the server always allows `127.0.0.1`,

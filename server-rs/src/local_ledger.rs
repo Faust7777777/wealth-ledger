@@ -14838,7 +14838,7 @@ fn ai_import_group_from_input(
         group["warnings"] = json!([
             {
                 "code": "ai_import_requires_user_confirmation",
-                "message": "AI 导入只生成候选；确认前不会写入账本。",
+                "message": "请确认这条候选记录。",
                 "severity": "info"
             }
         ]);
@@ -14848,7 +14848,7 @@ fn ai_import_group_from_input(
 
     Ok(json!({
         "id": atomic_group_id,
-        "title": format!("{}：待编辑候选", ai_source_label(source_kind, input)),
+        "title": format!("{}：待补全", ai_source_label(source_kind, input)),
         "operation": "create",
         "targetType": "movement",
         "targetId": movement_id,
@@ -14857,7 +14857,7 @@ fn ai_import_group_from_input(
         "warnings": [
             {
                 "code": "local_ai_requires_structured_movement",
-                "message": "本地账本模式不会猜金额；请编辑候选并补全结构化记录后再确认。",
+                "message": "请补全记录。",
                 "severity": "warning"
             }
         ],
@@ -14867,7 +14867,7 @@ fn ai_import_group_from_input(
             "errors": [
                 {
                     "code": "structured_movement_required",
-                    "message": "需要结构化 movement 后才能确认写入账本。"
+                    "message": "请补全记录后再确认。"
                 }
             ]
         },
@@ -14896,7 +14896,7 @@ fn ai_import_proposal_from_groups(
         )
     };
 
-    json!({
+    let mut proposal = json!({
         "id": proposal_id,
         "status": "pending",
         "source": {
@@ -14907,7 +14907,14 @@ fn ai_import_proposal_from_groups(
         "summary": summary,
         "warnings": [],
         "createdAt": now
-    })
+    });
+    if let Some(provider) = input.get("_aiProvider") {
+        if let Some(model) = provider.get("model").and_then(Value::as_str) {
+            proposal["source"]["modelName"] = json!(model);
+        }
+        proposal["source"]["promptVersion"] = json!("finwealth_cash_movement_v1");
+    }
+    proposal
 }
 
 fn csv_import_groups_from_input(
@@ -14988,7 +14995,7 @@ fn csv_import_groups_from_input(
                 group["warnings"] = json!([
                     {
                         "code": "csv_import_requires_user_confirmation",
-                        "message": "CSV 导入只生成候选；确认前不会写入账本。",
+                        "message": "请确认这条候选记录。",
                         "severity": "info"
                     }
                 ]);
@@ -15310,7 +15317,7 @@ fn invalid_ai_import_group(
         "warnings": [
             {
                 "code": "local_ai_requires_structured_movement",
-                "message": "本地账本模式不会猜金额；请编辑候选并补全结构化记录后再确认。",
+                "message": "请补全记录。",
                 "severity": "warning"
             }
         ],

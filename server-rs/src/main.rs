@@ -2368,6 +2368,43 @@ async fn create_ai_import_proposal(
             Ok(request) => request,
             Err(_) => return invalid_idempotency_key(),
         };
+        match local_ledger::replay_idempotency(path, &idempotency) {
+            Ok(Some(response)) => return idempotent_response(response),
+            Ok(None) => {}
+            Err(error) => return local_ledger_error(error, "ai_import_idempotency_failed"),
+        }
+        let input = if source_kind == "user_text" {
+            match ai_provider_config() {
+                Ok(Some(config)) => {
+                    let accounts = match local_ledger::list_accounts(path) {
+                        Ok(accounts) => accounts,
+                        Err(error) => return ledger_io_error(error),
+                    };
+                    match organize_ai_text_with_provider(&config, input, &accounts, &now).await {
+                        Ok(input) => input,
+                        Err(failure) => {
+                            return service_unavailable(
+                                failure.code,
+                                failure.message,
+                                json!({"provider": "openai_responses"}),
+                                failure.retryable,
+                            );
+                        }
+                    }
+                }
+                Ok(None) => input,
+                Err(message) => {
+                    return service_unavailable(
+                        "ai_provider_configuration_invalid",
+                        "AI provider configuration is incomplete or invalid.",
+                        json!({"reason": message}),
+                        false,
+                    );
+                }
+            }
+        } else {
+            input
+        };
         let context = local_ledger::AiImportContext {
             proposal_id: next_local_ai_proposal_id(),
             atomic_group_id: next_local_atomic_group_id(),
@@ -2387,6 +2424,443 @@ async fn create_ai_import_proposal(
     }
 
     envelope(state.ledger.create_ai_proposal(source_kind)).into_response()
+}
+
+struct AiProviderConfig {
+    endpoint: String,
+    api_key: String,
+    model: String,
+}
+
+#[derive(Debug)]
+struct AiProviderFailure {
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+}
+
+fn ai_provider_config() -> Result<Option<AiProviderConfig>, String> {
+    let provider = env::var("FINWEALTH_AI_PROVIDER").ok();
+    let api_key = env::var("FINWEALTH_AI_API_KEY").ok();
+    let model = env::var("FINWEALTH_AI_MODEL").ok();
+    let base_url = env::var("FINWEALTH_AI_BASE_URL").ok();
+    ai_provider_config_from(
+        provider.as_deref(),
+        api_key.as_deref(),
+        model.as_deref(),
+        base_url.as_deref(),
+    )
+}
+
+fn ai_provider_config_from(
+    provider: Option<&str>,
+    api_key: Option<&str>,
+    model: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<Option<AiProviderConfig>, String> {
+    match provider
+        .unwrap_or("none")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "none" | "disabled" => return Ok(None),
+        "openai" | "openai_responses" => {}
+        _ => return Err("FINWEALTH_AI_PROVIDER must be none or openai_responses".to_string()),
+    }
+    let api_key = api_key
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "FINWEALTH_AI_API_KEY is required".to_string())?
+        .to_string();
+    let model = model
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "FINWEALTH_AI_MODEL is required".to_string())?
+        .to_string();
+    let mut url = reqwest::Url::parse(base_url.unwrap_or("https://api.openai.com/v1").trim())
+        .map_err(|_| "FINWEALTH_AI_BASE_URL must be an absolute URL".to_string())?;
+    let loopback_http =
+        url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+    if url.scheme() != "https" && !loopback_http {
+        return Err("FINWEALTH_AI_BASE_URL must use HTTPS or loopback HTTP".to_string());
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "FINWEALTH_AI_BASE_URL must not contain credentials, query, or fragment".to_string(),
+        );
+    }
+    let path = format!("{}/responses", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    Ok(Some(AiProviderConfig {
+        endpoint: url.to_string(),
+        api_key,
+        model,
+    }))
+}
+
+async fn organize_ai_text_with_provider(
+    config: &AiProviderConfig,
+    mut input: Value,
+    accounts: &Value,
+    now: &str,
+) -> Result<Value, AiProviderFailure> {
+    let text = input
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(AiProviderFailure {
+            code: "ai_input_invalid",
+            message: "Text input is required for AI organization.",
+            retryable: false,
+        })?;
+    if text.len() > 20_000 {
+        return Err(AiProviderFailure {
+            code: "ai_input_too_large",
+            message: "Text input is too large for AI organization.",
+            retryable: false,
+        });
+    }
+    let account_context = ai_provider_account_context(accounts);
+    let account_ids = account_context
+        .iter()
+        .filter_map(|account| account.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let currencies = account_context
+        .iter()
+        .filter_map(|account| account.get("supportedCurrencies").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if account_ids.is_empty() || currencies.is_empty() {
+        return Err(AiProviderFailure {
+            code: "ai_context_unavailable",
+            message: "No active cash account is available for AI organization.",
+            retryable: false,
+        });
+    }
+    let schema = ai_text_organization_schema(&account_ids, &currencies);
+    let body = json!({
+        "model": config.model,
+        "store": false,
+        "max_output_tokens": 1200,
+        "instructions": concat!(
+            "Convert one Chinese personal-finance note into at most one cash movement. ",
+            "Return usable=false and movement=null when amount, direction, currency, or account cannot be determined from the note and account context. ",
+            "Never invent an account or amount. Use the supplied current timestamp only when the note omits a date. ",
+            "Income means cash in; expense means cash out. Keep the title short and factual."
+        ),
+        "input": format!(
+            "Current timestamp: {now}\nAccounts: {}\nUser note: {text}",
+            serde_json::to_string(&account_context).expect("account context should serialize")
+        ),
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "finwealth_cash_movement",
+                "strict": true,
+                "schema": schema
+            }
+        }
+    });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("finwealth/0.1 self-use AI organizer")
+        .build()
+        .map_err(|_| AiProviderFailure {
+            code: "ai_provider_client_failed",
+            message: "AI provider client could not be initialized.",
+            retryable: true,
+        })?;
+    let mut response = client
+        .post(&config.endpoint)
+        .bearer_auth(&config.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| AiProviderFailure {
+            code: "ai_provider_unavailable",
+            message: "AI provider request failed.",
+            retryable: true,
+        })?;
+    if !response.status().is_success() {
+        return Err(AiProviderFailure {
+            code: "ai_provider_rejected_request",
+            message: "AI provider rejected the request.",
+            retryable: response.status().is_server_error() || response.status().as_u16() == 429,
+        });
+    }
+    const MAX_AI_RESPONSE_BYTES: usize = 1_048_576;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_AI_RESPONSE_BYTES as u64)
+    {
+        return Err(AiProviderFailure {
+            code: "ai_provider_response_too_large",
+            message: "AI provider response exceeded the allowed size.",
+            retryable: false,
+        });
+    }
+    let mut response_bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| AiProviderFailure {
+        code: "ai_provider_response_invalid",
+        message: "AI provider returned an invalid response.",
+        retryable: true,
+    })? {
+        if response_bytes.len().saturating_add(chunk.len()) > MAX_AI_RESPONSE_BYTES {
+            return Err(AiProviderFailure {
+                code: "ai_provider_response_too_large",
+                message: "AI provider response exceeded the allowed size.",
+                retryable: false,
+            });
+        }
+        response_bytes.extend_from_slice(&chunk);
+    }
+    let response: Value =
+        serde_json::from_slice(&response_bytes).map_err(|_| AiProviderFailure {
+            code: "ai_provider_response_invalid",
+            message: "AI provider returned an invalid response.",
+            retryable: true,
+        })?;
+    let structured = ai_structured_output(&response)?;
+    if structured.get("usable").and_then(Value::as_bool) == Some(true) {
+        let movement = ai_provider_movement_input(&structured, &account_context, now)?;
+        input["movement"] = movement;
+    }
+    input["_aiProvider"] = json!({
+        "kind": "openai_responses",
+        "model": config.model,
+        "responseId": response.get("id").cloned().unwrap_or(Value::Null),
+        "usable": structured.get("usable").cloned().unwrap_or(json!(false)),
+        "confidence": structured.get("confidence").cloned().unwrap_or(json!(0))
+    });
+    Ok(input)
+}
+
+fn ai_provider_account_context(accounts: &Value) -> Vec<Value> {
+    accounts
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|account| {
+            account.get("status").and_then(Value::as_str) == Some("active")
+                && matches!(
+                    account.get("balanceMode").and_then(Value::as_str),
+                    Some("cash_balance" | "mixed")
+                )
+                && !matches!(
+                    account.get("accountType").and_then(Value::as_str),
+                    Some("loan" | "credit_card")
+                )
+                && account
+                    .get("supportedCurrencies")
+                    .and_then(Value::as_array)
+                    .is_some_and(|currencies| !currencies.is_empty())
+        })
+        .map(|account| {
+            json!({
+                "id": account["id"],
+                "displayName": account["displayName"],
+                "accountType": account["accountType"],
+                "defaultCurrency": account["defaultCurrency"],
+                "supportedCurrencies": account["supportedCurrencies"]
+            })
+        })
+        .collect()
+}
+
+fn ai_text_organization_schema(account_ids: &[String], currencies: &[String]) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["usable", "reason", "confidence", "movement"],
+        "properties": {
+            "usable": {"type": "boolean"},
+            "reason": {"type": "string"},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "movement": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["type", "occurredAt", "title", "accountId", "amount", "currency"],
+                        "properties": {
+                            "type": {"type": "string", "enum": ["income", "expense"]},
+                            "occurredAt": {"type": "string", "format": "date-time"},
+                            "title": {"type": "string"},
+                            "accountId": {"type": "string", "enum": account_ids},
+                            "amount": {"type": "string", "pattern": "^[0-9]+(?:\\.[0-9]{1,8})?$"},
+                            "currency": {"type": "string", "enum": currencies}
+                        }
+                    },
+                    {"type": "null"}
+                ]
+            }
+        }
+    })
+}
+
+fn ai_structured_output(response: &Value) -> Result<Value, AiProviderFailure> {
+    if response.get("status").and_then(Value::as_str) != Some("completed") {
+        return Err(AiProviderFailure {
+            code: "ai_provider_response_incomplete",
+            message: "AI provider response was incomplete.",
+            retryable: true,
+        });
+    }
+    for content in response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+    {
+        if content.get("type").and_then(Value::as_str) == Some("refusal") {
+            return Err(AiProviderFailure {
+                code: "ai_provider_refused",
+                message: "AI provider refused to organize this input.",
+                retryable: false,
+            });
+        }
+        if content.get("type").and_then(Value::as_str) == Some("output_text")
+            && let Some(text) = content.get("text").and_then(Value::as_str)
+        {
+            let structured: Value = serde_json::from_str(text).map_err(|_| AiProviderFailure {
+                code: "ai_provider_output_invalid",
+                message: "AI provider output did not match the required structure.",
+                retryable: true,
+            })?;
+            let confidence = structured.get("confidence").and_then(Value::as_f64);
+            if structured.get("usable").and_then(Value::as_bool).is_none()
+                || structured.get("reason").and_then(Value::as_str).is_none()
+                || confidence
+                    .is_none_or(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+                || !matches!(
+                    structured.get("movement"),
+                    Some(Value::Object(_) | Value::Null)
+                )
+            {
+                return Err(AiProviderFailure {
+                    code: "ai_provider_output_invalid",
+                    message: "AI provider output did not match the required structure.",
+                    retryable: true,
+                });
+            }
+            return Ok(structured);
+        }
+    }
+    Err(AiProviderFailure {
+        code: "ai_provider_output_missing",
+        message: "AI provider returned no structured output.",
+        retryable: true,
+    })
+}
+
+fn ai_provider_movement_input(
+    structured: &Value,
+    accounts: &[Value],
+    now: &str,
+) -> Result<Value, AiProviderFailure> {
+    let movement = structured
+        .get("movement")
+        .and_then(Value::as_object)
+        .ok_or(AiProviderFailure {
+            code: "ai_provider_output_invalid",
+            message: "AI provider marked output usable without a movement.",
+            retryable: true,
+        })?;
+    let movement_type = movement.get("type").and_then(Value::as_str);
+    let account_id = movement.get("accountId").and_then(Value::as_str);
+    let currency = movement.get("currency").and_then(Value::as_str);
+    let account = account_id.and_then(|id| {
+        accounts
+            .iter()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(id))
+    });
+    let valid_currency = account.is_some_and(|account| {
+        account
+            .get("supportedCurrencies")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == currency))
+    });
+    let amount = movement.get("amount").and_then(Value::as_str);
+    let valid_amount = amount.is_some_and(local_decimal_is_positive);
+    let occurred_at = movement
+        .get("occurredAt")
+        .and_then(Value::as_str)
+        .filter(|value| OffsetDateTime::parse(value, &Rfc3339).is_ok());
+    let title = movement
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.chars().count() <= 120);
+    if !matches!(movement_type, Some("income" | "expense"))
+        || account.is_none()
+        || !valid_currency
+        || !valid_amount
+        || occurred_at.is_none()
+        || title.is_none()
+    {
+        return Err(AiProviderFailure {
+            code: "ai_provider_output_invalid",
+            message: "AI provider output failed ledger validation.",
+            retryable: true,
+        });
+    }
+    let movement_type = movement_type.expect("validated movement type");
+    let amount = amount.expect("validated amount");
+    let currency = currency.expect("validated currency");
+    Ok(json!({
+        "type": movement_type,
+        "occurredAt": occurred_at.unwrap_or(now),
+        "title": title.expect("validated title"),
+        "entries": [{
+            "accountId": account_id.expect("validated account"),
+            "amount": amount,
+            "currency": currency,
+            "direction": if movement_type == "income" {"in"} else {"out"},
+            "role": "source"
+        }],
+        "amountBreakdown": {
+            "paidAmount": {"amount": amount, "currency": currency}
+        },
+        "tags": ["ai_organized"]
+    }))
+}
+
+fn local_decimal_is_positive(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 32
+        || value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| matches!(byte, b'-' | b'+'))
+    {
+        return false;
+    }
+    let mut parts = value.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    if parts.next().is_some()
+        || integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.is_some_and(|fraction| {
+            fraction.is_empty()
+                || fraction.len() > 8
+                || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return false;
+    }
+    integer.bytes().any(|byte| byte != b'0')
+        || fraction.is_some_and(|fraction| fraction.bytes().any(|byte| byte != b'0'))
 }
 
 async fn mark_dca_executed_as_proposal(
@@ -10657,6 +11131,155 @@ mod tests {
         assert!(!quote_provider_disabled_value(Some("yahoo")));
         assert!(!quote_provider_disabled_value(Some(" Yahoo ")));
         assert!(!quote_provider_disabled_value(Some("public")));
+    }
+
+    #[tokio::test]
+    async fn openai_responses_provider_returns_a_valid_review_only_movement() {
+        let captured = Arc::new(Mutex::new(Value::Null));
+        let captured_for_route = captured.clone();
+        let provider = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_for_route.clone();
+                async move {
+                    *captured.lock().expect("capture lock") = body;
+                    Json(json!({
+                        "id": "resp_test_ai_001",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "content": [{
+                                "type": "output_text",
+                                "text": serde_json::to_string(&json!({
+                                    "usable": true,
+                                    "reason": "金额和唯一账户明确",
+                                    "confidence": 0.98,
+                                    "movement": {
+                                        "type": "expense",
+                                        "occurredAt": "2026-07-18T12:00:00+08:00",
+                                        "title": "午餐",
+                                        "accountId": "acct_ai_cash",
+                                        "amount": "18",
+                                        "currency": "CNY"
+                                    }
+                                })).expect("structured output")
+                            }]
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("provider listener");
+        let address = listener.local_addr().expect("provider address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, provider)
+                .await
+                .expect("provider server");
+        });
+        let config = AiProviderConfig {
+            endpoint: format!("http://{address}/v1/responses"),
+            api_key: "test-only-key".to_string(),
+            model: "test-structured-model".to_string(),
+        };
+        let accounts = json!([{
+            "id": "acct_ai_cash",
+            "displayName": "日常账户",
+            "accountType": "bank",
+            "balanceMode": "cash_balance",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "status": "active",
+            "cashBalances": [{"currency": "CNY", "amount": "100"}]
+        }]);
+        let enriched = organize_ai_text_with_provider(
+            &config,
+            json!({"text": "午餐 18 元"}),
+            &accounts,
+            "2026-07-18T12:30:00+08:00",
+        )
+        .await
+        .expect("provider enrichment");
+        assert_eq!(enriched["movement"]["type"], "expense");
+        assert_eq!(enriched["movement"]["entries"][0]["amount"], "18");
+        assert_eq!(enriched["movement"]["entries"][0]["direction"], "out");
+        assert_eq!(enriched["_aiProvider"]["responseId"], "resp_test_ai_001");
+        let request = captured.lock().expect("captured request").clone();
+        assert_eq!(request["store"], false);
+        assert_eq!(request["text"]["format"]["type"], "json_schema");
+        assert_eq!(request["text"]["format"]["strict"], true);
+        assert_eq!(
+            request["text"]["format"]["schema"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            request["text"]["format"]["schema"]["required"],
+            json!(["usable", "reason", "confidence", "movement"])
+        );
+        assert!(
+            !request["input"]
+                .as_str()
+                .expect("provider input")
+                .contains("cashBalances")
+        );
+        task.abort();
+    }
+
+    #[test]
+    fn openai_responses_provider_detects_refusal_and_invalid_decimals() {
+        let refusal = json!({
+            "status": "completed",
+            "output": [{"content": [{"type": "refusal", "refusal": "no"}]}]
+        });
+        let error = ai_structured_output(&refusal).expect_err("refusal should fail closed");
+        assert_eq!(error.code, "ai_provider_refused");
+        assert!(local_decimal_is_positive("18.25"));
+        assert!(!local_decimal_is_positive("0"));
+        assert!(!local_decimal_is_positive("1e3"));
+        assert!(!local_decimal_is_positive("-1"));
+        assert!(!local_decimal_is_positive("1.123456789"));
+    }
+
+    #[test]
+    fn openai_responses_provider_configuration_is_explicit_and_tls_first() {
+        assert!(
+            ai_provider_config_from(None, None, None, None)
+                .expect("private default")
+                .is_none()
+        );
+        let official = ai_provider_config_from(
+            Some("openai_responses"),
+            Some("test-key"),
+            Some("test-model"),
+            None,
+        )
+        .expect("official config")
+        .expect("enabled provider");
+        assert_eq!(official.endpoint, "https://api.openai.com/v1/responses");
+        assert!(
+            ai_provider_config_from(
+                Some("openai_responses"),
+                Some("test-key"),
+                Some("test-model"),
+                Some("http://provider.example/v1"),
+            )
+            .is_err()
+        );
+        assert!(
+            ai_provider_config_from(
+                Some("openai_responses"),
+                Some("test-key"),
+                Some("test-model"),
+                Some("http://127.0.0.1:9000/v1"),
+            )
+            .expect("loopback config")
+            .is_some()
+        );
+        assert!(
+            ai_provider_config_from(Some("openai_responses"), None, Some("test-model"), None,)
+                .is_err()
+        );
     }
 
     #[test]
