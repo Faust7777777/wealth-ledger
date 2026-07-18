@@ -1043,6 +1043,24 @@ class LocalServerPortfolioRepository implements PortfolioRepository {
       parseAssetAllocationData(
         _m(await _c.getData('/v1/portfolio/allocation')),
       );
+
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingAdjustment(
+    Id accountId,
+    HoldingAdjustmentInput input,
+  ) async => _group(
+    _m(
+      await _c.postData(
+        '/v1/accounts/$accountId/holding-adjustment-proposals',
+        body: {
+          'instrumentId': input.instrumentId,
+          'targetQuantity': input.targetQuantity,
+          if (input.asOf != null) 'asOf': input.asOf,
+          if (input.note != null && input.note!.isNotEmpty) 'note': input.note,
+        },
+      ),
+    ),
+  );
 }
 
 class LocalServerMovementRepository implements MovementRepository {
@@ -1340,12 +1358,25 @@ class LocalServerDcaRepository implements DcaRepository {
   }
 }
 
+FxRateVm _fxRate(Map<String, dynamic> j) => FxRateVm(
+  baseCurrency: '${j['baseCurrency']}',
+  quoteCurrency: '${j['quoteCurrency']}',
+  rate: '${j['rate']}',
+  asOf: '${j['asOf']}',
+  status: _quote(j['status']),
+);
+
 class LocalServerQuoteRepository implements QuoteRepository {
   LocalServerQuoteRepository(this._c);
   final DevApiClient _c;
   @override
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       _quoteSummary(_m(await _c.getData('/v1/quotes/summary')));
+
+  @override
+  Future<List<FxRateVm>> listFxRates() async => [
+    for (final r in _list(await _c.getData('/v1/fx-rates'))) _fxRate(_m(r)),
+  ];
 
   @override
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>
@@ -1608,6 +1639,8 @@ Map<String, dynamic> _createSubBody(CreateSubscriptionInput i) => {
   'paymentAccountId': i.paymentAccountId,
   'billingCycle': _billingCycleJson(i.billingCycle),
   'startDate': i.startDate,
+  if (i.nextChargeDate != null && i.nextChargeDate!.isNotEmpty)
+    'nextChargeDate': i.nextChargeDate,
   if (i.duration != null) 'duration': _durationJson(i.duration!),
   if (i.endDate != null && i.endDate!.isNotEmpty) 'endDate': i.endDate,
   'autoRenew': i.autoRenew,
@@ -1623,6 +1656,8 @@ Map<String, dynamic> _updateSubBody(UpdateSubscriptionInput i) => {
   'paymentAccountId': i.paymentAccountId,
   'billingCycle': _billingCycleJson(i.billingCycle),
   'startDate': i.startDate,
+  if (i.nextChargeDate != null && i.nextChargeDate!.isNotEmpty)
+    'nextChargeDate': i.nextChargeDate,
   'duration': i.duration != null ? _durationJson(i.duration!) : null,
   'endDate': (i.endDate?.isNotEmpty ?? false) ? i.endDate : null,
   'autoRenew': i.autoRenew,

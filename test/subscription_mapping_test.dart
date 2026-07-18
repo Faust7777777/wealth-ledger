@@ -82,6 +82,7 @@ UpdateSubscriptionInput _updateInput({
   planName: planName,
   amount: const Money(amount: '20.00', currency: 'USD'),
   paymentAccountId: 'acct_us',
+  nextChargeDate: '2026-08-05',
   billingCycle: const SubscriptionBillingCycleVm(
     unit: BillingUnit.month,
     interval: 1,

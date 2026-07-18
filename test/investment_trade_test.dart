@@ -196,6 +196,11 @@ class _FakePortfolioRepo implements PortfolioRepository {
         totalLiabilities: Money(amount: '0', currency: 'CNY'),
         netWorth: Money(amount: '0', currency: 'CNY'),
       );
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingAdjustment(
+    Id accountId,
+    HoldingAdjustmentInput input,
+  ) => throw UnsupportedError('unused');
 }
 
 Widget _formHost(MovementRepository movementRepo) => ProviderScope(
@@ -735,7 +740,7 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(find.text('已入账'), findsNothing);
-      expect(find.text('已提交为待确认候选，尚未入账'), findsOneWidget);
+      expect(find.text('已加入待确认，尚未入账'), findsOneWidget);
       expect(find.text('前往审核'), findsOneWidget);
       // 未真正入账：不当作完成，表单保留。
       expect(find.byType(InvestmentTradePage), findsOneWidget);

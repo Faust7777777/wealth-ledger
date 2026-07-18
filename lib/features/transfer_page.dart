@@ -98,7 +98,7 @@ class _TransferPageState extends ConsumerState<TransferPage> {
         ref.invalidate(anomaliesProvider);
       }
       messenger.showSnackBar(
-        SnackBar(content: Text(result.ledgerWrite ? '转账已入账' : '转账已提交候选，尚未入账')),
+        SnackBar(content: Text(result.ledgerWrite ? '转账已入账' : '已加入待确认，尚未入账')),
       );
       if (mounted) router.pop();
     } catch (e) {

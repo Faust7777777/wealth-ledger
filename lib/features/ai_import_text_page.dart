@@ -32,9 +32,7 @@ class _AiImportTextPageState extends ConsumerState<AiImportTextPage> {
     try {
       await ref.read(aiProposalRepositoryProvider).createFromText(text);
       ref.invalidate(aiPendingProvider);
-      messenger.showSnackBar(
-        const SnackBar(content: Text('已生成候选；请在「AI 待确认」逐条复核后再入账')),
-      );
+      messenger.showSnackBar(const SnackBar(content: Text('已加入待确认')));
       router.go('/ai-review');
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
@@ -63,7 +61,7 @@ class _AiImportTextPageState extends ConsumerState<AiImportTextPage> {
             const SizedBox(height: AppSpacing.base),
             FilledButton(
               onPressed: _busy ? null : _submit,
-              child: Text(_busy ? '生成中…' : '生成候选'),
+              child: Text(_busy ? '导入中…' : '导入'),
             ),
           ],
         ),

@@ -15,6 +15,7 @@ import '../theme/app_colors.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
 import 'account_visuals.dart';
+import 'valuation_status_sheet.dart';
 
 class OverviewPage extends ConsumerWidget {
   const OverviewPage({super.key});
@@ -56,7 +57,8 @@ class OverviewPage extends ConsumerWidget {
           children: [
             // 首屏关键块轻微错峰入场；列表行不参与，避免滚动时反复触发。
             Reveal(child: _Hero(o: o)),
-            if (o.pendingSummary.total > 0)
+            // 估值问题不进大卡片（只在净资产旁留低强调小入口）。
+            if (o.pendingSummary.total - o.pendingSummary.quoteProblemCount > 0)
               Reveal(
                 delay: const Duration(milliseconds: 70),
                 child: _Pending(s: o.pendingSummary),
@@ -100,6 +102,9 @@ class _Hero extends StatelessWidget {
     final dark = Theme.of(context).brightness == Brightness.dark;
     final snap = o.latestSnapshot;
     final muted = Theme.of(context).textTheme.bodySmall;
+    final q = o.quoteStatusSummary;
+    final valuationProblemCount =
+        q.staleCount + q.offlineCachedCount + q.unpriceableCount + q.errorCount;
     final estimated =
         snap != null &&
         (snap.quality == ValueQuality.estimated ||
@@ -137,21 +142,27 @@ class _Hero extends StatelessWidget {
           style: Theme.of(context).textTheme.displayLarge,
         ),
         ?deltaLine,
-        if (!o.quoteStatusSummary.allFresh)
-          Padding(
-            padding: const EdgeInsets.only(top: AppSpacing.sm),
-            child: Text(
-              '◐ ${o.quoteStatusSummary.staleCount} 项报价过期 · 本地缓存',
-              style: AppType.caption.copyWith(
-                color: dark ? AppColors.warningText : AppColorsLight.warning,
-              ),
-            ),
-          ),
         Align(
           alignment: Alignment.centerLeft,
-          child: TextButton(
-            onPressed: () => context.push('/snapshots'),
-            child: const Text('查看历史'),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextButton(
+                onPressed: () => context.push('/snapshots'),
+                child: const Text('查看历史'),
+              ),
+              // 估值不完整时只留一个低强调入口；无问题时完全隐藏。
+              // 不常驻技术判断（过期/缓存），也不把净资产变成警告色。
+              if (valuationProblemCount > 0)
+                TextButton(
+                  onPressed: () => showValuationStatusDialog(context),
+                  style: TextButton.styleFrom(
+                    foregroundColor: muted?.color,
+                    textStyle: AppType.caption,
+                  ),
+                  child: Text('估值待完善 $valuationProblemCount'),
+                ),
+            ],
           ),
         ),
       ],
@@ -170,7 +181,6 @@ class _Pending extends StatelessWidget {
       ('账户异常', s.accountAnomalyCount, '/anomalies'),
       ('定投到期', s.dcaDueCount, '/investment'),
       ('在途交易', s.inTransitCount, null),
-      ('报价问题', s.quoteProblemCount, null),
       ('同步降级', s.syncProblemCount, null),
     ].where((e) => e.$2 > 0).toList();
 

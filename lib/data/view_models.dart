@@ -495,6 +495,21 @@ class CreateInstrumentInput {
   final String? symbol;
 }
 
+/// 持仓导入/数量校准输入（POST /v1/accounts/{id}/holding-adjustment-proposals）。
+/// 只生成待确认调整，target 为期望的当前数量（可为 0 = 清零）。
+class HoldingAdjustmentInput {
+  const HoldingAdjustmentInput({
+    required this.instrumentId,
+    required this.targetQuantity,
+    this.asOf,
+    this.note,
+  });
+  final Id instrumentId;
+  final DecimalString targetQuantity; // 非负，≤8 位小数
+  final IsoDateTime? asOf;
+  final String? note;
+}
+
 enum TradeSide { buy, sell }
 
 /// 手动投资成交输入。买入 principal=成交价款，卖出 principal=毛回款；
@@ -722,6 +737,22 @@ class AccountAnomalyVm {
   final AnomalyKind kind;
   final AnomalySeverity severity;
   final String detail;
+}
+
+/// 汇率读模型（GET /v1/fx-rates；只读，用于估值状态说明，不做前端换算）。
+class FxRateVm {
+  const FxRateVm({
+    required this.baseCurrency,
+    required this.quoteCurrency,
+    required this.rate,
+    required this.asOf,
+    required this.status,
+  });
+  final CurrencyCode baseCurrency;
+  final CurrencyCode quoteCurrency;
+  final DecimalString rate;
+  final IsoDateTime asOf;
+  final QuoteStatus status;
 }
 
 class QuoteStatusSummaryVm {
@@ -956,6 +987,7 @@ class CreateSubscriptionInput {
     required this.paymentAccountId,
     required this.billingCycle,
     required this.startDate,
+    this.nextChargeDate,
     this.duration,
     this.endDate,
     this.autoRenew = true,
@@ -970,6 +1002,10 @@ class CreateSubscriptionInput {
   final Id paymentAccountId;
   final SubscriptionBillingCycleVm billingCycle;
   final IsoDate startDate;
+
+  /// 下次扣费日（与开始日期是两个概念）。null → 服务端按开始日期排期。
+  /// 本月已续费的场景由用户直接填下个月日期。
+  final IsoDate? nextChargeDate;
   final SubscriptionDurationVm? duration;
   final IsoDate? endDate;
   final bool autoRenew;
@@ -987,6 +1023,7 @@ class UpdateSubscriptionInput {
     required this.paymentAccountId,
     required this.billingCycle,
     required this.startDate,
+    required this.nextChargeDate,
     required this.duration,
     required this.endDate,
     required this.autoRenew,
@@ -1002,6 +1039,9 @@ class UpdateSubscriptionInput {
   final Id paymentAccountId;
   final SubscriptionBillingCycleVm billingCycle;
   final IsoDate startDate;
+
+  /// 下次扣费日；编辑时以服务端返回值初始化，null（如已取消）则不发送。
+  final IsoDate? nextChargeDate;
   final SubscriptionDurationVm? duration; // 与 endDate 互斥
   final IsoDate? endDate;
   final bool autoRenew;

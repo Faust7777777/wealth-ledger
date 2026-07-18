@@ -98,7 +98,7 @@ class _Body extends ConsumerWidget {
         if (sub.duration != null)
           _InfoRow('持续时长', durationLabel(sub.duration!)),
         if (sub.endDate != null) _InfoRow('结束日期', sub.endDate!),
-        _InfoRow('自动续订', sub.autoRenew ? '开（仅记录续订偏好）' : '关'),
+        _InfoRow('自动续订', sub.autoRenew ? '开' : '关'),
         _InfoRow('提前提醒', '${sub.reminderDaysBefore} 天'),
         if (sub.note != null && sub.note!.isNotEmpty) _InfoRow('备注', sub.note!),
 
@@ -106,7 +106,7 @@ class _Body extends ConsumerWidget {
         _InfoRow('下期扣费', sub.nextChargeDate ?? '未排期'),
         _InfoRow('上期扣费', sub.lastChargeDate ?? '暂无'),
         _InfoRow(
-          '待确认候选',
+          '待确认扣费',
           sub.hasPendingCharge
               ? '本期已生成（${sub.pendingChargeDate ?? '待确认'}）'
               : '无',
@@ -260,11 +260,6 @@ class _ActionsState extends ConsumerState<_Actions> {
           icon: const Icon(Icons.receipt_long_outlined),
           label: Text(sub.hasPendingCharge ? '本期已有待确认扣费' : '记录本期扣费'),
         ),
-        const SizedBox(height: AppSpacing.xs),
-        Text(
-          '只生成待确认候选，确认后才入账；不代表已向服务商实际扣款。',
-          style: Theme.of(context).textTheme.bodySmall,
-        ),
         const SizedBox(height: AppSpacing.base),
         OutlinedButton.icon(
           onPressed: _busy || !canCancel ? null : _cancel,
@@ -316,10 +311,7 @@ class _ActionsState extends ConsumerState<_Actions> {
       context: context,
       builder: (c) => AlertDialog(
         title: const Text('取消订阅'),
-        content: const Text(
-          '仅停止本应用的未来扣费排期；不会向 ChatGPT、Claude 等服务商发起真实退订，'
-          '历史记录也不受影响。确认取消？',
-        ),
+        content: const Text('历史记录不受影响。确认取消？'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(c, false),
@@ -337,9 +329,7 @@ class _ActionsState extends ConsumerState<_Actions> {
     try {
       await ref.read(subscriptionRepositoryProvider).cancelSubscription(sub.id);
       ref.refreshSubscriptions(id: sub.id);
-      messenger.showSnackBar(
-        const SnackBar(content: Text('已取消未来扣费（未向服务商发起真实退订）')),
-      );
+      messenger.showSnackBar(const SnackBar(content: Text('已取消未来扣费')));
     } on ApiConflictException {
       messenger.showSnackBar(
         SnackBar(

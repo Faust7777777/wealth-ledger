@@ -44,6 +44,13 @@ abstract interface class PortfolioRepository {
   Future<List<HoldingVm>> listHoldings();
   Future<List<HoldingVm>> listHoldingsByAccount(Id accountId);
   Future<AssetAllocationVm> getAssetAllocation();
+
+  /// 持仓导入/数量校准：只生成待确认调整（进 AI 审核），确认前不动持仓。
+  /// 同一持仓已有待确认调整时服务端返回 409。仅 local_server。
+  Future<AiAtomicGroupVm> proposeHoldingAdjustment(
+    Id accountId,
+    HoldingAdjustmentInput input,
+  );
 }
 
 abstract interface class MovementRepository {
@@ -92,6 +99,10 @@ abstract interface class DcaRepository {
 abstract interface class QuoteRepository {
   Future<QuoteStatusSummaryVm> getQuoteSummary();
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode});
+
+  /// 汇率列表（只读）：用于估值状态面板判断币种是否有到本位币的路径，
+  /// 以及区分"较旧/缓存/缺失"；前端不用它做任何换算。
+  Future<List<FxRateVm>> listFxRates();
 }
 
 abstract interface class AiProposalRepository {

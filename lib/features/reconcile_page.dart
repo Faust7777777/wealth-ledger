@@ -163,11 +163,6 @@ class _ReconcilePageState extends ConsumerState<ReconcilePage> {
                   onPressed: canSave ? () => _save(acct, cur, current) : null,
                   child: Text(_busy ? '校准中…' : '记录校准'),
                 ),
-                const SizedBox(height: AppSpacing.sm),
-                Text(
-                  '校准会对差额生成一条 adjustment 候选并入账；不改动历史流水。',
-                  style: AppType.caption,
-                ),
               ],
             );
           },
@@ -227,7 +222,7 @@ class _ReconcilePageState extends ConsumerState<ReconcilePage> {
         ref.invalidate(anomaliesProvider);
       }
       messenger.showSnackBar(
-        SnackBar(content: Text(result.ledgerWrite ? '余额已校准' : '校准已提交候选，尚未入账')),
+        SnackBar(content: Text(result.ledgerWrite ? '余额已校准' : '已加入待确认，尚未入账')),
       );
       if (mounted) router.pop();
     } catch (e) {

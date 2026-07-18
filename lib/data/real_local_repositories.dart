@@ -90,6 +90,11 @@ class RealLocalPortfolioRepository implements PortfolioRepository {
         totalLiabilities: Money(amount: '0', currency: 'CNY'),
         netWorth: Money(amount: '0', currency: 'CNY'),
       );
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingAdjustment(
+    Id accountId,
+    HoldingAdjustmentInput input,
+  ) async => throw UnsupportedError('real_local 暂不支持持仓校准；请用 local_server');
 }
 
 class RealLocalMovementRepository implements MovementRepository {
@@ -157,6 +162,8 @@ class RealLocalQuoteRepository implements QuoteRepository {
   @override
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       const QuoteStatusSummaryVm();
+  @override
+  Future<List<FxRateVm>> listFxRates() async => const [];
   @override
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>
       QuoteRefreshResultVm(

@@ -400,6 +400,11 @@ class FixturePortfolioRepository implements PortfolioRepository {
       _holdings.where((h) => h.accountId == accountId).toList();
   @override
   Future<AssetAllocationVm> getAssetAllocation() async => _allocation;
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingAdjustment(
+    Id accountId,
+    HoldingAdjustmentInput input,
+  ) async => throw UnsupportedError('DEMO 演示只读，不支持持仓校准；请用 local_server');
 }
 
 class FixtureMovementRepository implements MovementRepository {
@@ -529,6 +534,16 @@ class FixtureQuoteRepository implements QuoteRepository {
   @override
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       const QuoteStatusSummaryVm(freshCount: 8, staleCount: 2);
+  @override
+  Future<List<FxRateVm>> listFxRates() async => const [
+    FxRateVm(
+      baseCurrency: 'USD',
+      quoteCurrency: 'CNY',
+      rate: '7.16',
+      asOf: _asOf,
+      status: QuoteStatus.stale,
+    ),
+  ];
   @override
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>
       const QuoteRefreshResultVm(

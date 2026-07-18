@@ -80,6 +80,7 @@ void main() {
           amount: created.amount,
           paymentAccountId: created.paymentAccountId,
           billingCycle: created.billingCycle,
+          nextChargeDate: created.nextChargeDate,
           startDate: created.startDate,
           duration: null,
           endDate: '2026-04-30',
@@ -249,6 +250,97 @@ void main() {
       expect(afterConfirm.lastChargeDate, '2026-01-05');
       expect(afterConfirm.nextChargeDate, '2026-02-05');
       expect(afterConfirm.hasPendingCharge, isFalse);
+    },
+    skip: _baseUrl.isEmpty
+        ? 'Set LOCAL_SERVER_API_BASE through --dart-define; run tools/frontend_local_server_smoke.ps1.'
+        : false,
+  );
+
+  test(
+    'next charge date is independent from start date and advances on edit',
+    () async {
+      final client = DevApiClient(_baseUrl);
+      final account = _map(
+        await client.postData(
+          '/v1/accounts',
+          body: {
+            'displayName': 'NextCharge CNY Card',
+            'accountType': 'bank',
+            'defaultCurrency': 'CNY',
+            'supportedCurrencies': ['CNY'],
+            'includeInNetWorth': true,
+            'balanceMode': 'cash_balance',
+            'openingBalances': [
+              {'currency': 'CNY', 'amount': '100.00', 'quality': 'exact'},
+            ],
+          },
+        ),
+      );
+      final repository = LocalServerSubscriptionRepository(client);
+
+      // 本月已续费：开始日期今天、下次扣费直接填下月 17 日。
+      final created = await repository.createSubscription(
+        CreateSubscriptionInput(
+          displayName: 'NextCharge integration',
+          provider: 'OpenAI',
+          amount: const Money(amount: '20.00', currency: 'CNY'),
+          paymentAccountId: '${account['id']}',
+          billingCycle: const SubscriptionBillingCycleVm(
+            unit: BillingUnit.month,
+            interval: 1,
+          ),
+          startDate: '2026-07-18',
+          nextChargeDate: '2026-08-17',
+        ),
+      );
+      expect(created.startDate, '2026-07-18');
+      expect(created.nextChargeDate, '2026-08-17');
+
+      // 编辑：开始日期移到旧 nextChargeDate 之后、不显式改下次扣费日 →
+      // 服务端把下次扣费日顺延到新开始日期。
+      final updated = await repository.updateSubscription(
+        created.id,
+        UpdateSubscriptionInput(
+          displayName: created.displayName,
+          provider: created.provider,
+          planName: created.planName,
+          amount: created.amount,
+          paymentAccountId: created.paymentAccountId,
+          billingCycle: created.billingCycle,
+          startDate: '2026-09-01',
+          nextChargeDate: null,
+          duration: null,
+          endDate: null,
+          autoRenew: created.autoRenew,
+          reminderDaysBefore: created.reminderDaysBefore,
+          status: created.status,
+          note: null,
+        ),
+      );
+      expect(updated.startDate, '2026-09-01');
+      expect(updated.nextChargeDate, '2026-09-01');
+
+      // 显式选择晚于开始日期的下次扣费日：原值保留。
+      final explicit = await repository.updateSubscription(
+        created.id,
+        UpdateSubscriptionInput(
+          displayName: created.displayName,
+          provider: created.provider,
+          planName: created.planName,
+          amount: created.amount,
+          paymentAccountId: created.paymentAccountId,
+          billingCycle: created.billingCycle,
+          startDate: '2026-09-01',
+          nextChargeDate: '2026-10-17',
+          duration: null,
+          endDate: null,
+          autoRenew: created.autoRenew,
+          reminderDaysBefore: created.reminderDaysBefore,
+          status: created.status,
+          note: null,
+        ),
+      );
+      expect(explicit.nextChargeDate, '2026-10-17');
     },
     skip: _baseUrl.isEmpty
         ? 'Set LOCAL_SERVER_API_BASE through --dart-define; run tools/frontend_local_server_smoke.ps1.'

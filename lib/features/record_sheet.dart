@@ -27,7 +27,7 @@ Future<void> showRecordSheet(BuildContext context, LedgerCapabilitiesVm caps) {
                 style: Theme.of(sheetCtx).textTheme.titleMedium,
               ),
               subtitle: Text(
-                canRecord || canPropose ? '选择记录方式（候选 → 确认）' : kReadOnlyHint,
+                canRecord || canPropose ? '选择记录方式' : kReadOnlyHint,
               ),
             ),
             _RecordTile(

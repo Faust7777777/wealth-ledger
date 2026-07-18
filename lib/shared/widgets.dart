@@ -405,8 +405,7 @@ class SectionHeader extends StatelessWidget {
 }
 
 /// 写入口统一提示：当前数据源无对应写能力时的原因文案。
-const String kReadOnlyHint =
-    '当前数据源只读：请以 local_server 可写模式启动（tools\\run_self_use_windows.ps1）';
+const String kReadOnlyHint = '当前为只读模式，无法记录';
 
 /// 写入口 gating 包装：capability 为 false 时禁用 [child] 并在下方给出原因。
 /// UI 只凭服务端 capabilities 决定可写性，不按数据源名称猜测。
@@ -457,11 +456,7 @@ class ErrorStateView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final (icon, title, hint) = _isConnection
-        ? (
-            Icons.cloud_off_outlined,
-            '无法连接本地服务',
-            '请先启动本地服务（tools\\run_self_use_windows.ps1），或到设置检查 API 地址。',
-          )
+        ? (Icons.cloud_off_outlined, '无法连接本地服务', '请先启动本机服务，或到设置检查服务器地址。')
         : _isAuth
         ? (Icons.lock_outline, '需要登录', null)
         : (Icons.error_outline, '出错了', null);
