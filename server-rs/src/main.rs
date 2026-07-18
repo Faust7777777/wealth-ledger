@@ -11770,6 +11770,20 @@ mod tests {
         assert!(clear_body["data"].get("duration").is_none());
         assert_eq!(clear_body["data"]["endDate"], Value::Null);
 
+        let (start_shift_status, start_shift_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/subscriptions/{subscription_id}"),
+            json!({"startDate": "2026-08-17"}),
+        )
+        .await;
+        assert_eq!(start_shift_status, StatusCode::OK, "{start_shift_body}");
+        assert_eq!(start_shift_body["data"]["startDate"], "2026-08-17");
+        assert_eq!(
+            start_shift_body["data"]["nextChargeDate"], "2026-08-17",
+            "moving the start beyond an inherited next charge must not create an impossible subscription"
+        );
+
         let (conflict_status, conflict_body) = request_json_body_from(
             router,
             Method::PATCH,

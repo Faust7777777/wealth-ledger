@@ -2466,6 +2466,9 @@ components:
         startDate; only non-null endDate removes duration; two null values clear
         the finite schedule. The complete patched subscription is rejected
         unless its payment account is non-archived and supports amount.currency.
+        When startDate moves beyond an inherited nextChargeDate and the request
+        does not explicitly replace nextChargeDate, the server advances the
+        inherited date to the new startDate.
       properties:
         displayName:
           type: string

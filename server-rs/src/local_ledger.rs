@@ -8952,6 +8952,15 @@ fn apply_subscription_patch(
             normalized_subscription_date(candidate.get("startDate"), "startDate", &mut date_errors)
         {
             candidate["billingAnchorDay"] = json!(start.day());
+            if !object.contains_key("nextChargeDate")
+                && candidate
+                    .get("nextChargeDate")
+                    .and_then(Value::as_str)
+                    .and_then(|value| Date::parse(value, &Iso8601::DATE).ok())
+                    .is_some_and(|next| next < start)
+            {
+                candidate["nextChargeDate"] = json!(start.to_string());
+            }
         }
         if !date_errors.is_empty() {
             return Err(LedgerError::InvalidInput(date_errors));

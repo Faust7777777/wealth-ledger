@@ -130,6 +130,7 @@ DataSourceMode =
 - `billingCycle`：`day|week|month|year` 与正整数 `interval`。
 - `billingAnchorDay`：自然月/年计算锚点，短月只临时落到月末。
 - `startDate`、可选 `duration`/`endDate`、可空 `nextChargeDate`。
+- PATCH 将 `startDate` 向后移动且未显式提交 `nextChargeDate` 时，如果旧下次扣费日早于新开始日期，服务端同步把下次扣费日推进到新开始日期；显式提交的 `nextChargeDate` 仍按用户值校验。
 - `paymentAccountId`：必须引用现有账户。
 - `status`：`trial|active|paused|cancelled|expired`。
 - `pendingChargeMovementId` 与 `pendingChargeDate` 必须成对出现。

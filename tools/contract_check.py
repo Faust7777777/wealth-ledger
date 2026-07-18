@@ -1967,9 +1967,19 @@ def main() -> None:
         "Two non-null values conflict",
         "non-null duration computes endDate",
         "two null values clear the finite schedule",
+        "advances the inherited date to the new startDate",
     ):
         if required_phrase not in update_subscription_description:
             fail("UpdateSubscriptionRequest must document nullable schedule replacement semantics")
+    local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    for snippet in [
+        '!object.contains_key("nextChargeDate")',
+        'candidate["nextChargeDate"] = json!(start.to_string())',
+    ]:
+        if snippet not in local_text:
+            fail(f"Subscription start-date shift behavior is incomplete: {snippet}")
+    if "moving the start beyond an inherited next charge" not in RUST_SERVER.read_text(encoding="utf-8"):
+        fail("Rust tests must cover inherited nextChargeDate advancement")
     categories_post_schema = doc["paths"]["/categories"]["post"]["requestBody"]["content"]["application/json"]["schema"].get("$ref")
     if categories_post_schema != "#/components/schemas/CreateCategoryInput":
         fail("POST /categories must use CreateCategoryInput, not the response Category schema")

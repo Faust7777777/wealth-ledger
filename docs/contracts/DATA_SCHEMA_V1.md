@@ -542,6 +542,7 @@ SubscriptionDueScanResult {
 - `paymentAccountId` 必须引用未归档账户，且该账户必须显式支持 `amount.currency`；创建和 PATCH 以修改后的完整对象校验，失败时原对象保持不变。
 - 账户后续被归档或移除支持币种属于付款能力漂移，不会反向改写既有 subscription。生成候选时必须重新校验；单条生成返回错误，批量扫描分别报告 `payment_account_unavailable` 或 `payment_currency_unsupported`。
 - `duration` 与 `endDate` 二选一；固定终止日期优先于 `autoRenew`，到期后必须显式延长。
+- `startDate` 是订阅计划开始日期，`nextChargeDate` 是下一次实际扣费日期，两者不得在 UI 中混为一个字段。PATCH 仅修改 `startDate` 且旧 `nextChargeDate` 已早于新开始日期时，服务端将后者安全推进到新开始日期。
 - 月度和年度周期以 `billingAnchorDay` 为锚点；短月份可落在月末，后续月份恢复原锚点。
 - 到期提醒只生成 `pending_review` 支出候选；确认前不影响账户余额。
 - 同一订阅、同一计费日期最多存在一个待确认扣费候选。
