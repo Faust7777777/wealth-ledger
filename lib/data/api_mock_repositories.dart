@@ -1340,12 +1340,25 @@ class LocalServerDcaRepository implements DcaRepository {
   }
 }
 
+FxRateVm _fxRate(Map<String, dynamic> j) => FxRateVm(
+  baseCurrency: '${j['baseCurrency']}',
+  quoteCurrency: '${j['quoteCurrency']}',
+  rate: '${j['rate']}',
+  asOf: '${j['asOf']}',
+  status: _quote(j['status']),
+);
+
 class LocalServerQuoteRepository implements QuoteRepository {
   LocalServerQuoteRepository(this._c);
   final DevApiClient _c;
   @override
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       _quoteSummary(_m(await _c.getData('/v1/quotes/summary')));
+
+  @override
+  Future<List<FxRateVm>> listFxRates() async => [
+    for (final r in _list(await _c.getData('/v1/fx-rates'))) _fxRate(_m(r)),
+  ];
 
   @override
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>

@@ -92,6 +92,10 @@ abstract interface class DcaRepository {
 abstract interface class QuoteRepository {
   Future<QuoteStatusSummaryVm> getQuoteSummary();
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode});
+
+  /// 汇率列表（只读）：用于估值状态面板判断币种是否有到本位币的路径，
+  /// 以及区分"较旧/缓存/缺失"；前端不用它做任何换算。
+  Future<List<FxRateVm>> listFxRates();
 }
 
 abstract interface class AiProposalRepository {

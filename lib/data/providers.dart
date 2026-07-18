@@ -306,6 +306,9 @@ final recentMovementsProvider = FutureProvider<List<MovementVm>>(
 final instrumentsProvider = FutureProvider<List<InstrumentVm>>(
   (ref) => ref.watch(instrumentRepositoryProvider).listInstruments(),
 );
+final fxRatesProvider = FutureProvider<List<FxRateVm>>(
+  (ref) => ref.watch(quoteRepositoryProvider).listFxRates(),
+);
 final snapshotsProvider = FutureProvider<List<NetWorthSnapshotVm>>(
   (ref) => ref.watch(snapshotRepositoryProvider).listSnapshots(),
 );

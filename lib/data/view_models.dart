@@ -724,6 +724,22 @@ class AccountAnomalyVm {
   final String detail;
 }
 
+/// 汇率读模型（GET /v1/fx-rates；只读，用于估值状态说明，不做前端换算）。
+class FxRateVm {
+  const FxRateVm({
+    required this.baseCurrency,
+    required this.quoteCurrency,
+    required this.rate,
+    required this.asOf,
+    required this.status,
+  });
+  final CurrencyCode baseCurrency;
+  final CurrencyCode quoteCurrency;
+  final DecimalString rate;
+  final IsoDateTime asOf;
+  final QuoteStatus status;
+}
+
 class QuoteStatusSummaryVm {
   const QuoteStatusSummaryVm({
     this.freshCount = 0,
