@@ -853,6 +853,8 @@ class AiAtomicGroupVm {
     required this.status,
     this.diffs = const [],
     this.warnings = const [],
+    this.proposedMovement,
+    this.isValid = true,
   });
   final Id id;
   final String title;
@@ -860,6 +862,15 @@ class AiAtomicGroupVm {
   final AiGroupStatus status;
   final List<AiFieldDiffVm> diffs;
   final List<String> warnings;
+
+  /// 结构化候选记录（proposedMovements[0]）；待补全候选为 null。
+  final MovementVm? proposedMovement;
+
+  /// 服务端 validation.isValid（缺失按 true 兼容旧候选）。
+  final bool isValid;
+
+  /// 待补全：无结构化记录或校验未过，只能编辑/拒绝，不能直接确认。
+  bool get needsCompletion => proposedMovement == null || !isValid;
 }
 
 class AiProposalVm {
@@ -869,12 +880,16 @@ class AiProposalVm {
     required this.sourceLabel,
     required this.groups,
     this.summary,
+    this.modelName,
   });
   final Id id;
   final AiProposalStatus status;
   final String sourceLabel; // 证据来源摘要（可见）
   final List<AiAtomicGroupVm> groups;
   final String? summary;
+
+  /// source.modelName：仅供诊断，不在候选主卡片展示。
+  final String? modelName;
 }
 
 class AccountAnomalyVm {

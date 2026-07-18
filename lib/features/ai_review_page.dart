@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../core/format.dart';
 import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../shared/widgets.dart';
@@ -134,6 +135,13 @@ class _GroupBlock extends ConsumerWidget {
               Expanded(child: Text(g.title, style: AppType.bodyStrong)),
             ],
           ),
+          if (g.proposedMovement != null) ...[
+            const SizedBox(height: AppSpacing.xs),
+            _MovementSummary(m: g.proposedMovement!),
+          ] else if (g.needsCompletion) ...[
+            const SizedBox(height: AppSpacing.xs),
+            _PendingCompletionPill(dark: dark),
+          ],
           if (g.diffs.isNotEmpty) ...[
             const SizedBox(height: AppSpacing.xs),
             for (final d in g.diffs) _DiffRow(d: d),
@@ -155,21 +163,24 @@ class _GroupBlock extends ConsumerWidget {
                 onPressed: () => context.push('/ai-edit/${g.id}'),
                 child: const Text('编辑'),
               ),
-              const SizedBox(width: AppSpacing.sm),
-              FilledButton(
-                // 确认能力由服务端 capabilities 决定；不可确认时禁用。
-                onPressed: ref.writeCapabilities.canConfirmProposal
-                    ? () => _run(
-                        context,
-                        ref,
-                        () => ref
-                            .read(aiProposalRepositoryProvider)
-                            .approveAtomicGroup(g.id),
-                        '已接受该组',
-                      )
-                    : null,
-                child: const Text('接受整组'),
-              ),
+              // 待补全候选没有可确认的结构化记录：不提供「接受整组」。
+              if (!g.needsCompletion) ...[
+                const SizedBox(width: AppSpacing.sm),
+                FilledButton(
+                  // 确认能力由服务端 capabilities 决定；不可确认时禁用。
+                  onPressed: ref.writeCapabilities.canConfirmProposal
+                      ? () => _run(
+                          context,
+                          ref,
+                          () => ref
+                              .read(aiProposalRepositoryProvider)
+                              .approveAtomicGroup(g.id),
+                          '已接受该组',
+                        )
+                      : null,
+                  child: const Text('接受整组'),
+                ),
+              ],
             ],
           ),
         ],
@@ -192,15 +203,16 @@ class _GroupBlock extends ConsumerWidget {
       ref.invalidate(upcomingSubscriptionsProvider);
       // 也可能是贷款利息候选：确认/拒绝都会改变 pending 指针与应计口径。
       ref.invalidate(liabilityPositionsProvider);
+      // 首页 pending count、近期流水与涉及账户在确认/拒绝后都重取。
+      ref.invalidate(overviewProvider);
+      ref.invalidate(recentMovementsProvider);
+      ref.invalidate(accountsProvider);
       final shouldRefreshLedgerViews =
           result?.ledgerWrite == true || result?.snapshotInvalidated == true;
       if (shouldRefreshLedgerViews) {
         // 只消费服务端确认结果：ledgerWrite/snapshotInvalidated 为真才刷新账本派生视图。
-        ref.invalidate(overviewProvider);
-        ref.invalidate(accountsProvider);
         ref.invalidate(liabilitiesProvider);
         ref.invalidate(holdingsProvider);
-        ref.invalidate(recentMovementsProvider);
         ref.invalidate(allocationProvider);
         ref.invalidate(snapshotsProvider);
         ref.invalidate(anomaliesProvider);
@@ -214,6 +226,71 @@ class _GroupBlock extends ConsumerWidget {
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
     }
+  }
+}
+
+/// 结构化候选摘要：账户 / 金额（原币）/ 时间。账户名从账户列表解析。
+class _MovementSummary extends ConsumerWidget {
+  const _MovementSummary({required this.m});
+  final MovementVm m;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final accounts =
+        ref.watch(accountsProvider).asData?.value ?? const <AccountVm>[];
+    final nameById = {for (final a in accounts) a.id: a.displayName};
+    final accountId = m.entries.isEmpty ? null : m.entries.first.accountId;
+    final amount = m.displayAmount;
+    Widget kv(String k, String v) => Padding(
+      padding: const EdgeInsets.symmetric(vertical: AppSpacing.xxs),
+      child: Row(
+        children: [
+          SizedBox(width: 64, child: Text(k, style: AppType.caption)),
+          Expanded(child: Text(v, style: AppType.body)),
+        ],
+      ),
+    );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        kv('标题', m.title),
+        if (accountId != null) kv('账户', nameById[accountId] ?? accountId),
+        if (amount != null) kv('金额', formatMoney(amount, withCode: true)),
+        // 本地日期 + 时分即可，不显秒与时区偏移。
+        kv(
+          '时间',
+          m.occurredAt.replaceFirst('T', ' ').padRight(16).substring(0, 16),
+        ),
+      ],
+    );
+  }
+}
+
+/// 待补全标记：信息不足以生成可确认的记录，提供编辑入口补全。
+class _PendingCompletionPill extends StatelessWidget {
+  const _PendingCompletionPill({required this.dark});
+  final bool dark;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = dark ? AppColors.warningText : AppColorsLight.warning;
+    return Container(
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppSpacing.sm,
+        vertical: 2,
+      ),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: dark ? 0.16 : 0.12),
+        borderRadius: BorderRadius.circular(AppRadius.sm),
+      ),
+      child: Text(
+        '待补全',
+        style: AppType.micro.copyWith(
+          color: color,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
   }
 }
 
