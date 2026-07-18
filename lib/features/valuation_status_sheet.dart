@@ -196,11 +196,6 @@ class _ValuationStatusDialogState extends ConsumerState<ValuationStatusDialog> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: AppSpacing.base),
-            child: Text('缺少有效报价或汇率时，我们会保留原始数量，不会猜测价格。', style: AppType.caption),
-          ),
-          const SizedBox(height: AppSpacing.sm),
           if (issues.isEmpty)
             const Padding(
               padding: EdgeInsets.all(AppSpacing.base),

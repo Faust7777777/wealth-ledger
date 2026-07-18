@@ -271,11 +271,6 @@ class _SubscriptionFormPageState extends ConsumerState<SubscriptionFormPage> {
                 Expanded(child: _intField(_billingInterval, '每几个')),
               ],
             ),
-            const SizedBox(height: AppSpacing.xs),
-            Text(
-              '月/年周期按自然月锚点：1 月 31 日 → 2 月末 → 3 月 31 日。',
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
             const SizedBox(height: AppSpacing.base),
             _termSection(),
             const SizedBox(height: AppSpacing.base),
