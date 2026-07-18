@@ -165,6 +165,7 @@ GET    /v1/accounts/anomalies
 
 ```http
 GET /v1/portfolio/overview
+GET /v1/portfolio/valuation-issues
 GET /v1/portfolio/holdings
 GET /v1/holdings
 GET /v1/accounts/{accountId}/holdings
@@ -180,6 +181,7 @@ GET /v1/portfolio/allocation
 - 持仓调整输入目标 quantity，不由客户端计算最终余额。服务端在同一账本锁内读取旧 quantity、生成 pending adjustment，并在确认时做 optimistic check；确认前持仓不变。
 - 该入口用于导入或校准交易所/券商当前持仓，不伪造现金买入。成本未知时不生成成本基础；原始 quantity 始终保留，缺报价时不得按 0 估值。
 - 持仓估值允许使用最多三跳的 FX 路径，例如 `BTC quantity × BTC/USDT quote × USDT/USD × USD/CNY`；每一段必须来自已保存的有效 Quote/FXRate，结果质量取整条路径中最差状态。
+- `valuation-issues` 是估值问题的权威逐资产读模型，返回账户、资产、原始数量、状态和结构化 reason；不返回面向用户的解释文案。它与 overview 的 `quoteProblemCount` 使用相同估值路径，前端不得再用直连汇率自行推断多跳路径是否缺失。
 
 ## 6. Movements
 

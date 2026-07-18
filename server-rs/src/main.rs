@@ -1183,6 +1183,7 @@ fn app_with_state(state: AppState) -> Router {
             post(create_holding_adjustment_proposal),
         )
         .route("/v1/portfolio/overview", get(portfolio_overview))
+        .route("/v1/portfolio/valuation-issues", get(valuation_issues))
         .route("/v1/portfolio/holdings", get(holdings))
         .route("/v1/holdings", get(holdings))
         .route("/v1/portfolio/allocation", get(asset_allocation))
@@ -1707,6 +1708,24 @@ async fn account_anomalies(
             .account_anomalies(DevScenario::from_query(&query)),
     )
     .into_response()
+}
+
+async fn valuation_issues(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_valuation_issues(path, &current_timestamp()) {
+            Ok(issues) => envelope(issues).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(json!([])).into_response()
 }
 
 async fn holdings(
@@ -9636,6 +9655,18 @@ mod tests {
         .await;
         assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
 
+        let (missing_quote_status, missing_quote_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/portfolio/valuation-issues",
+        )
+        .await;
+        assert_eq!(missing_quote_status, StatusCode::OK, "{missing_quote_body}");
+        assert_eq!(missing_quote_body["data"][0]["accountName"], "OKX");
+        assert_eq!(missing_quote_body["data"][0]["assetLabel"], "BTC");
+        assert_eq!(missing_quote_body["data"][0]["quantity"], "0.05");
+        assert_eq!(missing_quote_body["data"][0]["reason"], "missing_quote");
+
         let (refresh_status, refresh_body) = request_json_body_from(
             router.clone(),
             Method::POST,
@@ -9649,7 +9680,30 @@ mod tests {
                     "asOf": "2026-07-18T03:30:00Z",
                     "expiresAt": "2099-01-01T00:00:00Z",
                     "source": "test"
-                }],
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::OK, "{refresh_body}");
+        assert_eq!(refresh_body["data"]["status"], "success");
+
+        let (missing_fx_status, missing_fx_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/portfolio/valuation-issues",
+        )
+        .await;
+        assert_eq!(missing_fx_status, StatusCode::OK, "{missing_fx_body}");
+        assert_eq!(missing_fx_body["data"][0]["reason"], "missing_fx_path");
+        assert_eq!(missing_fx_body["data"][0]["sourceCurrency"], "USDT");
+        assert_eq!(missing_fx_body["data"][0]["targetCurrency"], "CNY");
+
+        let (fx_refresh_status, fx_refresh_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
                 "fxRates": [
                     {
                         "baseCurrency": "USDT",
@@ -9671,8 +9725,17 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(refresh_status, StatusCode::OK, "{refresh_body}");
-        assert_eq!(refresh_body["data"]["status"], "success");
+        assert_eq!(fx_refresh_status, StatusCode::OK, "{fx_refresh_body}");
+        assert_eq!(fx_refresh_body["data"]["status"], "success");
+
+        let (valued_issues_status, valued_issues_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/portfolio/valuation-issues",
+        )
+        .await;
+        assert_eq!(valued_issues_status, StatusCode::OK, "{valued_issues_body}");
+        assert_eq!(valued_issues_body["data"], json!([]));
 
         let (holdings_status, holdings_body) =
             request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
@@ -9734,7 +9797,7 @@ mod tests {
         assert_eq!(refresh_status, StatusCode::OK, "{refresh_body}");
 
         let (overview_status, overview_body) =
-            request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
         assert_eq!(overview_status, StatusCode::OK, "{overview_body}");
         assert_eq!(
             overview_body["data"]["latestSnapshot"]["quoteStatusSummary"]["staleCount"],
@@ -9744,6 +9807,16 @@ mod tests {
             overview_body["data"]["pendingSummary"]["quoteProblemCount"], 1,
             "a stale valuation still needs the compact quote-status entry"
         );
+
+        let (issues_status, issues_body) =
+            request_json_from(router, Method::GET, "/v1/portfolio/valuation-issues").await;
+        assert_eq!(issues_status, StatusCode::OK, "{issues_body}");
+        assert_eq!(issues_body["data"].as_array().expect("issues").len(), 1);
+        assert_eq!(issues_body["data"][0]["assetKind"], "cash");
+        assert_eq!(issues_body["data"][0]["assetLabel"], "USD");
+        assert_eq!(issues_body["data"][0]["quantity"], "10.00");
+        assert_eq!(issues_body["data"][0]["status"], "stale");
+        assert_eq!(issues_body["data"][0]["reason"], "stale_fx");
 
         let _ = std::fs::remove_file(path);
     }

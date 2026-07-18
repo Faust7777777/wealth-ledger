@@ -794,6 +794,27 @@ def check_multi_hop_valuation() -> None:
     ok("Multi-hop holding valuation and FX target inference passed")
 
 
+def check_valuation_issue_projection(doc: dict) -> None:
+    operation = doc["paths"]["/portfolio/valuation-issues"]["get"]
+    schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    if schema.get("$ref") != "#/components/schemas/ValuationIssueListResponse":
+        fail("Valuation issues must use ValuationIssueListResponse")
+    local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    for snippet in [
+        "pub fn list_valuation_issues(",
+        "fn valuation_issues_for_document(",
+        '"missing_fx_path"',
+        '"missing_quote"',
+    ]:
+        if snippet not in local_text:
+            fail(f"Valuation issue projection is incomplete: {snippet}")
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    if '"/v1/portfolio/valuation-issues"' not in rust_text:
+        fail("Valuation issue HTTP route is missing")
+
+    ok("Structured valuation issue projection passed")
+
+
 def check_investment_fee_semantics(doc: dict) -> None:
     local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
     for snippet in [
@@ -2095,6 +2116,7 @@ def main() -> None:
     check_quote_problem_summary(doc)
     check_holding_adjustment_proposal(doc)
     check_multi_hop_valuation()
+    check_valuation_issue_projection(doc)
     check_investment_fee_semantics(doc)
     check_investment_sale_result(doc)
     check_subscription_due_scan(doc)

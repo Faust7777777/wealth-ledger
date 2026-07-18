@@ -681,6 +681,11 @@ pub fn list_account_anomalies(path: &Path, now: &str) -> io::Result<Value> {
     Ok(json!(account_anomalies_for_document(&document, now)?))
 }
 
+pub fn list_valuation_issues(path: &Path, now: &str) -> io::Result<Value> {
+    let document = read_document(path)?;
+    Ok(json!(valuation_issues_for_document(&document, now)?))
+}
+
 pub fn list_quotes(path: &Path, now: &str) -> io::Result<Value> {
     let document = read_document(path)?;
     Ok(json!(project_quote_items(
@@ -6271,6 +6276,197 @@ fn account_anomalies_for_document(document: &Value, now: &str) -> io::Result<Vec
     }
 
     Ok(anomalies)
+}
+
+fn valuation_issues_for_document(document: &Value, now: &str) -> io::Result<Vec<Value>> {
+    let base_currency = document
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_BASE_CURRENCY);
+    let accounts = document["accounts"]
+        .as_array()
+        .expect("validated local ledger accounts should be an array");
+    let holdings = document["holdings"]
+        .as_array()
+        .expect("validated local ledger holdings should be an array");
+    let instruments = document["instruments"]
+        .as_array()
+        .expect("validated local ledger instruments should be an array");
+    let mut issues = Vec::new();
+
+    for account in accounts {
+        if account.get("status").and_then(Value::as_str) == Some("archived")
+            || !account
+                .get("includeInNetWorth")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        let account_id = account
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("validated account id should be a string");
+        let account_name = account
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or(account_id);
+
+        for balance in account
+            .get("cashBalances")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let currency = balance
+                .get("currency")
+                .and_then(Value::as_str)
+                .expect("validated cash balance currency should be a string");
+            let quantity = balance
+                .get("amount")
+                .and_then(Value::as_str)
+                .expect("validated cash balance amount should be a string");
+            if currency == base_currency || parse_decimal(quantity)? == DecimalAmount::ZERO {
+                continue;
+            }
+            let issue = match fx_rate_between(document, currency, base_currency, now) {
+                None => Some(("unpriceable", "missing_fx_path")),
+                Some((_, "stale")) => Some(("stale", "stale_fx")),
+                Some((_, "offline_cached")) => Some(("offline_cached", "offline_cached_fx")),
+                Some((_, _)) => None,
+            };
+            if let Some((status, reason)) = issue {
+                issues.push(json!({
+                    "id": format!("valuation_cash_{account_id}_{currency}"),
+                    "accountId": account_id,
+                    "accountName": account_name,
+                    "assetKind": "cash",
+                    "assetId": currency,
+                    "assetLabel": currency,
+                    "quantity": quantity,
+                    "quantityUnit": currency,
+                    "status": status,
+                    "reason": reason,
+                    "sourceCurrency": currency,
+                    "targetCurrency": base_currency
+                }));
+            }
+        }
+
+        for holding in holdings
+            .iter()
+            .filter(|holding| holding.get("accountId").and_then(Value::as_str) == Some(account_id))
+        {
+            let quantity = holding
+                .get("quantity")
+                .and_then(Value::as_str)
+                .expect("validated holding quantity should be a string");
+            if parse_decimal(quantity)? <= DecimalAmount::ZERO {
+                continue;
+            }
+            let instrument_id = holding
+                .get("instrumentId")
+                .and_then(Value::as_str)
+                .expect("validated holding instrumentId should be a string");
+            let instrument = instruments
+                .iter()
+                .find(|instrument| {
+                    instrument.get("id").and_then(Value::as_str) == Some(instrument_id)
+                })
+                .expect("validated holding should reference an instrument");
+            let provider_symbol = instrument
+                .get("symbol")
+                .and_then(Value::as_str)
+                .filter(|symbol| !symbol.trim().is_empty())
+                .or_else(|| instrument.get("displayName").and_then(Value::as_str))
+                .unwrap_or(instrument_id);
+            let quote_currency = instrument
+                .get("quoteCurrency")
+                .and_then(Value::as_str)
+                .expect("validated instrument quoteCurrency should be a string");
+            let asset_label = concise_asset_label(provider_symbol, quote_currency);
+
+            let quote = latest_quote_for_instrument(document, instrument_id);
+            let (status, reason, as_of) = match quote {
+                None => ("unpriceable", "missing_quote", None),
+                Some(quote) => {
+                    let quote_status = effective_quote_status(quote, now);
+                    let quote_as_of = quote.get("asOf").and_then(Value::as_str);
+                    match quote_status {
+                        "error" => ("error", "quote_error", quote_as_of),
+                        "incomplete" | "unpriceable" => {
+                            ("unpriceable", "missing_quote", quote_as_of)
+                        }
+                        _ => {
+                            let fx_status = if quote_currency == base_currency {
+                                Some("fresh")
+                            } else {
+                                fx_rate_between(document, quote_currency, base_currency, now)
+                                    .map(|(_, status)| status)
+                            };
+                            match fx_status {
+                                None => ("unpriceable", "missing_fx_path", quote_as_of),
+                                Some(fx_status) => {
+                                    let combined = combine_quote_status(quote_status, fx_status);
+                                    match combined {
+                                        "stale" if quote_status == "stale" => {
+                                            ("stale", "stale_quote", quote_as_of)
+                                        }
+                                        "stale" => ("stale", "stale_fx", quote_as_of),
+                                        "offline_cached" if quote_status == "offline_cached" => {
+                                            ("offline_cached", "offline_cached_quote", quote_as_of)
+                                        }
+                                        "offline_cached" => {
+                                            ("offline_cached", "offline_cached_fx", quote_as_of)
+                                        }
+                                        _ => continue,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            let mut issue = json!({
+                "id": format!("valuation_holding_{account_id}_{instrument_id}"),
+                "accountId": account_id,
+                "accountName": account_name,
+                "assetKind": "holding",
+                "assetId": instrument_id,
+                "assetLabel": asset_label,
+                "quantity": quantity,
+                "quantityUnit": asset_label,
+                "status": status,
+                "reason": reason,
+                "sourceCurrency": quote_currency,
+                "targetCurrency": base_currency
+            });
+            if let Some(as_of) = as_of {
+                issue["asOf"] = json!(as_of);
+            }
+            issues.push(issue);
+        }
+    }
+
+    issues.sort_by(|left, right| {
+        left.get("accountName")
+            .and_then(Value::as_str)
+            .cmp(&right.get("accountName").and_then(Value::as_str))
+            .then_with(|| {
+                left.get("assetLabel")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("assetLabel").and_then(Value::as_str))
+            })
+    });
+    Ok(issues)
+}
+
+fn concise_asset_label<'a>(symbol: &'a str, quote_currency: &str) -> &'a str {
+    symbol
+        .strip_suffix(quote_currency)
+        .and_then(|prefix| prefix.strip_suffix(['-', '/', '_']))
+        .filter(|prefix| !prefix.is_empty())
+        .unwrap_or(symbol)
 }
 
 fn sync_changes_for_document(document: &Value, since: Option<&str>) -> Result<Value, LedgerError> {

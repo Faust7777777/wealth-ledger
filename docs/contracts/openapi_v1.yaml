@@ -274,6 +274,18 @@ paths:
               schema:
                 $ref: "#/components/schemas/PortfolioOverviewResponse"
 
+  /portfolio/valuation-issues:
+    get:
+      tags: [Portfolio]
+      summary: List assets whose value is stale, cached, failed, or unavailable.
+      responses:
+        "200":
+          description: Structured valuation issues.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValuationIssueListResponse"
+
   /portfolio/holdings:
     get:
       tags: [Portfolio]
@@ -3183,6 +3195,66 @@ components:
           const: true
         data:
           $ref: "#/components/schemas/PortfolioOverview"
+    ValuationIssue:
+      type: object
+      required:
+        - id
+        - accountId
+        - accountName
+        - assetKind
+        - assetId
+        - assetLabel
+        - quantity
+        - quantityUnit
+        - status
+        - reason
+        - sourceCurrency
+        - targetCurrency
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        accountId:
+          $ref: "#/components/schemas/ID"
+        accountName:
+          type: string
+        assetKind:
+          enum: [cash, holding]
+        assetId:
+          type: string
+        assetLabel:
+          type: string
+        quantity:
+          $ref: "#/components/schemas/DecimalString"
+        quantityUnit:
+          type: string
+        status:
+          enum: [stale, offline_cached, unpriceable, error]
+        reason:
+          enum:
+            - missing_quote
+            - missing_fx_path
+            - stale_quote
+            - stale_fx
+            - offline_cached_quote
+            - offline_cached_fx
+            - quote_error
+            - fx_error
+        sourceCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        targetCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+    ValuationIssueListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ValuationIssue"
     AssetAllocationResponse:
       type: object
       required: [ok, data]

@@ -167,6 +167,8 @@ QuoteStatusSummary {
 - unpriceable：对应资产显示 `—`，待处理区显示无法估值。
 - offline_cached：顶栏或状态区显示离线缓存。
 
+估值问题详情由 `GET /v1/portfolio/valuation-issues` 返回。每个问题对应一个纳入净资产的非零现金余额或正数量持仓，保留原始 quantity，并用 `reason` 区分缺报价、缺 FX 路径、报价/汇率过期、离线缓存和 provider 错误。客户端只负责把 reason 映射成界面语言，不自行重建换算图。
+
 首页涨跌：
 
 - 默认显示“较上次快照”。
