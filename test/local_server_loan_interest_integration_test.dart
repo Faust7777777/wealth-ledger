@@ -97,10 +97,7 @@ void main() {
       Future<(int, Map<String, dynamic>)> rawPropose(String key) async {
         final res = await http.post(
           Uri.parse('$_baseUrl/v1/accounts/${loan.id}/loan-interest-proposals'),
-          headers: {
-            'content-type': 'application/json',
-            'idempotency-key': key,
-          },
+          headers: {'content-type': 'application/json', 'idempotency-key': key},
           body: jsonEncode({'throughDate': '2026-01-31'}),
         );
         return (

@@ -334,17 +334,15 @@ void main() {
         'note': '一月利息',
       });
       await expectLater(
-        _loanRepo(failStatus: 409).repo.proposeLoanInterest(
-          'a_loan',
-          throughDate: '2026-01-31',
-        ),
+        _loanRepo(
+          failStatus: 409,
+        ).repo.proposeLoanInterest('a_loan', throughDate: '2026-01-31'),
         throwsA(isA<ApiConflictException>()),
       );
       await expectLater(
-        _loanRepo(failStatus: 400).repo.proposeLoanInterest(
-          'a_loan',
-          throughDate: '2026-01-31',
-        ),
+        _loanRepo(
+          failStatus: 400,
+        ).repo.proposeLoanInterest('a_loan', throughDate: '2026-01-31'),
         throwsA(isA<ApiValidationException>()),
       );
     });
@@ -356,8 +354,10 @@ void main() {
       expect(p.accrualDays, 30);
       expect(p.nextPayment.projectedInterest.amount, '12.40');
       expect(p.nextPayment.projectedPrincipal.amount, '87.60');
-      expect(p.nextPayment.projectedInterest.amount,
-          isNot(p.accruedInterest.amount));
+      expect(
+        p.nextPayment.projectedInterest.amount,
+        isNot(p.accruedInterest.amount),
+      );
       expect(p.terms.rateType, LiabilityRateType.fixed);
       expect(p.terms.hasPendingInterest, isFalse);
       expect(
@@ -512,9 +512,7 @@ void main() {
       expect(find.text('已加入待确认'), findsNothing);
     });
 
-    testWidgets('还款计划：展开加载、balloon 显示「到期还款」、加载更多翻倍 limit', (
-      tester,
-    ) async {
+    testWidgets('还款计划：展开加载、balloon 显示「到期还款」、加载更多翻倍 limit', (tester) async {
       final schedule = parseRepaymentScheduleData(_scheduleJson());
       final more = parseRepaymentScheduleData(_scheduleJson(hasMore: false));
       final repo = _FakeLoanRepo(
