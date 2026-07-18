@@ -1035,6 +1035,193 @@ pub fn list_holdings_by_account(path: &Path, account_id: &str) -> io::Result<Val
     ))
 }
 
+pub fn create_holding_adjustment_proposal(
+    path: &Path,
+    account_id: &str,
+    input: &Value,
+    movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let Some(object) = input.as_object() else {
+            return Err(LedgerError::InvalidInput(vec![
+                "holding adjustment input must be a JSON object".to_string(),
+            ]));
+        };
+        let mut errors = Vec::new();
+        for key in object.keys() {
+            if !matches!(
+                key.as_str(),
+                "instrumentId" | "targetQuantity" | "asOf" | "note"
+            ) {
+                errors.push(format!("unsupported holding adjustment field: {key}"));
+            }
+        }
+        let instrument_id = required_string(object, "instrumentId", &mut errors);
+        let target_quantity = required_string(object, "targetQuantity", &mut errors);
+        let target = target_quantity
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok());
+        if target.is_none_or(|value| value < DecimalAmount::ZERO) {
+            errors.push("targetQuantity must be a non-negative decimal string".to_string());
+        }
+        let as_of = match object.get("asOf") {
+            None | Some(Value::Null) => Some(now.to_string()),
+            Some(Value::String(value)) if parse_rfc3339(value).is_some() => Some(value.to_string()),
+            _ => {
+                errors.push("asOf must be an RFC3339 timestamp".to_string());
+                None
+            }
+        };
+        let note = optional_string(object, "note", &mut errors);
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
+
+        let account = active_account(document, account_id).ok_or_else(|| {
+            LedgerError::NotFound(format!(
+                "holding account does not exist or is archived: {account_id}"
+            ))
+        })?;
+        if !matches!(
+            account.get("balanceMode").and_then(Value::as_str),
+            Some("holdings" | "mixed")
+        ) {
+            return Err(LedgerError::InvalidInput(vec![
+                "holding adjustment requires a holdings or mixed account".to_string(),
+            ]));
+        }
+        let instrument_id = instrument_id.expect("validated instrumentId");
+        let instrument = document["instruments"]
+            .as_array()
+            .expect("validated local ledger instruments should be an array")
+            .iter()
+            .find(|instrument| instrument.get("id").and_then(Value::as_str) == Some(&instrument_id))
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("instrument does not exist: {instrument_id}"))
+            })?;
+        let quote_currency = instrument
+            .get("quoteCurrency")
+            .and_then(Value::as_str)
+            .expect("validated instrument quoteCurrency")
+            .to_string();
+        if !account
+            .get("supportedCurrencies")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.as_str() == Some(quote_currency.as_str()))
+            })
+        {
+            return Err(LedgerError::InvalidInput(vec![format!(
+                "holding account does not support instrument quote currency: {quote_currency}"
+            )]));
+        }
+        if document["movements"]
+            .as_array()
+            .expect("validated local ledger movements should be an array")
+            .iter()
+            .any(|movement| {
+                movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                    && movement
+                        .get("holdingAdjustment")
+                        .and_then(|value| value.get("accountId"))
+                        .and_then(Value::as_str)
+                        == Some(account_id)
+                    && movement
+                        .get("holdingAdjustment")
+                        .and_then(|value| value.get("instrumentId"))
+                        .and_then(Value::as_str)
+                        == Some(instrument_id.as_str())
+            })
+        {
+            return Err(LedgerError::Conflict(
+                "holding already has a pending adjustment".to_string(),
+            ));
+        }
+
+        let previous = document["holdings"]
+            .as_array()
+            .expect("validated local ledger holdings should be an array")
+            .iter()
+            .find(|holding| {
+                holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                    && holding.get("instrumentId").and_then(Value::as_str)
+                        == Some(instrument_id.as_str())
+            })
+            .and_then(|holding| holding.get("quantity"))
+            .and_then(Value::as_str)
+            .and_then(|value| parse_decimal(value).ok())
+            .unwrap_or(DecimalAmount::ZERO);
+        let target = target.expect("validated targetQuantity");
+        if target == previous {
+            return Err(LedgerError::Conflict(
+                "holding already has the requested quantity".to_string(),
+            ));
+        }
+        let delta = target - previous;
+        let direction = if delta > DecimalAmount::ZERO {
+            "in"
+        } else {
+            "out"
+        };
+        let as_of = as_of.expect("validated asOf");
+        let display_name = instrument
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or(instrument_id.as_str());
+        let mut movement = json!({
+            "id": movement_id,
+            "atomicGroupId": atomic_group_id,
+            "type": "adjustment",
+            "occurredAt": as_of,
+            "recordedAt": now,
+            "status": "pending_review",
+            "title": format!("调整{display_name}持仓"),
+            "entries": [{
+                "id": format!("entry_{movement_id}_holding_adjustment"),
+                "accountId": account_id,
+                "instrumentId": instrument_id,
+                "amount": delta.abs().decimal_string(),
+                "currency": quote_currency,
+                "direction": direction,
+                "role": "adjustment"
+            }],
+            "holdingAdjustment": {
+                "accountId": account_id,
+                "instrumentId": instrument_id,
+                "previousQuantity": previous.decimal_string(),
+                "targetQuantity": target.decimal_string()
+            },
+            "tags": ["holding_adjustment"],
+            "source": {"kind": "manual", "createdBy": "user"},
+            "createdAt": now,
+            "updatedAt": now
+        });
+        if let Some(note) = note {
+            movement["description"] = json!(note);
+        }
+
+        document["movements"]
+            .as_array_mut()
+            .expect("validated local ledger movements should be an array")
+            .push(movement.clone());
+        let mut indexed_entry = movement["entries"][0].clone();
+        indexed_entry["movementId"] = json!(movement_id);
+        indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+        document["movementEntries"]
+            .as_array_mut()
+            .expect("validated local ledger movementEntries should be an array")
+            .push(indexed_entry);
+
+        Ok(atomic_group_from_movement(&movement, "pending"))
+    })
+}
+
 pub fn list_movements(path: &Path) -> io::Result<Value> {
     let document = read_document(path)?;
     let movements = document["movements"]
@@ -4166,12 +4353,96 @@ fn validate_movements<'a>(
             } else if movement_type != "correction" {
                 validate_movement_semantics(document, movement_type, entries, errors);
             }
+            validate_holding_adjustment_metadata(movement, movement_type, entries, index, errors);
         }
         validate_investment_sale_result(movement, index, errors);
         validate_movement_cost_basis_fx(movement, index, errors);
         validate_investment_replacement(movement, document, index, errors);
     }
     index_by_id
+}
+
+fn validate_holding_adjustment_metadata(
+    movement: &serde_json::Map<String, Value>,
+    movement_type: &str,
+    entries: &[Value],
+    movement_index: usize,
+    errors: &mut Vec<String>,
+) {
+    let instrument_adjustment = movement_type == "adjustment"
+        && entries
+            .iter()
+            .any(|entry| entry.get("instrumentId").is_some());
+    let Some(metadata) = movement.get("holdingAdjustment") else {
+        if instrument_adjustment {
+            errors.push(format!(
+                "movements[{movement_index}].holdingAdjustment is required for an instrument adjustment"
+            ));
+        }
+        return;
+    };
+    if !instrument_adjustment {
+        errors.push(format!(
+            "movements[{movement_index}].holdingAdjustment is only valid for an instrument adjustment"
+        ));
+        return;
+    }
+    let Some(metadata) = metadata.as_object() else {
+        errors.push(format!(
+            "movements[{movement_index}].holdingAdjustment must be an object"
+        ));
+        return;
+    };
+    let entry = &entries[0];
+    for key in ["accountId", "instrumentId"] {
+        if metadata.get(key).and_then(Value::as_str) != entry.get(key).and_then(Value::as_str) {
+            errors.push(format!(
+                "movements[{movement_index}].holdingAdjustment.{key} must match the entry"
+            ));
+        }
+    }
+    let previous = metadata
+        .get("previousQuantity")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    let target = metadata
+        .get("targetQuantity")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    if previous.is_none_or(|value| value < DecimalAmount::ZERO) {
+        errors.push(format!(
+            "movements[{movement_index}].holdingAdjustment.previousQuantity must be a non-negative decimal string"
+        ));
+    }
+    if target.is_none_or(|value| value < DecimalAmount::ZERO) {
+        errors.push(format!(
+            "movements[{movement_index}].holdingAdjustment.targetQuantity must be a non-negative decimal string"
+        ));
+    }
+    let entry_amount = entry
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    if let (Some(previous), Some(target), Some(entry_amount)) = (previous, target, entry_amount) {
+        let delta = target - previous;
+        let expected_direction = if delta > DecimalAmount::ZERO {
+            "in"
+        } else if delta < DecimalAmount::ZERO {
+            "out"
+        } else {
+            errors.push(format!(
+                "movements[{movement_index}].holdingAdjustment must change the quantity"
+            ));
+            return;
+        };
+        if entry_amount != delta.abs()
+            || entry.get("direction").and_then(Value::as_str) != Some(expected_direction)
+        {
+            errors.push(format!(
+                "movements[{movement_index}].holdingAdjustment delta must match the entry"
+            ));
+        }
+    }
 }
 
 fn validate_investment_replacement(
@@ -6561,6 +6832,16 @@ fn movement_from_create_input(
     }
     if let (Some(movement_type), Some(entries)) = (movement_type.as_deref(), entries.as_deref()) {
         validate_movement_semantics(document, movement_type, entries, &mut errors);
+        if movement_type == "adjustment"
+            && entries
+                .iter()
+                .any(|entry| entry.get("instrumentId").is_some())
+        {
+            errors.push(
+                "holding adjustments must use the account holding-adjustment proposal endpoint"
+                    .to_string(),
+            );
+        }
     }
 
     if !errors.is_empty() {
@@ -9685,13 +9966,10 @@ fn validate_movement_semantics(
         }
         "adjustment" => {
             if entries.len() != 1 {
-                errors.push("adjustment must contain exactly one cash entry".to_string());
+                errors.push("adjustment must contain exactly one entry".to_string());
                 return;
             }
             let entry = &entries[0];
-            if entry.get("instrumentId").is_some() {
-                errors.push("adjustment entry must not contain instrumentId".to_string());
-            }
             if entry.get("role").and_then(Value::as_str) != Some("adjustment") {
                 errors.push("adjustment entry.role must be adjustment".to_string());
             }
@@ -10035,11 +10313,134 @@ fn apply_movement_effect(
     match movement.get("type").and_then(Value::as_str) {
         Some("buy") => apply_buy_or_sell_movement(document, movement, entries, true, now),
         Some("sell") => apply_buy_or_sell_movement(document, movement, entries, false, now),
+        Some("adjustment") if movement.get("holdingAdjustment").is_some() => {
+            apply_holding_adjustment(document, movement, now)
+        }
         Some("correction") if movement.get("investmentReplacement").is_some() => {
             apply_investment_replacement_correction(document, movement, now)
         }
         _ => apply_movement_entries(document, entries, now),
     }
+}
+
+fn apply_holding_adjustment(
+    document: &mut Value,
+    movement: &Value,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let adjustment = movement
+        .get("holdingAdjustment")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["holding adjustment metadata is missing".to_string()])
+        })?;
+    let account_id = adjustment
+        .get("accountId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["holdingAdjustment.accountId is missing".to_string()])
+        })?;
+    let instrument_id = adjustment
+        .get("instrumentId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "holdingAdjustment.instrumentId is missing".to_string(),
+            ])
+        })?;
+    let previous = parse_decimal(
+        adjustment
+            .get("previousQuantity")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![
+                    "holdingAdjustment.previousQuantity is missing".to_string(),
+                ])
+            })?,
+    )
+    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    let target = parse_decimal(
+        adjustment
+            .get("targetQuantity")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![
+                    "holdingAdjustment.targetQuantity is missing".to_string(),
+                ])
+            })?,
+    )
+    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    if target < DecimalAmount::ZERO {
+        return Err(LedgerError::InvalidInput(vec![
+            "holding adjustment target quantity cannot be negative".to_string(),
+        ]));
+    }
+    if !active_account_exists(document, account_id) {
+        return Err(LedgerError::NotFound(format!(
+            "holding account does not exist or is archived: {account_id}"
+        )));
+    }
+    let index = document["holdings"]
+        .as_array()
+        .expect("validated local ledger holdings should be an array")
+        .iter()
+        .position(|holding| {
+            holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                && holding.get("instrumentId").and_then(Value::as_str) == Some(instrument_id)
+        });
+    let current = index
+        .and_then(|index| document["holdings"][index].get("quantity"))
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok())
+        .unwrap_or(DecimalAmount::ZERO);
+    if current != previous {
+        return Err(LedgerError::Conflict(format!(
+            "holding quantity changed after proposal creation: {instrument_id}"
+        )));
+    }
+    let as_of = movement
+        .get("occurredAt")
+        .and_then(Value::as_str)
+        .unwrap_or(now);
+
+    if target == DecimalAmount::ZERO {
+        if let Some(index) = index {
+            document["holdings"]
+                .as_array_mut()
+                .expect("validated local ledger holdings should be an array")
+                .remove(index);
+        }
+        return Ok(());
+    }
+
+    if let Some(index) = index {
+        let holding = document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .get_mut(index)
+            .expect("holding index should remain valid");
+        holding["quantity"] = json!(target.decimal_string());
+        holding["quoteStatus"] = json!("unpriceable");
+        holding["asOf"] = json!(as_of);
+        if let Some(object) = holding.as_object_mut() {
+            object.remove("marketValue");
+            object.remove("unrealizedPnl");
+            object.remove("unrealizedPnlRate");
+        }
+    } else {
+        document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .push(json!({
+                "id": stable_holding_id(account_id, instrument_id),
+                "accountId": account_id,
+                "instrumentId": instrument_id,
+                "quantity": target.decimal_string(),
+                "quoteStatus": "unpriceable",
+                "asOf": as_of
+            }));
+    }
+    Ok(())
 }
 
 fn apply_investment_replacement_correction(
@@ -14305,6 +14706,92 @@ mod tests {
         let error = upsert_fx_rate(&mut document, duplicate_time)
             .expect_err("same pair/time cannot use another id");
         assert!(error.contains("pair/asOf already exists"));
+    }
+
+    #[test]
+    fn holding_adjustment_metadata_must_match_its_entry_delta() {
+        let now = "2026-07-18T03:30:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["accounts"] = json!([account_from_create_input(
+            &json!({
+                "displayName": "OKX",
+                "accountType": "exchange",
+                "defaultCurrency": "USDT",
+                "supportedCurrencies": ["USDT"],
+                "includeInNetWorth": true,
+                "balanceMode": "holdings",
+                "openingBalances": []
+            }),
+            "acct_okx",
+            now,
+        )
+        .expect("holding account")]);
+        document["instruments"] = json!([{
+            "id": "inst_btc_usdt",
+            "type": "crypto",
+            "displayName": "Bitcoin",
+            "quoteCurrency": "USDT"
+        }]);
+        let movement = json!({
+            "id": "movement_holding_adjustment",
+            "atomicGroupId": "group_holding_adjustment",
+            "type": "adjustment",
+            "occurredAt": now,
+            "recordedAt": now,
+            "status": "pending_review",
+            "title": "调整 Bitcoin 持仓",
+            "entries": [{
+                "id": "entry_holding_adjustment",
+                "accountId": "acct_okx",
+                "instrumentId": "inst_btc_usdt",
+                "amount": "2",
+                "currency": "USDT",
+                "direction": "in",
+                "role": "adjustment"
+            }],
+            "holdingAdjustment": {
+                "accountId": "acct_okx",
+                "instrumentId": "inst_btc_usdt",
+                "previousQuantity": "1",
+                "targetQuantity": "3"
+            },
+            "tags": ["holding_adjustment"],
+            "source": {"kind": "manual", "createdBy": "user"},
+            "createdAt": now,
+            "updatedAt": now
+        });
+        let mut indexed_entry = movement["entries"][0].clone();
+        indexed_entry["movementId"] = json!("movement_holding_adjustment");
+        indexed_entry["atomicGroupId"] = json!("group_holding_adjustment");
+        document["movements"] = json!([movement]);
+        document["movementEntries"] = json!([indexed_entry]);
+        validate_document(&document).expect("valid holding adjustment should pass");
+
+        let mut wrong_delta = document.clone();
+        wrong_delta["movements"][0]["holdingAdjustment"]["targetQuantity"] = json!("4");
+        let errors = validate_document(&wrong_delta).expect_err("wrong delta must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("delta must match the entry"))
+        );
+
+        let mut wrong_account = document.clone();
+        wrong_account["movements"][0]["holdingAdjustment"]["accountId"] = json!("acct_other");
+        let errors = validate_document(&wrong_account).expect_err("wrong account must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("accountId must match the entry"))
+        );
+
+        let mut missing_metadata = document;
+        missing_metadata["movements"][0]
+            .as_object_mut()
+            .expect("movement object")
+            .remove("holdingAdjustment");
+        let errors = validate_document(&missing_metadata).expect_err("missing metadata must fail");
+        assert!(errors.iter().any(|error| error.contains("is required")));
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

@@ -746,6 +746,36 @@ def check_quote_problem_summary(doc: dict) -> None:
     ok("Quote-problem summary semantics passed")
 
 
+def check_holding_adjustment_proposal(doc: dict) -> None:
+    operation = doc["paths"]["/accounts/{accountId}/holding-adjustment-proposals"]["post"]
+    schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    if schema.get("$ref") != "#/components/schemas/HoldingAdjustmentInput":
+        fail("Holding adjustment proposal must use HoldingAdjustmentInput")
+    if "200" not in operation.get("responses", {}):
+        fail("Holding adjustment proposal must document its pending group response")
+
+    local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    for snippet in [
+        "pub fn create_holding_adjustment_proposal(",
+        '"holdingAdjustment": {',
+        '"previousQuantity": previous.decimal_string()',
+        '"targetQuantity": target.decimal_string()',
+        "apply_holding_adjustment(document, movement, now)",
+        "holding quantity changed after proposal creation:",
+    ]:
+        if snippet not in local_text:
+            fail(f"Holding adjustment implementation is incomplete: {snippet}")
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    for snippet in [
+        '"/v1/accounts/{account_id}/holding-adjustment-proposals"',
+        "local_ledger_holding_adjustment_proposal_imports_a_current_position",
+    ]:
+        if snippet not in rust_text:
+            fail(f"Holding adjustment HTTP slice is incomplete: {snippet}")
+
+    ok("Holding adjustment proposal contract and implementation passed")
+
+
 def check_investment_fee_semantics(doc: dict) -> None:
     local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
     for snippet in [
@@ -2045,6 +2075,7 @@ def main() -> None:
     check_dca_execution_input(doc)
     check_local_ledger_reference_integrity()
     check_quote_problem_summary(doc)
+    check_holding_adjustment_proposal(doc)
     check_investment_fee_semantics(doc)
     check_investment_sale_result(doc)
     check_subscription_due_scan(doc)

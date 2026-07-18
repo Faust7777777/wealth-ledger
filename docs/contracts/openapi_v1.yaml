@@ -241,6 +241,27 @@ paths:
               schema:
                 $ref: "#/components/schemas/HoldingListResponse"
 
+  /accounts/{accountId}/holding-adjustment-proposals:
+    post:
+      tags: [Portfolio]
+      summary: Propose importing or correcting one current holding quantity.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HoldingAdjustmentInput"
+      responses:
+        "200":
+          description: Pending holding-adjustment atomic group.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
+
   /portfolio/overview:
     get:
       tags: [Portfolio]
@@ -2028,6 +2049,33 @@ components:
           $ref: "#/components/schemas/ID"
         createdBy:
           enum: [user, ai, system]
+    HoldingAdjustment:
+      type: object
+      required: [accountId, instrumentId, previousQuantity, targetQuantity]
+      properties:
+        accountId:
+          $ref: "#/components/schemas/ID"
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        previousQuantity:
+          $ref: "#/components/schemas/DecimalString"
+        targetQuantity:
+          $ref: "#/components/schemas/DecimalString"
+    HoldingAdjustmentInput:
+      type: object
+      required: [instrumentId, targetQuantity]
+      additionalProperties: false
+      properties:
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        targetQuantity:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Desired current quantity; must be non-negative.
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+        note:
+          type: string
     Movement:
       type: object
       required:
@@ -2096,6 +2144,8 @@ components:
           $ref: "#/components/schemas/ExecutionFxBasis"
         investmentReplacement:
           $ref: "#/components/schemas/InvestmentReplacement"
+        holdingAdjustment:
+          $ref: "#/components/schemas/HoldingAdjustment"
         source:
           $ref: "#/components/schemas/DataSourceInfo"
         createdAt:

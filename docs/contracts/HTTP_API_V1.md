@@ -168,6 +168,7 @@ GET /v1/portfolio/overview
 GET /v1/portfolio/holdings
 GET /v1/holdings
 GET /v1/accounts/{accountId}/holdings
+POST /v1/accounts/{accountId}/holding-adjustment-proposals
 GET /v1/portfolio/allocation
 ```
 
@@ -176,6 +177,8 @@ GET /v1/portfolio/allocation
 - overview 返回 `APPLICATION_INTERFACES_V1.PortfolioOverview`。
 - holdings 来自同一底层数据，投资页与账户详情只是两种投影。
 - 主要持仓按市值占比排序，不按收益率排序。
+- 持仓调整输入目标 quantity，不由客户端计算最终余额。服务端在同一账本锁内读取旧 quantity、生成 pending adjustment，并在确认时做 optimistic check；确认前持仓不变。
+- 该入口用于导入或校准交易所/券商当前持仓，不伪造现金买入。成本未知时不生成成本基础；原始 quantity 始终保留，缺报价时不得按 0 估值。
 
 ## 6. Movements
 
@@ -202,7 +205,7 @@ POST  /v1/movements/corrections
 - `atomicGroupId` 是最小确认单位。
 - confirmed movement 的修改优先走 correction。
 - 所有分录币种必须在对应账户的 `supportedCurrencies` 中；带 `instrumentId` 的分录只允许进入 `holdings` / `mixed` 账户。
-- `income` / `dividend` / `interest` 当前为单现金分录 `in/source`；`expense` / `fee` 当前为单现金分录 `out/source`；`adjustment` 为单现金 `adjustment` 分录，方向可进可出。
+- `income` / `dividend` / `interest` 当前为单现金分录 `in/source`；`expense` / `fee` 当前为单现金分录 `out/source`；普通 `adjustment` 为单现金 `adjustment` 分录。带 instrument 的 adjustment 只能由持仓调整入口生成。
 - `buy` / `sell` 必须包含一条 principal 现金腿和一条带 `instrumentId` 的数量持仓腿，
   可额外包含 `role=fee|tax` 的现金 `out` 腿。费用腿必须与 principal 现金腿使用同一账户、
   同一币种，不允许把费用混入持仓数量。

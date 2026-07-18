@@ -1178,6 +1178,10 @@ fn app_with_state(state: AppState) -> Router {
         )
         .route("/v1/accounts/{account_id}/archive", post(archive_account))
         .route("/v1/accounts/{account_id}/holdings", get(account_holdings))
+        .route(
+            "/v1/accounts/{account_id}/holding-adjustment-proposals",
+            post(create_holding_adjustment_proposal),
+        )
         .route("/v1/portfolio/overview", get(portfolio_overview))
         .route("/v1/portfolio/holdings", get(holdings))
         .route("/v1/holdings", get(holdings))
@@ -1617,6 +1621,36 @@ async fn archive_account(
     match local_ledger::archive_account(path, &account_id, &now, &idempotency) {
         Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_account_archive"),
+    }
+}
+
+async fn create_holding_adjustment_proposal(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    let now = current_timestamp();
+    let operation = format!("POST /v1/accounts/{account_id}/holding-adjustment-proposals");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_holding_adjustment_proposal(
+        path,
+        &account_id,
+        &input,
+        &next_local_movement_id(),
+        &next_local_atomic_group_id(),
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_holding_adjustment_input"),
     }
 }
 
@@ -7397,6 +7431,319 @@ mod tests {
         let persisted = local_ledger::read_document(&path).expect("ledger should persist holding");
         assert_eq!(persisted["instruments"][0]["id"], "inst_csi300_fund");
         assert_eq!(persisted["holdings"][0]["quantity"], "100");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_holding_adjustment_proposal_imports_a_current_position() {
+        let path = unique_test_ledger_path("holding_adjustment_import");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "OKX",
+                "accountType": "exchange",
+                "defaultCurrency": "USDT",
+                "supportedCurrencies": ["USDT"],
+                "includeInNetWorth": true,
+                "balanceMode": "holdings",
+                "openingBalances": []
+            }),
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED, "{account_body}");
+        let account_id = account_body["data"]["id"].as_str().expect("account id");
+
+        let (instrument_status, instrument_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            json!({
+                "id": "inst_btc_usdt",
+                "type": "crypto",
+                "symbol": "BTC-USDT",
+                "displayName": "Bitcoin",
+                "quoteCurrency": "USDT",
+                "market": "CRYPTO"
+            }),
+        )
+        .await;
+        assert_eq!(instrument_status, StatusCode::CREATED, "{instrument_body}");
+
+        let endpoint = format!("/v1/accounts/{account_id}/holding-adjustment-proposals");
+        let (proposal_status, proposal_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt",
+                "targetQuantity": "0.00076078",
+                "asOf": "2026-07-18T03:30:00Z",
+                "note": "Imported from exchange balance"
+            }),
+        )
+        .await;
+        assert_eq!(proposal_status, StatusCode::OK, "{proposal_body}");
+        let atomic_group_id = proposal_body["data"]["id"]
+            .as_str()
+            .expect("atomic group id");
+
+        let (_, holdings_before) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(holdings_before["data"], json!([]));
+
+        let (duplicate_status, duplicate_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt",
+                "targetQuantity": "0.001"
+            }),
+        )
+        .await;
+        assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate_body}");
+
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{atomic_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+        assert_eq!(confirm_body["data"]["ledgerWrite"], true);
+
+        let (_, holdings_after) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(holdings_after["data"][0]["accountId"], account_id);
+        assert_eq!(holdings_after["data"][0]["instrumentId"], "inst_btc_usdt");
+        assert_eq!(holdings_after["data"][0]["quantity"], "0.00076078");
+        assert_eq!(holdings_after["data"][0]["quoteStatus"], "unpriceable");
+        assert_eq!(holdings_after["data"][0]["asOf"], "2026-07-18T03:30:00Z");
+        assert!(holdings_after["data"][0].get("costBasisTotal").is_none());
+
+        let (same_status, same_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt",
+                "targetQuantity": "0.00076078"
+            }),
+        )
+        .await;
+        assert_eq!(same_status, StatusCode::CONFLICT, "{same_body}");
+
+        let reduction_key = "holding-adjustment-reduction-retry";
+        let reduction_input = json!({
+            "instrumentId": "inst_btc_usdt",
+            "targetQuantity": "0.0005"
+        });
+        let (reduction_status, reduction_headers, reduction_body) =
+            request_json_body_with_idempotency_from(
+                router.clone(),
+                Method::POST,
+                &endpoint,
+                reduction_input.clone(),
+                Some(reduction_key),
+            )
+            .await;
+        assert_eq!(reduction_status, StatusCode::OK, "{reduction_body}");
+        assert!(reduction_headers.get("idempotency-replayed").is_none());
+        let reduction_group_id = reduction_body["data"]["id"]
+            .as_str()
+            .expect("reduction group id");
+        let (replay_status, replay_headers, replay_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            reduction_input,
+            Some(reduction_key),
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::OK, "{replay_body}");
+        assert_eq!(replay_body, reduction_body);
+        assert_eq!(
+            replay_headers
+                .get("idempotency-replayed")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        let (confirm_reduction_status, confirm_reduction_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{reduction_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_reduction_status,
+            StatusCode::OK,
+            "{confirm_reduction_body}"
+        );
+        let (_, reduced_holdings) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(reduced_holdings["data"][0]["quantity"], "0.0005");
+
+        let (zero_status, zero_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt",
+                "targetQuantity": "0"
+            }),
+        )
+        .await;
+        assert_eq!(zero_status, StatusCode::OK, "{zero_body}");
+        let zero_group_id = zero_body["data"]["id"].as_str().expect("zero group id");
+        let (confirm_zero_status, confirm_zero_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{zero_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_zero_status, StatusCode::OK, "{confirm_zero_body}");
+        let (_, empty_holdings) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(empty_holdings["data"], json!([]));
+
+        let (unsupported_instrument_status, unsupported_instrument_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            json!({
+                "id": "inst_eth_usd",
+                "type": "crypto",
+                "symbol": "ETH-USD",
+                "displayName": "Ethereum",
+                "quoteCurrency": "USD",
+                "market": "CRYPTO"
+            }),
+        )
+        .await;
+        assert_eq!(
+            unsupported_instrument_status,
+            StatusCode::CREATED,
+            "{unsupported_instrument_body}"
+        );
+        let (unsupported_status, unsupported_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_eth_usd",
+                "targetQuantity": "1"
+            }),
+        )
+        .await;
+        assert_eq!(
+            unsupported_status,
+            StatusCode::BAD_REQUEST,
+            "{unsupported_body}"
+        );
+
+        let (draft_status, draft_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            json!({
+                "type": "adjustment",
+                "occurredAt": "2026-07-18T03:30:00Z",
+                "title": "Direct holding adjustment",
+                "entries": [{
+                    "accountId": account_id,
+                    "instrumentId": "inst_btc_usdt",
+                    "amount": "1",
+                    "currency": "USDT",
+                    "direction": "in",
+                    "role": "adjustment"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(draft_status, StatusCode::BAD_REQUEST, "{draft_body}");
+        assert_eq!(draft_body["error"]["code"], "invalid_movement_draft_input");
+
+        let (restore_status, restore_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt",
+                "targetQuantity": "1"
+            }),
+        )
+        .await;
+        assert_eq!(restore_status, StatusCode::OK, "{restore_body}");
+        let restore_group_id = restore_body["data"]["id"]
+            .as_str()
+            .expect("restore group id");
+        let (confirm_restore_status, confirm_restore_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{restore_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_restore_status,
+            StatusCode::OK,
+            "{confirm_restore_body}"
+        );
+
+        let (conflict_proposal_status, conflict_proposal_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt",
+                "targetQuantity": "2"
+            }),
+        )
+        .await;
+        assert_eq!(
+            conflict_proposal_status,
+            StatusCode::OK,
+            "{conflict_proposal_body}"
+        );
+        let conflict_group_id = conflict_proposal_body["data"]["id"]
+            .as_str()
+            .expect("conflict group id");
+        let mut changed_document =
+            local_ledger::read_document(&path).expect("ledger should remain readable");
+        changed_document["holdings"][0]["quantity"] = json!("1.5");
+        local_ledger::write_document(&path, &changed_document)
+            .expect("concurrent holding change should remain a valid ledger");
+        let (confirm_conflict_status, confirm_conflict_body) = request_json_from(
+            router,
+            Method::POST,
+            &format!("/v1/atomic-groups/{conflict_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_conflict_status,
+            StatusCode::CONFLICT,
+            "{confirm_conflict_body}"
+        );
+        let unchanged_document = local_ledger::read_document(&path)
+            .expect("failed confirmation must not corrupt ledger");
+        assert_eq!(unchanged_document["holdings"][0]["quantity"], "1.5");
+        assert_eq!(
+            unchanged_document["movements"]
+                .as_array()
+                .expect("movements")
+                .iter()
+                .find(|movement| {
+                    movement.get("atomicGroupId").and_then(Value::as_str) == Some(conflict_group_id)
+                })
+                .and_then(|movement| movement.get("status"))
+                .and_then(Value::as_str),
+            Some("pending_review")
+        );
 
         let _ = std::fs::remove_file(path);
     }

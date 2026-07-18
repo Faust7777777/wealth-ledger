@@ -173,6 +173,7 @@ AI pending 读取层把 standalone pending movements 按 `atomicGroupId` 分组�
 - Instrument 的可选 `symbol`、`market`、`sourceRef` 存在时必须非空。
 - Quote 必须引用现有 Instrument；币种等于 Instrument `quoteCurrency`；价格为正 decimal string；时间、来源和状态合法；每个标的最多一条当前 quote。
 - movement entry 带 `instrumentId` 时，其 `currency` 必须等于对应 Instrument `quoteCurrency`。
+- 持仓导入/校准保存为带 `holdingAdjustment` metadata 的 pending adjustment movement。metadata 固化 previous/target quantity；确认时 previous 必须仍匹配当前持仓，否则冲突退出。成本未知时 holding 不写 `costBasisTotal`，缺报价时不写伪造 marketValue。
 - 所有本地账本写事务在业务变更和幂等结果加入内存 document 后、原子写盘前运行完整 document 校验。任何新增悬空引用、环、重复 ID 或币种冲突均返回 400，失败事务不得写入业务数据或幂等记录，磁盘文件保持不变。
 
 ## 4. 写入原则
