@@ -25,6 +25,7 @@ String _typeLabel(MovementType t) => switch (t) {
   MovementType.adjustment => '调整',
   MovementType.loanDisbursement => '放款',
   MovementType.loanRepayment => '还款',
+  MovementType.loanInterest => '贷款利息',
   MovementType.correction => '更正',
 };
 

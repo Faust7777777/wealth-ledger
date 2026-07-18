@@ -96,6 +96,27 @@ abstract interface class DcaRepository {
   Future<void> snoozeReminder(Id reminderId, {required IsoDate until});
 }
 
+/// 贷款：条款维护 + 应计利息候选 + 还款计划投影。
+/// 应计/拆分/计划一律来自服务端；「记录利息」只生成待确认候选（进 AI 审核）。
+abstract interface class LoanRepository {
+  Future<List<LiabilityPositionVm>> listLiabilityPositions({
+    IsoDate? throughDate,
+  });
+  Future<LoanRepaymentScheduleVm> getRepaymentSchedule(
+    Id accountId, {
+    int limit = 24,
+  });
+  Future<AccountVm> updateLiabilityTerms(
+    Id accountId,
+    LiabilityTermsInput input,
+  );
+  Future<AiAtomicGroupVm> proposeLoanInterest(
+    Id accountId, {
+    required IsoDate throughDate,
+    String? note,
+  });
+}
+
 abstract interface class QuoteRepository {
   Future<QuoteStatusSummaryVm> getQuoteSummary();
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode});

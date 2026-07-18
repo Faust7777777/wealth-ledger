@@ -31,6 +31,7 @@ enum MovementType {
   adjustment,
   loanDisbursement,
   loanRepayment,
+  loanInterest,
   correction,
 }
 
@@ -508,6 +509,158 @@ class HoldingAdjustmentInput {
   final DecimalString targetQuantity; // 非负，≤8 位小数
   final IsoDateTime? asOf;
   final String? note;
+}
+
+// ———————————— 贷款条款 / 负债头寸 / 还款计划 ————————————
+// 对齐 openapi LiabilityTerms* / LiabilityPosition / LoanRepaymentSchedule。
+// 计算结果（应计利息、下一期拆分、逐期计划）一律来自服务端，前端不得自行计算。
+
+enum LiabilityType { studentLoan, mortgage, consumerLoan, creditCard, other }
+
+enum LiabilityRateType { fixed, floating }
+
+/// 贷款条款输入（PATCH /v1/accounts/{id}/liability-terms；整表替换）。
+/// 年利率为 wire 十进制小数（3.65% → '0.0365'），转换在 UI 层完成。
+class LiabilityTermsInput {
+  const LiabilityTermsInput({
+    required this.liabilityType,
+    required this.annualRate,
+    required this.rateType,
+    required this.dayCountBasis,
+    required this.interestStartDate,
+    required this.maturityDate,
+    required this.repaymentStartDate,
+    required this.nextDueDate,
+    this.repaymentFrequency = 'monthly',
+    required this.scheduledPayment,
+    required this.paymentAccountId,
+  });
+  final LiabilityType liabilityType;
+  final DecimalString annualRate;
+  final LiabilityRateType rateType;
+  final int dayCountBasis; // 360 | 365
+  final IsoDate interestStartDate;
+  final IsoDate maturityDate;
+  final IsoDate repaymentStartDate;
+  final IsoDate nextDueDate;
+  final String repaymentFrequency; // monthly
+  final Money scheduledPayment;
+  final Id paymentAccountId;
+}
+
+/// 服务端贷款条款（含应计指针与待确认利息指针）。
+class LiabilityTermsVm {
+  const LiabilityTermsVm({
+    required this.liabilityType,
+    required this.annualRate,
+    required this.rateType,
+    required this.dayCountBasis,
+    required this.interestStartDate,
+    required this.maturityDate,
+    required this.repaymentStartDate,
+    required this.nextDueDate,
+    required this.scheduledPayment,
+    required this.paymentAccountId,
+    required this.lastInterestAccruedThrough,
+    this.pendingLoanInterestMovementId,
+    this.pendingLoanInterestThroughDate,
+    this.lastLoanInterestMovementId,
+  });
+  final LiabilityType liabilityType;
+  final DecimalString annualRate;
+  final LiabilityRateType rateType;
+  final int dayCountBasis;
+  final IsoDate interestStartDate;
+  final IsoDate maturityDate;
+  final IsoDate repaymentStartDate;
+  final IsoDate nextDueDate;
+  final Money scheduledPayment;
+  final Id paymentAccountId;
+  final IsoDate lastInterestAccruedThrough;
+  final Id? pendingLoanInterestMovementId;
+  final IsoDate? pendingLoanInterestThroughDate;
+  final Id? lastLoanInterestMovementId;
+
+  /// 已有待确认利息：禁重复提交、禁改条款，引导去审核。
+  bool get hasPendingInterest => pendingLoanInterestMovementId != null;
+}
+
+/// 下一期合同计划金额的预计拆分（服务端计算）。
+class LiabilityNextPaymentVm {
+  const LiabilityNextPaymentVm({
+    required this.dueDate,
+    required this.scheduledAmount,
+    required this.projectedInterest,
+    required this.projectedPrincipal,
+  });
+  final IsoDate dueDate;
+  final Money scheduledAmount;
+  final Money projectedInterest;
+  final Money projectedPrincipal;
+}
+
+/// 负债头寸（GET /v1/liability-positions；计算结果的权威来源）。
+class LiabilityPositionVm {
+  const LiabilityPositionVm({
+    required this.accountId,
+    required this.accountName,
+    required this.currency,
+    required this.terms,
+    required this.outstandingPrincipal,
+    required this.accruedThrough,
+    required this.accrualDays,
+    required this.accruedInterest,
+    required this.nextPayment,
+    required this.status,
+  });
+  final Id accountId;
+  final String accountName;
+  final CurrencyCode currency;
+  final LiabilityTermsVm terms;
+  final Money outstandingPrincipal;
+  final IsoDate accruedThrough;
+  final int accrualDays;
+  final Money accruedInterest;
+  final LiabilityNextPaymentVm nextPayment;
+  final String status; // active | matured | paid_off
+}
+
+/// 还款计划单期（kind=balloon 展示为「到期还款」）。
+class LoanRepaymentScheduleItemVm {
+  const LoanRepaymentScheduleItemVm({
+    required this.sequence,
+    required this.dueDate,
+    required this.openingBalance,
+    required this.interest,
+    required this.principal,
+    required this.payment,
+    required this.closingBalance,
+    required this.kind,
+  });
+  final int sequence;
+  final IsoDate dueDate;
+  final Money openingBalance;
+  final Money interest;
+  final Money principal;
+  final Money payment;
+  final Money closingBalance;
+  final String kind; // scheduled | balloon
+}
+
+/// 有界还款计划投影（GET /v1/accounts/{id}/repayment-schedule）。
+class LoanRepaymentScheduleVm {
+  const LoanRepaymentScheduleVm({
+    required this.accountId,
+    required this.currency,
+    required this.maturityDate,
+    required this.items,
+    required this.hasMore,
+  });
+  final Id accountId;
+  final CurrencyCode currency;
+  final IsoDate maturityDate;
+  final List<LoanRepaymentScheduleItemVm> items;
+  final bool hasMore;
 }
 
 enum TradeSide { buy, sell }

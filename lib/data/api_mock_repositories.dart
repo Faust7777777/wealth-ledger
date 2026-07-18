@@ -311,6 +311,7 @@ String _movementTypeWire(MovementType t) => switch (t) {
   MovementType.fee => 'fee',
   MovementType.adjustment => 'adjustment',
   MovementType.loanDisbursement => 'loan_disbursement',
+  MovementType.loanInterest => 'loan_interest',
   MovementType.loanRepayment => 'loan_repayment',
   MovementType.correction => 'correction',
 };
@@ -344,6 +345,7 @@ MovementType _movType(Object? s) => switch (s) {
   'fee' => MovementType.fee,
   'loan_disbursement' => MovementType.loanDisbursement,
   'loan_repayment' => MovementType.loanRepayment,
+  'loan_interest' => MovementType.loanInterest,
   'correction' => MovementType.correction,
   _ => MovementType.adjustment,
 };
@@ -1365,6 +1367,163 @@ FxRateVm _fxRate(Map<String, dynamic> j) => FxRateVm(
   asOf: '${j['asOf']}',
   status: _quote(j['status']),
 );
+
+// ———— 贷款条款 / 头寸 / 还款计划映射 ————
+LiabilityType _liabType(Object? s) => switch (s) {
+  'student_loan' => LiabilityType.studentLoan,
+  'mortgage' => LiabilityType.mortgage,
+  'consumer_loan' => LiabilityType.consumerLoan,
+  'credit_card' => LiabilityType.creditCard,
+  _ => LiabilityType.other,
+};
+
+String _liabTypeWire(LiabilityType t) => switch (t) {
+  LiabilityType.studentLoan => 'student_loan',
+  LiabilityType.mortgage => 'mortgage',
+  LiabilityType.consumerLoan => 'consumer_loan',
+  LiabilityType.creditCard => 'credit_card',
+  LiabilityType.other => 'other',
+};
+
+LiabilityTermsVm _liabilityTerms(Map<String, dynamic> j) => LiabilityTermsVm(
+  liabilityType: _liabType(j['liabilityType']),
+  annualRate: '${j['annualRate']}',
+  rateType: j['rateType'] == 'floating'
+      ? LiabilityRateType.floating
+      : LiabilityRateType.fixed,
+  dayCountBasis: _int(j['dayCountBasis']),
+  interestStartDate: '${j['interestStartDate']}',
+  maturityDate: '${j['maturityDate']}',
+  repaymentStartDate: '${j['repaymentStartDate']}',
+  nextDueDate: '${j['nextDueDate']}',
+  scheduledPayment: _money(j['scheduledPayment']),
+  paymentAccountId: '${j['paymentAccountId']}',
+  lastInterestAccruedThrough: '${j['lastInterestAccruedThrough']}',
+  pendingLoanInterestMovementId: j['pendingLoanInterestMovementId'] as String?,
+  pendingLoanInterestThroughDate:
+      j['pendingLoanInterestThroughDate'] as String?,
+  lastLoanInterestMovementId: j['lastLoanInterestMovementId'] as String?,
+);
+
+LiabilityNextPaymentVm _liabilityNextPayment(Map<String, dynamic> j) =>
+    LiabilityNextPaymentVm(
+      dueDate: '${j['dueDate']}',
+      scheduledAmount: _money(j['scheduledAmount']),
+      projectedInterest: _money(j['projectedInterest']),
+      projectedPrincipal: _money(j['projectedPrincipal']),
+    );
+
+/// 公开以便单测直接喂 LiabilityPosition JSON。
+LiabilityPositionVm parseLiabilityPositionData(Map<String, dynamic> j) =>
+    LiabilityPositionVm(
+      accountId: '${j['accountId']}',
+      accountName: '${j['accountName']}',
+      currency: '${j['currency']}',
+      terms: _liabilityTerms(_m(j['terms'])),
+      outstandingPrincipal: _money(j['outstandingPrincipal']),
+      accruedThrough: '${j['accruedThrough']}',
+      accrualDays: _int(j['accrualDays']),
+      accruedInterest: _money(j['accruedInterest']),
+      nextPayment: _liabilityNextPayment(_m(j['nextPayment'])),
+      status: '${j['status']}',
+    );
+
+LoanRepaymentScheduleItemVm _scheduleItem(Map<String, dynamic> j) =>
+    LoanRepaymentScheduleItemVm(
+      sequence: _int(j['sequence']),
+      dueDate: '${j['dueDate']}',
+      openingBalance: _money(j['openingBalance']),
+      interest: _money(j['interest']),
+      principal: _money(j['principal']),
+      payment: _money(j['payment']),
+      closingBalance: _money(j['closingBalance']),
+      kind: '${j['kind']}',
+    );
+
+/// 公开以便单测直接喂 LoanRepaymentSchedule JSON。
+LoanRepaymentScheduleVm parseRepaymentScheduleData(Map<String, dynamic> j) =>
+    LoanRepaymentScheduleVm(
+      accountId: '${j['accountId']}',
+      currency: '${j['currency']}',
+      maturityDate: '${j['maturityDate']}',
+      items: [for (final i in _list(j['items'])) _scheduleItem(_m(i))],
+      hasMore: _bool(j['hasMore']),
+    );
+
+class LocalServerLoanRepository implements LoanRepository {
+  LocalServerLoanRepository(this._c);
+  final DevApiClient _c;
+
+  @override
+  Future<List<LiabilityPositionVm>> listLiabilityPositions({
+    IsoDate? throughDate,
+  }) async => [
+    for (final p in _list(
+      await _c.getData(
+        throughDate == null
+            ? '/v1/liability-positions'
+            : '/v1/liability-positions?throughDate=$throughDate',
+      ),
+    ))
+      parseLiabilityPositionData(_m(p)),
+  ];
+
+  @override
+  Future<LoanRepaymentScheduleVm> getRepaymentSchedule(
+    Id accountId, {
+    int limit = 24,
+  }) async => parseRepaymentScheduleData(
+    _m(
+      await _c.getData(
+        '/v1/accounts/$accountId/repayment-schedule?limit=${limit.clamp(1, 360)}',
+      ),
+    ),
+  );
+
+  @override
+  Future<AccountVm> updateLiabilityTerms(
+    Id accountId,
+    LiabilityTermsInput input,
+  ) async => _account(
+    _m(
+      await _c.patchData(
+        '/v1/accounts/$accountId/liability-terms',
+        body: {
+          'liabilityType': _liabTypeWire(input.liabilityType),
+          'annualRate': input.annualRate,
+          'rateType': input.rateType == LiabilityRateType.floating
+              ? 'floating'
+              : 'fixed',
+          'dayCountBasis': input.dayCountBasis,
+          'interestStartDate': input.interestStartDate,
+          'maturityDate': input.maturityDate,
+          'repaymentStartDate': input.repaymentStartDate,
+          'nextDueDate': input.nextDueDate,
+          'repaymentFrequency': input.repaymentFrequency,
+          'scheduledPayment': _moneyJson(input.scheduledPayment),
+          'paymentAccountId': input.paymentAccountId,
+        },
+      ),
+    ),
+  );
+
+  @override
+  Future<AiAtomicGroupVm> proposeLoanInterest(
+    Id accountId, {
+    required IsoDate throughDate,
+    String? note,
+  }) async => _group(
+    _m(
+      await _c.postData(
+        '/v1/accounts/$accountId/loan-interest-proposals',
+        body: {
+          'throughDate': throughDate,
+          if (note != null && note.isNotEmpty) 'note': note,
+        },
+      ),
+    ),
+  );
+}
 
 class LocalServerQuoteRepository implements QuoteRepository {
   LocalServerQuoteRepository(this._c);

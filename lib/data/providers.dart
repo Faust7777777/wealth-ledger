@@ -245,6 +245,14 @@ final instrumentRepositoryProvider = Provider<InstrumentRepository>(
     api: () => LocalServerInstrumentRepository(ref.watch(devApiClientProvider)),
   ),
 );
+final loanRepositoryProvider = Provider<LoanRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalLoanRepository(),
+    fixture: () => const FixtureLoanRepository(),
+    api: () => LocalServerLoanRepository(ref.watch(devApiClientProvider)),
+  ),
+);
 final quoteRepositoryProvider = Provider<QuoteRepository>(
   (ref) => _pick(
     ref,
@@ -308,6 +316,9 @@ final instrumentsProvider = FutureProvider<List<InstrumentVm>>(
 );
 final fxRatesProvider = FutureProvider<List<FxRateVm>>(
   (ref) => ref.watch(quoteRepositoryProvider).listFxRates(),
+);
+final liabilityPositionsProvider = FutureProvider<List<LiabilityPositionVm>>(
+  (ref) => ref.watch(loanRepositoryProvider).listLiabilityPositions(),
 );
 final snapshotsProvider = FutureProvider<List<NetWorthSnapshotVm>>(
   (ref) => ref.watch(snapshotRepositoryProvider).listSnapshots(),
