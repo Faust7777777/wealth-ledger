@@ -25,6 +25,9 @@ import 'package:finwealth/data/repositories.dart';
 import 'package:finwealth/features/investment_page.dart';
 import 'package:finwealth/features/investment_trade_page.dart';
 import 'package:finwealth/features/movement_detail_page.dart';
+import 'package:finwealth/features/account_detail_page.dart';
+import 'package:finwealth/features/subscription_form_page.dart';
+import 'package:finwealth/features/valuation_status_sheet.dart';
 import 'package:finwealth/features/liabilities_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/overview_page.dart';
@@ -955,6 +958,198 @@ void main() {
       matchesGoldenFile('goldens/trade_detail_fx_loss_desktop_light.png'),
     );
   });
+  // —— 2026-07-18 批：订阅双日期表单 / 估值状态面板 / 多资产账户详情 ——
+  const okxAccount = AccountVm(
+    id: 'a_okx',
+    displayName: 'OKX',
+    accountType: AccountType.exchange,
+    isLiability: false,
+    balanceMode: 'mixed',
+    defaultCurrency: 'USDT',
+    supportedCurrencies: ['USDT', 'BTC', 'ETH'],
+    cashBalances: {'USDT': '123.45'},
+    value: ValuedMoney(
+      amount: '890.00',
+      currency: 'CNY',
+      asOf: '2026-07-18T09:00:00+08:00',
+      quality: ValueQuality.incomplete,
+    ),
+  );
+  const okxHoldings = [
+    HoldingVm(
+      id: 'h_btc',
+      accountId: 'a_okx',
+      instrumentId: 'inst_btc',
+      symbol: 'BTC',
+      displayName: 'Bitcoin',
+      quantity: '0.00076078',
+      quoteStatus: QuoteStatus.fresh,
+      marketValue: ValuedMoney(
+        amount: '380.00',
+        currency: 'CNY',
+        asOf: '2026-07-18T09:00:00+08:00',
+        quality: ValueQuality.estimated,
+      ),
+    ),
+    HoldingVm(
+      id: 'h_eth',
+      accountId: 'a_okx',
+      instrumentId: 'inst_eth',
+      symbol: 'ETH',
+      displayName: 'Ethereum',
+      quantity: '0.25',
+      quoteStatus: QuoteStatus.unpriceable,
+    ),
+  ];
+
+  Widget accountDetailHost(ThemeData theme) => ProviderScope(
+    overrides: [
+      capabilitiesProvider.overrideWith((ref) async => tradeCaps),
+      accountRepositoryProvider.overrideWithValue(
+        const _PreviewAccountRepo(okxAccount),
+      ),
+      portfolioRepositoryProvider.overrideWithValue(
+        const _PreviewCryptoPortfolioRepo(okxHoldings),
+      ),
+      instrumentsProvider.overrideWith((ref) async => const <InstrumentVm>[]),
+    ],
+    child: MaterialApp.router(
+      theme: theme,
+      routerConfig: GoRouter(
+        routes: [
+          GoRoute(
+            path: '/',
+            builder: (_, _) => const AccountDetailPage(accountId: 'a_okx'),
+          ),
+        ],
+      ),
+    ),
+  );
+
+  testWidgets('multi-asset account detail - dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 820));
+    await tester.pumpWidget(accountDetailHost(buildDarkTheme()));
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(AccountDetailPage),
+      matchesGoldenFile('goldens/account_multi_asset_dark.png'),
+    );
+  });
+
+  testWidgets('multi-asset account detail - light', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 820));
+    await tester.pumpWidget(accountDetailHost(buildLightTheme()));
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(AccountDetailPage),
+      matchesGoldenFile('goldens/account_multi_asset_light.png'),
+    );
+  });
+
+  Widget valuationHost(ThemeData theme) => ProviderScope(
+    overrides: [
+      accountsProvider.overrideWith((ref) async => const [okxAccount]),
+      holdingsProvider.overrideWith((ref) async => okxHoldings),
+      fxRatesProvider.overrideWith((ref) async => const <FxRateVm>[]),
+    ],
+    child: MaterialApp(
+      theme: theme,
+      home: const Scaffold(body: Center(child: ValuationStatusDialog())),
+    ),
+  );
+
+  testWidgets('valuation status dialog - dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(460, 700));
+    await tester.pumpWidget(valuationHost(buildDarkTheme()));
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(ValuationStatusDialog),
+      matchesGoldenFile('goldens/valuation_status_dialog_dark.png'),
+    );
+  });
+
+  Widget subFormHost(ThemeData theme) => ProviderScope(
+    overrides: [
+      capabilitiesProvider.overrideWith((ref) async => tradeCaps),
+      accountsProvider.overrideWith((ref) async => tradeAccounts),
+    ],
+    child: MaterialApp.router(
+      theme: theme,
+      routerConfig: GoRouter(
+        routes: [
+          GoRoute(path: '/', builder: (_, _) => const SubscriptionFormPage()),
+        ],
+      ),
+    ),
+  );
+
+  testWidgets('subscription form dual dates - dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 1120));
+    await tester.pumpWidget(subFormHost(buildDarkTheme()));
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(SubscriptionFormPage),
+      matchesGoldenFile('goldens/subscription_form_dual_dates_dark.png'),
+    );
+  });
+}
+
+/// 预览用账户仓库（多资产账户详情）。
+class _PreviewAccountRepo implements AccountRepository {
+  const _PreviewAccountRepo(this.account);
+  final AccountVm account;
+  @override
+  Future<AccountVm?> getAccount(Id id) async => account;
+  @override
+  Future<List<AccountVm>> listAccounts() async => [account];
+  @override
+  Future<List<AccountAnomalyVm>> listAnomalies() async => const [];
+  @override
+  Future<AccountVm> createAccount(CreateAccountInput input) =>
+      throw UnsupportedError('preview');
+  @override
+  Future<AccountVm> updateAccount(Id id, CreateAccountInput input) =>
+      throw UnsupportedError('preview');
+  @override
+  Future<void> archiveAccount(Id id) => throw UnsupportedError('preview');
+}
+
+/// 预览用持仓仓库（OKX 多资产）。
+class _PreviewCryptoPortfolioRepo implements PortfolioRepository {
+  const _PreviewCryptoPortfolioRepo(this.holdings);
+  final List<HoldingVm> holdings;
+  @override
+  Future<List<HoldingVm>> listHoldingsByAccount(Id accountId) async => holdings;
+  @override
+  Future<List<HoldingVm>> listHoldings() async => holdings;
+  @override
+  Future<PortfolioOverviewVm> getOverview() async => const PortfolioOverviewVm(
+    pendingSummary: PendingSummaryVm(),
+    quoteStatusSummary: QuoteStatusSummaryVm(),
+    primaryHoldings: [],
+    recentMovements: [],
+  );
+  @override
+  Future<AssetAllocationVm> getAssetAllocation() async =>
+      const AssetAllocationVm(
+        slices: [],
+        totalAssets: Money(amount: '0', currency: 'CNY'),
+        totalLiabilities: Money(amount: '0', currency: 'CNY'),
+        netWorth: Money(amount: '0', currency: 'CNY'),
+      );
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingAdjustment(
+    Id accountId,
+    HoldingAdjustmentInput input,
+  ) => throw UnsupportedError('preview');
 }
 
 /// 预览用只读 movement 仓库。
