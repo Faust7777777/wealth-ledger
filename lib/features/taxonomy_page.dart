@@ -48,7 +48,7 @@ class TaxonomyPage extends ConsumerWidget {
           padding: const EdgeInsets.all(AppSpacing.base),
           children: [
             Text(
-              '这些词表会暴露给 AI 用于填充分类和对手方；AI 只能生成候选，确认前不会写入账本。',
+              '这些词表供 AI 填充分类和对手方。',
               style: Theme.of(context).textTheme.bodySmall,
             ),
             if (loading) ...[
@@ -612,9 +612,7 @@ class _CounterpartyMergeCardState
             targetDisplayName: _targetName.text.trim(),
           );
       ref.invalidate(aiPendingProvider);
-      messenger.showSnackBar(
-        const SnackBar(content: Text('已生成合并候选，请到 AI 复核确认')),
-      );
+      messenger.showSnackBar(const SnackBar(content: Text('已加入待确认')));
       _selectedIds.clear();
       _targetName.clear();
     } catch (e) {
@@ -636,9 +634,7 @@ class _CounterpartyMergeCardState
             Text('合并对手方', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: AppSpacing.xs),
             Text(
-              disabled
-                  ? '至少需要两个对手方，才能生成合并候选。'
-                  : '用于把“瑞幸 / 瑞幸咖啡”这类同一对象归并；这里只生成候选，确认前不改历史记录。',
+              disabled ? '至少选择两个对手方。' : '用于把“瑞幸 / 瑞幸咖啡”这类同一对象归并。',
               style: Theme.of(context).textTheme.bodySmall,
             ),
             if (!disabled) ...[
@@ -676,7 +672,7 @@ class _CounterpartyMergeCardState
                 alignment: Alignment.centerRight,
                 child: FilledButton(
                   onPressed: _canSubmit ? _submit : null,
-                  child: Text(_busy ? '生成中…' : '生成合并候选'),
+                  child: Text(_busy ? '提交中…' : '提交合并'),
                 ),
               ),
             ],

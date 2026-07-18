@@ -181,19 +181,17 @@ class DueScanResultDialog extends StatelessWidget {
                   '已生成 ${r.createdCount} 个待确认扣费',
                   style: t.textTheme.titleSmall,
                 ),
-                const SizedBox(height: AppSpacing.xxs),
-                Text('确认后才会入账；不代表已向服务商实际扣款。', style: t.textTheme.bodySmall),
               ] else
                 Text(
                   r.skipped.isEmpty && !r.hasMore
                       ? '截至 ${r.throughDate} 没有需要生成的到期扣费。'
-                      : '本次没有生成新的扣费候选。',
+                      : '本次没有新增待确认扣费。',
                   style: t.textTheme.bodyMedium,
                 ),
               if (r.alreadyPendingCount > 0) ...[
                 const SizedBox(height: AppSpacing.sm),
                 Text(
-                  '已在审核队列 ${r.alreadyPendingCount} 个：此前生成的候选还未处理，无需重复生成。',
+                  '已在待确认队列 ${r.alreadyPendingCount} 个。',
                   style: t.textTheme.bodySmall,
                 ),
               ],

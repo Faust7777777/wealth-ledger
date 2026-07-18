@@ -44,9 +44,7 @@ class _AiImportCsvPageState extends ConsumerState<AiImportCsvPage> {
             defaultCurrency: defaultCurrency,
           );
       ref.invalidate(aiPendingProvider);
-      messenger.showSnackBar(
-        const SnackBar(content: Text('已按 CSV 行生成候选；请在「AI 待确认」逐组复核')),
-      );
+      messenger.showSnackBar(const SnackBar(content: Text('已加入待确认')));
       router.go('/ai-review');
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
@@ -93,7 +91,6 @@ class _AiImportCsvPageState extends ConsumerState<AiImportCsvPage> {
               padding: const EdgeInsets.all(AppSpacing.base),
               children: [
                 Text(
-                  '粘贴 CSV 后，每一行会生成一个候选 atomic group；确认前不会进入余额、流水或净值。'
                   '支持列名：occurredAt,title,amount,currency；amount 为负数表示支出，正数表示收入。',
                   style: AppType.caption,
                 ),
@@ -138,7 +135,7 @@ class _AiImportCsvPageState extends ConsumerState<AiImportCsvPage> {
                   onPressed: _canSubmit
                       ? () => _submit(selected.defaultCurrency)
                       : null,
-                  child: Text(_busy ? '生成中…' : '生成候选'),
+                  child: Text(_busy ? '导入中…' : '导入'),
                 ),
               ],
             );

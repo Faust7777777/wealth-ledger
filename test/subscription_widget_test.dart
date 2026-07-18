@@ -236,7 +236,7 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      expect(find.textContaining('当前数据源只读'), findsOneWidget);
+      expect(find.textContaining('当前为只读模式'), findsOneWidget);
       // WriteGate 的 AbsorbPointer(absorbing:true) 吸收动作点击（另有按钮内部一个非吸收的）。
       expect(
         find.ancestor(
@@ -465,8 +465,8 @@ void main() {
       );
       await tester.tap(scanButton());
       await tester.pumpAndSettle();
-      expect(find.text('本次没有生成新的扣费候选。'), findsOneWidget);
-      expect(find.textContaining('已在审核队列 1 个'), findsOneWidget);
+      expect(find.text('本次没有新增待确认扣费。'), findsOneWidget);
+      expect(find.textContaining('已在待确认队列 1 个'), findsOneWidget);
       // blocked 项映射为名称 + 日期 + 中文可恢复原因。
       expect(
         find.textContaining('ChatGPT Plus · 计划 2026-07-02'),

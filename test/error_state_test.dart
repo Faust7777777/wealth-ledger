@@ -34,7 +34,7 @@ void main() {
     );
 
     expect(find.text('无法连接本地服务'), findsOneWidget);
-    expect(find.textContaining('run_self_use_windows.ps1'), findsOneWidget);
+    expect(find.textContaining('请先启动本机服务'), findsOneWidget);
     expect(find.text('去登录'), findsNothing);
   });
 

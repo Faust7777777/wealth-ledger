@@ -29,8 +29,7 @@ class AiReviewPage extends ConsumerWidget {
           if (proposals.isEmpty) {
             return const EmptyState(
               icon: Icons.inbox_outlined,
-              title: '没有待确认的 AI 提案',
-              message: 'AI 导入或修改会先进入这里，逐组确认后才写入账本。',
+              title: '没有待确认项',
             );
           }
           return ListView(
@@ -205,10 +204,10 @@ class _GroupBlock extends ConsumerWidget {
         ref.invalidate(anomaliesProvider);
       }
       final suffix = result == null
-          ? '（未写账本）'
+          ? ''
           : result.ledgerWrite
           ? ' · 已入账'
-          : '（未产生新入账）';
+          : '（尚未入账）';
       messenger.showSnackBar(SnackBar(content: Text('$okMsg$suffix')));
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));

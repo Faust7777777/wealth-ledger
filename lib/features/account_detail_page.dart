@@ -120,7 +120,7 @@ class AccountDetailPage extends ConsumerWidget {
       context: context,
       builder: (c) => AlertDialog(
         title: const Text('归档账户'),
-        content: const Text('归档后不再计入新记录（后端可恢复）。确认归档？'),
+        content: const Text('归档后不能用于新记录。确认归档？'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(c, false),

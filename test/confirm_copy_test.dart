@@ -110,6 +110,6 @@ void main() {
     await tester.pumpAndSettle();
     await _submit(tester);
     expect(find.text('已入账'), findsNothing);
-    expect(find.text('已提交候选，尚未入账'), findsOneWidget);
+    expect(find.text('已加入待确认，尚未入账'), findsOneWidget);
   });
 }

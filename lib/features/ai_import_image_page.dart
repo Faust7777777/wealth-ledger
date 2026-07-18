@@ -125,9 +125,7 @@ class _AiImportImagePageState extends ConsumerState<AiImportImagePage> {
             mimeType: _mimeType,
           );
       ref.invalidate(aiPendingProvider);
-      messenger.showSnackBar(
-        const SnackBar(content: Text('已生成图片候选；请在「AI 待确认」复核')),
-      );
+      messenger.showSnackBar(const SnackBar(content: Text('已加入待确认')));
       router.go('/ai-review');
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
@@ -144,12 +142,6 @@ class _AiImportImagePageState extends ConsumerState<AiImportImagePage> {
         child: ListView(
           padding: const EdgeInsets.all(AppSpacing.base),
           children: [
-            Text(
-              '选择图片后会生成候选 evidence；确认前不会进入余额、流水或净值。'
-              '真实多模态识别接入后，会自动填充更完整的候选记录。',
-              style: AppType.caption,
-            ),
-            const SizedBox(height: AppSpacing.base),
             OutlinedButton.icon(
               onPressed: _picking ? null : _pickImage,
               icon: const Icon(Icons.image_outlined),
@@ -186,7 +178,7 @@ class _AiImportImagePageState extends ConsumerState<AiImportImagePage> {
             const SizedBox(height: AppSpacing.base),
             FilledButton(
               onPressed: _canSubmit ? _submit : null,
-              child: Text(_busy ? '生成中…' : '生成候选'),
+              child: Text(_busy ? '导入中…' : '导入'),
             ),
           ],
         ),

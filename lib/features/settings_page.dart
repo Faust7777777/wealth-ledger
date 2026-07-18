@@ -11,11 +11,10 @@ import 'remote_server_setup_page.dart';
 import '../theme/app_dimens.dart';
 
 String _modeLabel(DataSourceMode m) => switch (m) {
-  DataSourceMode.realLocal => '真实本地账本（默认；当前为空账本）',
-  DataSourceMode.debugFixture => 'DEMO 演示数据（隔离；不写真实账本、不同步）',
-  DataSourceMode.localServer =>
-    '本地 Rust 服务（dev/local server；可连 --ledger-path 真实账本）',
-  DataSourceMode.apiRemote => '远端 Finwealth 服务（HTTPS）',
+  DataSourceMode.realLocal => '本机数据（默认）',
+  DataSourceMode.debugFixture => 'DEMO 演示数据',
+  DataSourceMode.localServer => '本机服务',
+  DataSourceMode.apiRemote => '远程服务器（HTTPS）',
 };
 
 class SettingsPage extends ConsumerWidget {
@@ -91,9 +90,7 @@ class SettingsPage extends ConsumerWidget {
           const ListTile(
             contentPadding: EdgeInsets.zero,
             title: Text('关于'),
-            subtitle: Text(
-              'Wealth Ledger · 私有账本\nWindows / Android · Rust 服务端',
-            ),
+            subtitle: Text('Wealth Ledger\nWindows / Android'),
           ),
         ],
       ),

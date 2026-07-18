@@ -61,9 +61,7 @@ class _CorrectionPageState extends ConsumerState<CorrectionPage> {
             ),
           );
       ref.invalidate(aiPendingProvider);
-      messenger.showSnackBar(
-        const SnackBar(content: Text('已生成更正候选，请在 AI 复核中确认')),
-      );
+      messenger.showSnackBar(const SnackBar(content: Text('已加入待确认')));
       if (mounted) router.go('/ai-review');
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
@@ -151,10 +149,8 @@ class _CorrectionPageState extends ConsumerState<CorrectionPage> {
                   onPressed: _canSubmit(oldAmount)
                       ? () => _submit(m, entry)
                       : null,
-                  child: Text(_busy ? '生成中…' : '生成更正候选'),
+                  child: Text(_busy ? '提交中…' : '提交更正'),
                 ),
-                const SizedBox(height: AppSpacing.sm),
-                Text('这是候选变更；AI 复核中接受整组后才写账本。', style: AppType.caption),
               ],
             );
           },

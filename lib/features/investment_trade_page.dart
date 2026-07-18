@@ -528,7 +528,7 @@ class _InvestmentTradePageState extends ConsumerState<InvestmentTradePage> {
         // 未真正写入账本：留在表单，引导去审核确认，不表现为已完成。
         messenger.showSnackBar(
           SnackBar(
-            content: const Text('已提交为待确认候选，尚未入账'),
+            content: const Text('已加入待确认，尚未入账'),
             action: SnackBarAction(
               label: '前往审核',
               onPressed: () => router.push('/ai-review'),

@@ -189,7 +189,7 @@ class _SubscriptionFormPageState extends ConsumerState<SubscriptionFormPage> {
               Padding(
                 padding: const EdgeInsets.only(top: AppSpacing.xs),
                 child: Text(
-                  '该账户不支持 $_currency，请改用支持该币种的账户（不自动换汇）。',
+                  '该账户不支持 $_currency。',
                   style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
               ),
@@ -247,7 +247,6 @@ class _SubscriptionFormPageState extends ConsumerState<SubscriptionFormPage> {
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
               title: const Text('自动续订'),
-              subtitle: const Text('仅记录服务商续订偏好，本应用不会自动扣款'),
               value: _autoRenew,
               onChanged: (v) => setState(() => _autoRenew = v),
             ),
@@ -363,7 +362,7 @@ class _SubscriptionFormPageState extends ConsumerState<SubscriptionFormPage> {
     if (amountErr != null) return amountErr;
     if (_paymentAccountId == null) return '请选择付款账户';
     if (account != null && !_accountSupports(account, _currency)) {
-      return '付款账户不支持 $_currency，请改用支持该币种的账户（不自动换汇）';
+      return '付款账户不支持 $_currency';
     }
     final intervalErr = positiveIntError(_billingInterval.text, '计费周期');
     if (intervalErr != null) return intervalErr;
