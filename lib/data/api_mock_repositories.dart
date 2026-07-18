@@ -40,6 +40,17 @@ class ApiConflictException implements Exception {
       message ?? '操作冲突（409${code == null ? '' : ' · $code'}）：$path';
 }
 
+/// 服务暂不可用（503）：如 AI 整理失败。UI 只显示简短失败状态并允许重试，
+/// 不展示 provider 名、上游状态码或配置字段。
+class ApiServiceUnavailableException implements Exception {
+  ApiServiceUnavailableException(this.path, {this.code, this.message});
+  final String path;
+  final String? code;
+  final String? message;
+  @override
+  String toString() => '服务暂时不可用，请稍后重试';
+}
+
 /// 请求校验失败（400）：携带服务端 message 与 details.errors。
 /// UI 用 [userMessage] 呈现具体校验原因，不展示裸 HTTP 细节。
 class ApiValidationException implements Exception {
@@ -103,6 +114,13 @@ class DevApiClient {
     }
     if (res.statusCode == 409) {
       throw ApiConflictException(
+        path,
+        code: _errorField(res, 'code'),
+        message: _errorField(res, 'message'),
+      );
+    }
+    if (res.statusCode == 503) {
+      throw ApiServiceUnavailableException(
         path,
         code: _errorField(res, 'code'),
         message: _errorField(res, 'message'),
@@ -689,16 +707,28 @@ AiFieldDiffVm _diff(Map<String, dynamic> j) {
   );
 }
 
-AiAtomicGroupVm _group(Map<String, dynamic> j) => AiAtomicGroupVm(
-  id: '${j['id']}',
-  title: '${j['title']}',
-  operation: _aiOp(j['operation']),
-  status: _aiGroupStatus(j['status']),
-  diffs: [for (final d in _list(j['diffs'])) _diff(_m(d))],
-  warnings: [
-    for (final w in _list(j['warnings'])) (w is Map ? '${w['message']}' : '$w'),
-  ],
-);
+AiAtomicGroupVm _group(Map<String, dynamic> j) {
+  final proposed = _list(j['proposedMovements']);
+  final validation = j['validation'] is Map
+      ? _m(j['validation'])
+      : const <String, dynamic>{};
+  return AiAtomicGroupVm(
+    id: '${j['id']}',
+    title: '${j['title']}',
+    operation: _aiOp(j['operation']),
+    status: _aiGroupStatus(j['status']),
+    diffs: [for (final d in _list(j['diffs'])) _diff(_m(d))],
+    warnings: [
+      for (final w in _list(j['warnings']))
+        (w is Map ? '${w['message']}' : '$w'),
+    ],
+    proposedMovement: proposed.isEmpty ? null : _movement(_m(proposed.first)),
+    isValid: _bool(validation['isValid'], fallback: true),
+  );
+}
+
+/// 公开以便单测直接喂 AiProposal JSON（结构化/待补全候选映射）。
+AiProposalVm parseAiProposalData(Map<String, dynamic> j) => _proposal(j);
 
 AiProposalVm _proposal(Map<String, dynamic> j) {
   final src = j['source'] is Map ? _m(j['source']) : const <String, dynamic>{};
@@ -711,6 +741,7 @@ AiProposalVm _proposal(Map<String, dynamic> j) {
     status: _aiPropStatus(j['status']),
     sourceLabel: '${ev['label'] ?? src['kind'] ?? '输入'}',
     summary: j['summary'] as String?,
+    modelName: src['modelName'] as String?,
     groups: [for (final g in _list(j['atomicGroups'])) _group(_m(g))],
   );
 }
