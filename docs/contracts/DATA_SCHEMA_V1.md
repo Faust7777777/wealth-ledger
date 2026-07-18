@@ -191,36 +191,44 @@ YieldTerms {
 - 每个持仓同时最多一个待确认利息 movement；存在 pending 时不得修改条款。
 - 已确认 movement 固化当期本金、年利率、计息方式、天数和利息金额；后续修改条款不得改写历史。
 
+`YieldAccrual` 固化 holding、上次/本次截止日、本金、利率、计息方式、日基准、复利周期、天数和本期利息。
+
 ## 4. LiabilityTerms
 
 负债本身仍通过 Account 表示；贷款条款挂在账户上。
 
 ```ts
 LiabilityTerms {
-  id: ID;
-  accountId: ID;
   liabilityType:
     | "student_loan"
     | "mortgage"
     | "consumer_loan"
     | "credit_card"
     | "other";
-  principal?: Money;
-  interestRateAnnual?: DecimalString;
-  rateType?: "fixed" | "floating" | "unknown";
-  interestStartDate?: ISODate;
-  subsidyEndDate?: ISODate;
-  repaymentStartDate?: ISODate;
-  nextDueDate?: ISODate;
-  repaymentRuleNote?: string;
+  annualRate: DecimalString;
+  rateType: "fixed" | "floating";
+  dayCountBasis: 360 | 365;
+  interestStartDate: ISODate;
+  maturityDate: ISODate;
+  repaymentStartDate: ISODate;
+  nextDueDate: ISODate;
+  repaymentFrequency: "monthly";
+  scheduledPayment: Money;
+  paymentAccountId: ID;
+  lastInterestAccruedThrough: ISODate;
+  pendingLoanInterestMovementId?: ID;
 }
 ```
 
 规则：
 
-- 助学贷款可展示贴息期、计息开始时间、还款开始时间。
-- MVP 不自动计算复杂摊销表。
-- 未经用户确认的贷款利率规则不得自动写入正式账本。
+- 未偿本金来自负债账户当前负余额的绝对值，不另存一份会漂移的本金。
+- 简单利息按未偿本金、年利率、实际天数及 360/365 基准计算；读模型给出截至日期的应计利息和下一期计划金额的预计本金/利息拆分。
+- `scheduledPayment` 是用户录入的合同计划金额，不由服务端猜测等额本息或复杂摊销规则。
+- 生成贷款利息只创建 `pending_review` movement；确认后才增加负债并推进累计截止日，拒绝不改变余额。
+- 浮动利率由用户在每个计息区间前维护当前年利率；movement 固化当期利率，不假装自动跟踪 LPR 等外部基准。
+
+`LoanInterestAccrual` 固化负债 account、上次/本次截止日、计算时未偿金额、利率类型、年利率、日基准、天数和本期利息。
 
 ## 5. Movement
 
@@ -246,6 +254,8 @@ Movement {
   saleResult?: InvestmentSaleResult;
   costBasisFx?: ExecutionFxBasis;
   investmentReplacement?: InvestmentReplacement;
+  yieldAccrual?: YieldAccrual;
+  loanInterestAccrual?: LoanInterestAccrual;
   subscriptionId?: ID;
   scheduledChargeDate?: ISODate;
   source: DataSourceInfo;
@@ -265,6 +275,7 @@ MovementType =
   | "adjustment"
   | "loan_disbursement"
   | "loan_repayment"
+  | "loan_interest"
   | "correction";
 
 MovementStatus =

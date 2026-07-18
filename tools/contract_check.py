@@ -839,6 +839,31 @@ def check_yield_interest_slice(doc: dict) -> None:
     ok("Fixed-yield terms, accrual, and reviewed interest passed")
 
 
+def check_loan_interest_slice(doc: dict) -> None:
+    for path, method in [
+        ("/liability-positions", "get"),
+        ("/accounts/{accountId}/liability-terms", "patch"),
+        ("/accounts/{accountId}/loan-interest-proposals", "post"),
+    ]:
+        if method not in doc["paths"].get(path, {}):
+            fail(f"Loan-interest endpoint missing: {method.upper()} {path}")
+    local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    for snippet in [
+        "pub fn list_liability_positions(",
+        "pub fn update_account_liability_terms(",
+        "pub fn create_loan_interest_proposal(",
+        "mark_loan_interest_accrued_for_movements",
+        "validate_loan_interest_accrual_metadata",
+    ]:
+        if snippet not in local_text:
+            fail(f"Loan-interest implementation is incomplete: {snippet}")
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    if "local_ledger_loan_disbursement_and_repayment_preserve_accounting_identity" not in rust_text:
+        fail("Loan-interest HTTP regression is missing")
+
+    ok("Loan terms, projected payment split, and reviewed interest passed")
+
+
 def check_valuation_issue_projection(doc: dict) -> None:
     operation = doc["paths"]["/portfolio/valuation-issues"]["get"]
     schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
@@ -2163,6 +2188,7 @@ def main() -> None:
     check_multi_hop_valuation()
     check_public_quote_provider()
     check_yield_interest_slice(doc)
+    check_loan_interest_slice(doc)
     check_valuation_issue_projection(doc)
     check_investment_fee_semantics(doc)
     check_investment_sale_result(doc)

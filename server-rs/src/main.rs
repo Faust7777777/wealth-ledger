@@ -1178,6 +1178,15 @@ fn app_with_state(state: AppState) -> Router {
         )
         .route("/v1/accounts/{account_id}/archive", post(archive_account))
         .route("/v1/accounts/{account_id}/holdings", get(account_holdings))
+        .route("/v1/liability-positions", get(liability_positions))
+        .route(
+            "/v1/accounts/{account_id}/liability-terms",
+            patch(update_account_liability_terms),
+        )
+        .route(
+            "/v1/accounts/{account_id}/loan-interest-proposals",
+            post(create_loan_interest_proposal),
+        )
         .route(
             "/v1/accounts/{account_id}/holding-adjustment-proposals",
             post(create_holding_adjustment_proposal),
@@ -1862,6 +1871,76 @@ async fn create_holding_interest_proposal(
     ) {
         Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_interest_proposal_input"),
+    }
+}
+
+async fn liability_positions(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return envelope(json!([])).into_response();
+    };
+    match local_ledger::list_liability_positions(path, query.get("throughDate").map(String::as_str))
+    {
+        Ok(positions) => envelope(positions).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_liability_position_query"),
+    }
+}
+
+async fn update_account_liability_terms(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("PATCH /v1/accounts/{account_id}/liability-terms");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::update_account_liability_terms(
+        path,
+        &account_id,
+        &input,
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_liability_terms_input"),
+    }
+}
+
+async fn create_loan_interest_proposal(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("POST /v1/accounts/{account_id}/loan-interest-proposals");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_loan_interest_proposal(
+        path,
+        &account_id,
+        &input,
+        &next_local_movement_id(),
+        &next_local_atomic_group_id(),
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_loan_interest_proposal_input"),
     }
 }
 
@@ -8388,7 +8467,6 @@ mod tests {
         .await;
         assert_eq!(replay_status, StatusCode::OK, "{replay_body}");
         assert_eq!(replay_body["data"]["id"], interest_body["data"]["id"]);
-
         let (pending_patch_status, pending_patch_body) =
             request_json_body_from(router.clone(), Method::PATCH, &terms_endpoint, terms_input)
                 .await;
@@ -9501,6 +9579,167 @@ mod tests {
         .await;
         assert_eq!(confirm_repayment_status, StatusCode::OK);
 
+        let terms_endpoint = format!("/v1/accounts/{}/liability-terms", account_ids[1]);
+        let terms_input = json!({
+            "liabilityType": "consumer_loan",
+            "annualRate": "0.365",
+            "rateType": "fixed",
+            "dayCountBasis": 365,
+            "interestStartDate": "2026-01-01",
+            "maturityDate": "2027-01-01",
+            "repaymentStartDate": "2026-02-01",
+            "nextDueDate": "2026-02-01",
+            "repaymentFrequency": "monthly",
+            "scheduledPayment": {"amount": "100", "currency": "CNY"},
+            "paymentAccountId": account_ids[0]
+        });
+        let (terms_status, terms_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &terms_endpoint,
+            terms_input.clone(),
+        )
+        .await;
+        assert_eq!(terms_status, StatusCode::OK, "{terms_body}");
+
+        let (positions_status, positions_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/liability-positions?throughDate=2026-01-31",
+        )
+        .await;
+        assert_eq!(positions_status, StatusCode::OK, "{positions_body}");
+        assert_eq!(
+            positions_body["data"][0]["outstandingPrincipal"]["amount"],
+            "400"
+        );
+        assert_eq!(positions_body["data"][0]["accruedInterest"]["amount"], "12");
+        assert_eq!(
+            positions_body["data"][0]["nextPayment"]["projectedInterest"]["amount"],
+            "12.4"
+        );
+        assert_eq!(
+            positions_body["data"][0]["nextPayment"]["projectedPrincipal"]["amount"],
+            "87.6"
+        );
+
+        let interest_endpoint = format!("/v1/accounts/{}/loan-interest-proposals", account_ids[1]);
+        let interest_idempotency = next_local_id("loan_interest_replay");
+        let (interest_status, _, interest_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            json!({"throughDate": "2026-01-31"}),
+            Some(&interest_idempotency),
+        )
+        .await;
+        assert_eq!(interest_status, StatusCode::OK, "{interest_body}");
+        let interest_group = interest_body["data"]["id"]
+            .as_str()
+            .expect("loan interest group");
+        let (replay_status, _, replay_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            json!({"throughDate": "2026-01-31"}),
+            Some(&interest_idempotency),
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::OK, "{replay_body}");
+        assert_eq!(replay_body["data"]["id"], interest_body["data"]["id"]);
+        let mut broken_loan_link =
+            local_ledger::read_document(&path).expect("loan ledger should remain readable");
+        broken_loan_link["accounts"][1]["liabilityTerms"]
+            .as_object_mut()
+            .expect("liability terms")
+            .remove("pendingLoanInterestMovementId");
+        assert!(
+            local_ledger::write_document(&path, &broken_loan_link).is_err(),
+            "a pending loan interest movement without its account pointer must be rejected"
+        );
+        let (pending_terms_status, pending_terms_body) =
+            request_json_body_from(router.clone(), Method::PATCH, &terms_endpoint, terms_input)
+                .await;
+        assert_eq!(
+            pending_terms_status,
+            StatusCode::CONFLICT,
+            "{pending_terms_body}"
+        );
+        let (_, loan_before_interest) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[1]),
+        )
+        .await;
+        assert_eq!(
+            loan_before_interest["data"]["cashBalances"][0]["amount"],
+            "-400.00"
+        );
+        let (reject_interest_status, reject_interest_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{interest_group}/reject"),
+        )
+        .await;
+        assert_eq!(
+            reject_interest_status,
+            StatusCode::NO_CONTENT,
+            "{reject_interest_body}"
+        );
+        let (replacement_interest_status, replacement_interest_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            json!({"throughDate": "2026-01-31"}),
+        )
+        .await;
+        assert_eq!(
+            replacement_interest_status,
+            StatusCode::OK,
+            "{replacement_interest_body}"
+        );
+        let replacement_interest_group = replacement_interest_body["data"]["id"]
+            .as_str()
+            .expect("replacement loan interest group");
+        let mut conflicted_loan_document =
+            local_ledger::read_document(&path).expect("loan ledger should remain readable");
+        conflicted_loan_document["accounts"][1]["liabilityTerms"]["lastInterestAccruedThrough"] =
+            json!("2026-01-02");
+        local_ledger::write_document(&path, &conflicted_loan_document)
+            .expect("the independently valid loan terms change should persist");
+        let (conflict_status, conflict_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{replacement_interest_group}/confirm"),
+        )
+        .await;
+        assert_eq!(conflict_status, StatusCode::CONFLICT, "{conflict_body}");
+        let (_, loan_after_conflict) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[1]),
+        )
+        .await;
+        assert_eq!(
+            loan_after_conflict["data"]["cashBalances"][0]["amount"], "-400.00",
+            "a failed loan interest confirmation must not change the debt"
+        );
+        conflicted_loan_document["accounts"][1]["liabilityTerms"]["lastInterestAccruedThrough"] =
+            json!("2026-01-01");
+        local_ledger::write_document(&path, &conflicted_loan_document)
+            .expect("restored loan terms should remain valid");
+        let (confirm_interest_status, confirm_interest_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{replacement_interest_group}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_interest_status,
+            StatusCode::OK,
+            "{confirm_interest_body}"
+        );
+
         let (_, bank) = request_json_from(
             router.clone(),
             Method::GET,
@@ -9515,18 +9754,22 @@ mod tests {
         .await;
         let (_, overview) = request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
         assert_eq!(bank["data"]["cashBalances"][0]["amount"], "400.00");
-        assert_eq!(loan["data"]["cashBalances"][0]["amount"], "-400.00");
+        assert_eq!(loan["data"]["cashBalances"][0]["amount"], "-412.00");
+        assert_eq!(
+            loan["data"]["liabilityTerms"]["lastInterestAccruedThrough"],
+            "2026-01-31"
+        );
         assert_eq!(
             overview["data"]["latestSnapshot"]["grossAssets"]["amount"],
             "400.00"
         );
         assert_eq!(
             overview["data"]["latestSnapshot"]["totalLiabilities"]["amount"],
-            "400.00"
+            "412.00"
         );
         assert_eq!(
             overview["data"]["latestSnapshot"]["netWorth"]["amount"],
-            "0.00"
+            "-12.00"
         );
 
         let _ = std::fs::remove_file(path);

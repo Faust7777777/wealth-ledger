@@ -369,6 +369,65 @@ paths:
               schema:
                 $ref: "#/components/schemas/AiAtomicGroupResponse"
 
+  /liability-positions:
+    get:
+      tags: [Accounts]
+      summary: List loan positions with accrued interest and the next scheduled payment split.
+      parameters:
+        - in: query
+          name: throughDate
+          schema:
+            $ref: "#/components/schemas/ISODate"
+      responses:
+        "200":
+          description: Liability positions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiabilityPositionListResponse"
+
+  /accounts/{accountId}/liability-terms:
+    patch:
+      tags: [Accounts]
+      summary: Configure interest and scheduled-payment terms for a liability account.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LiabilityTermsInput"
+      responses:
+        "200":
+          description: Account with updated liability terms.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountResponse"
+
+  /accounts/{accountId}/loan-interest-proposals:
+    post:
+      tags: [Accounts]
+      summary: Propose accrued loan interest through a date for review.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InterestProposalInput"
+      responses:
+        "200":
+          description: Pending loan-interest atomic group.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
+
   /portfolio/allocation:
     get:
       tags: [Portfolio]
@@ -1749,6 +1808,8 @@ components:
             type: string
         note:
           type: string
+        liabilityTerms:
+          $ref: "#/components/schemas/LiabilityTerms"
         createdAt:
           $ref: "#/components/schemas/ISODateTime"
         updatedAt:
@@ -2069,6 +2130,117 @@ components:
           items:
             $ref: "#/components/schemas/YieldPosition"
 
+    LiabilityTermsInput:
+      type: object
+      additionalProperties: false
+      required:
+        - liabilityType
+        - annualRate
+        - rateType
+        - dayCountBasis
+        - interestStartDate
+        - maturityDate
+        - repaymentStartDate
+        - nextDueDate
+        - repaymentFrequency
+        - scheduledPayment
+        - paymentAccountId
+      properties:
+        liabilityType:
+          enum: [student_loan, mortgage, consumer_loan, credit_card, other]
+        annualRate:
+          $ref: "#/components/schemas/DecimalString"
+        rateType:
+          enum: [fixed, floating]
+        dayCountBasis:
+          enum: [360, 365]
+        interestStartDate:
+          $ref: "#/components/schemas/ISODate"
+        maturityDate:
+          $ref: "#/components/schemas/ISODate"
+        repaymentStartDate:
+          $ref: "#/components/schemas/ISODate"
+        nextDueDate:
+          $ref: "#/components/schemas/ISODate"
+        repaymentFrequency:
+          enum: [monthly]
+        scheduledPayment:
+          $ref: "#/components/schemas/Money"
+        paymentAccountId:
+          $ref: "#/components/schemas/ID"
+    LiabilityTerms:
+      allOf:
+        - $ref: "#/components/schemas/LiabilityTermsInput"
+        - type: object
+          required: [lastInterestAccruedThrough, updatedAt]
+          properties:
+            lastInterestAccruedThrough:
+              $ref: "#/components/schemas/ISODate"
+            pendingLoanInterestMovementId:
+              $ref: "#/components/schemas/ID"
+            pendingLoanInterestThroughDate:
+              $ref: "#/components/schemas/ISODate"
+            lastLoanInterestMovementId:
+              $ref: "#/components/schemas/ID"
+            updatedAt:
+              $ref: "#/components/schemas/ISODateTime"
+    LiabilityNextPayment:
+      type: object
+      required: [dueDate, scheduledAmount, projectedInterest, projectedPrincipal]
+      properties:
+        dueDate:
+          $ref: "#/components/schemas/ISODate"
+        scheduledAmount:
+          $ref: "#/components/schemas/Money"
+        projectedInterest:
+          $ref: "#/components/schemas/Money"
+        projectedPrincipal:
+          $ref: "#/components/schemas/Money"
+    LiabilityPosition:
+      type: object
+      required:
+        - accountId
+        - accountName
+        - currency
+        - terms
+        - outstandingPrincipal
+        - accruedThrough
+        - accrualDays
+        - accruedInterest
+        - nextPayment
+        - status
+      properties:
+        accountId:
+          $ref: "#/components/schemas/ID"
+        accountName:
+          type: string
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+        terms:
+          $ref: "#/components/schemas/LiabilityTerms"
+        outstandingPrincipal:
+          $ref: "#/components/schemas/Money"
+        accruedThrough:
+          $ref: "#/components/schemas/ISODate"
+        accrualDays:
+          type: integer
+        accruedInterest:
+          $ref: "#/components/schemas/Money"
+        nextPayment:
+          $ref: "#/components/schemas/LiabilityNextPayment"
+        status:
+          enum: [active, matured, paid_off]
+    LiabilityPositionListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/LiabilityPosition"
+
     MovementEntry:
       type: object
       required: [id, accountId, amount, currency, direction, role]
@@ -2301,6 +2473,37 @@ components:
           type: integer
         interestAmount:
           $ref: "#/components/schemas/Money"
+    LoanInterestAccrual:
+      type: object
+      required:
+        - accountId
+        - previousAccruedThrough
+        - throughDate
+        - outstandingPrincipal
+        - annualRate
+        - rateType
+        - dayCountBasis
+        - accrualDays
+        - interestAmount
+      properties:
+        accountId:
+          $ref: "#/components/schemas/ID"
+        previousAccruedThrough:
+          $ref: "#/components/schemas/ISODate"
+        throughDate:
+          $ref: "#/components/schemas/ISODate"
+        outstandingPrincipal:
+          $ref: "#/components/schemas/Money"
+        annualRate:
+          $ref: "#/components/schemas/DecimalString"
+        rateType:
+          enum: [fixed, floating]
+        dayCountBasis:
+          enum: [360, 365]
+        accrualDays:
+          type: integer
+        interestAmount:
+          $ref: "#/components/schemas/Money"
     Movement:
       type: object
       required:
@@ -2334,6 +2537,7 @@ components:
             - adjustment
             - loan_disbursement
             - loan_repayment
+            - loan_interest
             - correction
         occurredAt:
           $ref: "#/components/schemas/ISODateTime"
@@ -2373,6 +2577,8 @@ components:
           $ref: "#/components/schemas/HoldingAdjustment"
         yieldAccrual:
           $ref: "#/components/schemas/YieldAccrual"
+        loanInterestAccrual:
+          $ref: "#/components/schemas/LoanInterestAccrual"
         source:
           $ref: "#/components/schemas/DataSourceInfo"
         createdAt:
