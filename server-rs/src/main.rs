@@ -1186,6 +1186,15 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/portfolio/valuation-issues", get(valuation_issues))
         .route("/v1/portfolio/holdings", get(holdings))
         .route("/v1/holdings", get(holdings))
+        .route("/v1/yield-positions", get(yield_positions))
+        .route(
+            "/v1/holdings/{holding_id}/yield-terms",
+            patch(update_holding_yield_terms),
+        )
+        .route(
+            "/v1/holdings/{holding_id}/interest-proposals",
+            post(create_holding_interest_proposal),
+        )
         .route("/v1/portfolio/allocation", get(asset_allocation))
         .route("/v1/movements", get(movements))
         .route("/v1/movements/recent", get(recent_movements))
@@ -1791,6 +1800,69 @@ async fn asset_allocation(
             .asset_allocation(DevScenario::from_query(&query)),
     )
     .into_response()
+}
+
+async fn yield_positions(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return envelope(json!([])).into_response();
+    };
+    match local_ledger::list_yield_positions(path, query.get("throughDate").map(String::as_str)) {
+        Ok(positions) => envelope(positions).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_yield_position_query"),
+    }
+}
+
+async fn update_holding_yield_terms(
+    State(state): State<AppState>,
+    Path(holding_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("PATCH /v1/holdings/{holding_id}/yield-terms");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::update_holding_yield_terms(path, &holding_id, &input, &now, &idempotency) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_yield_terms_input"),
+    }
+}
+
+async fn create_holding_interest_proposal(
+    State(state): State<AppState>,
+    Path(holding_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("POST /v1/holdings/{holding_id}/interest-proposals");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_holding_interest_proposal(
+        path,
+        &holding_id,
+        &input,
+        &next_local_movement_id(),
+        &next_local_atomic_group_id(),
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_interest_proposal_input"),
+    }
 }
 
 async fn movements(
@@ -8161,6 +8233,290 @@ mod tests {
                 .and_then(|movement| movement.get("status"))
                 .and_then(Value::as_str),
             Some("pending_review")
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_yield_terms_accrue_and_confirm_interest_without_touching_principal() {
+        let path = unique_test_ledger_path("yield_interest_flow");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let mut account_ids = Vec::new();
+        for (display_name, account_type, balance_mode, opening_balances) in [
+            (
+                "利息收款账户",
+                "bank",
+                "cash_balance",
+                json!([{"currency": "CNY", "amount": "100.00"}]),
+            ),
+            ("定期存款账户", "brokerage", "holdings", json!([])),
+        ] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/accounts",
+                json!({
+                    "displayName": display_name,
+                    "accountType": account_type,
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": balance_mode,
+                    "openingBalances": opening_balances
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            account_ids.push(body["data"]["id"].as_str().expect("account id").to_string());
+        }
+        let payout_account_id = &account_ids[0];
+        let holding_account_id = &account_ids[1];
+
+        let (instrument_status, instrument_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            json!({
+                "id": "inst_fixed_deposit_cny",
+                "type": "fund",
+                "displayName": "一年期定期存款",
+                "quoteCurrency": "CNY"
+            }),
+        )
+        .await;
+        assert_eq!(instrument_status, StatusCode::CREATED, "{instrument_body}");
+
+        let adjustment_endpoint =
+            format!("/v1/accounts/{holding_account_id}/holding-adjustment-proposals");
+        let (proposal_status, proposal_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &adjustment_endpoint,
+            json!({
+                "instrumentId": "inst_fixed_deposit_cny",
+                "targetQuantity": "10000",
+                "asOf": "2026-01-01T00:00:00Z"
+            }),
+        )
+        .await;
+        assert_eq!(proposal_status, StatusCode::OK, "{proposal_body}");
+        let adjustment_group = proposal_body["data"]["id"]
+            .as_str()
+            .expect("adjustment group");
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{adjustment_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+        let (_, holdings_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        let holding_id = holdings_body["data"][0]["id"].as_str().expect("holding id");
+
+        let terms_endpoint = format!("/v1/holdings/{holding_id}/yield-terms");
+        let terms_input = json!({
+            "principal": {"amount": "10000", "currency": "CNY"},
+            "annualRate": "0.0365",
+            "rateType": "fixed",
+            "interestMethod": "simple",
+            "dayCountBasis": 365,
+            "compoundingFrequency": "none",
+            "interestStartDate": "2026-01-01",
+            "maturityDate": "2027-01-01",
+            "payoutAccountId": payout_account_id
+        });
+        let (terms_status, terms_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &terms_endpoint,
+            terms_input.clone(),
+        )
+        .await;
+        assert_eq!(terms_status, StatusCode::OK, "{terms_body}");
+        assert_eq!(terms_body["data"]["yieldTerms"]["annualRate"], "0.0365");
+
+        let (positions_status, positions_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/yield-positions?throughDate=2026-01-31",
+        )
+        .await;
+        assert_eq!(positions_status, StatusCode::OK, "{positions_body}");
+        assert_eq!(positions_body["data"][0]["accrualDays"], 30);
+        assert_eq!(positions_body["data"][0]["accruedInterest"]["amount"], "30");
+        let (matured_status, matured_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/yield-positions?throughDate=2028-01-01",
+        )
+        .await;
+        assert_eq!(matured_status, StatusCode::OK, "{matured_body}");
+        assert_eq!(matured_body["data"][0]["accruedThrough"], "2027-01-01");
+        assert_eq!(matured_body["data"][0]["status"], "matured");
+        assert_eq!(matured_body["data"][0]["accruedInterest"]["amount"], "365");
+
+        let interest_endpoint = format!("/v1/holdings/{holding_id}/interest-proposals");
+        let interest_input = json!({"throughDate": "2026-01-31"});
+        let interest_idempotency = next_local_id("yield_interest_replay");
+        let (interest_status, _, interest_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            interest_input.clone(),
+            Some(&interest_idempotency),
+        )
+        .await;
+        assert_eq!(interest_status, StatusCode::OK, "{interest_body}");
+        assert_eq!(
+            interest_body["data"]["proposedMovements"][0]["entries"][0]["amount"],
+            "30"
+        );
+        let interest_group = interest_body["data"]["id"]
+            .as_str()
+            .expect("interest group");
+        let (replay_status, _, replay_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            interest_input.clone(),
+            Some(&interest_idempotency),
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::OK, "{replay_body}");
+        assert_eq!(replay_body["data"]["id"], interest_body["data"]["id"]);
+
+        let (pending_patch_status, pending_patch_body) =
+            request_json_body_from(router.clone(), Method::PATCH, &terms_endpoint, terms_input)
+                .await;
+        assert_eq!(
+            pending_patch_status,
+            StatusCode::CONFLICT,
+            "{pending_patch_body}"
+        );
+
+        let mut broken_link =
+            local_ledger::read_document(&path).expect("ledger should remain readable");
+        broken_link["holdings"][0]["yieldTerms"]
+            .as_object_mut()
+            .expect("yield terms")
+            .remove("pendingInterestMovementId");
+        assert!(
+            local_ledger::write_document(&path, &broken_link).is_err(),
+            "a pending interest movement without the holding pointer must be rejected"
+        );
+
+        let (_, payout_before) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{payout_account_id}"),
+        )
+        .await;
+        assert_eq!(payout_before["data"]["cashBalances"][0]["amount"], "100.00");
+        let (duplicate_status, duplicate_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            interest_input,
+        )
+        .await;
+        assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate_body}");
+
+        let (reject_status, reject_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{interest_group}/reject"),
+        )
+        .await;
+        assert_eq!(reject_status, StatusCode::NO_CONTENT, "{reject_body}");
+        let (_, holding_after_reject) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{holding_account_id}/holdings"),
+        )
+        .await;
+        assert!(
+            holding_after_reject["data"][0]["yieldTerms"]
+                .get("pendingInterestMovementId")
+                .is_none(),
+            "reject must release the holding for a later proposal"
+        );
+        let (replacement_status, replacement_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            json!({"throughDate": "2026-01-31"}),
+        )
+        .await;
+        assert_eq!(replacement_status, StatusCode::OK, "{replacement_body}");
+        let replacement_group = replacement_body["data"]["id"]
+            .as_str()
+            .expect("replacement interest group");
+
+        let mut conflicted_document =
+            local_ledger::read_document(&path).expect("ledger should remain readable");
+        conflicted_document["holdings"][0]["yieldTerms"]["lastAccruedThrough"] =
+            json!("2026-01-02");
+        local_ledger::write_document(&path, &conflicted_document)
+            .expect("the independently valid concurrent terms change should persist");
+        let (conflict_status, conflict_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{replacement_group}/confirm"),
+        )
+        .await;
+        assert_eq!(conflict_status, StatusCode::CONFLICT, "{conflict_body}");
+        let (_, payout_after_conflict) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{payout_account_id}"),
+        )
+        .await;
+        assert_eq!(
+            payout_after_conflict["data"]["cashBalances"][0]["amount"], "100.00",
+            "a failed confirmation must not apply the cash entry"
+        );
+        conflicted_document["holdings"][0]["yieldTerms"]["lastAccruedThrough"] =
+            json!("2026-01-01");
+        local_ledger::write_document(&path, &conflicted_document)
+            .expect("restored terms should remain valid");
+
+        let (confirm_interest_status, confirm_interest_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{replacement_group}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_interest_status,
+            StatusCode::OK,
+            "{confirm_interest_body}"
+        );
+        let (_, payout_after) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{payout_account_id}"),
+        )
+        .await;
+        assert_eq!(payout_after["data"]["cashBalances"][0]["amount"], "130.00");
+        let (_, holding_after) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{holding_account_id}/holdings"),
+        )
+        .await;
+        assert_eq!(holding_after["data"][0]["quantity"], "10000");
+        assert_eq!(
+            holding_after["data"][0]["yieldTerms"]["lastAccruedThrough"],
+            "2026-01-31"
+        );
+        assert!(
+            holding_after["data"][0]["yieldTerms"]
+                .get("pendingInterestMovementId")
+                .is_none()
         );
 
         let _ = std::fs::remove_file(path);

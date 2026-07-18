@@ -165,6 +165,32 @@ Holding {
   不使用不同币种的裸数字相减，也不伪造换算后的成本。
 - 时间加权收益、区间收益、现金流归因暂缓。
 
+## 3A. 固定收益持仓条款
+
+利率条款属于具体 Holding，而不是全局 Instrument；同一产品在不同账户可以有不同本金、起息日和到期日。
+
+```ts
+YieldTerms {
+  principal: Money;
+  annualRate: DecimalString;
+  rateType: "fixed" | "floating";
+  interestMethod: "simple" | "compound";
+  dayCountBasis: 360 | 365;
+  compoundingFrequency: "none" | "monthly" | "quarterly" | "annual";
+  interestStartDate: ISODate;
+  maturityDate: ISODate;
+  payoutAccountId: ID;
+  lastAccruedThrough: ISODate;
+  pendingInterestMovementId?: ID;
+}
+```
+
+- simple 使用实际天数 / dayCountBasis；compound 对完整月/季/年周期复利，剩余天数按当前复合余额进行日比例计提。
+- 应计收益是派生读模型，不直接改变余额。
+- 生成利息后只创建 `pending_review` interest movement；确认后才增加收款账户余额并推进 `lastAccruedThrough`。
+- 每个持仓同时最多一个待确认利息 movement；存在 pending 时不得修改条款。
+- 已确认 movement 固化当期本金、年利率、计息方式、天数和利息金额；后续修改条款不得改写历史。
+
 ## 4. LiabilityTerms
 
 负债本身仍通过 Account 表示；贷款条款挂在账户上。

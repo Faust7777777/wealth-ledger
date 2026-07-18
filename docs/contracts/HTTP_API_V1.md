@@ -170,6 +170,9 @@ GET /v1/portfolio/holdings
 GET /v1/holdings
 GET /v1/accounts/{accountId}/holdings
 POST /v1/accounts/{accountId}/holding-adjustment-proposals
+GET /v1/yield-positions?throughDate=YYYY-MM-DD
+PATCH /v1/holdings/{holdingId}/yield-terms
+POST /v1/holdings/{holdingId}/interest-proposals
 GET /v1/portfolio/allocation
 ```
 
@@ -183,6 +186,7 @@ GET /v1/portfolio/allocation
 - 持仓估值允许使用最多三跳的 FX 路径，例如 `BTC quantity × BTC/USDT quote × USDT/USD × USD/CNY`；每一段必须来自已保存的有效 Quote/FXRate，结果质量取整条路径中最差状态。
 - `valuation-issues` 是估值问题的权威逐资产读模型，返回账户、资产、原始数量、状态和结构化 reason；不返回面向用户的解释文案。它与 overview 的 `quoteProblemCount` 使用相同估值路径，前端不得再用直连汇率自行推断多跳路径是否缺失。
 - 最新估值刷新可显式配置 `FINWEALTH_QUOTE_PROVIDER=public`：BTC/ETH/USDT 使用 CoinGecko，传统法币 FX 使用 Frankfurter/ECB；默认 `none` 不联网。`public` 不提供历史行情，历史价格仍只在 Yahoo provider 下可用。
+- 固定收益条款配置在具体 holding 上，包含明确本金、年利率、起息/到期日、360/365 日计数、单利或月/季/年复利及收款账户。`yield-positions` 返回截至指定日期的应计收益；`interest-proposals` 固化本期计算依据并进入既有审核队列，确认前不增加余额，确认后才推进累计截止日。
 
 ## 6. Movements
 

@@ -310,6 +310,65 @@ paths:
               schema:
                 $ref: "#/components/schemas/HoldingListResponse"
 
+  /yield-positions:
+    get:
+      tags: [Portfolio]
+      summary: List fixed-yield positions with accrued interest.
+      parameters:
+        - in: query
+          name: throughDate
+          schema:
+            $ref: "#/components/schemas/ISODate"
+      responses:
+        "200":
+          description: Yield positions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/YieldPositionListResponse"
+
+  /holdings/{holdingId}/yield-terms:
+    patch:
+      tags: [Portfolio]
+      summary: Configure interest terms for one concrete holding.
+      parameters:
+        - $ref: "#/components/parameters/holdingId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/YieldTermsInput"
+      responses:
+        "200":
+          description: Holding with updated yield terms.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HoldingResponse"
+
+  /holdings/{holdingId}/interest-proposals:
+    post:
+      tags: [Portfolio]
+      summary: Propose accrued interest through a date for review.
+      parameters:
+        - $ref: "#/components/parameters/holdingId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InterestProposalInput"
+      responses:
+        "200":
+          description: Pending interest atomic group.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
+
   /portfolio/allocation:
     get:
       tags: [Portfolio]
@@ -1456,6 +1515,12 @@ components:
       required: true
       schema:
         $ref: "#/components/schemas/ID"
+    holdingId:
+      name: holdingId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ID"
     categoryId:
       name: categoryId
       in: path
@@ -1882,6 +1947,8 @@ components:
           $ref: "#/components/schemas/ISODateTime"
         note:
           type: string
+        yieldTerms:
+          $ref: "#/components/schemas/YieldTerms"
     HoldingListResponse:
       type: object
       required: [ok, data]
@@ -1892,6 +1959,115 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Holding"
+    HoldingResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/Holding"
+    YieldTermsInput:
+      type: object
+      additionalProperties: false
+      required:
+        - principal
+        - annualRate
+        - rateType
+        - interestMethod
+        - dayCountBasis
+        - compoundingFrequency
+        - interestStartDate
+        - maturityDate
+        - payoutAccountId
+      properties:
+        principal:
+          $ref: "#/components/schemas/Money"
+        annualRate:
+          $ref: "#/components/schemas/DecimalString"
+        rateType:
+          enum: [fixed, floating]
+        interestMethod:
+          enum: [simple, compound]
+        dayCountBasis:
+          enum: [360, 365]
+        compoundingFrequency:
+          enum: [none, monthly, quarterly, annual]
+        interestStartDate:
+          $ref: "#/components/schemas/ISODate"
+        maturityDate:
+          $ref: "#/components/schemas/ISODate"
+        payoutAccountId:
+          $ref: "#/components/schemas/ID"
+    YieldTerms:
+      allOf:
+        - $ref: "#/components/schemas/YieldTermsInput"
+        - type: object
+          required: [lastAccruedThrough, updatedAt]
+          properties:
+            lastAccruedThrough:
+              $ref: "#/components/schemas/ISODate"
+            pendingInterestMovementId:
+              $ref: "#/components/schemas/ID"
+            pendingInterestThroughDate:
+              $ref: "#/components/schemas/ISODate"
+            lastInterestMovementId:
+              $ref: "#/components/schemas/ID"
+            updatedAt:
+              $ref: "#/components/schemas/ISODateTime"
+    InterestProposalInput:
+      type: object
+      additionalProperties: false
+      required: [throughDate]
+      properties:
+        throughDate:
+          $ref: "#/components/schemas/ISODate"
+        note:
+          type: string
+    YieldPosition:
+      type: object
+      required:
+        - holdingId
+        - accountId
+        - instrumentId
+        - instrumentName
+        - terms
+        - accruedThrough
+        - accrualDays
+        - fullCompoundingPeriods
+        - accruedInterest
+        - status
+      properties:
+        holdingId:
+          $ref: "#/components/schemas/ID"
+        accountId:
+          $ref: "#/components/schemas/ID"
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        instrumentName:
+          type: string
+        terms:
+          $ref: "#/components/schemas/YieldTerms"
+        accruedThrough:
+          $ref: "#/components/schemas/ISODate"
+        accrualDays:
+          type: integer
+        fullCompoundingPeriods:
+          type: integer
+        accruedInterest:
+          $ref: "#/components/schemas/Money"
+        status:
+          enum: [active, matured]
+    YieldPositionListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/YieldPosition"
 
     MovementEntry:
       type: object
@@ -2088,6 +2264,43 @@ components:
           $ref: "#/components/schemas/ISODateTime"
         note:
           type: string
+    YieldAccrual:
+      type: object
+      required:
+        - holdingId
+        - previousAccruedThrough
+        - throughDate
+        - principal
+        - annualRate
+        - interestMethod
+        - dayCountBasis
+        - compoundingFrequency
+        - accrualDays
+        - fullCompoundingPeriods
+        - interestAmount
+      properties:
+        holdingId:
+          $ref: "#/components/schemas/ID"
+        previousAccruedThrough:
+          $ref: "#/components/schemas/ISODate"
+        throughDate:
+          $ref: "#/components/schemas/ISODate"
+        principal:
+          $ref: "#/components/schemas/Money"
+        annualRate:
+          $ref: "#/components/schemas/DecimalString"
+        interestMethod:
+          enum: [simple, compound]
+        dayCountBasis:
+          enum: [360, 365]
+        compoundingFrequency:
+          enum: [none, monthly, quarterly, annual]
+        accrualDays:
+          type: integer
+        fullCompoundingPeriods:
+          type: integer
+        interestAmount:
+          $ref: "#/components/schemas/Money"
     Movement:
       type: object
       required:
@@ -2158,6 +2371,8 @@ components:
           $ref: "#/components/schemas/InvestmentReplacement"
         holdingAdjustment:
           $ref: "#/components/schemas/HoldingAdjustment"
+        yieldAccrual:
+          $ref: "#/components/schemas/YieldAccrual"
         source:
           $ref: "#/components/schemas/DataSourceInfo"
         createdAt:

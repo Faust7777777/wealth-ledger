@@ -813,6 +813,32 @@ def check_public_quote_provider() -> None:
     ok("Opt-in public crypto and FX provider passed")
 
 
+def check_yield_interest_slice(doc: dict) -> None:
+    for path, method in [
+        ("/yield-positions", "get"),
+        ("/holdings/{holdingId}/yield-terms", "patch"),
+        ("/holdings/{holdingId}/interest-proposals", "post"),
+    ]:
+        if method not in doc["paths"].get(path, {}):
+            fail(f"Yield-interest endpoint missing: {method.upper()} {path}")
+    local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    for snippet in [
+        "pub fn list_yield_positions(",
+        "pub fn update_holding_yield_terms(",
+        "pub fn create_holding_interest_proposal(",
+        "fn calculate_yield_accrual(",
+        "mark_yield_interest_accrued_for_movements",
+        "yield_accrual_supports_simple_and_periodic_compound_interest",
+    ]:
+        if snippet not in local_text:
+            fail(f"Yield-interest implementation is incomplete: {snippet}")
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    if "local_ledger_yield_terms_accrue_and_confirm_interest_without_touching_principal" not in rust_text:
+        fail("Yield-interest HTTP regression is missing")
+
+    ok("Fixed-yield terms, accrual, and reviewed interest passed")
+
+
 def check_valuation_issue_projection(doc: dict) -> None:
     operation = doc["paths"]["/portfolio/valuation-issues"]["get"]
     schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
@@ -2136,6 +2162,7 @@ def main() -> None:
     check_holding_adjustment_proposal(doc)
     check_multi_hop_valuation()
     check_public_quote_provider()
+    check_yield_interest_slice(doc)
     check_valuation_issue_projection(doc)
     check_investment_fee_semantics(doc)
     check_investment_sale_result(doc)

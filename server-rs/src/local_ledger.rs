@@ -1099,6 +1099,234 @@ pub fn list_holdings_by_account(path: &Path, account_id: &str) -> io::Result<Val
     ))
 }
 
+pub fn list_yield_positions(path: &Path, through_date: Option<&str>) -> Result<Value, LedgerError> {
+    let document = read_document(path)?;
+    let through_date = match through_date {
+        Some(value) => Date::parse(value, &Iso8601::DATE).map_err(|_| {
+            LedgerError::InvalidInput(vec!["throughDate must be an ISO date".to_string()])
+        })?,
+        None => OffsetDateTime::now_utc().date(),
+    };
+    Ok(json!(yield_positions_for_document(
+        &document,
+        through_date
+    )?))
+}
+
+pub fn update_holding_yield_terms(
+    path: &Path,
+    holding_id: &str,
+    input: &Value,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let holding = document["holdings"]
+            .as_array()
+            .expect("validated local ledger holdings should be an array")
+            .iter()
+            .find(|holding| holding.get("id").and_then(Value::as_str) == Some(holding_id))
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("holding does not exist: {holding_id}"))
+            })?;
+        if holding
+            .get("yieldTerms")
+            .and_then(|terms| terms.get("pendingInterestMovementId"))
+            .is_some()
+        {
+            return Err(LedgerError::Conflict(
+                "holding has a pending interest proposal".to_string(),
+            ));
+        }
+        if holding_has_pending_adjustment(document, &holding) {
+            return Err(LedgerError::Conflict(
+                "holding has a pending quantity adjustment".to_string(),
+            ));
+        }
+        let terms = yield_terms_from_input(document, &holding, input, now)?;
+        let updated = document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .iter_mut()
+            .find(|holding| holding.get("id").and_then(Value::as_str) == Some(holding_id))
+            .expect("holding should still exist");
+        updated["yieldTerms"] = terms;
+        let payload = updated.clone();
+        append_sync_change(document, "holding", holding_id, "update", &payload, now);
+        Ok(payload)
+    })
+}
+
+pub fn create_holding_interest_proposal(
+    path: &Path,
+    holding_id: &str,
+    input: &Value,
+    movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let Some(object) = input.as_object() else {
+            return Err(LedgerError::InvalidInput(vec![
+                "interest proposal input must be a JSON object".to_string(),
+            ]));
+        };
+        let mut errors = Vec::new();
+        for key in object.keys() {
+            if !matches!(key.as_str(), "throughDate" | "note") {
+                errors.push(format!("unsupported interest proposal field: {key}"));
+            }
+        }
+        let through_date = required_string(object, "throughDate", &mut errors);
+        let note = optional_string(object, "note", &mut errors);
+        let through_date_value = through_date
+            .as_deref()
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+        if through_date.is_some() && through_date_value.is_none() {
+            errors.push("throughDate must be an ISO date".to_string());
+        }
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
+
+        let holding = document["holdings"]
+            .as_array()
+            .expect("validated local ledger holdings should be an array")
+            .iter()
+            .find(|holding| holding.get("id").and_then(Value::as_str) == Some(holding_id))
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("holding does not exist: {holding_id}"))
+            })?;
+        let terms = holding.get("yieldTerms").ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["holding has no yield terms".to_string()])
+        })?;
+        if terms.get("pendingInterestMovementId").is_some() {
+            return Err(LedgerError::Conflict(
+                "holding already has a pending interest proposal".to_string(),
+            ));
+        }
+        if holding_has_pending_adjustment(document, &holding) {
+            return Err(LedgerError::Conflict(
+                "holding has a pending quantity adjustment".to_string(),
+            ));
+        }
+        let start = Date::parse(
+            terms
+                .get("lastAccruedThrough")
+                .or_else(|| terms.get("interestStartDate"))
+                .and_then(Value::as_str)
+                .expect("validated yield accrual start date"),
+            &Iso8601::DATE,
+        )
+        .expect("validated yield accrual start date should parse");
+        let requested_through = through_date_value.expect("validated throughDate");
+        let maturity = terms
+            .get("maturityDate")
+            .and_then(Value::as_str)
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+        let through = maturity.map_or(requested_through, |maturity| {
+            requested_through.min(maturity)
+        });
+        if through <= start {
+            return Err(LedgerError::Conflict(
+                "throughDate must be after the last accrued date".to_string(),
+            ));
+        }
+        let accrual = calculate_yield_accrual(terms, start, through)?;
+        if accrual.amount == DecimalAmount::ZERO {
+            return Err(LedgerError::Conflict(
+                "accrued interest is below ledger precision".to_string(),
+            ));
+        }
+        let payout_account_id = terms
+            .get("payoutAccountId")
+            .and_then(Value::as_str)
+            .expect("validated payoutAccountId");
+        let currency = terms
+            .get("principal")
+            .and_then(|principal| principal.get("currency"))
+            .and_then(Value::as_str)
+            .expect("validated principal currency");
+        let display_name = holding
+            .get("instrumentId")
+            .and_then(Value::as_str)
+            .and_then(|instrument_id| {
+                document["instruments"]
+                    .as_array()
+                    .expect("validated instruments")
+                    .iter()
+                    .find(|instrument| {
+                        instrument.get("id").and_then(Value::as_str) == Some(instrument_id)
+                    })
+            })
+            .and_then(|instrument| instrument.get("displayName"))
+            .and_then(Value::as_str)
+            .unwrap_or("投资产品");
+        let mut movement = json!({
+            "id": movement_id,
+            "atomicGroupId": atomic_group_id,
+            "type": "interest",
+            "occurredAt": format!("{through}T00:00:00Z"),
+            "recordedAt": now,
+            "status": "pending_review",
+            "title": format!("{display_name}利息"),
+            "entries": [{
+                "id": format!("entry_{movement_id}_interest"),
+                "accountId": payout_account_id,
+                "amount": accrual.amount.decimal_string(),
+                "currency": currency,
+                "direction": "in",
+                "role": "source"
+            }],
+            "yieldAccrual": {
+                "holdingId": holding_id,
+                "previousAccruedThrough": start.to_string(),
+                "throughDate": through.to_string(),
+                "principal": terms["principal"].clone(),
+                "annualRate": terms["annualRate"].clone(),
+                "interestMethod": terms["interestMethod"].clone(),
+                "dayCountBasis": terms["dayCountBasis"].clone(),
+                "compoundingFrequency": terms["compoundingFrequency"].clone(),
+                "accrualDays": accrual.days,
+                "fullCompoundingPeriods": accrual.full_periods,
+                "interestAmount": {"amount": accrual.amount.decimal_string(), "currency": currency}
+            },
+            "tags": ["yield_interest"],
+            "source": {"kind": "system", "sourceId": holding_id, "createdBy": "system"},
+            "createdAt": now,
+            "updatedAt": now
+        });
+        if let Some(note) = note {
+            movement["description"] = json!(note);
+        }
+
+        document["movements"]
+            .as_array_mut()
+            .expect("validated movements")
+            .push(movement.clone());
+        let mut indexed_entry = movement["entries"][0].clone();
+        indexed_entry["movementId"] = json!(movement_id);
+        indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+        document["movementEntries"]
+            .as_array_mut()
+            .expect("validated movement entries")
+            .push(indexed_entry);
+        let updated_holding = document["holdings"]
+            .as_array_mut()
+            .expect("validated holdings")
+            .iter_mut()
+            .find(|holding| holding.get("id").and_then(Value::as_str) == Some(holding_id))
+            .expect("holding should exist");
+        updated_holding["yieldTerms"]["pendingInterestMovementId"] = json!(movement_id);
+        updated_holding["yieldTerms"]["pendingInterestThroughDate"] = json!(through.to_string());
+
+        Ok(atomic_group_from_movement(&movement, "pending"))
+    })
+}
+
 pub fn create_holding_adjustment_proposal(
     path: &Path,
     account_id: &str,
@@ -1205,6 +1433,24 @@ pub fn create_holding_adjustment_proposal(
         {
             return Err(LedgerError::Conflict(
                 "holding already has a pending adjustment".to_string(),
+            ));
+        }
+
+        if document["holdings"]
+            .as_array()
+            .expect("validated holdings")
+            .iter()
+            .find(|holding| {
+                holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                    && holding.get("instrumentId").and_then(Value::as_str)
+                        == Some(instrument_id.as_str())
+            })
+            .and_then(|holding| holding.get("yieldTerms"))
+            .and_then(|terms| terms.get("pendingInterestMovementId"))
+            .is_some()
+        {
+            return Err(LedgerError::Conflict(
+                "holding has a pending interest proposal".to_string(),
             ));
         }
 
@@ -1667,6 +1913,7 @@ pub fn confirm_atomic_group(
             }
             mark_dca_reminders_recorded_for_movements(document, &candidate_movements, now);
             mark_subscriptions_charged_for_movements(document, &candidate_movements, now)?;
+            mark_yield_interest_accrued_for_movements(document, &candidate_movements, now)?;
         }
 
         Ok(json!({
@@ -1731,6 +1978,7 @@ pub fn reject_atomic_group(
         }
 
         clear_rejected_subscription_charge_proposals(document, &candidate_movements, now);
+        clear_rejected_yield_interest_proposals(document, &candidate_movements, now);
 
         Ok(Value::Null)
     })
@@ -3794,7 +4042,56 @@ fn validate_core_ledger_entities(document: &Value, errors: &mut Vec<String>) {
         errors,
     );
     let movement_index = validate_movements(document, &account_ids, &instrument_ids, errors);
+    validate_yield_pending_links(document, errors);
     validate_movement_entry_index(document.get("movementEntries"), &movement_index, errors);
+}
+
+fn validate_yield_pending_links(document: &Value, errors: &mut Vec<String>) {
+    let movements = document["movements"]
+        .as_array()
+        .expect("validated movements should be an array");
+    for (index, holding) in document["holdings"]
+        .as_array()
+        .expect("validated holdings should be an array")
+        .iter()
+        .enumerate()
+    {
+        let Some(terms) = holding.get("yieldTerms") else {
+            continue;
+        };
+        let Some(pending_id) = terms
+            .get("pendingInterestMovementId")
+            .and_then(Value::as_str)
+        else {
+            if terms.get("pendingInterestThroughDate").is_some() {
+                errors.push(format!(
+                    "holdings[{index}].yieldTerms.pendingInterestThroughDate requires a pending movement"
+                ));
+            }
+            continue;
+        };
+        let holding_id = holding.get("id").and_then(Value::as_str);
+        let pending = movements
+            .iter()
+            .find(|movement| movement.get("id").and_then(Value::as_str) == Some(pending_id));
+        let valid = pending.is_some_and(|movement| {
+            movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                && movement
+                    .get("yieldAccrual")
+                    .and_then(|accrual| accrual.get("holdingId"))
+                    .and_then(Value::as_str)
+                    == holding_id
+                && movement
+                    .get("yieldAccrual")
+                    .and_then(|accrual| accrual.get("throughDate"))
+                    == terms.get("pendingInterestThroughDate")
+        });
+        if !valid {
+            errors.push(format!(
+                "holdings[{index}].yieldTerms pending interest link is invalid"
+            ));
+        }
+    }
 }
 
 fn validate_fx_rates(value: Option<&Value>, errors: &mut Vec<String>) {
@@ -4299,6 +4596,129 @@ fn validate_holdings(
         {
             errors.push(format!("holdings[{index}].asOf must be a non-empty string"));
         }
+        if let Some(terms) = holding.get("yieldTerms") {
+            validate_yield_terms(terms, index, account_ids, errors);
+        }
+    }
+}
+
+fn validate_yield_terms(
+    value: &Value,
+    holding_index: usize,
+    account_ids: &BTreeSet<&str>,
+    errors: &mut Vec<String>,
+) {
+    let label = format!("holdings[{holding_index}].yieldTerms");
+    let Some(terms) = value.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    validate_positive_money(
+        terms.get("principal"),
+        &format!("{label}.principal"),
+        errors,
+    );
+    if terms
+        .get("annualRate")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok())
+        .is_none_or(|value| value <= DecimalAmount::ZERO)
+    {
+        errors.push(format!(
+            "{label}.annualRate must be a positive decimal string"
+        ));
+    }
+    if !matches!(
+        terms.get("rateType").and_then(Value::as_str),
+        Some("fixed" | "floating")
+    ) {
+        errors.push(format!("{label}.rateType is invalid"));
+    }
+    let method = terms.get("interestMethod").and_then(Value::as_str);
+    let frequency = terms.get("compoundingFrequency").and_then(Value::as_str);
+    if !matches!(method, Some("simple" | "compound")) {
+        errors.push(format!("{label}.interestMethod is invalid"));
+    }
+    if !matches!(frequency, Some("none" | "monthly" | "quarterly" | "annual")) {
+        errors.push(format!("{label}.compoundingFrequency is invalid"));
+    }
+    if method == Some("simple") && frequency != Some("none") {
+        errors.push(format!(
+            "{label} simple interest requires compoundingFrequency=none"
+        ));
+    }
+    if method == Some("compound") && frequency == Some("none") {
+        errors.push(format!(
+            "{label} compound interest requires a compounding frequency"
+        ));
+    }
+    if !matches!(
+        terms.get("dayCountBasis").and_then(Value::as_u64),
+        Some(360 | 365)
+    ) {
+        errors.push(format!("{label}.dayCountBasis must be 360 or 365"));
+    }
+    let start = terms
+        .get("interestStartDate")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let maturity = terms
+        .get("maturityDate")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let last = terms
+        .get("lastAccruedThrough")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    if start.is_none() {
+        errors.push(format!("{label}.interestStartDate must be an ISO date"));
+    }
+    if maturity.is_none() {
+        errors.push(format!("{label}.maturityDate must be an ISO date"));
+    }
+    if last.is_none() {
+        errors.push(format!("{label}.lastAccruedThrough must be an ISO date"));
+    }
+    if let (Some(start), Some(last), Some(maturity)) = (start, last, maturity)
+        && (last < start || last > maturity)
+    {
+        errors.push(format!(
+            "{label}.lastAccruedThrough must be within the interest term"
+        ));
+    }
+    if terms
+        .get("payoutAccountId")
+        .and_then(Value::as_str)
+        .is_none_or(|account_id| !account_ids.contains(account_id))
+    {
+        errors.push(format!(
+            "{label}.payoutAccountId must reference an existing account"
+        ));
+    }
+    if terms
+        .get("updatedAt")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339)
+        .is_none()
+    {
+        errors.push(format!("{label}.updatedAt must be an RFC3339 timestamp"));
+    }
+    for key in ["pendingInterestMovementId", "lastInterestMovementId"] {
+        if let Some(value) = terms.get(key)
+            && value.as_str().is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.{key} must be a non-empty string"));
+        }
+    }
+    if let Some(value) = terms.get("pendingInterestThroughDate")
+        && value
+            .as_str()
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok())
+            .is_none()
+    {
+        errors.push(format!(
+            "{label}.pendingInterestThroughDate must be an ISO date"
+        ));
     }
 }
 
@@ -4418,6 +4838,14 @@ fn validate_movements<'a>(
                 validate_movement_semantics(document, movement_type, entries, errors);
             }
             validate_holding_adjustment_metadata(movement, movement_type, entries, index, errors);
+            validate_yield_accrual_metadata(
+                document,
+                movement,
+                movement_type,
+                entries,
+                index,
+                errors,
+            );
         }
         validate_investment_sale_result(movement, index, errors);
         validate_movement_cost_basis_fx(movement, index, errors);
@@ -4505,6 +4933,104 @@ fn validate_holding_adjustment_metadata(
             errors.push(format!(
                 "movements[{movement_index}].holdingAdjustment delta must match the entry"
             ));
+        }
+    }
+}
+
+fn validate_yield_accrual_metadata(
+    document: &Value,
+    movement: &serde_json::Map<String, Value>,
+    movement_type: &str,
+    entries: &[Value],
+    movement_index: usize,
+    errors: &mut Vec<String>,
+) {
+    let Some(accrual) = movement.get("yieldAccrual") else {
+        return;
+    };
+    let label = format!("movements[{movement_index}].yieldAccrual");
+    if movement_type != "interest" || entries.len() != 1 {
+        errors.push(format!(
+            "{label} is only valid on a single-entry interest movement"
+        ));
+        return;
+    }
+    let Some(accrual) = accrual.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    let holding_id = accrual.get("holdingId").and_then(Value::as_str);
+    let holding = holding_id.and_then(|holding_id| {
+        document["holdings"]
+            .as_array()
+            .expect("validated holdings")
+            .iter()
+            .find(|holding| holding.get("id").and_then(Value::as_str) == Some(holding_id))
+    });
+    if holding.is_none() {
+        errors.push(format!(
+            "{label}.holdingId must reference an existing holding"
+        ));
+    }
+    let previous = accrual
+        .get("previousAccruedThrough")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let through = accrual
+        .get("throughDate")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    if previous.is_none() || through.is_none() || previous >= through {
+        errors.push(format!("{label} must use valid increasing accrual dates"));
+    }
+    validate_positive_money(
+        accrual.get("principal"),
+        &format!("{label}.principal"),
+        errors,
+    );
+    validate_positive_money(
+        accrual.get("interestAmount"),
+        &format!("{label}.interestAmount"),
+        errors,
+    );
+    if accrual
+        .get("annualRate")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok())
+        .is_none_or(|value| value <= DecimalAmount::ZERO)
+    {
+        errors.push(format!("{label}.annualRate must be positive"));
+    }
+    let entry_amount = entries[0].get("amount").and_then(Value::as_str);
+    let entry_currency = entries[0].get("currency").and_then(Value::as_str);
+    if accrual
+        .get("interestAmount")
+        .and_then(|value| value.get("amount"))
+        .and_then(Value::as_str)
+        != entry_amount
+        || accrual
+            .get("interestAmount")
+            .and_then(|value| value.get("currency"))
+            .and_then(Value::as_str)
+            != entry_currency
+    {
+        errors.push(format!("{label}.interestAmount must match the entry"));
+    }
+    if let Some(holding) = holding {
+        let terms = holding.get("yieldTerms");
+        if terms.is_none() {
+            errors.push(format!("{label} holding must have yieldTerms"));
+        } else if movement.get("status").and_then(Value::as_str) == Some("pending_review") {
+            let movement_id = movement.get("id").and_then(Value::as_str);
+            if terms
+                .and_then(|terms| terms.get("pendingInterestMovementId"))
+                .and_then(Value::as_str)
+                != movement_id
+            {
+                errors.push(format!(
+                    "{label} pending movement must match the holding pending pointer"
+                ));
+            }
         }
     }
 }
@@ -9772,6 +10298,349 @@ fn advance_subscription_date(date: Date, unit: &str, count: u64) -> Option<Date>
     }
 }
 
+struct YieldAccrual {
+    amount: DecimalAmount,
+    days: i64,
+    full_periods: u64,
+}
+
+fn yield_terms_from_input(
+    document: &Value,
+    holding: &Value,
+    input: &Value,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "yield terms input must be a JSON object".to_string(),
+        ]));
+    };
+    let mut errors = Vec::new();
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "principal"
+                | "annualRate"
+                | "rateType"
+                | "interestMethod"
+                | "dayCountBasis"
+                | "compoundingFrequency"
+                | "interestStartDate"
+                | "maturityDate"
+                | "payoutAccountId"
+        ) {
+            errors.push(format!("unsupported yield terms field: {key}"));
+        }
+    }
+    let principal = normalized_required_money(object.get("principal"), "principal", &mut errors);
+    if principal
+        .as_ref()
+        .and_then(|value| value.get("amount"))
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok())
+        .is_none_or(|value| value <= DecimalAmount::ZERO)
+    {
+        errors.push("principal.amount must be positive".to_string());
+    }
+    let annual_rate = required_string(object, "annualRate", &mut errors);
+    if annual_rate
+        .as_deref()
+        .and_then(|value| parse_decimal(value).ok())
+        .is_none_or(|value| value <= DecimalAmount::ZERO)
+    {
+        errors.push("annualRate must be a positive decimal string".to_string());
+    }
+    let rate_type = required_enum(object, "rateType", &["fixed", "floating"], &mut errors);
+    let interest_method = required_enum(
+        object,
+        "interestMethod",
+        &["simple", "compound"],
+        &mut errors,
+    );
+    let day_count_basis = object.get("dayCountBasis").and_then(Value::as_u64);
+    if !matches!(day_count_basis, Some(360 | 365)) {
+        errors.push("dayCountBasis must be 360 or 365".to_string());
+    }
+    let compounding_frequency = required_enum(
+        object,
+        "compoundingFrequency",
+        &["none", "monthly", "quarterly", "annual"],
+        &mut errors,
+    );
+    if matches!(interest_method.as_deref(), Some("simple"))
+        && !matches!(compounding_frequency.as_deref(), Some("none"))
+    {
+        errors.push("simple interest requires compoundingFrequency=none".to_string());
+    }
+    if matches!(interest_method.as_deref(), Some("compound"))
+        && matches!(compounding_frequency.as_deref(), Some("none"))
+    {
+        errors.push("compound interest requires a compounding frequency".to_string());
+    }
+    let interest_start_date = required_string(object, "interestStartDate", &mut errors);
+    let interest_start = interest_start_date
+        .as_deref()
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    if interest_start_date.is_some() && interest_start.is_none() {
+        errors.push("interestStartDate must be an ISO date".to_string());
+    }
+    let maturity_date = required_string(object, "maturityDate", &mut errors);
+    let maturity = maturity_date
+        .as_deref()
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    if maturity_date.is_some() && maturity.is_none() {
+        errors.push("maturityDate must be an ISO date".to_string());
+    }
+    if let (Some(start), Some(maturity)) = (interest_start, maturity)
+        && maturity <= start
+    {
+        errors.push("maturityDate must be after interestStartDate".to_string());
+    }
+    let payout_account_id = required_string(object, "payoutAccountId", &mut errors);
+
+    let instrument_currency = holding
+        .get("instrumentId")
+        .and_then(Value::as_str)
+        .and_then(|instrument_id| {
+            document["instruments"]
+                .as_array()
+                .expect("validated instruments")
+                .iter()
+                .find(|instrument| {
+                    instrument.get("id").and_then(Value::as_str) == Some(instrument_id)
+                })
+        })
+        .and_then(|instrument| instrument.get("quoteCurrency"))
+        .and_then(Value::as_str);
+    let principal_currency = principal
+        .as_ref()
+        .and_then(|principal| principal.get("currency"))
+        .and_then(Value::as_str);
+    if principal_currency.is_some() && principal_currency != instrument_currency {
+        errors.push("principal.currency must match instrument quoteCurrency".to_string());
+    }
+    if let (Some(account_id), Some(currency)) = (payout_account_id.as_deref(), principal_currency) {
+        match active_account(document, account_id) {
+            None => errors.push("payoutAccountId must reference an active account".to_string()),
+            Some(account)
+                if !account
+                    .get("supportedCurrencies")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| item.as_str() == Some(currency))
+                    }) =>
+            {
+                errors.push("payout account does not support principal currency".to_string())
+            }
+            Some(_) => {}
+        }
+    }
+
+    let existing = holding.get("yieldTerms");
+    let existing_start = existing
+        .and_then(|terms| terms.get("interestStartDate"))
+        .and_then(Value::as_str);
+    let existing_last = existing
+        .and_then(|terms| terms.get("lastAccruedThrough"))
+        .and_then(Value::as_str);
+    if let (Some(existing_start), Some(existing_last), Some(next_start)) = (
+        existing_start,
+        existing_last,
+        interest_start_date.as_deref(),
+    ) && existing_last != existing_start
+        && next_start != existing_start
+    {
+        errors.push("interestStartDate cannot change after interest was accrued".to_string());
+    }
+    if let (Some(last), Some(maturity)) = (
+        existing_last.and_then(|value| Date::parse(value, &Iso8601::DATE).ok()),
+        maturity,
+    ) && maturity < last
+    {
+        errors.push("maturityDate cannot precede the last accrued date".to_string());
+    }
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    let start = interest_start_date.expect("validated interestStartDate");
+    Ok(json!({
+        "principal": principal.expect("validated principal"),
+        "annualRate": annual_rate.expect("validated annualRate"),
+        "rateType": rate_type.expect("validated rateType"),
+        "interestMethod": interest_method.expect("validated interestMethod"),
+        "dayCountBasis": day_count_basis.expect("validated dayCountBasis"),
+        "compoundingFrequency": compounding_frequency.expect("validated compoundingFrequency"),
+        "interestStartDate": start,
+        "maturityDate": maturity_date.expect("validated maturityDate"),
+        "payoutAccountId": payout_account_id.expect("validated payoutAccountId"),
+        "lastAccruedThrough": existing_last.unwrap_or(start.as_str()),
+        "updatedAt": now
+    }))
+}
+
+fn yield_positions_for_document(
+    document: &Value,
+    through_date: Date,
+) -> Result<Vec<Value>, LedgerError> {
+    let mut positions = Vec::new();
+    for holding in document["holdings"]
+        .as_array()
+        .expect("validated holdings")
+        .iter()
+        .filter(|holding| holding.get("yieldTerms").is_some())
+    {
+        let terms = holding.get("yieldTerms").expect("yieldTerms should exist");
+        let start = Date::parse(
+            terms
+                .get("lastAccruedThrough")
+                .and_then(Value::as_str)
+                .expect("validated lastAccruedThrough"),
+            &Iso8601::DATE,
+        )
+        .expect("validated lastAccruedThrough should parse");
+        let maturity = Date::parse(
+            terms
+                .get("maturityDate")
+                .and_then(Value::as_str)
+                .expect("validated maturityDate"),
+            &Iso8601::DATE,
+        )
+        .expect("validated maturityDate should parse");
+        let effective_through = through_date.min(maturity);
+        let accrual = if effective_through > start {
+            calculate_yield_accrual(terms, start, effective_through)?
+        } else {
+            YieldAccrual {
+                amount: DecimalAmount::ZERO,
+                days: 0,
+                full_periods: 0,
+            }
+        };
+        let instrument_id = holding
+            .get("instrumentId")
+            .and_then(Value::as_str)
+            .expect("validated instrumentId");
+        let instrument_name = document["instruments"]
+            .as_array()
+            .expect("validated instruments")
+            .iter()
+            .find(|instrument| instrument.get("id").and_then(Value::as_str) == Some(instrument_id))
+            .and_then(|instrument| instrument.get("displayName"))
+            .and_then(Value::as_str)
+            .unwrap_or(instrument_id);
+        let currency = terms["principal"]["currency"]
+            .as_str()
+            .expect("validated principal currency");
+        positions.push(json!({
+            "holdingId": holding["id"],
+            "accountId": holding["accountId"],
+            "instrumentId": instrument_id,
+            "instrumentName": instrument_name,
+            "terms": terms,
+            "accruedThrough": effective_through.to_string(),
+            "accrualDays": accrual.days,
+            "fullCompoundingPeriods": accrual.full_periods,
+            "accruedInterest": {"amount": accrual.amount.decimal_string(), "currency": currency},
+            "status": if through_date >= maturity {"matured"} else {"active"}
+        }));
+    }
+    Ok(positions)
+}
+
+fn calculate_yield_accrual(
+    terms: &Value,
+    start: Date,
+    through: Date,
+) -> Result<YieldAccrual, LedgerError> {
+    if through <= start {
+        return Ok(YieldAccrual {
+            amount: DecimalAmount::ZERO,
+            days: 0,
+            full_periods: 0,
+        });
+    }
+    let principal = parse_decimal(
+        terms["principal"]["amount"]
+            .as_str()
+            .expect("validated principal amount"),
+    )?;
+    let annual_rate = parse_decimal(terms["annualRate"].as_str().expect("validated annualRate"))?;
+    let basis = terms["dayCountBasis"]
+        .as_u64()
+        .expect("validated dayCountBasis");
+    let days = (through - start).whole_days();
+    if terms["interestMethod"].as_str() == Some("simple") {
+        return Ok(YieldAccrual {
+            amount: prorated_interest(principal, annual_rate, days, basis)?,
+            days,
+            full_periods: 0,
+        });
+    }
+
+    let (months, periods_per_year) = match terms["compoundingFrequency"].as_str() {
+        Some("monthly") => (1_i32, 12_i128),
+        Some("quarterly") => (3_i32, 4_i128),
+        Some("annual") => (12_i32, 1_i128),
+        _ => {
+            return Err(LedgerError::InvalidInput(vec![
+                "compound yield terms have an invalid frequency".to_string(),
+            ]));
+        }
+    };
+    let divisor = DecimalAmount(periods_per_year * DecimalAmount::SCALE);
+    let period_rate = divide_decimal(annual_rate, divisor).ok_or_else(|| {
+        LedgerError::InvalidInput(vec![
+            "annualRate cannot be divided by frequency".to_string(),
+        ])
+    })?;
+    let mut balance = principal;
+    let mut cursor = start;
+    let mut full_periods = 0_u64;
+    while let Some(next) = add_calendar_months(cursor, months)
+        && next <= through
+    {
+        balance += multiply_decimal(balance, period_rate);
+        cursor = next;
+        full_periods = full_periods.checked_add(1).ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["compounding period count overflow".to_string()])
+        })?;
+    }
+    let remaining_days = (through - cursor).whole_days();
+    if remaining_days > 0 {
+        balance += prorated_interest(balance, annual_rate, remaining_days, basis)?;
+    }
+    Ok(YieldAccrual {
+        amount: balance - principal,
+        days,
+        full_periods,
+    })
+}
+
+fn prorated_interest(
+    principal: DecimalAmount,
+    annual_rate: DecimalAmount,
+    days: i64,
+    basis: u64,
+) -> Result<DecimalAmount, LedgerError> {
+    let numerator = principal
+        .0
+        .checked_mul(annual_rate.0)
+        .and_then(|value| value.checked_mul(i128::from(days)))
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["interest calculation overflow".to_string()])
+        })?;
+    let denominator = DecimalAmount::SCALE
+        .checked_mul(i128::from(basis))
+        .ok_or_else(|| LedgerError::InvalidInput(vec!["day count basis overflow".to_string()]))?;
+    if denominator == 0 {
+        return Err(LedgerError::InvalidInput(vec![
+            "day count basis cannot be zero".to_string(),
+        ]));
+    }
+    Ok(DecimalAmount(numerator / denominator))
+}
+
 fn advance_subscription_billing_date(
     date: Date,
     unit: &str,
@@ -10588,6 +11457,28 @@ fn normalized_required_money(
 
 fn active_account_exists(document: &Value, account_id: &str) -> bool {
     active_account(document, account_id).is_some()
+}
+
+fn holding_has_pending_adjustment(document: &Value, holding: &Value) -> bool {
+    let account_id = holding.get("accountId").and_then(Value::as_str);
+    let instrument_id = holding.get("instrumentId").and_then(Value::as_str);
+    document["movements"]
+        .as_array()
+        .expect("validated movements")
+        .iter()
+        .any(|movement| {
+            movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                && movement
+                    .get("holdingAdjustment")
+                    .and_then(|adjustment| adjustment.get("accountId"))
+                    .and_then(Value::as_str)
+                    == account_id
+                && movement
+                    .get("holdingAdjustment")
+                    .and_then(|adjustment| adjustment.get("instrumentId"))
+                    .and_then(Value::as_str)
+                    == instrument_id
+        })
 }
 
 fn active_account<'a>(document: &'a Value, account_id: &str) -> Option<&'a Value> {
@@ -12061,6 +12952,97 @@ fn mark_subscriptions_charged_for_movements(
         );
     }
     Ok(())
+}
+
+fn mark_yield_interest_accrued_for_movements(
+    document: &mut Value,
+    movements: &[Value],
+    now: &str,
+) -> Result<(), LedgerError> {
+    let accruals = movements
+        .iter()
+        .filter_map(|movement| {
+            let accrual = movement.get("yieldAccrual")?;
+            Some((
+                movement.get("id")?.as_str()?.to_string(),
+                accrual.get("holdingId")?.as_str()?.to_string(),
+                accrual.get("previousAccruedThrough")?.as_str()?.to_string(),
+                accrual.get("throughDate")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (movement_id, holding_id, previous, through) in accruals {
+        let updated = {
+            let holding = document["holdings"]
+                .as_array_mut()
+                .expect("validated holdings")
+                .iter_mut()
+                .find(|holding| holding.get("id").and_then(Value::as_str) == Some(&holding_id))
+                .ok_or_else(|| {
+                    LedgerError::NotFound(format!(
+                        "yield holding does not exist during confirmation: {holding_id}"
+                    ))
+                })?;
+            let terms = holding
+                .get_mut("yieldTerms")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    LedgerError::Conflict(format!(
+                        "yield terms disappeared before confirmation: {holding_id}"
+                    ))
+                })?;
+            if terms
+                .get("pendingInterestMovementId")
+                .and_then(Value::as_str)
+                != Some(movement_id.as_str())
+                || terms.get("lastAccruedThrough").and_then(Value::as_str)
+                    != Some(previous.as_str())
+            {
+                return Err(LedgerError::Conflict(format!(
+                    "yield terms changed after proposal creation: {holding_id}"
+                )));
+            }
+            terms.insert("lastAccruedThrough".to_string(), json!(through));
+            terms.insert("lastInterestMovementId".to_string(), json!(movement_id));
+            terms.insert("updatedAt".to_string(), json!(now));
+            terms.remove("pendingInterestMovementId");
+            terms.remove("pendingInterestThroughDate");
+            holding.clone()
+        };
+        append_sync_change(document, "holding", &holding_id, "update", &updated, now);
+    }
+    Ok(())
+}
+
+fn clear_rejected_yield_interest_proposals(document: &mut Value, movements: &[Value], now: &str) {
+    let rejected = movements
+        .iter()
+        .filter_map(|movement| {
+            Some((
+                movement.get("id")?.as_str()?.to_string(),
+                movement
+                    .get("yieldAccrual")?
+                    .get("holdingId")?
+                    .as_str()?
+                    .to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (movement_id, holding_id) in rejected {
+        if let Some(holding) = document["holdings"]
+            .as_array_mut()
+            .expect("validated holdings")
+            .iter_mut()
+            .find(|holding| holding.get("id").and_then(Value::as_str) == Some(&holding_id))
+            && holding["yieldTerms"]["pendingInterestMovementId"].as_str()
+                == Some(movement_id.as_str())
+            && let Some(terms) = holding.get_mut("yieldTerms").and_then(Value::as_object_mut)
+        {
+            terms.remove("pendingInterestMovementId");
+            terms.remove("pendingInterestThroughDate");
+            terms.insert("updatedAt".to_string(), json!(now));
+        }
+    }
 }
 
 fn clear_rejected_subscription_charge_proposals(
@@ -15198,6 +16180,52 @@ mod tests {
             .clone()
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn yield_accrual_supports_simple_and_periodic_compound_interest() {
+        let start = Date::parse("2026-01-01", &Iso8601::DATE).expect("start");
+        let end = Date::parse("2027-01-01", &Iso8601::DATE).expect("end");
+        let simple = json!({
+            "principal": {"amount": "1000", "currency": "CNY"},
+            "annualRate": "0.12",
+            "interestMethod": "simple",
+            "dayCountBasis": 365,
+            "compoundingFrequency": "none"
+        });
+        let simple_accrual = calculate_yield_accrual(&simple, start, end).expect("simple accrual");
+        assert_eq!(simple_accrual.amount.decimal_string(), "120");
+        assert_eq!(simple_accrual.days, 365);
+        assert_eq!(simple_accrual.full_periods, 0);
+
+        let basis_360_end = Date::parse("2026-01-31", &Iso8601::DATE).expect("360 basis end");
+        let simple_360 = json!({
+            "principal": {"amount": "1000", "currency": "CNY"},
+            "annualRate": "0.12",
+            "interestMethod": "simple",
+            "dayCountBasis": 360,
+            "compoundingFrequency": "none"
+        });
+        let basis_360_accrual =
+            calculate_yield_accrual(&simple_360, start, basis_360_end).expect("360 basis accrual");
+        assert_eq!(basis_360_accrual.days, 30);
+        assert_eq!(basis_360_accrual.amount.decimal_string(), "10");
+
+        let compound = json!({
+            "principal": {"amount": "1000", "currency": "CNY"},
+            "annualRate": "0.12",
+            "interestMethod": "compound",
+            "dayCountBasis": 365,
+            "compoundingFrequency": "monthly"
+        });
+        let compound_accrual =
+            calculate_yield_accrual(&compound, start, end).expect("compound accrual");
+        assert_eq!(compound_accrual.full_periods, 12);
+        assert!(
+            compound_accrual.amount > simple_accrual.amount,
+            "monthly compounding should exceed simple interest at the same nominal rate"
+        );
+        assert_eq!(compound_accrual.amount.decimal_string(), "126.82503014");
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {
