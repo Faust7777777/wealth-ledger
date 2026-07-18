@@ -1344,6 +1344,37 @@ pub fn list_liability_positions(
     )?))
 }
 
+pub fn loan_repayment_schedule(
+    path: &Path,
+    account_id: &str,
+    limit: Option<&str>,
+) -> Result<Value, LedgerError> {
+    let limit = match limit {
+        None => 24_usize,
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| (1..=360).contains(value))
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![
+                    "limit must be an integer from 1 through 360".to_string(),
+                ])
+            })?,
+    };
+    let document = read_document(path)?;
+    let account = document["accounts"]
+        .as_array()
+        .expect("validated accounts")
+        .iter()
+        .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+        .ok_or_else(|| LedgerError::NotFound(format!("account does not exist: {account_id}")))?;
+    let terms = account.get("liabilityTerms").ok_or_else(|| {
+        LedgerError::InvalidInput(vec!["account has no liability terms".to_string()])
+    })?;
+    let (outstanding, currency) = liability_outstanding(account)?;
+    projected_loan_repayment_schedule(account, terms, outstanding, currency, limit)
+}
+
 pub fn update_account_liability_terms(
     path: &Path,
     account_id: &str,
@@ -11405,6 +11436,117 @@ fn liability_outstanding(account: &Value) -> Result<(DecimalAmount, &str), Ledge
     ))
 }
 
+fn projected_loan_repayment_schedule(
+    account: &Value,
+    terms: &Value,
+    outstanding: DecimalAmount,
+    currency: &str,
+    limit: usize,
+) -> Result<Value, LedgerError> {
+    let mut period_start = Date::parse(
+        terms["lastInterestAccruedThrough"]
+            .as_str()
+            .expect("validated lastInterestAccruedThrough"),
+        &Iso8601::DATE,
+    )
+    .expect("validated lastInterestAccruedThrough should parse");
+    let maturity = Date::parse(
+        terms["maturityDate"]
+            .as_str()
+            .expect("validated maturityDate"),
+        &Iso8601::DATE,
+    )
+    .expect("validated maturityDate should parse");
+    let mut due_date = Date::parse(
+        terms["nextDueDate"]
+            .as_str()
+            .expect("validated nextDueDate"),
+        &Iso8601::DATE,
+    )
+    .expect("validated nextDueDate should parse");
+    let anchor_day = due_date.day();
+    while due_date <= period_start && due_date < maturity {
+        due_date = add_calendar_months_with_anchor(due_date, 1, anchor_day).ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["repayment schedule date overflow".to_string()])
+        })?;
+    }
+    due_date = due_date.min(maturity);
+
+    let annual_rate = parse_decimal(terms["annualRate"].as_str().expect("validated annualRate"))?;
+    let basis = terms["dayCountBasis"]
+        .as_u64()
+        .expect("validated dayCountBasis");
+    let scheduled_payment = parse_decimal(
+        terms["scheduledPayment"]["amount"]
+            .as_str()
+            .expect("validated scheduledPayment"),
+    )?;
+    let mut opening = outstanding;
+    let mut items = Vec::new();
+    let mut total_payments = DecimalAmount::ZERO;
+    let mut total_interest = DecimalAmount::ZERO;
+    let mut total_principal = DecimalAmount::ZERO;
+    let mut sequence = 1_u64;
+
+    while opening > DecimalAmount::ZERO && due_date > period_start && items.len() < limit {
+        let days = (due_date - period_start).whole_days();
+        let interest = prorated_interest(opening, annual_rate, days, basis)?;
+        let total_due = opening + interest;
+        let is_maturity = due_date == maturity;
+        let payment = if is_maturity {
+            total_due
+        } else {
+            scheduled_payment.min(total_due)
+        };
+        let interest_paid = payment.min(interest);
+        let principal_paid = payment - interest_paid;
+        let unpaid_interest = interest - interest_paid;
+        let closing = opening - principal_paid + unpaid_interest;
+        total_payments += payment;
+        total_interest += interest;
+        total_principal += principal_paid;
+        items.push(json!({
+            "sequence": sequence,
+            "dueDate": due_date.to_string(),
+            "accrualDays": days,
+            "openingBalance": {"amount": opening.decimal_string(), "currency": currency},
+            "interest": {"amount": interest.decimal_string(), "currency": currency},
+            "principal": {"amount": principal_paid.decimal_string(), "currency": currency},
+            "payment": {"amount": payment.decimal_string(), "currency": currency},
+            "unpaidInterest": {"amount": unpaid_interest.decimal_string(), "currency": currency},
+            "closingBalance": {"amount": closing.decimal_string(), "currency": currency},
+            "kind": if is_maturity && payment > scheduled_payment {"balloon"} else {"scheduled"}
+        }));
+        opening = closing;
+        period_start = due_date;
+        sequence += 1;
+        if is_maturity || opening == DecimalAmount::ZERO {
+            break;
+        }
+        due_date = add_calendar_months_with_anchor(due_date, 1, anchor_day)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["repayment schedule date overflow".to_string()])
+            })?
+            .min(maturity);
+    }
+    let has_more = opening > DecimalAmount::ZERO && due_date > period_start;
+    Ok(json!({
+        "accountId": account["id"],
+        "accountName": account["displayName"],
+        "currency": currency,
+        "generatedFrom": terms["lastInterestAccruedThrough"],
+        "maturityDate": terms["maturityDate"],
+        "items": items,
+        "projectedTotals": {
+            "payments": {"amount": total_payments.decimal_string(), "currency": currency},
+            "interest": {"amount": total_interest.decimal_string(), "currency": currency},
+            "principal": {"amount": total_principal.decimal_string(), "currency": currency}
+        },
+        "remainingBalanceAfterPage": {"amount": opening.decimal_string(), "currency": currency},
+        "hasMore": has_more
+    }))
+}
+
 fn calculate_yield_accrual(
     terms: &Value,
     start: Date,
@@ -17192,6 +17334,46 @@ mod tests {
             "monthly compounding should exceed simple interest at the same nominal rate"
         );
         assert_eq!(compound_accrual.amount.decimal_string(), "126.82503014");
+    }
+
+    #[test]
+    fn loan_schedule_handles_negative_amortization_and_maturity_balloon() {
+        let account = json!({
+            "id": "acct_negative_amortization",
+            "displayName": "高息测试贷款",
+            "defaultCurrency": "CNY",
+            "cashBalances": [{"currency": "CNY", "amount": "-1000"}]
+        });
+        let terms = json!({
+            "annualRate": "1.2",
+            "dayCountBasis": 365,
+            "lastInterestAccruedThrough": "2026-01-01",
+            "nextDueDate": "2026-02-01",
+            "maturityDate": "2026-03-01",
+            "scheduledPayment": {"amount": "1", "currency": "CNY"}
+        });
+        let schedule = projected_loan_repayment_schedule(
+            &account,
+            &terms,
+            DecimalAmount::parse("1000").expect("outstanding"),
+            "CNY",
+            24,
+        )
+        .expect("schedule");
+        assert_eq!(schedule["items"].as_array().unwrap().len(), 2);
+        assert_eq!(schedule["items"][0]["payment"]["amount"], "1");
+        assert!(
+            parse_decimal(
+                schedule["items"][0]["unpaidInterest"]["amount"]
+                    .as_str()
+                    .expect("unpaid interest")
+            )
+            .expect("decimal")
+                > DecimalAmount::ZERO
+        );
+        assert_eq!(schedule["items"][1]["kind"], "balloon");
+        assert_eq!(schedule["items"][1]["closingBalance"]["amount"], "0");
+        assert_eq!(schedule["hasMore"], false);
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

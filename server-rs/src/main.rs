@@ -1180,6 +1180,10 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/accounts/{account_id}/holdings", get(account_holdings))
         .route("/v1/liability-positions", get(liability_positions))
         .route(
+            "/v1/accounts/{account_id}/repayment-schedule",
+            get(loan_repayment_schedule),
+        )
+        .route(
             "/v1/accounts/{account_id}/liability-terms",
             patch(update_account_liability_terms),
         )
@@ -1885,6 +1889,24 @@ async fn liability_positions(
     {
         Ok(positions) => envelope(positions).into_response(),
         Err(error) => local_ledger_error(error, "invalid_liability_position_query"),
+    }
+}
+
+async fn loan_repayment_schedule(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    match local_ledger::loan_repayment_schedule(
+        path,
+        &account_id,
+        query.get("limit").map(String::as_str),
+    ) {
+        Ok(schedule) => envelope(schedule).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_loan_repayment_schedule_query"),
     }
 }
 
@@ -9622,6 +9644,36 @@ mod tests {
             positions_body["data"][0]["nextPayment"]["projectedPrincipal"]["amount"],
             "87.6"
         );
+        let schedule_endpoint =
+            format!("/v1/accounts/{}/repayment-schedule?limit=2", account_ids[1]);
+        let (schedule_status, schedule_body) =
+            request_json_from(router.clone(), Method::GET, &schedule_endpoint).await;
+        assert_eq!(schedule_status, StatusCode::OK, "{schedule_body}");
+        assert_eq!(schedule_body["data"]["items"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            schedule_body["data"]["items"][0]["interest"]["amount"],
+            "12.4"
+        );
+        assert_eq!(
+            schedule_body["data"]["items"][0]["principal"]["amount"],
+            "87.6"
+        );
+        assert_eq!(
+            schedule_body["data"]["items"][1]["interest"]["amount"],
+            "8.7472"
+        );
+        assert_eq!(
+            schedule_body["data"]["remainingBalanceAfterPage"]["amount"],
+            "221.1472"
+        );
+        assert_eq!(schedule_body["data"]["hasMore"], true);
+        let (invalid_schedule_status, _) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}/repayment-schedule?limit=0", account_ids[1]),
+        )
+        .await;
+        assert_eq!(invalid_schedule_status, StatusCode::BAD_REQUEST);
 
         let interest_endpoint = format!("/v1/accounts/{}/loan-interest-proposals", account_ids[1]);
         let interest_idempotency = next_local_id("loan_interest_replay");

@@ -842,6 +842,7 @@ def check_yield_interest_slice(doc: dict) -> None:
 def check_loan_interest_slice(doc: dict) -> None:
     for path, method in [
         ("/liability-positions", "get"),
+        ("/accounts/{accountId}/repayment-schedule", "get"),
         ("/accounts/{accountId}/liability-terms", "patch"),
         ("/accounts/{accountId}/loan-interest-proposals", "post"),
     ]:
@@ -850,6 +851,8 @@ def check_loan_interest_slice(doc: dict) -> None:
     local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
     for snippet in [
         "pub fn list_liability_positions(",
+        "pub fn loan_repayment_schedule(",
+        "fn projected_loan_repayment_schedule(",
         "pub fn update_account_liability_terms(",
         "pub fn create_loan_interest_proposal(",
         "mark_loan_interest_accrued_for_movements",
