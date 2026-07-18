@@ -27,6 +27,16 @@ String? nonNegativeIntError(String raw, String field) {
   return null;
 }
 
+/// 下次扣费日不得早于订阅开始日期（两个不同概念；YYYY-MM-DD 字典序比较）。
+/// null/空视为未排期，交服务端按开始日期处理。
+String? nextChargeDateError(String? nextChargeDate, String startDate) {
+  if (nextChargeDate == null || nextChargeDate.isEmpty) return null;
+  if (nextChargeDate.compareTo(startDate) < 0) {
+    return '下次扣费日不能早于订阅开始日期';
+  }
+  return null;
+}
+
 /// 结束日期必须晚于开始日期（YYYY-MM-DD 字典序比较即可）。
 String? endDateAfterStartError(String? endDate, String startDate) {
   if (endDate == null || endDate.isEmpty) return '请选择结束日期';

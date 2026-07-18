@@ -80,6 +80,7 @@ void main() {
           amount: created.amount,
           paymentAccountId: created.paymentAccountId,
           billingCycle: created.billingCycle,
+          nextChargeDate: created.nextChargeDate,
           startDate: created.startDate,
           duration: null,
           endDate: '2026-04-30',

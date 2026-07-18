@@ -956,6 +956,7 @@ class CreateSubscriptionInput {
     required this.paymentAccountId,
     required this.billingCycle,
     required this.startDate,
+    this.nextChargeDate,
     this.duration,
     this.endDate,
     this.autoRenew = true,
@@ -970,6 +971,10 @@ class CreateSubscriptionInput {
   final Id paymentAccountId;
   final SubscriptionBillingCycleVm billingCycle;
   final IsoDate startDate;
+
+  /// 下次扣费日（与开始日期是两个概念）。null → 服务端按开始日期排期。
+  /// 本月已续费的场景由用户直接填下个月日期。
+  final IsoDate? nextChargeDate;
   final SubscriptionDurationVm? duration;
   final IsoDate? endDate;
   final bool autoRenew;
@@ -987,6 +992,7 @@ class UpdateSubscriptionInput {
     required this.paymentAccountId,
     required this.billingCycle,
     required this.startDate,
+    required this.nextChargeDate,
     required this.duration,
     required this.endDate,
     required this.autoRenew,
@@ -1002,6 +1008,9 @@ class UpdateSubscriptionInput {
   final Id paymentAccountId;
   final SubscriptionBillingCycleVm billingCycle;
   final IsoDate startDate;
+
+  /// 下次扣费日；编辑时以服务端返回值初始化，null（如已取消）则不发送。
+  final IsoDate? nextChargeDate;
   final SubscriptionDurationVm? duration; // 与 endDate 互斥
   final IsoDate? endDate;
   final bool autoRenew;

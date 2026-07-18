@@ -1608,6 +1608,8 @@ Map<String, dynamic> _createSubBody(CreateSubscriptionInput i) => {
   'paymentAccountId': i.paymentAccountId,
   'billingCycle': _billingCycleJson(i.billingCycle),
   'startDate': i.startDate,
+  if (i.nextChargeDate != null && i.nextChargeDate!.isNotEmpty)
+    'nextChargeDate': i.nextChargeDate,
   if (i.duration != null) 'duration': _durationJson(i.duration!),
   if (i.endDate != null && i.endDate!.isNotEmpty) 'endDate': i.endDate,
   'autoRenew': i.autoRenew,
@@ -1623,6 +1625,8 @@ Map<String, dynamic> _updateSubBody(UpdateSubscriptionInput i) => {
   'paymentAccountId': i.paymentAccountId,
   'billingCycle': _billingCycleJson(i.billingCycle),
   'startDate': i.startDate,
+  if (i.nextChargeDate != null && i.nextChargeDate!.isNotEmpty)
+    'nextChargeDate': i.nextChargeDate,
   'duration': i.duration != null ? _durationJson(i.duration!) : null,
   'endDate': (i.endDate?.isNotEmpty ?? false) ? i.endDate : null,
   'autoRenew': i.autoRenew,
