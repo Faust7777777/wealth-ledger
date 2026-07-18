@@ -79,7 +79,8 @@ try {
       test/local_server_dca_integration_test.dart `
       test/local_server_investment_trade_integration_test.dart `
       test/local_server_holding_adjustment_integration_test.dart `
-      test/local_server_loan_interest_integration_test.dart
+      test/local_server_loan_interest_integration_test.dart `
+      test/local_server_ai_text_integration_test.dart
     $flutterExitCode = $LASTEXITCODE
   } finally {
     Pop-Location
@@ -87,7 +88,7 @@ try {
   if ($flutterExitCode -ne 0) {
     throw "Flutter local-server integration tests failed"
   }
-  Write-Host "OK: Flutter local-server integration smoke passed (subscriptions + accounts + dca + trades + holdings + loans)"
+  Write-Host "OK: Flutter local-server integration smoke passed (subscriptions + accounts + dca + trades + holdings + loans + ai-text)"
 } catch {
   Write-Host "FAILED: $($_.Exception.Message)"
   foreach ($logPath in @($stdout, $stderr)) {
