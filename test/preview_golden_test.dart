@@ -20,7 +20,11 @@ import 'package:finwealth/features/account_form_page.dart';
 import 'package:finwealth/features/account_type_picker.dart';
 import 'package:finwealth/features/dca_execution_dialog.dart';
 import 'package:finwealth/data/api_mock_repositories.dart'
-    show parseLiabilityPositionData, parseMovementData;
+    show
+        ApiServiceUnavailableException,
+        parseAiProposalData,
+        parseLiabilityPositionData,
+        parseMovementData;
 import 'package:finwealth/data/repositories.dart';
 import 'package:finwealth/features/investment_page.dart';
 import 'package:finwealth/features/investment_trade_page.dart';
@@ -30,6 +34,7 @@ import 'package:finwealth/features/subscription_form_page.dart';
 import 'package:finwealth/features/valuation_status_sheet.dart';
 import 'package:finwealth/features/liability_terms_page.dart';
 import 'package:finwealth/features/loan_section.dart';
+import 'package:finwealth/features/ai_import_text_page.dart';
 import 'package:finwealth/features/liabilities_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/overview_page.dart';
@@ -1221,6 +1226,185 @@ void main() {
       matchesGoldenFile('goldens/liability_terms_form_dark.png'),
     );
   });
+  // —— 2026-07-19 批：AI 文本整理复核卡（结构化 + 待补全）——
+  final aiTextProposals = [
+    parseAiProposalData({
+      'id': 'prop_text_1',
+      'status': 'pending',
+      'source': {
+        'kind': 'user_text',
+        'modelName': 'gpt-x-preview',
+        'evidenceRefs': [
+          {'label': '午餐 18 元'},
+        ],
+      },
+      'atomicGroups': [
+        {
+          'id': 'ag_text_1',
+          'title': '新增：午餐',
+          'operation': 'create',
+          'status': 'pending',
+          'proposedMovements': [
+            {
+              'id': 'mov_text_1',
+              'atomicGroupId': 'ag_text_1',
+              'type': 'expense',
+              'status': 'pending_review',
+              'title': '午餐',
+              'occurredAt': '2026-07-19T12:30:00+08:00',
+              'entries': [
+                {
+                  'accountId': 'a_cash',
+                  'amount': '18',
+                  'currency': 'CNY',
+                  'direction': 'out',
+                  'role': 'source',
+                },
+              ],
+            },
+          ],
+          'diffs': <Object>[],
+          'warnings': <Object>[],
+          'validation': {'isValid': true, 'errors': <Object>[]},
+        },
+      ],
+    }),
+    parseAiProposalData({
+      'id': 'prop_text_2',
+      'status': 'pending',
+      'source': {
+        'kind': 'user_text',
+        'evidenceRefs': [
+          {'label': '上个月好像还有笔水电费'},
+        ],
+      },
+      'atomicGroups': [
+        {
+          'id': 'ag_text_2',
+          'title': '文本：待补全',
+          'operation': 'create',
+          'status': 'pending',
+          'proposedMovements': <Object>[],
+          'diffs': <Object>[],
+          'warnings': <Object>[],
+          'validation': {'isValid': false, 'errors': <Object>[]},
+        },
+      ],
+    }),
+  ];
+
+  Widget aiTextReviewHost(ThemeData theme) => ProviderScope(
+    overrides: [
+      capabilitiesProvider.overrideWith((ref) async => tradeCaps),
+      accountsProvider.overrideWith(
+        (ref) async => const [
+          AccountVm(
+            id: 'a_cash',
+            displayName: '现金钱包',
+            accountType: AccountType.cash,
+            isLiability: false,
+            defaultCurrency: 'CNY',
+          ),
+        ],
+      ),
+      aiProposalRepositoryProvider.overrideWithValue(
+        _PreviewAiRepo(aiTextProposals),
+      ),
+    ],
+    child: MaterialApp.router(
+      theme: theme,
+      routerConfig: GoRouter(
+        routes: [
+          GoRoute(path: '/', builder: (_, _) => const AiReviewPage()),
+          GoRoute(path: '/ai-edit/:id', builder: (_, _) => const Placeholder()),
+        ],
+      ),
+    ),
+  );
+
+  testWidgets('ai text review cards - dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 860));
+    await tester.pumpWidget(aiTextReviewHost(buildDarkTheme()));
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(AiReviewPage),
+      matchesGoldenFile('goldens/ai_text_review_dark.png'),
+    );
+  });
+
+  testWidgets('ai text import unavailable - dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 700));
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          capabilitiesProvider.overrideWith((ref) async => tradeCaps),
+          aiProposalRepositoryProvider.overrideWithValue(
+            _PreviewAiRepo(const [], failCreate: true),
+          ),
+        ],
+        child: MaterialApp.router(
+          theme: buildDarkTheme(),
+          routerConfig: GoRouter(
+            routes: [
+              GoRoute(path: '/', builder: (_, _) => const AiImportTextPage()),
+            ],
+          ),
+        ),
+      ),
+    );
+    await _settleEntrance(tester);
+    await tester.enterText(find.byType(TextField), '午餐 18 元');
+    await tester.tap(find.text('导入'));
+    await tester.pumpAndSettle();
+    await expectLater(
+      find.byType(AiImportTextPage),
+      matchesGoldenFile('goldens/ai_text_import_unavailable_dark.png'),
+    );
+  });
+}
+
+/// 预览用 AI 提案仓库。
+class _PreviewAiRepo implements AiProposalRepository {
+  const _PreviewAiRepo(this.pending, {this.failCreate = false});
+  final List<AiProposalVm> pending;
+  final bool failCreate;
+
+  @override
+  Future<List<AiProposalVm>> listPending() async => pending;
+  @override
+  Future<AiProposalVm?> getProposal(Id id) async => null;
+  @override
+  Future<ConfirmResultVm> approveAtomicGroup(Id groupId) =>
+      throw UnsupportedError('preview');
+  @override
+  Future<void> rejectAtomicGroup(Id groupId, {String? reason}) =>
+      throw UnsupportedError('preview');
+  @override
+  Future<void> createFromText(String text) async {
+    if (failCreate) {
+      throw ApiServiceUnavailableException('/v1/ai/proposals/from-text');
+    }
+  }
+
+  @override
+  Future<void> createFromCsv(
+    String csv, {
+    Id? defaultAccountId,
+    String? defaultCurrency,
+  }) => throw UnsupportedError('preview');
+  @override
+  Future<void> createFromImage({
+    required String fileName,
+    required String imageBase64,
+    String? mimeType,
+  }) => throw UnsupportedError('preview');
+  @override
+  Future<void> editAtomicGroup(Id groupId, ManualRecordInput input) =>
+      throw UnsupportedError('preview');
 }
 
 /// 预览用贷款仓库。

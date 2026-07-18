@@ -83,6 +83,16 @@ AiProposalVm _pendingProposal() => const AiProposalVm(
       title: '测试组',
       operation: AiOperation.create,
       status: AiGroupStatus.pending,
+      // 结构化候选才有「接受整组」；无 movement 的组走待补全门控。
+      proposedMovement: MovementVm(
+        id: 'mov_g1',
+        atomicGroupId: 'ag_1',
+        type: MovementType.expense,
+        status: MovementStatus.pendingReview,
+        title: '测试支出',
+        occurredAt: '2026-07-19T12:00:00Z',
+        displayAmount: Money(amount: '18.00', currency: 'CNY'),
+      ),
     ),
   ],
 );
