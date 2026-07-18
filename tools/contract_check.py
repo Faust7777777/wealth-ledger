@@ -845,6 +845,7 @@ def check_loan_interest_slice(doc: dict) -> None:
         ("/accounts/{accountId}/repayment-schedule", "get"),
         ("/accounts/{accountId}/liability-terms", "patch"),
         ("/accounts/{accountId}/loan-interest-proposals", "post"),
+        ("/accounts/{accountId}/loan-payment-proposals", "post"),
     ]:
         if method not in doc["paths"].get(path, {}):
             fail(f"Loan-interest endpoint missing: {method.upper()} {path}")
@@ -855,7 +856,10 @@ def check_loan_interest_slice(doc: dict) -> None:
         "fn projected_loan_repayment_schedule(",
         "pub fn update_account_liability_terms(",
         "pub fn create_loan_interest_proposal(",
+        "pub fn create_loan_payment_proposal(",
         "mark_loan_interest_accrued_for_movements",
+        "mark_loan_payments_recorded_for_movements",
+        "validate_loan_payment_metadata",
         "validate_loan_interest_accrual_metadata",
     ]:
         if snippet not in local_text:

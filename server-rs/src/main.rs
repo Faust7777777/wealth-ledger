@@ -1192,6 +1192,10 @@ fn app_with_state(state: AppState) -> Router {
             post(create_loan_interest_proposal),
         )
         .route(
+            "/v1/accounts/{account_id}/loan-payment-proposals",
+            post(create_loan_payment_proposal),
+        )
+        .route(
             "/v1/accounts/{account_id}/holding-adjustment-proposals",
             post(create_holding_adjustment_proposal),
         )
@@ -1963,6 +1967,36 @@ async fn create_loan_interest_proposal(
     ) {
         Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_loan_interest_proposal_input"),
+    }
+}
+
+async fn create_loan_payment_proposal(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("POST /v1/accounts/{account_id}/loan-payment-proposals");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_loan_payment_proposal(
+        path,
+        &account_id,
+        &input,
+        &next_local_movement_id(),
+        &next_local_movement_id(),
+        &next_local_atomic_group_id(),
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_loan_payment_proposal_input"),
     }
 }
 
@@ -9804,7 +9838,8 @@ mod tests {
             &format!("/v1/accounts/{}", account_ids[1]),
         )
         .await;
-        let (_, overview) = request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
+        let (_, overview) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
         assert_eq!(bank["data"]["cashBalances"][0]["amount"], "400.00");
         assert_eq!(loan["data"]["cashBalances"][0]["amount"], "-412.00");
         assert_eq!(
@@ -9822,6 +9857,166 @@ mod tests {
         assert_eq!(
             overview["data"]["latestSnapshot"]["netWorth"]["amount"],
             "-12.00"
+        );
+
+        let payment_endpoint = format!("/v1/accounts/{}/loan-payment-proposals", account_ids[1]);
+        let payment_input = json!({"paymentDate": "2026-02-01"});
+        let payment_idempotency = next_local_id("loan_payment_replay");
+        let (payment_status, _, payment_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &payment_endpoint,
+            payment_input.clone(),
+            Some(&payment_idempotency),
+        )
+        .await;
+        assert_eq!(payment_status, StatusCode::OK, "{payment_body}");
+        assert_eq!(
+            payment_body["data"]["proposedMovements"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            payment_body["data"]["proposedMovements"][1]["loanPayment"]["interestAmount"]["amount"],
+            "0.412"
+        );
+        assert_eq!(
+            payment_body["data"]["proposedMovements"][1]["loanPayment"]["principalAmount"]["amount"],
+            "99.588"
+        );
+        let payment_group = payment_body["data"]["id"]
+            .as_str()
+            .expect("loan payment group");
+        let (payment_replay_status, _, payment_replay_body) =
+            request_json_body_with_idempotency_from(
+                router.clone(),
+                Method::POST,
+                &payment_endpoint,
+                payment_input.clone(),
+                Some(&payment_idempotency),
+            )
+            .await;
+        assert_eq!(payment_replay_status, StatusCode::OK);
+        assert_eq!(
+            payment_replay_body["data"]["id"],
+            payment_body["data"]["id"]
+        );
+        let (reject_payment_status, reject_payment_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{payment_group}/reject"),
+        )
+        .await;
+        assert_eq!(
+            reject_payment_status,
+            StatusCode::NO_CONTENT,
+            "{reject_payment_body}"
+        );
+        let (replacement_payment_status, replacement_payment_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &payment_endpoint,
+            payment_input,
+        )
+        .await;
+        assert_eq!(
+            replacement_payment_status,
+            StatusCode::OK,
+            "{replacement_payment_body}"
+        );
+        let replacement_payment_group = replacement_payment_body["data"]["id"]
+            .as_str()
+            .expect("replacement loan payment group");
+        let mut conflicted_payment_document =
+            local_ledger::read_document(&path).expect("loan payment ledger should remain readable");
+        conflicted_payment_document["accounts"][1]["liabilityTerms"]["nextDueDate"] =
+            json!("2026-02-02");
+        local_ledger::write_document(&path, &conflicted_payment_document)
+            .expect("independently valid next due date change should persist");
+        let (payment_conflict_status, payment_conflict_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{replacement_payment_group}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            payment_conflict_status,
+            StatusCode::CONFLICT,
+            "{payment_conflict_body}"
+        );
+        let (_, bank_after_payment_conflict) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        let (_, loan_after_payment_conflict) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[1]),
+        )
+        .await;
+        assert_eq!(
+            bank_after_payment_conflict["data"]["cashBalances"][0]["amount"],
+            "400.00"
+        );
+        assert_eq!(
+            loan_after_payment_conflict["data"]["cashBalances"][0]["amount"],
+            "-412.00"
+        );
+        assert_eq!(
+            loan_after_payment_conflict["data"]["liabilityTerms"]["lastInterestAccruedThrough"],
+            "2026-01-31"
+        );
+        conflicted_payment_document["accounts"][1]["liabilityTerms"]["nextDueDate"] =
+            json!("2026-02-01");
+        local_ledger::write_document(&path, &conflicted_payment_document)
+            .expect("restored next due date should remain valid");
+        let (confirm_payment_status, confirm_payment_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{replacement_payment_group}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_payment_status,
+            StatusCode::OK,
+            "{confirm_payment_body}"
+        );
+        let (_, bank_after_payment) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        let (_, loan_after_payment) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[1]),
+        )
+        .await;
+        assert_eq!(
+            bank_after_payment["data"]["cashBalances"][0]["amount"],
+            "300.00"
+        );
+        assert_eq!(
+            loan_after_payment["data"]["cashBalances"][0]["amount"],
+            "-312.412"
+        );
+        assert_eq!(
+            loan_after_payment["data"]["liabilityTerms"]["lastInterestAccruedThrough"],
+            "2026-02-01"
+        );
+        assert_eq!(
+            loan_after_payment["data"]["liabilityTerms"]["nextDueDate"],
+            "2026-03-01"
+        );
+        assert!(
+            loan_after_payment["data"]["liabilityTerms"]
+                .get("pendingLoanPaymentMovementId")
+                .is_none()
         );
 
         let _ = std::fs::remove_file(path);

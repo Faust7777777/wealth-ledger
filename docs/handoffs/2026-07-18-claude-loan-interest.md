@@ -10,6 +10,7 @@ GET   /v1/liability-positions?throughDate=YYYY-MM-DD
 GET   /v1/accounts/{accountId}/repayment-schedule?limit=24
 PATCH /v1/accounts/{accountId}/liability-terms
 POST  /v1/accounts/{accountId}/loan-interest-proposals
+POST  /v1/accounts/{accountId}/loan-payment-proposals
 ```
 
 `liability-positions` 是计算结果的权威来源，返回当前未偿金额、指定日期的应计利息，以及下一期合同计划金额的预计利息与本金拆分。前端不得自行计算。
@@ -25,6 +26,7 @@ POST  /v1/accounts/{accountId}/loan-interest-proposals
 7. 400 展示字段原因；409 提示数据已变化或已有待确认利息；网络失败保留表单。
 8. 新增 wire movement type `loan_interest` → `MovementType.loanInterest`，流水与审核标题显示「贷款利息」；不得继续落入当前 unknown→adjustment 兜底。
 9. 账户详情增加可折叠的还款计划列表，逐期显示日期、付款、本金、利息和期末债务；按 `hasMore` 继续请求更大 limit，`balloon` 只显示为「到期还款」。
+10. 「记录还款」默认使用合同计划金额，也允许改实际金额；提交 `paymentDate` 和可选 `amount`。成功进入审核，不直接修改余额。审核卡片同时展示付款额、本金、利息与还款后债务。
 
 ## 文案边界
 
@@ -41,5 +43,6 @@ POST  /v1/accounts/{accountId}/loan-interest-proposals
 5. `loan_interest` 映射、流水详情和审核卡片不得显示成「调整」。
 6. 两期计划应为：首期利息 12.4/本金 87.6/期末 312.4；第二期利息 8.7472/本金 91.2528/期末 221.1472。
 7. 360/1200 宽度无溢出；百分比与 wire 小数映射有回归测试。
+8. 412 CNY 债务在次日还款 100：当期利息 0.412、本金 99.588；确认后付款账户减少 100、债务变为 312.412、下次还款日推进一个自然月。
 
 只改 Flutter 与前端测试，不改 Rust、OpenAPI、账本格式或部署。

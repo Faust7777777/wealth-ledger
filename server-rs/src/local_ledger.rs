@@ -1397,11 +1397,10 @@ pub fn update_account_liability_terms(
                 "liability terms require a liability account".to_string(),
             ]));
         }
-        if account
-            .get("liabilityTerms")
-            .and_then(|terms| terms.get("pendingLoanInterestMovementId"))
-            .is_some()
-        {
+        if account.get("liabilityTerms").is_some_and(|terms| {
+            terms.get("pendingLoanInterestMovementId").is_some()
+                || terms.get("pendingLoanPaymentMovementId").is_some()
+        }) {
             return Err(LedgerError::Conflict(
                 "account has a pending loan interest proposal".to_string(),
             ));
@@ -1466,7 +1465,9 @@ pub fn create_loan_interest_proposal(
         let terms = account.get("liabilityTerms").ok_or_else(|| {
             LedgerError::InvalidInput(vec!["account has no liability terms".to_string()])
         })?;
-        if terms.get("pendingLoanInterestMovementId").is_some() {
+        if terms.get("pendingLoanInterestMovementId").is_some()
+            || terms.get("pendingLoanPaymentMovementId").is_some()
+        {
             return Err(LedgerError::Conflict(
                 "account already has a pending loan interest proposal".to_string(),
             ));
@@ -1570,6 +1571,285 @@ pub fn create_loan_interest_proposal(
             json!(through.to_string());
         updated_account["updatedAt"] = json!(now);
         Ok(atomic_group_from_movement(&movement, "pending"))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_loan_payment_proposal(
+    path: &Path,
+    account_id: &str,
+    input: &Value,
+    interest_movement_id: &str,
+    payment_movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let Some(object) = input.as_object() else {
+            return Err(LedgerError::InvalidInput(vec![
+                "loan payment proposal input must be a JSON object".to_string(),
+            ]));
+        };
+        let mut errors = Vec::new();
+        for key in object.keys() {
+            if !matches!(key.as_str(), "paymentDate" | "amount" | "note") {
+                errors.push(format!("unsupported loan payment proposal field: {key}"));
+            }
+        }
+        let payment_date = required_string(object, "paymentDate", &mut errors);
+        let payment_date_value = payment_date
+            .as_deref()
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+        if payment_date.is_some() && payment_date_value.is_none() {
+            errors.push("paymentDate must be an ISO date".to_string());
+        }
+        let note = optional_string(object, "note", &mut errors);
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
+
+        let account = document["accounts"]
+            .as_array()
+            .expect("validated accounts")
+            .iter()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("account does not exist: {account_id}"))
+            })?;
+        let terms = account.get("liabilityTerms").ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["account has no liability terms".to_string()])
+        })?;
+        if terms.get("pendingLoanInterestMovementId").is_some()
+            || terms.get("pendingLoanPaymentMovementId").is_some()
+        {
+            return Err(LedgerError::Conflict(
+                "account already has a pending loan proposal".to_string(),
+            ));
+        }
+        let start = Date::parse(
+            terms["lastInterestAccruedThrough"]
+                .as_str()
+                .expect("validated lastInterestAccruedThrough"),
+            &Iso8601::DATE,
+        )
+        .expect("validated lastInterestAccruedThrough should parse");
+        let maturity = Date::parse(
+            terms["maturityDate"]
+                .as_str()
+                .expect("validated maturityDate"),
+            &Iso8601::DATE,
+        )
+        .expect("validated maturityDate should parse");
+        let payment_date = payment_date_value.expect("validated paymentDate");
+        if payment_date < start || payment_date > maturity {
+            return Err(LedgerError::InvalidInput(vec![
+                "paymentDate must be between the last accrued date and maturityDate".to_string(),
+            ]));
+        }
+        let (outstanding, currency) = liability_outstanding(&account)?;
+        if outstanding == DecimalAmount::ZERO {
+            return Err(LedgerError::Conflict(
+                "loan account has no outstanding balance".to_string(),
+            ));
+        }
+        let annual_rate =
+            parse_decimal(terms["annualRate"].as_str().expect("validated annualRate"))?;
+        let basis = terms["dayCountBasis"]
+            .as_u64()
+            .expect("validated dayCountBasis");
+        let days = (payment_date - start).whole_days();
+        let interest = if days > 0 {
+            prorated_interest(outstanding, annual_rate, days, basis)?
+        } else {
+            DecimalAmount::ZERO
+        };
+        let scheduled_payment = terms["scheduledPayment"].clone();
+        let requested_payment = match object.get("amount") {
+            None | Some(Value::Null) => scheduled_payment.clone(),
+            Some(value) => {
+                normalized_required_money(Some(value), "amount", &mut errors).unwrap_or(Value::Null)
+            }
+        };
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
+        let requested_currency = requested_payment
+            .get("currency")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let payment = requested_payment
+            .get("amount")
+            .and_then(Value::as_str)
+            .and_then(|value| parse_decimal(value).ok());
+        if requested_currency != currency {
+            return Err(LedgerError::InvalidInput(vec![
+                "amount.currency must match the loan currency".to_string(),
+            ]));
+        }
+        let Some(payment) = payment.filter(|value| *value > DecimalAmount::ZERO) else {
+            return Err(LedgerError::InvalidInput(vec![
+                "amount.amount must be positive".to_string(),
+            ]));
+        };
+        let total_due = outstanding + interest;
+        if payment > total_due {
+            return Err(LedgerError::InvalidInput(vec![
+                "payment amount cannot exceed the total loan balance and accrued interest"
+                    .to_string(),
+            ]));
+        }
+        let interest_portion = payment.min(interest);
+        let principal_portion = payment - interest_portion;
+        let previous_next_due = Date::parse(
+            terms["nextDueDate"]
+                .as_str()
+                .expect("validated nextDueDate"),
+            &Iso8601::DATE,
+        )
+        .expect("validated nextDueDate should parse");
+        let anchor_day = terms["repaymentAnchorDay"]
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .expect("validated repaymentAnchorDay");
+        let next_due = add_calendar_months_with_anchor(previous_next_due, 1, anchor_day)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["next repayment date overflow".to_string()])
+            })?
+            .min(maturity);
+        let occurred_at = format!("{payment_date}T23:59:59Z");
+        let payment_account_id = terms["paymentAccountId"]
+            .as_str()
+            .expect("validated paymentAccountId");
+
+        let mut movements = Vec::new();
+        if interest > DecimalAmount::ZERO {
+            movements.push(json!({
+                "id": interest_movement_id,
+                "atomicGroupId": atomic_group_id,
+                "type": "loan_interest",
+                "occurredAt": occurred_at,
+                "recordedAt": now,
+                "status": "pending_review",
+                "title": format!("{} 贷款利息", account["displayName"].as_str().unwrap_or(account_id)),
+                "entries": [{
+                    "id": format!("entry_{interest_movement_id}_loan_interest"),
+                    "accountId": account_id,
+                    "amount": interest.decimal_string(),
+                    "currency": currency,
+                    "direction": "out",
+                    "role": "source"
+                }],
+                "loanInterestAccrual": {
+                    "accountId": account_id,
+                    "previousAccruedThrough": start.to_string(),
+                    "throughDate": payment_date.to_string(),
+                    "outstandingPrincipal": {"amount": outstanding.decimal_string(), "currency": currency},
+                    "annualRate": terms["annualRate"].clone(),
+                    "rateType": terms["rateType"].clone(),
+                    "dayCountBasis": basis,
+                    "accrualDays": days,
+                    "interestAmount": {"amount": interest.decimal_string(), "currency": currency}
+                },
+                "tags": ["loan_interest", "loan_payment"],
+                "source": {"kind": "system", "sourceId": account_id, "createdBy": "system"},
+                "createdAt": now,
+                "updatedAt": now
+            }));
+        }
+        let mut payment_movement = json!({
+            "id": payment_movement_id,
+            "atomicGroupId": atomic_group_id,
+            "type": "loan_repayment",
+            "occurredAt": occurred_at,
+            "recordedAt": now,
+            "status": "pending_review",
+            "title": format!("{} 还款", account["displayName"].as_str().unwrap_or(account_id)),
+            "entries": [
+                {
+                    "id": format!("entry_{payment_movement_id}_payment"),
+                    "accountId": payment_account_id,
+                    "amount": payment.decimal_string(),
+                    "currency": currency,
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "id": format!("entry_{payment_movement_id}_loan"),
+                    "accountId": account_id,
+                    "amount": payment.decimal_string(),
+                    "currency": currency,
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ],
+            "loanPayment": {
+                "accountId": account_id,
+                "paymentAccountId": payment_account_id,
+                "paymentDate": payment_date.to_string(),
+                "previousNextDueDate": previous_next_due.to_string(),
+                "nextDueDate": next_due.to_string(),
+                "paymentAmount": {"amount": payment.decimal_string(), "currency": currency},
+                "interestAmount": {"amount": interest_portion.decimal_string(), "currency": currency},
+                "principalAmount": {"amount": principal_portion.decimal_string(), "currency": currency},
+                "unpaidInterest": {"amount": (interest - interest_portion).decimal_string(), "currency": currency}
+            },
+            "tags": ["loan_payment"],
+            "source": {"kind": "manual", "createdBy": "user"},
+            "createdAt": now,
+            "updatedAt": now
+        });
+        if interest > DecimalAmount::ZERO {
+            payment_movement["loanPayment"]["linkedInterestMovementId"] =
+                json!(interest_movement_id);
+        }
+        if let Some(note) = note {
+            payment_movement["description"] = json!(note);
+        }
+        movements.push(payment_movement.clone());
+
+        for movement in &movements {
+            document["movements"]
+                .as_array_mut()
+                .expect("validated movements")
+                .push(movement.clone());
+            for entry in movement["entries"].as_array().expect("movement entries") {
+                let mut indexed_entry = entry.clone();
+                indexed_entry["movementId"] = movement["id"].clone();
+                indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+                document["movementEntries"]
+                    .as_array_mut()
+                    .expect("validated movement entries")
+                    .push(indexed_entry);
+            }
+        }
+        let updated_account = document["accounts"]
+            .as_array_mut()
+            .expect("validated accounts")
+            .iter_mut()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+            .expect("account should exist");
+        if interest > DecimalAmount::ZERO {
+            updated_account["liabilityTerms"]["pendingLoanInterestMovementId"] =
+                json!(interest_movement_id);
+            updated_account["liabilityTerms"]["pendingLoanInterestThroughDate"] =
+                json!(payment_date.to_string());
+        }
+        updated_account["liabilityTerms"]["pendingLoanPaymentMovementId"] =
+            json!(payment_movement_id);
+        updated_account["liabilityTerms"]["pendingLoanPaymentDate"] =
+            json!(payment_date.to_string());
+        updated_account["updatedAt"] = json!(now);
+
+        let mut group = atomic_group_from_movement(&payment_movement, "pending");
+        group["proposedMovements"] = json!(
+            movements
+                .iter()
+                .map(project_movement_for_api)
+                .collect::<Vec<_>>()
+        );
+        Ok(group)
     })
 }
 
@@ -2161,6 +2441,7 @@ pub fn confirm_atomic_group(
             mark_subscriptions_charged_for_movements(document, &candidate_movements, now)?;
             mark_yield_interest_accrued_for_movements(document, &candidate_movements, now)?;
             mark_loan_interest_accrued_for_movements(document, &candidate_movements, now)?;
+            mark_loan_payments_recorded_for_movements(document, &candidate_movements, now)?;
         }
 
         Ok(json!({
@@ -2227,6 +2508,7 @@ pub fn reject_atomic_group(
         clear_rejected_subscription_charge_proposals(document, &candidate_movements, now);
         clear_rejected_yield_interest_proposals(document, &candidate_movements, now);
         clear_rejected_loan_interest_proposals(document, &candidate_movements, now);
+        clear_rejected_loan_payment_proposals(document, &candidate_movements, now);
 
         Ok(Value::Null)
     })
@@ -4309,6 +4591,14 @@ fn validate_liability_terms(value: &Value, account_index: usize, errors: &mut Ve
     if terms.get("repaymentFrequency").and_then(Value::as_str) != Some("monthly") {
         errors.push(format!("{label}.repaymentFrequency must be monthly"));
     }
+    if !matches!(
+        terms.get("repaymentAnchorDay").and_then(Value::as_u64),
+        Some(1..=31)
+    ) {
+        errors.push(format!(
+            "{label}.repaymentAnchorDay must be from 1 through 31"
+        ));
+    }
     validate_positive_money(
         terms.get("scheduledPayment"),
         &format!("{label}.scheduledPayment"),
@@ -4382,6 +4672,8 @@ fn validate_liability_terms(value: &Value, account_index: usize, errors: &mut Ve
     for key in [
         "pendingLoanInterestMovementId",
         "lastLoanInterestMovementId",
+        "pendingLoanPaymentMovementId",
+        "lastLoanPaymentMovementId",
     ] {
         if let Some(value) = terms.get(key)
             && value.as_str().is_none_or(str::is_empty)
@@ -4398,6 +4690,16 @@ fn validate_liability_terms(value: &Value, account_index: usize, errors: &mut Ve
         errors.push(format!(
             "{label}.pendingLoanInterestThroughDate must be an ISO date"
         ));
+    }
+    for key in ["pendingLoanPaymentDate", "lastPaymentDate"] {
+        if let Some(value) = terms.get(key)
+            && value
+                .as_str()
+                .and_then(|value| Date::parse(value, &Iso8601::DATE).ok())
+                .is_none()
+        {
+            errors.push(format!("{label}.{key} must be an ISO date"));
+        }
     }
 }
 
@@ -4512,36 +4814,65 @@ fn validate_liability_term_links(document: &Value, errors: &mut Vec<String>) {
                 "accounts[{index}].liabilityTerms payment account must support the loan currency"
             ));
         }
-        let Some(pending_id) = terms
+        let account_id = account.get("id").and_then(Value::as_str);
+        if let Some(pending_id) = terms
             .get("pendingLoanInterestMovementId")
             .and_then(Value::as_str)
-        else {
+        {
+            let pending = movements
+                .iter()
+                .find(|movement| movement.get("id").and_then(Value::as_str) == Some(pending_id));
+            let valid = pending.is_some_and(|movement| {
+                movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                    && movement
+                        .get("loanInterestAccrual")
+                        .and_then(|accrual| accrual.get("accountId"))
+                        .and_then(Value::as_str)
+                        == account_id
+                    && movement
+                        .get("loanInterestAccrual")
+                        .and_then(|accrual| accrual.get("throughDate"))
+                        == terms.get("pendingLoanInterestThroughDate")
+            });
+            if !valid {
+                errors.push(format!(
+                    "accounts[{index}].liabilityTerms pending loan interest link is invalid"
+                ));
+            }
+        } else {
             if terms.get("pendingLoanInterestThroughDate").is_some() {
                 errors.push(format!(
                     "accounts[{index}].liabilityTerms.pendingLoanInterestThroughDate requires a pending movement"
                 ));
             }
-            continue;
-        };
-        let account_id = account.get("id").and_then(Value::as_str);
-        let pending = movements
-            .iter()
-            .find(|movement| movement.get("id").and_then(Value::as_str) == Some(pending_id));
-        let valid = pending.is_some_and(|movement| {
-            movement.get("status").and_then(Value::as_str) == Some("pending_review")
-                && movement
-                    .get("loanInterestAccrual")
-                    .and_then(|accrual| accrual.get("accountId"))
-                    .and_then(Value::as_str)
-                    == account_id
-                && movement
-                    .get("loanInterestAccrual")
-                    .and_then(|accrual| accrual.get("throughDate"))
-                    == terms.get("pendingLoanInterestThroughDate")
-        });
-        if !valid {
+        }
+        if let Some(pending_id) = terms
+            .get("pendingLoanPaymentMovementId")
+            .and_then(Value::as_str)
+        {
+            let pending = movements
+                .iter()
+                .find(|movement| movement.get("id").and_then(Value::as_str) == Some(pending_id));
+            let valid = pending.is_some_and(|movement| {
+                movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                    && movement
+                        .get("loanPayment")
+                        .and_then(|payment| payment.get("accountId"))
+                        .and_then(Value::as_str)
+                        == account_id
+                    && movement
+                        .get("loanPayment")
+                        .and_then(|payment| payment.get("paymentDate"))
+                        == terms.get("pendingLoanPaymentDate")
+            });
+            if !valid {
+                errors.push(format!(
+                    "accounts[{index}].liabilityTerms pending loan payment link is invalid"
+                ));
+            }
+        } else if terms.get("pendingLoanPaymentDate").is_some() {
             errors.push(format!(
-                "accounts[{index}].liabilityTerms pending loan interest link is invalid"
+                "accounts[{index}].liabilityTerms.pendingLoanPaymentDate requires a pending movement"
             ));
         }
     }
@@ -5308,6 +5639,14 @@ fn validate_movements<'a>(
                 index,
                 errors,
             );
+            validate_loan_payment_metadata(
+                document,
+                movement,
+                movement_type,
+                entries,
+                index,
+                errors,
+            );
         }
         validate_investment_sale_result(movement, index, errors);
         validate_movement_cost_basis_fx(movement, index, errors);
@@ -5597,6 +5936,142 @@ fn validate_loan_interest_accrual_metadata(
                 "{label} pending movement must match the account pending pointer"
             ));
         }
+    }
+}
+
+fn validate_loan_payment_metadata(
+    document: &Value,
+    movement: &serde_json::Map<String, Value>,
+    movement_type: &str,
+    entries: &[Value],
+    movement_index: usize,
+    errors: &mut Vec<String>,
+) {
+    let Some(payment) = movement.get("loanPayment") else {
+        return;
+    };
+    let label = format!("movements[{movement_index}].loanPayment");
+    if movement_type != "loan_repayment" || entries.len() != 2 {
+        errors.push(format!(
+            "{label} is only valid on a two-entry loan_repayment movement"
+        ));
+        return;
+    }
+    let Some(payment) = payment.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    let account_id = payment.get("accountId").and_then(Value::as_str);
+    let payment_account_id = payment.get("paymentAccountId").and_then(Value::as_str);
+    let account = account_id.and_then(|id| active_account(document, id));
+    if account.is_none_or(|account| !is_liability_account(account)) {
+        errors.push(format!(
+            "{label}.accountId must reference a liability account"
+        ));
+    }
+    if payment_account_id
+        .and_then(|id| active_account(document, id))
+        .is_none_or(is_liability_account)
+    {
+        errors.push(format!(
+            "{label}.paymentAccountId must reference a non-liability account"
+        ));
+    }
+    for key in ["paymentDate", "previousNextDueDate", "nextDueDate"] {
+        if payment
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok())
+            .is_none()
+        {
+            errors.push(format!("{label}.{key} must be an ISO date"));
+        }
+    }
+    validate_positive_money(
+        payment.get("paymentAmount"),
+        &format!("{label}.paymentAmount"),
+        errors,
+    );
+    for key in ["interestAmount", "principalAmount", "unpaidInterest"] {
+        validate_non_negative_money(
+            payment.get(key).unwrap_or(&Value::Null),
+            &format!("{label}.{key}"),
+            errors,
+        );
+    }
+    let payment_amount = payment
+        .get("paymentAmount")
+        .and_then(|money| money.get("amount"))
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    let interest_amount = payment
+        .get("interestAmount")
+        .and_then(|money| money.get("amount"))
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    let principal_amount = payment
+        .get("principalAmount")
+        .and_then(|money| money.get("amount"))
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    if let (Some(payment_amount), Some(interest_amount), Some(principal_amount)) =
+        (payment_amount, interest_amount, principal_amount)
+        && payment_amount != interest_amount + principal_amount
+    {
+        errors.push(format!(
+            "{label}.paymentAmount must equal interestAmount plus principalAmount"
+        ));
+    }
+    let source = entries
+        .iter()
+        .find(|entry| entry.get("role").and_then(Value::as_str) == Some("source"));
+    let destination = entries
+        .iter()
+        .find(|entry| entry.get("role").and_then(Value::as_str) == Some("destination"));
+    if source
+        .and_then(|entry| entry.get("accountId"))
+        .and_then(Value::as_str)
+        != payment_account_id
+        || destination
+            .and_then(|entry| entry.get("accountId"))
+            .and_then(Value::as_str)
+            != account_id
+        || source
+            .and_then(|entry| entry.get("amount"))
+            .and_then(Value::as_str)
+            != payment
+                .get("paymentAmount")
+                .and_then(|money| money.get("amount"))
+                .and_then(Value::as_str)
+    {
+        errors.push(format!("{label} must match the repayment entries"));
+    }
+    if let Some(linked_id) = payment
+        .get("linkedInterestMovementId")
+        .and_then(Value::as_str)
+    {
+        let linked = document["movements"]
+            .as_array()
+            .expect("validated movements")
+            .iter()
+            .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(linked_id));
+        if linked.is_none_or(|linked| {
+            linked.get("atomicGroupId") != movement.get("atomicGroupId")
+                || linked.get("loanInterestAccrual").is_none()
+        }) {
+            errors.push(format!(
+                "{label}.linkedInterestMovementId must reference loan interest in the same group"
+            ));
+        }
+    }
+    if let Some(account) = account
+        && movement.get("status").and_then(Value::as_str) == Some("pending_review")
+        && account["liabilityTerms"]["pendingLoanPaymentMovementId"].as_str()
+            != movement.get("id").and_then(Value::as_str)
+    {
+        errors.push(format!(
+            "{label} pending movement must match the account pending pointer"
+        ));
     }
 }
 
@@ -11290,7 +11765,11 @@ fn liability_terms_from_input(
         return Err(LedgerError::InvalidInput(errors));
     }
     let start = interest_start_date.expect("validated interestStartDate");
-    Ok(json!({
+    let repayment_anchor_day = existing
+        .and_then(|terms| terms.get("repaymentAnchorDay"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| u64::from(repayment_start.expect("validated repaymentStartDate").day()));
+    let mut terms = json!({
         "liabilityType": liability_type.expect("validated liabilityType"),
         "annualRate": annual_rate.expect("validated annualRate"),
         "rateType": rate_type.expect("validated rateType"),
@@ -11300,11 +11779,24 @@ fn liability_terms_from_input(
         "repaymentStartDate": repayment_start_date.expect("validated repaymentStartDate"),
         "nextDueDate": next_due_date.expect("validated nextDueDate"),
         "repaymentFrequency": repayment_frequency.expect("validated repaymentFrequency"),
+        "repaymentAnchorDay": repayment_anchor_day,
         "scheduledPayment": scheduled_payment.expect("validated scheduledPayment"),
         "paymentAccountId": payment_account_id.expect("validated paymentAccountId"),
         "lastInterestAccruedThrough": existing_last.unwrap_or(start.as_str()),
         "updatedAt": now
-    }))
+    });
+    if let Some(existing) = existing {
+        for key in [
+            "lastLoanInterestMovementId",
+            "lastLoanPaymentMovementId",
+            "lastPaymentDate",
+        ] {
+            if let Some(value) = existing.get(key) {
+                terms[key] = value.clone();
+            }
+        }
+    }
+    Ok(terms)
 }
 
 fn liability_positions_for_document(
@@ -14147,6 +14639,102 @@ fn clear_rejected_loan_interest_proposals(document: &mut Value, movements: &[Val
         {
             terms.remove("pendingLoanInterestMovementId");
             terms.remove("pendingLoanInterestThroughDate");
+            terms.insert("updatedAt".to_string(), json!(now));
+            account["updatedAt"] = json!(now);
+        }
+    }
+}
+
+fn mark_loan_payments_recorded_for_movements(
+    document: &mut Value,
+    movements: &[Value],
+    now: &str,
+) -> Result<(), LedgerError> {
+    let payments = movements
+        .iter()
+        .filter_map(|movement| {
+            let payment = movement.get("loanPayment")?;
+            Some((
+                movement.get("id")?.as_str()?.to_string(),
+                payment.get("accountId")?.as_str()?.to_string(),
+                payment.get("previousNextDueDate")?.as_str()?.to_string(),
+                payment.get("nextDueDate")?.as_str()?.to_string(),
+                payment.get("paymentDate")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (movement_id, account_id, previous_due, next_due, payment_date) in payments {
+        let updated = {
+            let account = document["accounts"]
+                .as_array_mut()
+                .expect("validated accounts")
+                .iter_mut()
+                .find(|account| account.get("id").and_then(Value::as_str) == Some(&account_id))
+                .ok_or_else(|| {
+                    LedgerError::NotFound(format!(
+                        "loan account does not exist during payment confirmation: {account_id}"
+                    ))
+                })?;
+            let terms = account
+                .get_mut("liabilityTerms")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    LedgerError::Conflict(format!(
+                        "liability terms disappeared before payment confirmation: {account_id}"
+                    ))
+                })?;
+            if terms
+                .get("pendingLoanPaymentMovementId")
+                .and_then(Value::as_str)
+                != Some(movement_id.as_str())
+                || terms.get("nextDueDate").and_then(Value::as_str) != Some(previous_due.as_str())
+            {
+                return Err(LedgerError::Conflict(format!(
+                    "liability payment terms changed after proposal creation: {account_id}"
+                )));
+            }
+            terms.insert("nextDueDate".to_string(), json!(next_due));
+            terms.insert("lastPaymentDate".to_string(), json!(payment_date));
+            terms.insert("lastLoanPaymentMovementId".to_string(), json!(movement_id));
+            terms.insert("updatedAt".to_string(), json!(now));
+            terms.remove("pendingLoanPaymentMovementId");
+            terms.remove("pendingLoanPaymentDate");
+            account["updatedAt"] = json!(now);
+            account.clone()
+        };
+        append_sync_change(document, "account", &account_id, "update", &updated, now);
+    }
+    Ok(())
+}
+
+fn clear_rejected_loan_payment_proposals(document: &mut Value, movements: &[Value], now: &str) {
+    let rejected = movements
+        .iter()
+        .filter_map(|movement| {
+            Some((
+                movement.get("id")?.as_str()?.to_string(),
+                movement
+                    .get("loanPayment")?
+                    .get("accountId")?
+                    .as_str()?
+                    .to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (movement_id, account_id) in rejected {
+        if let Some(account) = document["accounts"]
+            .as_array_mut()
+            .expect("validated accounts")
+            .iter_mut()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(&account_id))
+            && account["liabilityTerms"]["pendingLoanPaymentMovementId"].as_str()
+                == Some(movement_id.as_str())
+            && let Some(terms) = account
+                .get_mut("liabilityTerms")
+                .and_then(Value::as_object_mut)
+        {
+            terms.remove("pendingLoanPaymentMovementId");
+            terms.remove("pendingLoanPaymentDate");
             terms.insert("updatedAt".to_string(), json!(now));
             account["updatedAt"] = json!(now);
         }

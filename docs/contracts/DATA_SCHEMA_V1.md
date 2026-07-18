@@ -213,10 +213,12 @@ LiabilityTerms {
   repaymentStartDate: ISODate;
   nextDueDate: ISODate;
   repaymentFrequency: "monthly";
+  repaymentAnchorDay: 1..31;
   scheduledPayment: Money;
   paymentAccountId: ID;
   lastInterestAccruedThrough: ISODate;
   pendingLoanInterestMovementId?: ID;
+  pendingLoanPaymentMovementId?: ID;
 }
 ```
 
@@ -227,9 +229,10 @@ LiabilityTerms {
 - `scheduledPayment` 是用户录入的合同计划金额，不由服务端猜测等额本息或复杂摊销规则。
 - 多期还款表从当前未偿债务开始，逐月按真实间隔天数计算；计划金额不足当期利息时未付利息进入期末债务，到期日用气球款结清投影余额。它是基于现有条款的前瞻读模型，不改写账本。
 - 生成贷款利息只创建 `pending_review` movement；确认后才增加负债并推进累计截止日，拒绝不改变余额。
+- 还款候选把付款日前新增利息和 `loan_repayment` 放在同一 atomic group；确认同时扣付款账户、减少债务并推进计息截止日和 `nextDueDate`。付款先覆盖当期利息，剩余部分减少本金；不足覆盖的利息保留在债务余额中。
 - 浮动利率由用户在每个计息区间前维护当前年利率；movement 固化当期利率，不假装自动跟踪 LPR 等外部基准。
 
-`LoanInterestAccrual` 固化负债 account、上次/本次截止日、计算时未偿金额、利率类型、年利率、日基准、天数和本期利息。
+`LoanInterestAccrual` 固化负债 account、上次/本次截止日、计算时未偿金额、利率类型、年利率、日基准、天数和本期利息。`LoanPayment` 固化付款账户、还款日、付款额、本金/利息拆分、未付利息和前后到期日。
 
 ## 5. Movement
 
