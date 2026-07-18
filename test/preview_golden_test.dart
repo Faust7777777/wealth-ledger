@@ -20,7 +20,7 @@ import 'package:finwealth/features/account_form_page.dart';
 import 'package:finwealth/features/account_type_picker.dart';
 import 'package:finwealth/features/dca_execution_dialog.dart';
 import 'package:finwealth/data/api_mock_repositories.dart'
-    show parseMovementData;
+    show parseLiabilityPositionData, parseMovementData;
 import 'package:finwealth/data/repositories.dart';
 import 'package:finwealth/features/investment_page.dart';
 import 'package:finwealth/features/investment_trade_page.dart';
@@ -28,6 +28,8 @@ import 'package:finwealth/features/movement_detail_page.dart';
 import 'package:finwealth/features/account_detail_page.dart';
 import 'package:finwealth/features/subscription_form_page.dart';
 import 'package:finwealth/features/valuation_status_sheet.dart';
+import 'package:finwealth/features/liability_terms_page.dart';
+import 'package:finwealth/features/loan_section.dart';
 import 'package:finwealth/features/liabilities_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
 import 'package:finwealth/features/overview_page.dart';
@@ -1100,6 +1102,151 @@ void main() {
       matchesGoldenFile('goldens/subscription_form_dual_dates_dark.png'),
     );
   });
+  // —— 2026-07-18 批 2：贷款条款 / 贷款区 ——
+  const loanPreviewAccount = AccountVm(
+    id: 'a_loan',
+    displayName: '邮储助学贷款',
+    accountType: AccountType.loan,
+    isLiability: true,
+    balanceMode: 'liability',
+    defaultCurrency: 'CNY',
+    cashBalances: {'CNY': '-400.00'},
+  );
+
+  final loanPosition = parseLiabilityPositionData({
+    'accountId': 'a_loan',
+    'accountName': '邮储助学贷款',
+    'currency': 'CNY',
+    'terms': {
+      'liabilityType': 'student_loan',
+      'annualRate': '0.365',
+      'rateType': 'fixed',
+      'dayCountBasis': 365,
+      'interestStartDate': '2026-01-01',
+      'maturityDate': '2026-12-01',
+      'repaymentStartDate': '2026-02-01',
+      'nextDueDate': '2026-02-01',
+      'repaymentFrequency': 'monthly',
+      'scheduledPayment': {'amount': '100.00', 'currency': 'CNY'},
+      'paymentAccountId': 'a_cash',
+      'lastInterestAccruedThrough': '2026-01-01',
+      'updatedAt': '2026-07-18T00:00:00Z',
+    },
+    'outstandingPrincipal': {'amount': '400.00', 'currency': 'CNY'},
+    'accruedThrough': '2026-01-31',
+    'accrualDays': 30,
+    'accruedInterest': {'amount': '12.00', 'currency': 'CNY'},
+    'nextPayment': {
+      'dueDate': '2026-02-01',
+      'scheduledAmount': {'amount': '100.00', 'currency': 'CNY'},
+      'projectedInterest': {'amount': '12.40', 'currency': 'CNY'},
+      'projectedPrincipal': {'amount': '87.60', 'currency': 'CNY'},
+    },
+    'status': 'active',
+  });
+
+  Widget loanHost(ThemeData theme, Widget page) => ProviderScope(
+    overrides: [
+      capabilitiesProvider.overrideWith((ref) async => tradeCaps),
+      accountsProvider.overrideWith((ref) async => tradeAccounts),
+      accountRepositoryProvider.overrideWithValue(
+        const _PreviewAccountRepo(loanPreviewAccount),
+      ),
+      loanRepositoryProvider.overrideWithValue(
+        _PreviewLoanRepo([loanPosition]),
+      ),
+    ],
+    child: MaterialApp.router(
+      theme: theme,
+      routerConfig: GoRouter(
+        routes: [GoRoute(path: '/', builder: (_, _) => page)],
+      ),
+    ),
+  );
+
+  testWidgets('loan section - dark', skip: !_previewEnabled, (tester) async {
+    await sized(tester, const Size(400, 760));
+    await tester.pumpWidget(
+      loanHost(
+        buildDarkTheme(),
+        const Scaffold(
+          body: Padding(
+            padding: EdgeInsets.all(16),
+            child: SingleChildScrollView(
+              child: LoanSection(account: loanPreviewAccount),
+            ),
+          ),
+        ),
+      ),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(Scaffold),
+      matchesGoldenFile('goldens/loan_section_dark.png'),
+    );
+  });
+
+  testWidgets('loan section - light', skip: !_previewEnabled, (tester) async {
+    await sized(tester, const Size(400, 760));
+    await tester.pumpWidget(
+      loanHost(
+        buildLightTheme(),
+        const Scaffold(
+          body: Padding(
+            padding: EdgeInsets.all(16),
+            child: SingleChildScrollView(
+              child: LoanSection(account: loanPreviewAccount),
+            ),
+          ),
+        ),
+      ),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(Scaffold),
+      matchesGoldenFile('goldens/loan_section_light.png'),
+    );
+  });
+
+  testWidgets('liability terms form - dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 1240));
+    await tester.pumpWidget(
+      loanHost(buildDarkTheme(), const LiabilityTermsPage(accountId: 'a_loan')),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(LiabilityTermsPage),
+      matchesGoldenFile('goldens/liability_terms_form_dark.png'),
+    );
+  });
+}
+
+/// 预览用贷款仓库。
+class _PreviewLoanRepo implements LoanRepository {
+  const _PreviewLoanRepo(this.positions);
+  final List<LiabilityPositionVm> positions;
+  @override
+  Future<List<LiabilityPositionVm>> listLiabilityPositions({
+    IsoDate? throughDate,
+  }) async => positions;
+  @override
+  Future<LoanRepaymentScheduleVm> getRepaymentSchedule(
+    Id accountId, {
+    int limit = 24,
+  }) => throw UnsupportedError('preview');
+  @override
+  Future<AccountVm> updateLiabilityTerms(
+    Id accountId,
+    LiabilityTermsInput input,
+  ) => throw UnsupportedError('preview');
+  @override
+  Future<AiAtomicGroupVm> proposeLoanInterest(
+    Id accountId, {
+    required IsoDate throughDate,
+    String? note,
+  }) => throw UnsupportedError('preview');
 }
 
 /// 预览用账户仓库（多资产账户详情）。
