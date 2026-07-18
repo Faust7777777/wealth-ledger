@@ -720,6 +720,32 @@ def check_local_ledger_reference_integrity() -> None:
     ok("Local-ledger taxonomy and quote integrity checks passed")
 
 
+def check_quote_problem_summary(doc: dict) -> None:
+    description = (
+        doc["components"]["schemas"]["PendingSummary"]["properties"]
+        ["quoteProblemCount"].get("description", "")
+    )
+    for phrase in ("stale", "offline-cached", "unpriceable", "error"):
+        if phrase not in description:
+            fail(f"quoteProblemCount description must include {phrase}")
+
+    local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    for snippet in [
+        '"quoteProblemCount": summary.stale_count',
+        "+ summary.offline_cached_count",
+        "+ summary.unpriceable_count",
+        "+ summary.error_count",
+    ]:
+        if snippet not in local_text:
+            fail(f"Rust quoteProblemCount aggregation is incomplete: {snippet}")
+
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    if "local_ledger_quote_problem_count_includes_stale_fx_valuation" not in rust_text:
+        fail("Rust tests must cover stale FX in quoteProblemCount")
+
+    ok("Quote-problem summary semantics passed")
+
+
 def check_investment_fee_semantics(doc: dict) -> None:
     local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
     for snippet in [
@@ -2008,6 +2034,7 @@ def main() -> None:
 
     check_dca_execution_input(doc)
     check_local_ledger_reference_integrity()
+    check_quote_problem_summary(doc)
     check_investment_fee_semantics(doc)
     check_investment_sale_result(doc)
     check_subscription_due_scan(doc)

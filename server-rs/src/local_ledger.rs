@@ -2411,7 +2411,10 @@ pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
             "accountAnomalyCount": summary.account_anomaly_count,
             "dcaDueCount": dca_due_count,
             "inTransitCount": in_transit_count,
-            "quoteProblemCount": summary.unpriceable_count,
+            "quoteProblemCount": summary.stale_count
+                + summary.offline_cached_count
+                + summary.unpriceable_count
+                + summary.error_count,
             "syncProblemCount": 0
         },
         "quoteStatusSummary": {

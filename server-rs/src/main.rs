@@ -9228,6 +9228,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ledger_quote_problem_count_includes_stale_fx_valuation() {
+        let path = unique_test_ledger_path("stale_fx_problem_count");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "外币账户",
+                "accountType": "wallet",
+                "defaultCurrency": "USD",
+                "supportedCurrencies": ["USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "USD", "amount": "10.00"}]
+            }),
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED, "{account_body}");
+
+        let (refresh_status, refresh_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "fxRates": [{
+                    "baseCurrency": "USD",
+                    "quoteCurrency": "CNY",
+                    "rate": "7.00",
+                    "asOf": "2026-07-01T00:00:00Z",
+                    "expiresAt": "2026-07-02T00:00:00Z",
+                    "source": "stale_test"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::OK, "{refresh_body}");
+
+        let (overview_status, overview_body) =
+            request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_status, StatusCode::OK, "{overview_body}");
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["quoteStatusSummary"]["staleCount"],
+            1
+        );
+        assert_eq!(
+            overview_body["data"]["pendingSummary"]["quoteProblemCount"], 1,
+            "a stale valuation still needs the compact quote-status entry"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_dca_plan_create_due_skip_and_snooze() {
         let path = unique_test_ledger_path("dca_plan");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");

@@ -3099,6 +3099,7 @@ components:
           type: integer
         quoteProblemCount:
           type: integer
+          description: Total stale, offline-cached, unpriceable, and error valuation items.
         syncProblemCount:
           type: integer
     PortfolioOverview:

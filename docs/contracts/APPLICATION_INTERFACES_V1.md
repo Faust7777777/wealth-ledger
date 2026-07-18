@@ -109,6 +109,7 @@ PendingSummary {
 
 - 首页默认展示“较上次快照”。
 - 只有报价与汇率全 fresh 才允许展示“今日涨跌”。
+- `quoteProblemCount` 是 stale、offline cached、unpriceable 与 error 估值项数量之和；不得只统计缺失报价，也不得把所有问题统一描述成“本地缓存”。
 - `primaryHoldings` 按市值占比排序，不按收益率排序。
 
 ## 4. MovementService
