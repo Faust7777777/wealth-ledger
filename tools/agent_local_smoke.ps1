@@ -15,15 +15,11 @@ $token = [Convert]::ToHexString(
   [Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
 ).ToLowerInvariant()
 $serverExecutable = Join-Path $root "server-rs\target\debug\finwealth-server.exe"
-if (!(Test-Path -LiteralPath $serverExecutable -PathType Leaf)) {
-  & cargo build --quiet --manifest-path (Join-Path $root "server-rs\Cargo.toml")
-  if ($LASTEXITCODE -ne 0) { throw "cargo build failed." }
-}
+& cargo build --quiet --manifest-path (Join-Path $root "server-rs\Cargo.toml")
+if ($LASTEXITCODE -ne 0) { throw "cargo build failed." }
 $agentExecutable = Join-Path $root "agent-service\dist\main.js"
-if (!(Test-Path -LiteralPath $agentExecutable -PathType Leaf)) {
-  & npm --prefix (Join-Path $root "agent-service") run build
-  if ($LASTEXITCODE -ne 0) { throw "Agent TypeScript build failed." }
-}
+& npm --prefix (Join-Path $root "agent-service") run build
+if ($LASTEXITCODE -ne 0) { throw "Agent TypeScript build failed." }
 
 try {
   $env:FINWEALTH_AGENT_BASE_URL = "http://127.0.0.1:$AgentPort"
@@ -103,14 +99,47 @@ try {
     throw "Attachment upload failed with $([int]$uploadResponse.StatusCode)."
   }
   $upload = $uploadResponse.Content.ReadAsStringAsync().Result | ConvertFrom-Json
+  $attachmentId = $upload.data.id
   $uploadRequest.Dispose()
   $multipart.Dispose()
+  if (!$attachmentId) { throw "Attachment upload did not return an ID." }
+
+  $metadata = Invoke-RestMethod `
+    -Method Get `
+    -Uri "http://127.0.0.1:$ServerPort/v1/agent/attachments/$attachmentId"
+  if ($metadata.data.mimeType -ne "image/png") {
+    throw "Attachment metadata did not pass through the Rust proxy."
+  }
+  if ($metadata.data.PSObject.Properties.Name -contains "originalPath" -or
+      $metadata.data.PSObject.Properties.Name -contains "workingPath") {
+    throw "Attachment metadata exposed a storage path."
+  }
+
+  $contentResponse = $http.GetAsync(
+    "http://127.0.0.1:$ServerPort/v1/agent/attachments/$attachmentId/content"
+  ).Result
+  if (!$contentResponse.IsSuccessStatusCode) {
+    throw "Attachment download failed with $([int]$contentResponse.StatusCode)."
+  }
+  $allContentHeaders = $contentResponse.Headers.ToString() +
+    $contentResponse.Content.Headers.ToString()
+  if ($contentResponse.Content.Headers.ContentType.MediaType -ne "image/png" -or
+      !$contentResponse.Headers.ETag -or
+      $allContentHeaders -notmatch "(?im)^X-Content-Type-Options:\s*nosniff\s*$" -or
+      $contentResponse.Headers.CacheControl.Private -ne $true -or
+      $contentResponse.Headers.CacheControl.NoStore -ne $true) {
+    throw "Attachment download headers did not pass through the Rust proxy."
+  }
+  $downloaded = $contentResponse.Content.ReadAsByteArrayAsync().Result
+  if ([Convert]::ToBase64String($downloaded) -ne [Convert]::ToBase64String([IO.File]::ReadAllBytes($image))) {
+    throw "Attachment download bytes differ from the upload."
+  }
+  $contentResponse.Dispose()
   $http.Dispose()
-  if (!$upload.data.id) { throw "Attachment upload did not return an ID." }
 
   $messageBody = @{
     text = "hello"
-    attachmentIds = @($upload.data.id)
+    attachmentIds = @($attachmentId)
   } | ConvertTo-Json -Compress
   try {
     Invoke-WebRequest `

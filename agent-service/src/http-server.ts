@@ -220,6 +220,24 @@ export function createAgentHttpServer(
         ok(response, result.value, 201);
         return;
       }
+      let match = path.match(/^\/v1\/agent\/attachments\/([^/]+)\/content$/);
+      if (match?.[1] && request.method === "GET") {
+        const content = await service.getAttachmentContent(principal, match[1]);
+        response.writeHead(200, {
+          "content-type": content.metadata.mimeType,
+          "content-length": content.bytes.length,
+          "cache-control": "private, no-store",
+          etag: `"sha256-${content.metadata.sha256}"`,
+          "x-content-type-options": "nosniff",
+        });
+        response.end(content.bytes);
+        return;
+      }
+      match = path.match(/^\/v1\/agent\/attachments\/([^/]+)$/);
+      if (match?.[1] && request.method === "GET") {
+        ok(response, await service.getAttachment(principal, match[1]));
+        return;
+      }
       if (path === "/v1/agent/conversations") {
         if (request.method === "GET") {
           ok(response, await service.listConversations(principal));
@@ -241,7 +259,7 @@ export function createAgentHttpServer(
         }
       }
 
-      let match = path.match(/^\/v1\/agent\/conversations\/([^/]+)$/);
+      match = path.match(/^\/v1\/agent\/conversations\/([^/]+)$/);
       if (match?.[1] && request.method === "PATCH") {
         const conversationId = match[1];
         const body = await readJson(request);

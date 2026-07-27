@@ -1609,6 +1609,76 @@ paths:
               schema:
                 $ref: "#/components/schemas/AgentAttachmentResponse"
 
+  /agent/attachments/{attachmentId}:
+    get:
+      tags: [Agent]
+      summary: Read attachment metadata without exposing server storage paths.
+      parameters:
+        - name: attachmentId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+      responses:
+        "200":
+          description: Owned attachment metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentAttachmentResponse"
+        "404":
+          description: Attachment is absent or belongs to another account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/attachments/{attachmentId}/content:
+    get:
+      tags: [Agent]
+      summary: Read the authenticated account's archived image bytes.
+      parameters:
+        - name: attachmentId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+      responses:
+        "200":
+          description: Original validated image with private no-store caching.
+          headers:
+            ETag:
+              description: SHA-256 validator for the original archived bytes.
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+                enum: ["private, no-store"]
+            X-Content-Type-Options:
+              schema:
+                type: string
+                enum: [nosniff]
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Attachment is absent or belongs to another account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
   /agent/memories:
     get:
       tags: [Agent]
@@ -1790,9 +1860,35 @@ paths:
           schema:
             type: integer
             minimum: 0
+        - name: Last-Event-ID
+          in: header
+          description: Last applied numeric cursor; ignored when `after` is present.
+          schema:
+            type: integer
+            minimum: 0
       responses:
         "200":
-          description: text/event-stream with id, event, and JSON data fields.
+          description: |-
+            Resumable `text/event-stream`. Each frame contains a numeric `id`,
+            an `event` name, and one JSON object in `data`.
+
+            Event payloads:
+            - `run.queued`: `runId`, `userMessageId`, `assistantMessageId`.
+            - `run.started`: `runId`, `assistantMessageId`.
+            - `message.delta`: `assistantMessageId`, `delta`.
+            - `tool.started`: `runId`, `name`.
+            - `tool.completed`: `runId`, `name`, `isError`.
+            - `run.completed`: `runId`, `assistantMessageId`.
+            - `run.failed`: `runId`, `assistantMessageId`, `code`.
+
+            Clients persist the largest fully applied cursor. Reconnecting with
+            `after` or `Last-Event-ID` replays only later retained events before
+            continuing the live stream. Tool payloads and hidden reasoning are
+            never included.
+          content:
+            text/event-stream:
+              schema:
+                type: string
 
   /agent/runs/{runId}/cancel:
     post:

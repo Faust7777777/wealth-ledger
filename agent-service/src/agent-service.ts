@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { EventHub } from "./event-hub.js";
 import { StateStore } from "./state-store.js";
@@ -187,6 +187,32 @@ export class AgentService {
     }
     const { originalPath: _original, workingPath: _working, ...safe } = attachment;
     return safe;
+  }
+
+  async getAttachment(
+    principal: Principal,
+    attachmentId: string,
+  ): Promise<Omit<AgentAttachment, "originalPath" | "workingPath">> {
+    const state = await this.store.read(principal.userId);
+    const attachment = state.attachments.find(
+      (item) => item.id === attachmentId && item.ledgerId === principal.ledgerId,
+    );
+    if (!attachment) throw new Error("attachment_not_found");
+    const { originalPath: _original, workingPath: _working, ...safe } = attachment;
+    return safe;
+  }
+
+  async getAttachmentContent(
+    principal: Principal,
+    attachmentId: string,
+  ): Promise<{ metadata: Omit<AgentAttachment, "originalPath" | "workingPath">; bytes: Buffer }> {
+    const state = await this.store.read(principal.userId);
+    const attachment = state.attachments.find(
+      (item) => item.id === attachmentId && item.ledgerId === principal.ledgerId,
+    );
+    if (!attachment) throw new Error("attachment_not_found");
+    const { originalPath, workingPath: _working, ...metadata } = attachment;
+    return { metadata, bytes: await readFile(originalPath) };
   }
 
   async listMemories(principal: Principal): Promise<AgentMemory[]> {

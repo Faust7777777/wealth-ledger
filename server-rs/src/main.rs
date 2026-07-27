@@ -1588,6 +1588,7 @@ async fn agent_proxy(
         axum::http::header::ETAG,
         axum::http::header::RETRY_AFTER,
         axum::http::HeaderName::from_static("idempotency-replayed"),
+        axum::http::HeaderName::from_static("x-content-type-options"),
     ] {
         if let Some(value) = response_headers.get(&header_name) {
             response.headers_mut().insert(header_name, value.clone());

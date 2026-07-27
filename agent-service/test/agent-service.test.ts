@@ -319,15 +319,14 @@ test("archives an image and passes only owned attachment IDs to the model", asyn
     "x-finwealth-device-id": owner.deviceId,
   };
   try {
+    const imageBytes = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    );
     const form = new FormData();
     form.append(
       "file",
-      new Blob([
-        Buffer.from(
-          "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-          "base64",
-        ),
-      ], { type: "image/png" }),
+      new Blob([imageBytes], { type: "image/png" }),
       "bill.png",
     );
     const uploaded = await fetch(`${base}/v1/agent/attachments`, {
@@ -337,6 +336,41 @@ test("archives an image and passes only owned attachment IDs to the model", asyn
     });
     assert.equal(uploaded.status, 201);
     const uploadedBody = await uploaded.json() as { data: { id: string } };
+
+    const metadata = await fetch(
+      `${base}/v1/agent/attachments/${uploadedBody.data.id}`,
+      { headers: principalHeaders },
+    );
+    assert.equal(metadata.status, 200);
+    const metadataBody = await metadata.json() as {
+      data: Record<string, unknown>;
+    };
+    assert.equal(metadataBody.data.mimeType, "image/png");
+    assert.equal(metadataBody.data.fileName, "bill.png");
+    assert.equal("originalPath" in metadataBody.data, false);
+    assert.equal("workingPath" in metadataBody.data, false);
+
+    const content = await fetch(
+      `${base}/v1/agent/attachments/${uploadedBody.data.id}/content`,
+      { headers: principalHeaders },
+    );
+    assert.equal(content.status, 200);
+    assert.equal(content.headers.get("content-type"), "image/png");
+    assert.equal(content.headers.get("cache-control"), "private, no-store");
+    assert.equal(content.headers.get("x-content-type-options"), "nosniff");
+    assert.match(content.headers.get("etag") ?? "", /^"sha256-[a-f0-9]{64}"$/);
+    assert.deepEqual(Buffer.from(await content.arrayBuffer()), imageBytes);
+
+    const otherLedger = await fetch(
+      `${base}/v1/agent/attachments/${uploadedBody.data.id}`,
+      {
+        headers: {
+          ...principalHeaders,
+          "x-finwealth-ledger-id": "ledger-other",
+        },
+      },
+    );
+    assert.equal(otherLedger.status, 404);
 
     const sent = await fetch(
       `${base}/v1/agent/conversations/${conversation.id}/messages`,
