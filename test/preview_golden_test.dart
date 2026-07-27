@@ -24,6 +24,7 @@ import 'package:finwealth/data/api_mock_repositories.dart'
         ApiServiceUnavailableException,
         parseAiProposalData,
         parseLiabilityPositionData,
+        parseYieldPositionData,
         parseMovementData;
 import 'package:finwealth/data/repositories.dart';
 import 'package:finwealth/features/investment_page.dart';
@@ -34,6 +35,8 @@ import 'package:finwealth/features/subscription_form_page.dart';
 import 'package:finwealth/features/valuation_status_sheet.dart';
 import 'package:finwealth/features/liability_terms_page.dart';
 import 'package:finwealth/features/loan_section.dart';
+import 'package:finwealth/features/yield_section.dart';
+import 'package:finwealth/features/yield_terms_page.dart';
 import 'package:finwealth/features/ai_import_text_page.dart';
 import 'package:finwealth/features/liabilities_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
@@ -1226,6 +1229,102 @@ void main() {
       matchesGoldenFile('goldens/liability_terms_form_dark.png'),
     );
   });
+  // —— 2026-07-27 批：固定收益条款 / 收益区 ——
+  const yieldPreviewHolding = HoldingVm(
+    id: 'h_deposit',
+    accountId: 'a_bank',
+    instrumentId: 'inst_deposit',
+    symbol: 'DEP',
+    displayName: '一年期定存',
+    quantity: '10000',
+    quoteStatus: QuoteStatus.fresh,
+  );
+
+  final yieldPosition = parseYieldPositionData({
+    'holdingId': 'h_deposit',
+    'accountId': 'a_bank',
+    'instrumentId': 'inst_deposit',
+    'instrumentName': '一年期定存',
+    'terms': {
+      'principal': {'amount': '10000.00', 'currency': 'CNY'},
+      'annualRate': '0.0365',
+      'rateType': 'fixed',
+      'interestMethod': 'simple',
+      'dayCountBasis': 365,
+      'compoundingFrequency': 'none',
+      'interestStartDate': '2026-01-01',
+      'maturityDate': '2027-01-01',
+      'payoutAccountId': 'a_cash',
+      'lastAccruedThrough': '2026-01-01',
+      'updatedAt': '2026-07-27T00:00:00Z',
+    },
+    'accruedThrough': '2026-01-31',
+    'accrualDays': 30,
+    'fullCompoundingPeriods': 0,
+    'accruedInterest': {'amount': '30.00', 'currency': 'CNY'},
+    'status': 'active',
+  });
+
+  Widget yieldHost(ThemeData theme, Widget page) => ProviderScope(
+    overrides: [
+      capabilitiesProvider.overrideWith((ref) async => tradeCaps),
+      accountsProvider.overrideWith((ref) async => tradeAccounts),
+      holdingsProvider.overrideWith((ref) async => const [yieldPreviewHolding]),
+      yieldRepositoryProvider.overrideWithValue(
+        _PreviewYieldRepo([yieldPosition]),
+      ),
+    ],
+    child: MaterialApp.router(
+      theme: theme,
+      routerConfig: GoRouter(
+        routes: [GoRoute(path: '/', builder: (_, _) => page)],
+      ),
+    ),
+  );
+
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('yield section - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(400, 520));
+      await tester.pumpWidget(
+        yieldHost(
+          theme,
+          const Scaffold(
+            body: Padding(
+              padding: EdgeInsets.all(16),
+              child: SingleChildScrollView(
+                child: YieldSection(holding: yieldPreviewHolding),
+              ),
+            ),
+          ),
+        ),
+      );
+      await _settleEntrance(tester);
+      await expectLater(
+        find.byType(Scaffold),
+        matchesGoldenFile('goldens/yield_section_$name.png'),
+      );
+    });
+  }
+
+  testWidgets('yield terms form - dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 1180));
+    await tester.pumpWidget(
+      yieldHost(buildDarkTheme(), const YieldTermsPage(holdingId: 'h_deposit')),
+    );
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(YieldTermsPage),
+      matchesGoldenFile('goldens/yield_terms_form_dark.png'),
+    );
+  });
+
   // —— 2026-07-19 批：AI 文本整理复核卡（结构化 + 待补全）——
   final aiTextProposals = [
     parseAiProposalData({
@@ -1428,6 +1527,25 @@ class _PreviewLoanRepo implements LoanRepository {
   @override
   Future<AiAtomicGroupVm> proposeLoanInterest(
     Id accountId, {
+    required IsoDate throughDate,
+    String? note,
+  }) => throw UnsupportedError('preview');
+}
+
+/// 预览用固定收益仓库。
+class _PreviewYieldRepo implements YieldRepository {
+  const _PreviewYieldRepo(this.positions);
+  final List<YieldPositionVm> positions;
+  @override
+  Future<List<YieldPositionVm>> listYieldPositions({
+    IsoDate? throughDate,
+  }) async => positions;
+  @override
+  Future<HoldingVm> updateYieldTerms(Id holdingId, YieldTermsInput input) =>
+      throw UnsupportedError('preview');
+  @override
+  Future<AiAtomicGroupVm> proposeInterest(
+    Id holdingId, {
     required IsoDate throughDate,
     String? note,
   }) => throw UnsupportedError('preview');
