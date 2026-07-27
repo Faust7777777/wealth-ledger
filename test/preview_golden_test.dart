@@ -2,6 +2,8 @@
 // 供人肉眼/模型核验子主题、字体、间距、动效入场后的静态形态。
 // 生成：PREVIEW_GOLDENS=1 flutter test --update-goldens test/preview_golden_test.dart
 // 默认在普通 `flutter test` 中跳过（golden 依赖字体/Skia，跨机不稳，不做门禁）。
+import 'dart:convert';
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -34,6 +36,7 @@ import 'package:finwealth/features/subscription_form_page.dart';
 import 'package:finwealth/features/valuation_status_sheet.dart';
 import 'package:finwealth/features/liability_terms_page.dart';
 import 'package:finwealth/features/loan_section.dart';
+import 'package:finwealth/features/agent_panel.dart';
 import 'package:finwealth/features/ai_import_text_page.dart';
 import 'package:finwealth/features/liabilities_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
@@ -1365,6 +1368,268 @@ void main() {
       matchesGoldenFile('goldens/ai_text_import_unavailable_dark.png'),
     );
   });
+
+  // —— 2026-07-28 批：Agent 控制中枢 ——
+  const agentConversation = AgentConversationVm(
+    id: 'conv_1',
+    title: '主会话',
+    isPrimary: true,
+    status: AgentConversationStatus.active,
+    createdAt: '2026-07-28T00:00:00Z',
+    updatedAt: '2026-07-28T00:00:00Z',
+  );
+
+  AgentMessageVm agentMessage(
+    String id,
+    AgentMessageRole role,
+    String text, {
+    List<String> attachmentIds = const [],
+    AgentMessageStatus status = AgentMessageStatus.completed,
+  }) => AgentMessageVm(
+    id: id,
+    conversationId: 'conv_1',
+    role: role,
+    text: text,
+    status: status,
+    createdAt: '2026-07-28T00:00:00Z',
+    attachmentIds: attachmentIds,
+  );
+
+  Widget agentHost(
+    ThemeData theme, {
+    bool configured = true,
+    List<AgentMessageVm> messages = const [],
+    List<AgentMemoryVm> memories = const [],
+    List<AgentEventVm> events = const [],
+  }) => ProviderScope(
+    overrides: [
+      capabilitiesProvider.overrideWith((ref) async => tradeCaps),
+      accountsProvider.overrideWith((ref) async => const <AccountVm>[]),
+      aiPendingProvider.overrideWith((ref) async => const <AiProposalVm>[]),
+      agentRepositoryProvider.overrideWithValue(
+        _PreviewAgentRepo(
+          configured: configured,
+          messages: messages,
+          memories: memories,
+          frames: events,
+          conversations: const [agentConversation],
+        ),
+      ),
+    ],
+    child: MaterialApp(
+      theme: theme,
+      home: const Scaffold(body: AgentPanel()),
+    ),
+  );
+
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('agent panel empty - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(400, 640));
+      await tester.pumpWidget(agentHost(theme));
+      await _settleEntrance(tester);
+      await expectLater(
+        find.byType(AgentPanel),
+        matchesGoldenFile('goldens/agent_panel_empty_$name.png'),
+      );
+    });
+
+    testWidgets('agent panel streaming - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(400, 640));
+      await tester.pumpWidget(
+        agentHost(
+          theme,
+          messages: [agentMessage('m1', AgentMessageRole.user, '帮我看看这张账单')],
+          events: const [
+            AgentEventVm(
+              cursor: 1,
+              type: AgentEventType.runQueued,
+              runId: 'run_1',
+              userMessageId: 'm1',
+              assistantMessageId: 'm2',
+            ),
+            AgentEventVm(
+              cursor: 2,
+              type: AgentEventType.runStarted,
+              runId: 'run_1',
+              assistantMessageId: 'm2',
+            ),
+            AgentEventVm(
+              cursor: 3,
+              type: AgentEventType.messageDelta,
+              assistantMessageId: 'm2',
+              delta: '这张账单里有 3 笔支出，',
+            ),
+            AgentEventVm(
+              cursor: 4,
+              type: AgentEventType.messageDelta,
+              assistantMessageId: 'm2',
+              delta: '我按商户归了类。',
+            ),
+            AgentEventVm(
+              cursor: 5,
+              type: AgentEventType.toolStarted,
+              runId: 'run_1',
+              toolName: 'finwealth_query',
+            ),
+          ],
+        ),
+      );
+      await _settleEntrance(tester);
+      await expectLater(
+        find.byType(AgentPanel),
+        matchesGoldenFile('goldens/agent_panel_streaming_$name.png'),
+      );
+    });
+  }
+
+  testWidgets('agent panel unconfigured - dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 640));
+    await tester.pumpWidget(agentHost(buildDarkTheme(), configured: false));
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(AgentPanel),
+      matchesGoldenFile('goldens/agent_panel_unconfigured_dark.png'),
+    );
+  });
+
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets(
+      'agent panel memory and image - $name',
+      skip: !_previewEnabled,
+      (tester) async {
+        await sized(tester, const Size(400, 720));
+        await tester.pumpWidget(
+          agentHost(
+            theme,
+            messages: [
+              agentMessage(
+                'm1',
+                AgentMessageRole.user,
+                '这张微信账单帮我整理一下',
+                attachmentIds: const ['att_1'],
+              ),
+              agentMessage(
+                'm2',
+                AgentMessageRole.assistant,
+                '已经整理好 3 笔支出，去审核里确认就会入账。',
+              ),
+            ],
+            memories: const [
+              AgentMemoryVm(
+                id: 'mem_1',
+                content: '同一天的多笔支出分开记，不要合并',
+                reason: '你已经纠正过两次',
+                status: AgentMemoryStatus.suggested,
+                createdAt: '2026-07-28T00:00:00Z',
+                updatedAt: '2026-07-28T00:00:00Z',
+              ),
+            ],
+          ),
+        );
+        await _settleEntrance(tester);
+        await expectLater(
+          find.byType(AgentPanel),
+          matchesGoldenFile('goldens/agent_panel_memory_$name.png'),
+        );
+      },
+    );
+  }
+}
+
+/// 预览用 Agent 仓库：事件流一次性回放，用于渲染流式与工具活动的静态形态。
+class _PreviewAgentRepo implements AgentRepository {
+  const _PreviewAgentRepo({
+    required this.configured,
+    required this.messages,
+    required this.memories,
+    required this.frames,
+    required this.conversations,
+  });
+
+  final bool configured;
+  final List<AgentMessageVm> messages;
+  final List<AgentMemoryVm> memories;
+  final List<AgentEventVm> frames;
+  final List<AgentConversationVm> conversations;
+
+  @override
+  Future<AgentStatusVm> getStatus() async =>
+      AgentStatusVm(configured: configured, modelCount: configured ? 1 : 0);
+  @override
+  Future<List<AgentModelVm>> listModels() async => configured
+      ? const [
+          AgentModelVm(
+            id: 'preview/model',
+            provider: 'preview',
+            displayName: '预览模型',
+            supportsImages: true,
+          ),
+        ]
+      : const [];
+  @override
+  Future<List<AgentConversationVm>> listConversations() async => conversations;
+  @override
+  Future<List<AgentMessageVm>> listMessages(Id conversationId) async =>
+      messages;
+  // 预览里连接保持打开，静态形态才是流式态而不是断线态。
+  @override
+  Stream<AgentEventVm> events(Id conversationId, {int? after}) async* {
+    yield* Stream.fromIterable(frames);
+    await Completer<void>().future;
+  }
+
+  @override
+  Future<List<AgentMemoryVm>> listMemories() async => memories;
+  @override
+  Future<Uint8List> getAttachmentContent(Id attachmentId) async => base64Decode(
+    'iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAIAAADYYG7QAAAAQklEQVR4'
+    'nO3OQQ0AIAwAsYlGFErQhQuOR5MK6Jy9vjL5QEhISKgeCAkJCdUDISEh'
+    'oXogJCQkVA+EhISE6oGQkNBjFy1m8vF2AlEMAAAAAElFTkSuQmCC',
+  );
+  @override
+  Future<AgentAttachmentVm> getAttachment(Id attachmentId) =>
+      throw UnsupportedError('preview');
+  @override
+  Future<AgentAttachmentVm> uploadAttachment({
+    required String fileName,
+    required String mimeType,
+    required Uint8List bytes,
+  }) => throw UnsupportedError('preview');
+  @override
+  Future<AgentMemoryVm> reviewMemory(
+    Id memoryId, {
+    required AgentMemoryStatus decision,
+  }) => throw UnsupportedError('preview');
+  @override
+  Future<AgentConversationVm> createConversation({String? title}) =>
+      throw UnsupportedError('preview');
+  @override
+  Future<AgentConversationVm> updateConversation(
+    Id conversationId, {
+    String? title,
+    AgentConversationStatus? status,
+    String? modelId,
+  }) => throw UnsupportedError('preview');
+  @override
+  Future<AgentRunAcceptedVm> sendMessage(
+    Id conversationId, {
+    required String text,
+    List<Id> attachmentIds = const [],
+  }) => throw UnsupportedError('preview');
+  @override
+  Future<void> cancelRun(Id runId) => throw UnsupportedError('preview');
 }
 
 /// 预览用 AI 提案仓库。
