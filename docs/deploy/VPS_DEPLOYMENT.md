@@ -19,6 +19,47 @@ cd wealth-ledger
 sudo bash tools/install_vps_systemd.sh
 ```
 
+## Pi Agent sidecar
+
+The Agent is a separate Node.js 22 service behind the Rust API. The app never
+connects to its loopback port directly. Install `bubblewrap` first; shell commands
+run with only the per-user workspace mounted writable, while model credentials
+and the rest of the host filesystem remain outside that mount.
+
+Create one random internal token and place the same value in both files:
+
+```text
+/etc/finwealth/server.env:
+FINWEALTH_AGENT_BASE_URL=http://127.0.0.1:8792
+FINWEALTH_AGENT_INTERNAL_TOKEN=<random value>
+
+/etc/finwealth/agent.env:
+FINWEALTH_AGENT_INTERNAL_TOKEN=<same random value>
+```
+
+Then install and start the sidecar from a reviewed source checkout:
+
+```bash
+sudo bash tools/install_vps_agent.sh
+```
+
+Pi provider credentials and model configuration live under
+`/var/lib/finwealth-agent/pi/` and must remain owned by `finwealth` with mode
+`0700`/`0600`. The service removes the Rust internal token from its process
+environment before creating Pi sessions, and tool subprocesses receive a small
+environment allow-list rather than the service environment.
+
+Agent state, sessions, images, workspace files, and Pi credentials are not part
+of the ledger backup. Back them up separately while the sidecar is stopped:
+
+```bash
+sudo bash tools/backup_vps_agent.sh
+```
+
+The default output is `/var/backups/finwealth-agent/<UTC timestamp>/`. It is a
+root-only checksum-verified archive and contains model credentials; store or
+copy it with the same care as `/etc/finwealth/*.env`.
+
 The script:
 
 - builds `server-rs` in release mode;

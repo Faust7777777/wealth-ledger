@@ -14,6 +14,7 @@ migrate_working_dir/
 tmp/
 backups/
 dist/
+node_modules/
 
 # Local secrets, signing material, and real ledger state
 .env

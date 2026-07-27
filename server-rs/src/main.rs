@@ -4,6 +4,7 @@ use argon2::{
 };
 use axum::{
     Extension, Json, Router,
+    body::{Body, to_bytes},
     extract::{DefaultBodyLimit, Json as JsonExtractor, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
@@ -47,6 +48,10 @@ const REFRESH_TOKEN_TTL_DAYS: i64 = 30;
 const IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
 const IDEMPOTENCY_RETENTION_DAYS: i64 = 30;
 const DEV_UNAUTHENTICATED_DEVICE_ID: &str = "dev_unauthenticated_device";
+const AGENT_INTERNAL_DEVICE_ID: &str = "dev_agent_sidecar";
+const OWNER_USER_ID: &str = "usr_owner";
+const OWNER_LEDGER_ID: &str = "ledger_default";
+const AGENT_PROXY_BODY_LIMIT: usize = 55 * 1024 * 1024;
 const OVERVIEW_EMPTY: &str =
     include_str!("../../docs/contracts/examples/portfolio_overview_empty.response.json");
 const OVERVIEW_DEGRADED: &str =
@@ -67,6 +72,31 @@ struct AppState {
     auth: AuthStore,
     allow_ledger_scenario: bool,
     allowed_hosts: Vec<String>,
+    agent_gateway: AgentGateway,
+}
+
+#[derive(Clone)]
+struct AgentGateway {
+    base_url: Option<String>,
+    internal_token: Option<String>,
+    client: reqwest::Client,
+}
+
+impl AgentGateway {
+    fn from_env() -> Self {
+        Self::new(
+            env::var("FINWEALTH_AGENT_BASE_URL").ok(),
+            env::var("FINWEALTH_AGENT_INTERNAL_TOKEN").ok(),
+        )
+    }
+
+    fn new(base_url: Option<String>, internal_token: Option<String>) -> Self {
+        Self {
+            base_url: base_url.map(|value| value.trim_end_matches('/').to_string()),
+            internal_token,
+            client: reqwest::Client::new(),
+        }
+    }
 }
 
 impl AppState {
@@ -78,6 +108,7 @@ impl AppState {
             auth: AuthStore::from_env_or_dev_with_default_state_path(None),
             allow_ledger_scenario: env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
             allowed_hosts: allowed_hosts_from_env(),
+            agent_gateway: AgentGateway::from_env(),
         }
     }
 
@@ -99,6 +130,7 @@ impl AppState {
             auth: AuthStore::from_env_or_dev_with_default_state_path(Some(auth_state_path)),
             allow_ledger_scenario: env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
             allowed_hosts: allowed_hosts_from_env(),
+            agent_gateway: AgentGateway::from_env(),
         }
     }
 
@@ -111,6 +143,12 @@ impl AppState {
     #[cfg(test)]
     fn with_allow_ledger_scenario(mut self, allow: bool) -> Self {
         self.allow_ledger_scenario = allow;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_agent_gateway(mut self, base_url: String, internal_token: &str) -> Self {
+        self.agent_gateway = AgentGateway::new(Some(base_url), Some(internal_token.to_string()));
         self
     }
 
@@ -180,6 +218,13 @@ struct AuthTokens {
 #[derive(Clone)]
 struct AuthenticatedDevice {
     id: String,
+}
+
+#[derive(Clone)]
+struct AuthenticatedPrincipal {
+    user_id: String,
+    ledger_id: String,
+    device_id: String,
 }
 
 impl AuthStore {
@@ -960,6 +1005,8 @@ fn check_production_config_from_env() -> Result<(), Vec<String>> {
         &allowed_hosts_from_env(),
         env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
         quote_provider.as_deref(),
+        env::var("FINWEALTH_AGENT_BASE_URL").ok().as_deref(),
+        env::var("FINWEALTH_AGENT_INTERNAL_TOKEN").ok().as_deref(),
     );
     if errors.is_empty() {
         Ok(())
@@ -974,6 +1021,8 @@ fn production_config_errors(
     allowed_hosts: &[String],
     allow_ledger_scenario: bool,
     quote_provider: Option<&str>,
+    agent_base_url: Option<&str>,
+    agent_internal_token: Option<&str>,
 ) -> Vec<String> {
     let mut errors = validate_auth_config(config).err().unwrap_or_default();
     if !config.require_auth {
@@ -997,6 +1046,39 @@ fn production_config_errors(
         None | Some("") | Some("none") | Some("yahoo") | Some("public")
     ) {
         errors.push("FINWEALTH_QUOTE_PROVIDER must be none, yahoo, or public".to_string());
+    }
+    match (
+        agent_base_url.map(str::trim).filter(|value| !value.is_empty()),
+        agent_internal_token
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        (None, None) => {}
+        (Some(base_url), Some(token)) => {
+            let valid_url = reqwest::Url::parse(base_url).ok().is_some_and(|url| {
+                url.scheme() == "http"
+                    && url.port().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+            });
+            if !valid_url {
+                errors.push(
+                    "FINWEALTH_AGENT_BASE_URL must be an explicit loopback http URL with a port"
+                        .to_string(),
+                );
+            }
+            if token.len() < 32 || token == "change-me" {
+                errors.push(
+                    "FINWEALTH_AGENT_INTERNAL_TOKEN must be a non-placeholder value of at least 32 characters"
+                        .to_string(),
+                );
+            }
+        }
+        _ => errors.push(
+            "FINWEALTH_AGENT_BASE_URL and FINWEALTH_AGENT_INTERNAL_TOKEN must be configured together"
+                .to_string(),
+        ),
     }
     errors
 }
@@ -1327,6 +1409,8 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/sync/changes", get(sync_changes))
         .route("/v1/sync/push", post(sync_push))
         .route("/v1/sync/ack", post(sync_ack))
+        .route("/v1/agent", any(agent_proxy))
+        .route("/v1/agent/{*path}", any(agent_proxy))
         .route("/v1/transfers/execute", any(forbidden))
         .route("/v1/broker/orders", any(forbidden))
         .route("/v1/broker/buy", any(forbidden))
@@ -1374,10 +1458,15 @@ async fn require_auth_middleware(
     if is_public_auth_path(request.uri().path()) {
         return next.run(request).await;
     }
+    if agent_internal_token_matches(&state, request.headers()) {
+        if request.uri().path().starts_with("/v1/agent") {
+            return forbidden().await;
+        }
+        insert_authenticated_principal(&mut request, AGENT_INTERNAL_DEVICE_ID.to_string());
+        return next.run(request).await;
+    }
     if !state.auth.should_require_auth() {
-        request.extensions_mut().insert(AuthenticatedDevice {
-            id: DEV_UNAUTHENTICATED_DEVICE_ID.to_string(),
-        });
+        insert_authenticated_principal(&mut request, DEV_UNAUTHENTICATED_DEVICE_ID.to_string());
         return next.run(request).await;
     }
     let Some(token) = bearer_token(request.headers()) else {
@@ -1386,10 +1475,125 @@ async fn require_auth_middleware(
     let Some(device_id) = state.auth.device_id_for_access_token(&token) else {
         return unauthorized("auth_required", "Bearer access token is required.");
     };
-    request
-        .extensions_mut()
-        .insert(AuthenticatedDevice { id: device_id });
+    insert_authenticated_principal(&mut request, device_id);
     next.run(request).await
+}
+
+fn agent_internal_token_matches(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(expected) = state.agent_gateway.internal_token.as_deref() else {
+        return false;
+    };
+    let Some(candidate) = headers
+        .get("x-finwealth-internal-token")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    expected.len() == candidate.len() && bool::from(expected.as_bytes().ct_eq(candidate.as_bytes()))
+}
+
+fn insert_authenticated_principal(request: &mut Request, device_id: String) {
+    request.extensions_mut().insert(AuthenticatedDevice {
+        id: device_id.clone(),
+    });
+    request.extensions_mut().insert(AuthenticatedPrincipal {
+        user_id: OWNER_USER_ID.to_string(),
+        ledger_id: OWNER_LEDGER_ID.to_string(),
+        device_id,
+    });
+}
+
+async fn agent_proxy(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    request: Request,
+) -> Response {
+    let Some(base_url) = state.agent_gateway.base_url.as_deref() else {
+        return service_unavailable(
+            "agent_service_unavailable",
+            "Agent service is not configured.",
+            json!({}),
+            true,
+        );
+    };
+    let Some(internal_token) = state.agent_gateway.internal_token.as_deref() else {
+        return service_unavailable(
+            "agent_service_unavailable",
+            "Agent service authentication is not configured.",
+            json!({}),
+            false,
+        );
+    };
+
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or(request.uri().path());
+    let upstream_url = format!("{base_url}{path_and_query}");
+    let method = request.method().clone();
+    let forwarded_headers = request.headers().clone();
+    let body = match to_bytes(request.into_body(), AGENT_PROXY_BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(_) => {
+            return bad_request(
+                "agent_request_too_large",
+                "Agent request body is too large.",
+                json!({ "maxBytes": AGENT_PROXY_BODY_LIMIT }),
+            );
+        }
+    };
+
+    let mut upstream = state
+        .agent_gateway
+        .client
+        .request(method, &upstream_url)
+        .header("x-finwealth-internal-token", internal_token)
+        .header("x-finwealth-user-id", &principal.user_id)
+        .header("x-finwealth-ledger-id", &principal.ledger_id)
+        .header("x-finwealth-device-id", &principal.device_id)
+        .body(body);
+    for header_name in [
+        axum::http::header::ACCEPT,
+        axum::http::header::CONTENT_TYPE,
+        axum::http::header::IF_MATCH,
+        axum::http::HeaderName::from_static("last-event-id"),
+    ] {
+        if let Some(value) = forwarded_headers.get(&header_name) {
+            upstream = upstream.header(header_name, value);
+        }
+    }
+    if let Some(value) = forwarded_headers.get("idempotency-key") {
+        upstream = upstream.header("idempotency-key", value);
+    }
+
+    let upstream_response = match upstream.send().await {
+        Ok(response) => response,
+        Err(_) => {
+            return service_unavailable(
+                "agent_service_unavailable",
+                "Agent service could not be reached.",
+                json!({}),
+                true,
+            );
+        }
+    };
+    let status = upstream_response.status();
+    let response_headers = upstream_response.headers().clone();
+    let mut response = Response::new(Body::from_stream(upstream_response.bytes_stream()));
+    *response.status_mut() = status;
+    for header_name in [
+        axum::http::header::CONTENT_TYPE,
+        axum::http::header::CACHE_CONTROL,
+        axum::http::header::ETAG,
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderName::from_static("idempotency-replayed"),
+    ] {
+        if let Some(value) = response_headers.get(&header_name) {
+            response.headers_mut().insert(header_name, value.clone());
+        }
+    }
+    response
 }
 
 fn is_public_auth_path(path: &str) -> bool {
@@ -6186,6 +6390,131 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    async fn test_response_json(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body");
+        serde_json::from_slice(&bytes).expect("JSON response")
+    }
+
+    #[tokio::test]
+    async fn agent_gateway_injects_owner_principal_and_streams_upstream_response() {
+        async fn upstream(headers: HeaderMap) -> Json<Value> {
+            Json(json!({
+                "ok": true,
+                "data": {
+                    "userId": headers
+                        .get("x-finwealth-user-id")
+                        .and_then(|value| value.to_str().ok()),
+                    "ledgerId": headers
+                        .get("x-finwealth-ledger-id")
+                        .and_then(|value| value.to_str().ok()),
+                    "deviceId": headers
+                        .get("x-finwealth-device-id")
+                        .and_then(|value| value.to_str().ok()),
+                    "internalToken": headers
+                        .get("x-finwealth-internal-token")
+                        .and_then(|value| value.to_str().ok()),
+                }
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("agent gateway listener");
+        let address = listener.local_addr().expect("agent gateway address");
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/agent/status", get(upstream)),
+            )
+            .await
+            .expect("agent gateway server");
+        });
+
+        let response = app_with_state(
+            AppState::dev().with_agent_gateway(format!("http://{address}"), "test-internal-token"),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/v1/agent/status")
+                .body(Body::empty())
+                .expect("agent status request"),
+        )
+        .await
+        .expect("agent gateway response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = test_response_json(response).await;
+        assert_eq!(body["data"]["userId"], OWNER_USER_ID);
+        assert_eq!(body["data"]["ledgerId"], OWNER_LEDGER_ID);
+        assert_eq!(body["data"]["deviceId"], DEV_UNAUTHENTICATED_DEVICE_ID);
+        assert_eq!(body["data"]["internalToken"], "test-internal-token");
+    }
+
+    #[tokio::test]
+    async fn agent_gateway_is_fail_closed_when_not_configured() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/agent/status")
+                    .body(Body::empty())
+                    .expect("agent status request"),
+            )
+            .await
+            .expect("agent gateway response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = test_response_json(response).await;
+        assert_eq!(body["error"]["code"], "agent_service_unavailable");
+    }
+
+    #[tokio::test]
+    async fn agent_internal_token_authenticates_sidecar_without_a_bearer_token() {
+        let auth = AuthStore::configured("wu", hash_password_for_test("correct horse"), true);
+        let router = app_with_state(
+            AppState::dev()
+                .with_auth(auth)
+                .with_agent_gateway("http://127.0.0.1:9".to_string(), "sidecar-secret"),
+        );
+
+        let allowed = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/accounts")
+                    .header("x-finwealth-internal-token", "sidecar-secret")
+                    .body(Body::empty())
+                    .expect("internal request"),
+            )
+            .await
+            .expect("internal response");
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        let denied = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/accounts")
+                    .header("x-finwealth-internal-token", "wrong-secret")
+                    .body(Body::empty())
+                    .expect("invalid internal request"),
+            )
+            .await
+            .expect("invalid internal response");
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let recursion = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/agent/status")
+                    .header("x-finwealth-internal-token", "sidecar-secret")
+                    .body(Body::empty())
+                    .expect("recursive internal request"),
+            )
+            .await
+            .expect("recursive internal response");
+        assert_eq!(recursion.status(), StatusCode::FORBIDDEN);
+    }
+
     #[test]
     fn refuses_non_loopback_addresses() {
         let result = std::panic::catch_unwind(|| {
@@ -6644,6 +6973,8 @@ mod tests {
             &["127.0.0.1".to_string(), "api.example.com".to_string()],
             false,
             Some("none"),
+            None,
+            None,
         );
         assert!(valid.is_empty(), "{valid:?}");
         let public_provider = production_config_errors(
@@ -6652,6 +6983,8 @@ mod tests {
             &["127.0.0.1".to_string(), "api.example.com".to_string()],
             false,
             Some("public"),
+            Some("http://127.0.0.1:8792"),
+            Some("0123456789abcdef0123456789abcdef"),
         );
         assert!(public_provider.is_empty(), "{public_provider:?}");
 
@@ -6668,12 +7001,19 @@ mod tests {
             &["127.0.0.1".to_string(), "localhost".to_string()],
             true,
             Some("typo"),
+            Some("https://agent.example.com"),
+            None,
         );
         assert!(errors.iter().any(|error| error.contains("REQUIRE_AUTH")));
         assert!(errors.iter().any(|error| error.contains("loopback")));
         assert!(errors.iter().any(|error| error.contains("ALLOWED_HOSTS")));
         assert!(errors.iter().any(|error| error.contains("LEDGER_SCENARIO")));
         assert!(errors.iter().any(|error| error.contains("QUOTE_PROVIDER")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("configured together"))
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ tags:
   - name: Snapshots
   - name: Taxonomy
   - name: Sync
+  - name: Agent
 
 paths:
   /health:
@@ -1551,6 +1552,262 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/status:
+    get:
+      tags: [Agent]
+      summary: Read the authenticated account's Agent runtime status.
+      responses:
+        "200":
+          description: Agent status. configured=false means no usable Pi model is configured.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentStatusResponse"
+        "503":
+          description: The loopback Agent service is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/models:
+    get:
+      tags: [Agent]
+      summary: List Pi models permitted for the authenticated account.
+      responses:
+        "200":
+          description: Server-configured models; provider credentials are never returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentModelListResponse"
+
+  /agent/attachments:
+    post:
+      tags: [Agent]
+      summary: Archive one image attachment for a later Agent message.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: PNG, JPEG, or WEBP, at most 15 MiB.
+      responses:
+        "201":
+          description: Attachment archived in the authenticated account workspace.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentAttachmentResponse"
+
+  /agent/memories:
+    get:
+      tags: [Agent]
+      summary: List suggested, active, and rejected Agent memories.
+      responses:
+        "200":
+          description: Account-scoped memory records.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentMemoryListResponse"
+
+  /agent/memories/{memoryId}/review:
+    post:
+      tags: [Agent]
+      summary: Approve or reject an Agent-proposed general memory.
+      parameters:
+        - name: memoryId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [decision]
+              properties:
+                decision:
+                  enum: [active, rejected]
+      responses:
+        "200":
+          description: Reviewed memory.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentMemoryResponse"
+
+  /agent/conversations:
+    get:
+      tags: [Agent]
+      summary: List the account's primary and additional Agent conversations.
+      responses:
+        "200":
+          description: Conversations ordered by most recent activity.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentConversationListResponse"
+    post:
+      tags: [Agent]
+      summary: Create an additional Agent conversation.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                  maxLength: 100
+      responses:
+        "201":
+          description: Conversation created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentConversationResponse"
+
+  /agent/conversations/{conversationId}:
+    patch:
+      tags: [Agent]
+      summary: Rename, archive, restore, or change the selected model.
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                status:
+                  enum: [active, archived]
+                modelId:
+                  type: string
+      responses:
+        "200":
+          description: Updated conversation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentConversationResponse"
+
+  /agent/conversations/{conversationId}/messages:
+    get:
+      tags: [Agent]
+      summary: List normalized messages without hidden reasoning or raw tool payloads.
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+      responses:
+        "200":
+          description: Conversation messages.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentMessageListResponse"
+    post:
+      tags: [Agent]
+      summary: Queue a user message for the Pi session.
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+                  minLength: 1
+                  maxLength: 100000
+                attachmentIds:
+                  type: array
+                  maxItems: 8
+                  uniqueItems: true
+                  items:
+                    $ref: "#/components/schemas/ID"
+      responses:
+        "202":
+          description: Message accepted and queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentRunAcceptedResponse"
+        "503":
+          description: No permitted Pi model is configured.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/conversations/{conversationId}/events:
+    get:
+      tags: [Agent]
+      summary: Stream resumable normalized Agent events over SSE.
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - name: after
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: text/event-stream with id, event, and JSON data fields.
+
+  /agent/runs/{runId}/cancel:
+    post:
+      tags: [Agent]
+      summary: Abort the active Pi operation for an owned run.
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Cancellation result.
 
 components:
   securitySchemes:
@@ -4211,3 +4468,211 @@ components:
               type: array
               items:
                 $ref: "#/components/schemas/SyncConflict"
+    AgentModel:
+      type: object
+      required: [id, provider, displayName, supportsImages]
+      properties:
+        id:
+          type: string
+          description: Stable provider/model identifier accepted when selecting a conversation model.
+        provider:
+          type: string
+        displayName:
+          type: string
+        supportsImages:
+          type: boolean
+    AgentConversation:
+      type: object
+      required:
+        [id, userId, ledgerId, title, isPrimary, status, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        userId:
+          $ref: "#/components/schemas/ID"
+        ledgerId:
+          $ref: "#/components/schemas/ID"
+        title:
+          type: string
+        isPrimary:
+          type: boolean
+        status:
+          enum: [active, archived]
+        selectedModelId:
+          type: string
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        updatedAt:
+          $ref: "#/components/schemas/ISODateTime"
+    AgentMessage:
+      type: object
+      required: [id, conversationId, role, text, status, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        conversationId:
+          $ref: "#/components/schemas/ID"
+        role:
+          enum: [user, assistant, system]
+        text:
+          type: string
+        status:
+          enum: [queued, streaming, completed, failed]
+        runId:
+          $ref: "#/components/schemas/ID"
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        completedAt:
+          $ref: "#/components/schemas/ISODateTime"
+        errorCode:
+          type: string
+        attachmentIds:
+          type: array
+          items:
+            $ref: "#/components/schemas/ID"
+    AgentAttachment:
+      type: object
+      required: [id, userId, ledgerId, fileName, mimeType, sizeBytes, sha256, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        userId:
+          $ref: "#/components/schemas/ID"
+        ledgerId:
+          $ref: "#/components/schemas/ID"
+        fileName:
+          type: string
+        mimeType:
+          enum: [image/png, image/jpeg, image/webp]
+        sizeBytes:
+          type: integer
+          minimum: 1
+          maximum: 15728640
+        sha256:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+    AgentMemory:
+      type: object
+      required: [id, userId, ledgerId, content, reason, status, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        userId:
+          $ref: "#/components/schemas/ID"
+        ledgerId:
+          $ref: "#/components/schemas/ID"
+        content:
+          type: string
+        reason:
+          type: string
+        status:
+          enum: [suggested, active, rejected]
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        updatedAt:
+          $ref: "#/components/schemas/ISODateTime"
+    AgentStatusResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: object
+          required: [service, configured, userId, ledgerId, modelCount]
+          properties:
+            service:
+              const: finwealth-agent
+            configured:
+              type: boolean
+            userId:
+              $ref: "#/components/schemas/ID"
+            ledgerId:
+              $ref: "#/components/schemas/ID"
+            modelCount:
+              type: integer
+              minimum: 0
+            primaryConversationId:
+              $ref: "#/components/schemas/ID"
+    AgentModelListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentModel"
+    AgentAttachmentResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AgentAttachment"
+    AgentMemoryResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AgentMemory"
+    AgentMemoryListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentMemory"
+    AgentConversationResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AgentConversation"
+    AgentConversationListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentConversation"
+    AgentMessageListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentMessage"
+    AgentRunAcceptedResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: object
+          required: [runId, userMessageId, assistantMessageId]
+          properties:
+            runId:
+              $ref: "#/components/schemas/ID"
+            userMessageId:
+              $ref: "#/components/schemas/ID"
+            assistantMessageId:
+              $ref: "#/components/schemas/ID"

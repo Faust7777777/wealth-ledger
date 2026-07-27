@@ -1,0 +1,35 @@
+[Unit]
+Description=Finwealth Pi Agent sidecar
+After=network-online.target finwealth-server.service
+Wants=network-online.target
+Requires=finwealth-server.service
+
+[Service]
+Type=simple
+User=finwealth
+Group=finwealth
+EnvironmentFile=/etc/finwealth/agent.env
+ExecStart=/usr/bin/node /opt/finwealth/agent-service/dist/main.js
+Restart=on-failure
+RestartSec=3
+UMask=0077
+StateDirectory=finwealth-agent
+StateDirectoryMode=0700
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/finwealth-agent
+LockPersonality=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
