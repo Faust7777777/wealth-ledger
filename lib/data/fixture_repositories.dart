@@ -405,7 +405,44 @@ class FixturePortfolioRepository implements PortfolioRepository {
     Id accountId,
     HoldingAdjustmentInput input,
   ) async => throw UnsupportedError('DEMO 演示只读，不支持持仓校准；请用 local_server');
+  @override
+  Future<List<ValuationIssueVm>> listValuationIssues() async =>
+      _valuationIssues;
 }
+
+/// 与 DEMO 概览的 quoteProblemCount=2 保持一致的结构化问题清单。
+const List<ValuationIssueVm> _valuationIssues = [
+  ValuationIssueVm(
+    id: 'valuation_holding_acct_us_broker_inst_nvda',
+    accountId: 'acct_us_broker',
+    accountName: '美股券商',
+    assetKind: ValuationAssetKind.holding,
+    assetId: 'inst_nvda',
+    assetLabel: 'NVDA',
+    quantity: '12',
+    quantityUnit: 'NVDA',
+    status: ValuationIssueStatus.stale,
+    reason: ValuationIssueReason.staleQuote,
+    sourceCurrency: 'USD',
+    targetCurrency: 'CNY',
+    asOf: _asOf,
+  ),
+  ValuationIssueVm(
+    id: 'valuation_holding_acct_us_broker_inst_aapl',
+    accountId: 'acct_us_broker',
+    accountName: '美股券商',
+    assetKind: ValuationAssetKind.holding,
+    assetId: 'inst_aapl',
+    assetLabel: 'AAPL',
+    quantity: '20',
+    quantityUnit: 'AAPL',
+    status: ValuationIssueStatus.stale,
+    reason: ValuationIssueReason.staleFx,
+    sourceCurrency: 'USD',
+    targetCurrency: 'CNY',
+    asOf: _asOf,
+  ),
+];
 
 class FixtureMovementRepository implements MovementRepository {
   const FixtureMovementRepository();
@@ -559,15 +596,6 @@ class FixtureQuoteRepository implements QuoteRepository {
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       const QuoteStatusSummaryVm(freshCount: 8, staleCount: 2);
   @override
-  Future<List<FxRateVm>> listFxRates() async => const [
-    FxRateVm(
-      baseCurrency: 'USD',
-      quoteCurrency: 'CNY',
-      rate: '7.16',
-      asOf: _asOf,
-      status: QuoteStatus.stale,
-    ),
-  ];
   @override
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>
       const QuoteRefreshResultVm(

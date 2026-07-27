@@ -907,20 +907,52 @@ class AccountAnomalyVm {
   final String detail;
 }
 
-/// 汇率读模型（GET /v1/fx-rates；只读，用于估值状态说明，不做前端换算）。
-class FxRateVm {
-  const FxRateVm({
-    required this.baseCurrency,
-    required this.quoteCurrency,
-    required this.rate,
-    required this.asOf,
+enum ValuationAssetKind { cash, holding }
+
+enum ValuationIssueStatus { stale, offlineCached, unpriceable, error }
+
+enum ValuationIssueReason {
+  missingQuote,
+  missingFxPath,
+  staleQuote,
+  staleFx,
+  offlineCachedQuote,
+  offlineCachedFx,
+  quoteError,
+  fxError,
+}
+
+/// 估值问题读模型（GET /v1/portfolio/valuation-issues）。
+/// 服务端按账户与资产逐条给出未计入总值的原因；前端只展示，不再自行推断。
+class ValuationIssueVm {
+  const ValuationIssueVm({
+    required this.id,
+    required this.accountId,
+    required this.accountName,
+    required this.assetKind,
+    required this.assetId,
+    required this.assetLabel,
+    required this.quantity,
+    required this.quantityUnit,
     required this.status,
+    required this.reason,
+    required this.sourceCurrency,
+    required this.targetCurrency,
+    this.asOf,
   });
-  final CurrencyCode baseCurrency;
-  final CurrencyCode quoteCurrency;
-  final DecimalString rate;
-  final IsoDateTime asOf;
-  final QuoteStatus status;
+  final Id id;
+  final Id accountId;
+  final String accountName;
+  final ValuationAssetKind assetKind;
+  final String assetId;
+  final String assetLabel;
+  final DecimalString quantity;
+  final String quantityUnit;
+  final ValuationIssueStatus status;
+  final ValuationIssueReason reason;
+  final CurrencyCode sourceCurrency;
+  final CurrencyCode targetCurrency;
+  final IsoDateTime? asOf;
 }
 
 class QuoteStatusSummaryVm {

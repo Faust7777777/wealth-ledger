@@ -1094,6 +1094,12 @@ class LocalServerPortfolioRepository implements PortfolioRepository {
       ),
     ),
   );
+
+  @override
+  Future<List<ValuationIssueVm>> listValuationIssues() async => [
+    for (final i in _list(await _c.getData('/v1/portfolio/valuation-issues')))
+      _valuationIssue(_m(i)),
+  ];
 }
 
 class LocalServerMovementRepository implements MovementRepository {
@@ -1391,13 +1397,46 @@ class LocalServerDcaRepository implements DcaRepository {
   }
 }
 
-FxRateVm _fxRate(Map<String, dynamic> j) => FxRateVm(
-  baseCurrency: '${j['baseCurrency']}',
-  quoteCurrency: '${j['quoteCurrency']}',
-  rate: '${j['rate']}',
-  asOf: '${j['asOf']}',
-  status: _quote(j['status']),
+ValuationAssetKind _valuationAssetKind(Object? s) =>
+    s == 'cash' ? ValuationAssetKind.cash : ValuationAssetKind.holding;
+
+ValuationIssueStatus _valuationStatus(Object? s) => switch (s) {
+  'stale' => ValuationIssueStatus.stale,
+  'offline_cached' => ValuationIssueStatus.offlineCached,
+  'error' => ValuationIssueStatus.error,
+  _ => ValuationIssueStatus.unpriceable,
+};
+
+ValuationIssueReason _valuationReason(Object? s) => switch (s) {
+  'missing_fx_path' => ValuationIssueReason.missingFxPath,
+  'stale_quote' => ValuationIssueReason.staleQuote,
+  'stale_fx' => ValuationIssueReason.staleFx,
+  'offline_cached_quote' => ValuationIssueReason.offlineCachedQuote,
+  'offline_cached_fx' => ValuationIssueReason.offlineCachedFx,
+  'quote_error' => ValuationIssueReason.quoteError,
+  'fx_error' => ValuationIssueReason.fxError,
+  _ => ValuationIssueReason.missingQuote,
+};
+
+ValuationIssueVm _valuationIssue(Map<String, dynamic> j) => ValuationIssueVm(
+  id: '${j['id']}',
+  accountId: '${j['accountId']}',
+  accountName: '${j['accountName']}',
+  assetKind: _valuationAssetKind(j['assetKind']),
+  assetId: '${j['assetId']}',
+  assetLabel: '${j['assetLabel']}',
+  quantity: '${j['quantity']}',
+  quantityUnit: '${j['quantityUnit']}',
+  status: _valuationStatus(j['status']),
+  reason: _valuationReason(j['reason']),
+  sourceCurrency: '${j['sourceCurrency']}',
+  targetCurrency: '${j['targetCurrency']}',
+  asOf: j['asOf'] == null ? null : '${j['asOf']}',
 );
+
+/// 供测试直接校验 wire → VM 映射。
+ValuationIssueVm parseValuationIssueData(Map<String, dynamic> j) =>
+    _valuationIssue(j);
 
 // ———— 贷款条款 / 头寸 / 还款计划映射 ————
 LiabilityType _liabType(Object? s) => switch (s) {
@@ -1562,11 +1601,6 @@ class LocalServerQuoteRepository implements QuoteRepository {
   @override
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       _quoteSummary(_m(await _c.getData('/v1/quotes/summary')));
-
-  @override
-  Future<List<FxRateVm>> listFxRates() async => [
-    for (final r in _list(await _c.getData('/v1/fx-rates'))) _fxRate(_m(r)),
-  ];
 
   @override
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>

@@ -95,6 +95,11 @@ class RealLocalPortfolioRepository implements PortfolioRepository {
     Id accountId,
     HoldingAdjustmentInput input,
   ) async => throw UnsupportedError('real_local 暂不支持持仓校准；请用 local_server');
+
+  /// 不伪造"没有问题"：该数据源没有估值读模型，直接报不支持。
+  @override
+  Future<List<ValuationIssueVm>> listValuationIssues() async =>
+      throw UnsupportedError('real_local 暂不支持估值状态；请用 local_server');
 }
 
 class RealLocalMovementRepository implements MovementRepository {
@@ -187,7 +192,6 @@ class RealLocalQuoteRepository implements QuoteRepository {
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       const QuoteStatusSummaryVm();
   @override
-  Future<List<FxRateVm>> listFxRates() async => const [];
   @override
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>
       QuoteRefreshResultVm(

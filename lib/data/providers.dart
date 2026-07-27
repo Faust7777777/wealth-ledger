@@ -314,8 +314,10 @@ final recentMovementsProvider = FutureProvider<List<MovementVm>>(
 final instrumentsProvider = FutureProvider<List<InstrumentVm>>(
   (ref) => ref.watch(instrumentRepositoryProvider).listInstruments(),
 );
-final fxRatesProvider = FutureProvider<List<FxRateVm>>(
-  (ref) => ref.watch(quoteRepositoryProvider).listFxRates(),
+// 不自动退避重试：失败要立刻在面板里给出短错误和「重试」，而不是长时间转圈。
+final valuationIssuesProvider = FutureProvider<List<ValuationIssueVm>>(
+  (ref) => ref.watch(portfolioRepositoryProvider).listValuationIssues(),
+  retry: (_, _) => null,
 );
 final liabilityPositionsProvider = FutureProvider<List<LiabilityPositionVm>>(
   (ref) => ref.watch(loanRepositoryProvider).listLiabilityPositions(),
