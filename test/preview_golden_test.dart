@@ -34,6 +34,7 @@ import 'package:finwealth/features/subscription_form_page.dart';
 import 'package:finwealth/features/valuation_status_sheet.dart';
 import 'package:finwealth/features/liability_terms_page.dart';
 import 'package:finwealth/features/loan_section.dart';
+import 'package:finwealth/features/ai_import_image_page.dart';
 import 'package:finwealth/features/ai_import_text_page.dart';
 import 'package:finwealth/features/liabilities_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
@@ -1365,6 +1366,69 @@ void main() {
       matchesGoldenFile('goldens/ai_text_import_unavailable_dark.png'),
     );
   });
+
+  // —— 2026-07-27 批：AI 图片整理（选图优先 + 503 保留状态）——
+  Widget aiImageHost(ThemeData theme, {bool failCreate = false}) =>
+      ProviderScope(
+        overrides: [
+          capabilitiesProvider.overrideWith((ref) async => tradeCaps),
+          aiProposalRepositoryProvider.overrideWithValue(
+            _PreviewAiRepo(const [], failCreate: failCreate),
+          ),
+        ],
+        child: MaterialApp.router(
+          theme: theme,
+          routerConfig: GoRouter(
+            routes: [
+              GoRoute(path: '/', builder: (_, _) => const AiImportImagePage()),
+            ],
+          ),
+        ),
+      );
+
+  Future<void> loadPreviewImage(WidgetTester tester) async {
+    await tester.tap(find.text('粘贴图片数据'));
+    await tester.pumpAndSettle();
+    await tester.enterText(
+      find.byType(TextField),
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQ'
+      'DwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    );
+    await tester.tap(find.text('使用这张图片'));
+    await tester.pumpAndSettle();
+  }
+
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('ai image import default - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(400, 560));
+      await tester.pumpWidget(aiImageHost(theme));
+      await _settleEntrance(tester);
+      await expectLater(
+        find.byType(AiImportImagePage),
+        matchesGoldenFile('goldens/ai_image_import_default_$name.png'),
+      );
+    });
+  }
+
+  testWidgets('ai image import unavailable - dark', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(400, 700));
+    await tester.pumpWidget(aiImageHost(buildDarkTheme(), failCreate: true));
+    await _settleEntrance(tester);
+    await loadPreviewImage(tester);
+    await tester.tap(find.widgetWithText(FilledButton, '整理'));
+    await tester.pumpAndSettle();
+    await expectLater(
+      find.byType(AiImportImagePage),
+      matchesGoldenFile('goldens/ai_image_import_unavailable_dark.png'),
+    );
+  });
 }
 
 /// 预览用 AI 提案仓库。
@@ -1401,7 +1465,12 @@ class _PreviewAiRepo implements AiProposalRepository {
     required String fileName,
     required String imageBase64,
     String? mimeType,
-  }) => throw UnsupportedError('preview');
+  }) async {
+    if (failCreate) {
+      throw ApiServiceUnavailableException('/v1/ai/proposals/from-image');
+    }
+  }
+
   @override
   Future<void> editAtomicGroup(Id groupId, ManualRecordInput input) =>
       throw UnsupportedError('preview');
