@@ -38,6 +38,9 @@ const List<String> _banned = [
   'Rust',
   'atomic group',
   '后端',
+  '图片只作为证据',
+  '只作为证据',
+  'data URL',
 ];
 
 /// 提取一行代码中的单引号字符串字面量内容（忽略行首注释）。
