@@ -99,7 +99,8 @@ void main() {
 
     testWidgets('手机宽度：原「记录」FAB 仍在且可开记录 sheet', (tester) async {
       await _pumpApp(tester, const Size(400, 800));
-      final fab = find.byType(FloatingActionButton);
+      // 手机上「记录」与低强调 Agent 入口同屏；这里只断言记录 FAB。
+      final fab = find.widgetWithText(FloatingActionButton, '记录');
       expect(fab, findsOneWidget);
       await tester.tap(fab);
       await tester.pumpAndSettle();
