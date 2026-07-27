@@ -7,6 +7,7 @@
 - 分支：`feat/pi-agent-control-center`
 - 基线：`0c55498`（`origin/feat/subscription-sync-integration`）
 - 功能提交：`70553d0 feat(agent): add Pi control center backend`
+- 契约补全：`b4a8745 fix(agent): formalize SSE and attachment retrieval`
 - 未修改 Flutter `lib/**`、Flutter `test/**` 或平台客户端。
 - Claude 最新可见前端成果仍是 `origin/feat/ai-image-organization-ui @ 6abb256`；Pi Agent 前端任务另见 `2026-07-28-claude-pi-agent-frontend.md`。
 
@@ -21,15 +22,17 @@
 7. 记忆：模型只能创建 `suggested` 通用记忆；用户经 API 批准后才成为 `active` 并注入后续提示。已明确禁止商户到账户映射和秘密记忆。
 8. 工作区：替换 Pi 不受限的内置文件/shell tools。读写路径做 canonical containment；Linux shell 经 bubblewrap，仅挂载专属 workspace，并使用环境变量 allow-list。Windows 不做不安全降级。
 9. 部署与备份：Node 22 systemd unit、环境样例、安装脚本、工作区 sandbox smoke、独立 Agent state/附件/session/模型凭据备份脚本和 VPS 文档。
+10. 附件回读：提供归属校验后的安全元数据与原图接口，元数据不暴露存储路径；原图响应包含正确 MIME、SHA-256 ETag、private/no-store 与 nosniff，供历史消息和 App 重启后恢复预览。
+11. SSE 正式契约：OpenAPI 明确 `run.queued`、`run.started`、`message.delta`、tool 与结束事件字段，并规定 `after` / `Last-Event-ID` 的 cursor 续接语义。
 
 ## 验证结果
 
 - Rust：`cargo test`，145 passed / 0 failed。
 - Node：TypeScript check/build；10 passed / 0 failed。
 - Node production audit：0 vulnerabilities。
-- `python tools/contract_check.py`：通过，OpenAPI 84 paths / 156 schemas。
+- `python tools/contract_check.py`：通过，OpenAPI 86 paths / 156 schemas。
 - `git diff --check`、`cargo fmt --check`：通过。
-- `tools/agent_local_smoke.ps1`：真实启动 Rust 与 Node；状态、会话、附件、空模型 503 fail-closed 通过。
+- `tools/agent_local_smoke.ps1`：真实启动 Rust 与 Node；状态、会话、附件上传/安全元数据/原图响应头与字节、空模型 503 fail-closed 通过。
 - `tools/agent_workspace_sandbox_smoke.sh`：WSL bubblewrap 边界通过，workspace 可写、宿主外部路径不可见。
 - 新增 shell 脚本 `bash -n`：通过。
 - 变更文件 credential-shaped literal 扫描：无命中；生产秘密未写入仓库。
