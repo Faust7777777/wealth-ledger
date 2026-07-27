@@ -51,11 +51,18 @@ class ApiServiceUnavailableException implements Exception {
   String toString() => '服务暂时不可用，请稍后重试';
 }
 
-/// 请求校验失败（400）：携带服务端 message 与 details.errors。
-/// UI 用 [userMessage] 呈现具体校验原因，不展示裸 HTTP 细节。
+/// 请求校验失败（400）：携带服务端 code、message 与 details.errors。
+/// UI 用 [userMessage] 呈现具体校验原因，或按 [code] 映射成本地化短原因；
+/// 一律不展示裸 HTTP 细节。
 class ApiValidationException implements Exception {
-  ApiValidationException(this.path, {this.message, this.details = const []});
+  ApiValidationException(
+    this.path, {
+    this.code,
+    this.message,
+    this.details = const [],
+  });
   final String path;
+  final String? code;
   final String? message;
   final List<String> details;
 
@@ -129,6 +136,7 @@ class DevApiClient {
     if (res.statusCode == 400) {
       throw ApiValidationException(
         path,
+        code: _errorField(res, 'code'),
         message: _errorField(res, 'message'),
         details: _errorDetails(res),
       );
