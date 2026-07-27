@@ -15,6 +15,7 @@ tools/contract_check.py` 零输出；未改 provider 配置；`git diff --check`
 | `edbf05d` | 选图优先的图片整理页、本地化 400/503 处理 |
 | `af82a26` | 8 条专项测试 + 真实 Rust 联调 + smoke 增列 + 禁语扩展 |
 | （golden 提交） | 选图默认态与 503 态 golden 预览 |
+| `3ce56a0` | 统一可用性回归（§4）与两处窄屏溢出修复 |
 | （最后一笔） | 本回执 |
 
 合并、打包与部署归 Codex；未合集成线、未建 Release。
@@ -68,12 +69,37 @@ tools/contract_check.py` 零输出；未改 provider 配置；`git diff --check`
    `error.code=ai_image_input_mime_invalid`；余额不变。
 4. 同一 Idempotency-Key 重放返回同一 proposal，pending 只新增一项。
 
+## 3b. 统一可用性回归（清单 §4，按要求并入最后一项前端分支）
+
+新增 `test/responsive_regression_test.dart`：首页、账户详情（含多资产持仓行）、
+AI 导入（文本 / 图片 / CSV）、AI Review 六个页面，各自在
+**360 / 1200 / 1440** 宽度下断言无布局异常。
+
+扫出并修掉两处既有窄屏溢出（都不在本批三项范围内，属回归扫描的产物）：
+
+1. `overview_page.dart` 资产构成图例：金额文本改为可省略的 `Flexible`，
+   360 宽下不再把整行撑破 52–66 px。
+2. `ai_import_csv_page.dart` 默认账户下拉：补 `isExpanded: true` 与省略号，
+   长账户名不再溢出 164 px。
+
+两处修改后重新生成全部 golden，**PNG 逐字节无变化**——说明真实字体下的排版
+未被改动，改的只是极窄场景下的降级行为。
+
+其余 §4 条目：可见字符串扫描由 `defensive_copy_scan_test` 覆盖
+（`lib/features`、`lib/app`、`lib/shared`，本批新增 3 条禁语）；
+真实写路径一律以 Rust local-server smoke 为准，fixture/mock 不冒充写入成功。
+
+**给 Codex 的提醒**：本分支只含图片批的改动，因此这份回归跑不到
+`fix/authoritative-valuation-ui` 的估值面板与 `feat/fixed-yield-ui` 的
+收益条款/收益区。三项合入集成线后建议原样复跑该测试文件，
+并把这两个页面加进 `pages` 表。
+
 ## 4. 门禁实际结果
 
 - `git diff --check`：零输出。
 - `dart format --output=none --set-exit-if-changed lib test`：通过。
 - `flutter analyze`：No issues found。
-- `flutter test`：**217 passed / 49 skipped / 0 failed**
+- `flutter test`：**223 passed / 49 skipped / 0 failed**
   （skipped = 39 golden 预览 + 10 真实联调）。
 - `pwsh tools/frontend_local_server_smoke.ps1`：通过
   （8 文件 10 用例串行，含新增图片联调）。
