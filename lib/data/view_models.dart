@@ -1273,3 +1273,183 @@ class SubscriptionDueScanResultVm {
   final List<SubscriptionDueScanCreatedVm> created;
   final List<SubscriptionDueScanSkipVm> skipped;
 }
+
+// ———— Pi Agent 控制中枢（/v1/agent/**）————
+
+enum AgentConversationStatus { active, archived }
+
+enum AgentMessageRole { user, assistant, system }
+
+enum AgentMessageStatus { queued, streaming, completed, failed }
+
+enum AgentMemoryStatus { suggested, active, rejected }
+
+enum AgentEventType {
+  runQueued,
+  runStarted,
+  messageDelta,
+  toolStarted,
+  toolCompleted,
+  runCompleted,
+  runFailed,
+  unknown,
+}
+
+/// Agent 运行时状态。configured=false 表示服务端没有可用模型。
+class AgentStatusVm {
+  const AgentStatusVm({
+    required this.configured,
+    required this.modelCount,
+    this.primaryConversationId,
+  });
+  final bool configured;
+  final int modelCount;
+  final Id? primaryConversationId;
+}
+
+/// 服务端允许的模型；不含任何凭据或 provider 配置路径。
+class AgentModelVm {
+  const AgentModelVm({
+    required this.id,
+    required this.provider,
+    required this.displayName,
+    required this.supportsImages,
+  });
+  final String id;
+  final String provider;
+  final String displayName;
+  final bool supportsImages;
+}
+
+class AgentConversationVm {
+  const AgentConversationVm({
+    required this.id,
+    required this.title,
+    required this.isPrimary,
+    required this.status,
+    required this.createdAt,
+    required this.updatedAt,
+    this.selectedModelId,
+  });
+  final Id id;
+  final String title;
+  final bool isPrimary;
+  final AgentConversationStatus status;
+  final IsoDateTime createdAt;
+  final IsoDateTime updatedAt;
+  final String? selectedModelId;
+}
+
+class AgentMessageVm {
+  const AgentMessageVm({
+    required this.id,
+    required this.conversationId,
+    required this.role,
+    required this.text,
+    required this.status,
+    required this.createdAt,
+    this.runId,
+    this.completedAt,
+    this.errorCode,
+    this.attachmentIds = const [],
+  });
+  final Id id;
+  final Id conversationId;
+  final AgentMessageRole role;
+  final String text;
+  final AgentMessageStatus status;
+  final IsoDateTime createdAt;
+  final Id? runId;
+  final IsoDateTime? completedAt;
+  final String? errorCode;
+  final List<Id> attachmentIds;
+
+  AgentMessageVm copyWith({
+    String? text,
+    AgentMessageStatus? status,
+    Id? runId,
+    String? errorCode,
+  }) => AgentMessageVm(
+    id: id,
+    conversationId: conversationId,
+    role: role,
+    text: text ?? this.text,
+    status: status ?? this.status,
+    createdAt: createdAt,
+    runId: runId ?? this.runId,
+    completedAt: completedAt,
+    errorCode: errorCode ?? this.errorCode,
+    attachmentIds: attachmentIds,
+  );
+}
+
+/// 附件安全元数据；不含服务端存储路径。
+class AgentAttachmentVm {
+  const AgentAttachmentVm({
+    required this.id,
+    required this.fileName,
+    required this.mimeType,
+    required this.sizeBytes,
+    required this.sha256,
+    required this.createdAt,
+  });
+  final Id id;
+  final String fileName;
+  final String mimeType;
+  final int sizeBytes;
+  final String sha256;
+  final IsoDateTime createdAt;
+}
+
+class AgentMemoryVm {
+  const AgentMemoryVm({
+    required this.id,
+    required this.content,
+    required this.reason,
+    required this.status,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+  final Id id;
+  final String content;
+  final String reason;
+  final AgentMemoryStatus status;
+  final IsoDateTime createdAt;
+  final IsoDateTime updatedAt;
+}
+
+/// POST 消息后的受理结果（202）：本地据此立刻建立 queued 占位。
+class AgentRunAcceptedVm {
+  const AgentRunAcceptedVm({
+    required this.runId,
+    required this.userMessageId,
+    required this.assistantMessageId,
+  });
+  final Id runId;
+  final Id userMessageId;
+  final Id assistantMessageId;
+}
+
+/// 规范化 SSE 事件。cursor 用于断线续接；不含 tool payload 与隐藏推理。
+class AgentEventVm {
+  const AgentEventVm({
+    required this.cursor,
+    required this.type,
+    this.runId,
+    this.userMessageId,
+    this.assistantMessageId,
+    this.delta,
+    this.toolName,
+    this.isError,
+    this.code,
+  });
+  final int cursor;
+  final AgentEventType type;
+  final Id? runId;
+  final Id? userMessageId;
+  final Id? assistantMessageId;
+  final String? delta;
+  final String? toolName;
+  final bool? isError;
+  final String? code;
+}

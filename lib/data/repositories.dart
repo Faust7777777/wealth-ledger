@@ -2,6 +2,8 @@
 // 命名对齐 DATA_SCHEMA_V1 §14；方法对齐 APPLICATION_INTERFACES_V1 的读路径。
 // 第一阶段只暴露读方法 + 空/隔离实现；写路径（confirmAtomicGroup / approve /
 // markExecutedAsProposal 等）在后续批次补，并仍走"候选→确认"。
+import 'dart:typed_data';
+
 import 'view_models.dart';
 import '../core/types.dart';
 
@@ -115,6 +117,48 @@ abstract interface class LoanRepository {
     required IsoDate throughDate,
     String? note,
   });
+}
+
+/// Pi Agent 控制中枢。只经现有 Rust 公网 origin 的 `/v1/agent/**`；
+/// Agent 不直接写账本，账务变更一律落到既有 AI 待审核列表。
+abstract interface class AgentRepository {
+  Future<AgentStatusVm> getStatus();
+  Future<List<AgentModelVm>> listModels();
+
+  Future<AgentAttachmentVm> uploadAttachment({
+    required String fileName,
+    required String mimeType,
+    required Uint8List bytes,
+  });
+  Future<AgentAttachmentVm> getAttachment(Id attachmentId);
+  Future<Uint8List> getAttachmentContent(Id attachmentId);
+
+  Future<List<AgentMemoryVm>> listMemories();
+  Future<AgentMemoryVm> reviewMemory(
+    Id memoryId, {
+    required AgentMemoryStatus decision,
+  });
+
+  Future<List<AgentConversationVm>> listConversations();
+  Future<AgentConversationVm> createConversation({String? title});
+  Future<AgentConversationVm> updateConversation(
+    Id conversationId, {
+    String? title,
+    AgentConversationStatus? status,
+    String? modelId,
+  });
+
+  Future<List<AgentMessageVm>> listMessages(Id conversationId);
+  Future<AgentRunAcceptedVm> sendMessage(
+    Id conversationId, {
+    required String text,
+    List<Id> attachmentIds,
+  });
+
+  /// SSE：`after` 为已应用的最大 cursor，重连时只补发之后的事件。
+  Stream<AgentEventVm> events(Id conversationId, {int? after});
+
+  Future<void> cancelRun(Id runId);
 }
 
 abstract interface class QuoteRepository {

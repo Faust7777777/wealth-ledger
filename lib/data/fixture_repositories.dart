@@ -1,5 +1,7 @@
 // Wealth Ledger — debug_fixture 仓库：隔离的 DEMO 数据（对齐 examples/portfolio_overview_degraded）。
 // 仅 debug/demo 模式注入；绝不写真实账本、绝不参与同步。所有数据均为虚构演示。
+import 'dart:typed_data';
+
 import '../core/types.dart';
 import 'repositories.dart';
 import 'view_models.dart';
@@ -551,6 +553,62 @@ class FixtureLoanRepository implements LoanRepository {
     required IsoDate throughDate,
     String? note,
   }) async => throw UnsupportedError('DEMO 演示只读，不支持记录利息；请用 local_server');
+}
+
+class FixtureAgentRepository implements AgentRepository {
+  const FixtureAgentRepository();
+  Never _unsupported() =>
+      throw UnsupportedError('DEMO 演示只读，不支持 Agent；请用 local_server');
+  @override
+  Future<AgentStatusVm> getStatus() async =>
+      const AgentStatusVm(configured: false, modelCount: 0);
+  @override
+  Future<List<AgentModelVm>> listModels() async => const [];
+  @override
+  Future<List<AgentMemoryVm>> listMemories() async => const [];
+  @override
+  Future<List<AgentConversationVm>> listConversations() async => const [];
+  @override
+  Future<AgentAttachmentVm> uploadAttachment({
+    required String fileName,
+    required String mimeType,
+    required Uint8List bytes,
+  }) async => _unsupported();
+  @override
+  Future<AgentAttachmentVm> getAttachment(Id attachmentId) async =>
+      _unsupported();
+  @override
+  Future<Uint8List> getAttachmentContent(Id attachmentId) async =>
+      _unsupported();
+  @override
+  Future<AgentMemoryVm> reviewMemory(
+    Id memoryId, {
+    required AgentMemoryStatus decision,
+  }) async => _unsupported();
+  @override
+  Future<AgentConversationVm> createConversation({String? title}) async =>
+      _unsupported();
+  @override
+  Future<AgentConversationVm> updateConversation(
+    Id conversationId, {
+    String? title,
+    AgentConversationStatus? status,
+    String? modelId,
+  }) async => _unsupported();
+  @override
+  Future<List<AgentMessageVm>> listMessages(Id conversationId) async =>
+      const [];
+  @override
+  Future<AgentRunAcceptedVm> sendMessage(
+    Id conversationId, {
+    required String text,
+    List<Id> attachmentIds = const [],
+  }) async => _unsupported();
+  @override
+  Stream<AgentEventVm> events(Id conversationId, {int? after}) =>
+      const Stream.empty();
+  @override
+  Future<void> cancelRun(Id runId) async => _unsupported();
 }
 
 class FixtureQuoteRepository implements QuoteRepository {

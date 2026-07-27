@@ -1,6 +1,8 @@
 // Wealth Ledger — real_local 仓库：默认空账本。
 // 不加载 fixture、不写真实账本、不报错、不接真实行情/AI/同步。
 // TODO(LOCAL_LEDGER_FORMAT_V1): 接真实本地账本（由后端线 / Rust core 提供）；当前一律返回空。
+import 'dart:typed_data';
+
 import '../core/types.dart';
 import 'repositories.dart';
 import 'view_models.dart';
@@ -179,6 +181,62 @@ class RealLocalLoanRepository implements LoanRepository {
     required IsoDate throughDate,
     String? note,
   }) async => throw UnsupportedError('real_local 暂不支持记录利息；请用 local_server');
+}
+
+class RealLocalAgentRepository implements AgentRepository {
+  const RealLocalAgentRepository();
+  Never _unsupported() =>
+      throw UnsupportedError('real_local 暂不支持 Agent；请用 local_server');
+  @override
+  Future<AgentStatusVm> getStatus() async =>
+      const AgentStatusVm(configured: false, modelCount: 0);
+  @override
+  Future<List<AgentModelVm>> listModels() async => const [];
+  @override
+  Future<List<AgentMemoryVm>> listMemories() async => const [];
+  @override
+  Future<List<AgentConversationVm>> listConversations() async => const [];
+  @override
+  Future<AgentAttachmentVm> uploadAttachment({
+    required String fileName,
+    required String mimeType,
+    required Uint8List bytes,
+  }) async => _unsupported();
+  @override
+  Future<AgentAttachmentVm> getAttachment(Id attachmentId) async =>
+      _unsupported();
+  @override
+  Future<Uint8List> getAttachmentContent(Id attachmentId) async =>
+      _unsupported();
+  @override
+  Future<AgentMemoryVm> reviewMemory(
+    Id memoryId, {
+    required AgentMemoryStatus decision,
+  }) async => _unsupported();
+  @override
+  Future<AgentConversationVm> createConversation({String? title}) async =>
+      _unsupported();
+  @override
+  Future<AgentConversationVm> updateConversation(
+    Id conversationId, {
+    String? title,
+    AgentConversationStatus? status,
+    String? modelId,
+  }) async => _unsupported();
+  @override
+  Future<List<AgentMessageVm>> listMessages(Id conversationId) async =>
+      const [];
+  @override
+  Future<AgentRunAcceptedVm> sendMessage(
+    Id conversationId, {
+    required String text,
+    List<Id> attachmentIds = const [],
+  }) async => _unsupported();
+  @override
+  Stream<AgentEventVm> events(Id conversationId, {int? after}) =>
+      const Stream.empty();
+  @override
+  Future<void> cancelRun(Id runId) async => _unsupported();
 }
 
 class RealLocalQuoteRepository implements QuoteRepository {

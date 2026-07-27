@@ -4,6 +4,7 @@
 // 形状对齐 docs/contracts（DATA_SCHEMA_V1 / examples / FRONTEND_API_INTEGRATION_HANDOFF_V1）。
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
@@ -54,8 +55,14 @@ class ApiServiceUnavailableException implements Exception {
 /// 请求校验失败（400）：携带服务端 message 与 details.errors。
 /// UI 用 [userMessage] 呈现具体校验原因，不展示裸 HTTP 细节。
 class ApiValidationException implements Exception {
-  ApiValidationException(this.path, {this.message, this.details = const []});
+  ApiValidationException(
+    this.path, {
+    this.code,
+    this.message,
+    this.details = const [],
+  });
   final String path;
+  final String? code;
   final String? message;
   final List<String> details;
 
@@ -106,6 +113,20 @@ class DevApiClient {
       : '$baseUrl$path${path.contains('?') ? '&' : '?'}scenario=$scenario';
 
   Object? _handle(http.Response res, String path) {
+    _throwForStatus(res, path);
+    if (res.statusCode == 204 || res.bodyBytes.isEmpty) {
+      return null; // 如 AI reject 返回 204
+    }
+    final body = jsonDecode(utf8.decode(res.bodyBytes));
+    if (body is Map<String, dynamic>) {
+      if (body['ok'] == false) throw Exception('API error · $path');
+      return body.containsKey('data') ? body['data'] : body;
+    }
+    return body;
+  }
+
+  /// 状态码 → 类型化异常。JSON 与二进制响应共用同一套错误语义。
+  void _throwForStatus(http.Response res, String path) {
     if (res.statusCode == 401) {
       throw ApiUnauthorizedException(path);
     }
@@ -126,9 +147,11 @@ class DevApiClient {
         message: _errorField(res, 'message'),
       );
     }
-    if (res.statusCode == 400) {
+    // 400 与 413（附件过大）同属"请求本身不合法"，用同一种类型化异常呈现。
+    if (res.statusCode == 400 || res.statusCode == 413) {
       throw ApiValidationException(
         path,
+        code: _errorField(res, 'code'),
         message: _errorField(res, 'message'),
         details: _errorDetails(res),
       );
@@ -139,15 +162,6 @@ class DevApiClient {
         'HTTP ${res.statusCode} · $path${message == null ? '' : ' · $message'}',
       );
     }
-    if (res.statusCode == 204 || res.bodyBytes.isEmpty) {
-      return null; // 如 AI reject 返回 204
-    }
-    final body = jsonDecode(utf8.decode(res.bodyBytes));
-    if (body is Map<String, dynamic>) {
-      if (body['ok'] == false) throw Exception('API error · $path');
-      return body.containsKey('data') ? body['data'] : body;
-    }
-    return body;
   }
 
   /// 读取错误信封 error.details.errors（服务端校验失败的逐条原因）。
@@ -182,6 +196,146 @@ class DevApiClient {
 
   Future<Object?> patchData(String path, {Object? body}) =>
       _send('PATCH', path, body: body);
+
+  /// multipart 上传（Agent 附件）。写入语义与 JSON POST 一致：
+  /// 首次调用前生成 Idempotency-Key，401 刷新后的重放复用同一个 key，
+  /// 不会因为重试重复归档同一张图。
+  Future<Object?> postMultipart(
+    String path, {
+    required String field,
+    required String fileName,
+    required String mimeType,
+    required Uint8List bytes,
+  }) => _sendMultipart(
+    path,
+    field: field,
+    fileName: fileName,
+    mimeType: mimeType,
+    bytes: bytes,
+    idempotencyKey: _newIdempotencyKey(),
+  );
+
+  Future<Object?> _sendMultipart(
+    String path, {
+    required String field,
+    required String fileName,
+    required String mimeType,
+    required Uint8List bytes,
+    required String idempotencyKey,
+    bool retried = false,
+  }) async {
+    // 手写 multipart：part 的 Content-Type 必须是真实图片 MIME（服务端据此校验），
+    // 而 http 包的 MultipartFile 需要额外依赖才能设置它。
+    final boundary = '----finwealth${_newIdempotencyKey()}';
+    final safeName = fileName.replaceAll(RegExp(r'[\r\n"]'), '_');
+    final head = utf8.encode(
+      '--$boundary\r\n'
+      'content-disposition: form-data; name="$field"; filename="$safeName"\r\n'
+      'content-type: $mimeType\r\n\r\n',
+    );
+    final tail = utf8.encode('\r\n--$boundary--\r\n');
+    final request = http.Request('POST', Uri.parse(_url(path)))
+      ..headers.addAll(await _headers())
+      ..headers['idempotency-key'] = idempotencyKey
+      ..headers['content-type'] = 'multipart/form-data; boundary=$boundary'
+      ..bodyBytes = <int>[...head, ...bytes, ...tail];
+    final res = await http.Response.fromStream(await _client.send(request));
+    if (res.statusCode == 401 && !retried && await _refreshSession()) {
+      return _sendMultipart(
+        path,
+        field: field,
+        fileName: fileName,
+        mimeType: mimeType,
+        bytes: bytes,
+        idempotencyKey: idempotencyKey,
+        retried: true,
+      );
+    }
+    return _handle(res, path);
+  }
+
+  /// 二进制读取（Agent 附件原图）：返回字节与服务端声明的 MIME。
+  Future<({Uint8List bytes, String mimeType})> getBytes(
+    String path, {
+    bool retried = false,
+  }) async {
+    final res = await _client.get(
+      Uri.parse(_url(path)),
+      headers: await _headers(),
+    );
+    if (res.statusCode == 401 && !retried && await _refreshSession()) {
+      return getBytes(path, retried: true);
+    }
+    _throwForStatus(res, path);
+    return (
+      bytes: res.bodyBytes,
+      mimeType: res.headers['content-type']?.split(';').first.trim() ?? '',
+    );
+  }
+
+  /// SSE 订阅：逐帧产出 (cursor, event, data)。`after` 为已应用的最大 cursor，
+  /// 断线重连时由调用方续接；401 刷新后重连一次。
+  Stream<({int cursor, String event, Map<String, dynamic> data})> streamEvents(
+    String path, {
+    int? after,
+  }) async* {
+    var retried = false;
+    while (true) {
+      final uri = Uri.parse(_url(after == null ? path : '$path?after=$after'));
+      final request = http.Request('GET', uri)
+        ..headers.addAll(await _headers())
+        ..headers['accept'] = 'text/event-stream';
+      if (after != null) request.headers['last-event-id'] = '$after';
+      final res = await _client.send(request);
+      if (res.statusCode == 401 && !retried && await _refreshSession()) {
+        retried = true;
+        continue;
+      }
+      if (res.statusCode != 200) {
+        await res.stream.drain<void>();
+        throw res.statusCode == 401
+            ? ApiUnauthorizedException(path)
+            : Exception('HTTP ${res.statusCode} · $path');
+      }
+      var id = 0;
+      var event = '';
+      final data = StringBuffer();
+      await for (final line
+          in res.stream
+              .transform(utf8.decoder)
+              .transform(const LineSplitter())) {
+        if (line.isEmpty) {
+          if (event.isNotEmpty && data.isNotEmpty) {
+            final decoded = jsonDecode(data.toString());
+            yield (
+              cursor: id,
+              event: event,
+              data: decoded is Map
+                  ? decoded.cast<String, dynamic>()
+                  : <String, dynamic>{},
+            );
+          }
+          event = '';
+          data.clear();
+          continue;
+        }
+        if (line.startsWith(':')) continue; // keep-alive
+        final colon = line.indexOf(':');
+        if (colon < 0) continue;
+        final key = line.substring(0, colon);
+        final value = line.substring(colon + 1).trimLeft();
+        switch (key) {
+          case 'id':
+            id = int.tryParse(value) ?? id;
+          case 'event':
+            event = value;
+          case 'data':
+            data.write(value);
+        }
+      }
+      return;
+    }
+  }
 
   /// 统一请求入口：access token 过期（401）时用 refresh token 换新并重放一次。
   /// auth 端点自身不重试，避免刷新循环。写入的 Idempotency-Key 在首次调用前生成，
@@ -1554,6 +1708,263 @@ class LocalServerLoanRepository implements LoanRepository {
       ),
     ),
   );
+}
+
+// ———— Pi Agent 映射 ————
+AgentStatusVm _agentStatus(Map<String, dynamic> j) => AgentStatusVm(
+  configured: _bool(j['configured']),
+  modelCount: _int(j['modelCount']),
+  primaryConversationId: j['primaryConversationId'] as String?,
+);
+
+AgentModelVm _agentModel(Map<String, dynamic> j) => AgentModelVm(
+  id: '${j['id']}',
+  provider: '${j['provider']}',
+  displayName: '${j['displayName']}',
+  supportsImages: _bool(j['supportsImages']),
+);
+
+AgentConversationVm _agentConversation(Map<String, dynamic> j) =>
+    AgentConversationVm(
+      id: '${j['id']}',
+      title: '${j['title']}',
+      isPrimary: _bool(j['isPrimary']),
+      status: j['status'] == 'archived'
+          ? AgentConversationStatus.archived
+          : AgentConversationStatus.active,
+      createdAt: '${j['createdAt']}',
+      updatedAt: '${j['updatedAt']}',
+      selectedModelId: j['selectedModelId'] as String?,
+    );
+
+AgentMessageRole _agentRole(Object? s) => switch (s) {
+  'assistant' => AgentMessageRole.assistant,
+  'system' => AgentMessageRole.system,
+  _ => AgentMessageRole.user,
+};
+
+AgentMessageStatus _agentMessageStatus(Object? s) => switch (s) {
+  'queued' => AgentMessageStatus.queued,
+  'streaming' => AgentMessageStatus.streaming,
+  'failed' => AgentMessageStatus.failed,
+  _ => AgentMessageStatus.completed,
+};
+
+AgentMessageVm _agentMessage(Map<String, dynamic> j) => AgentMessageVm(
+  id: '${j['id']}',
+  conversationId: '${j['conversationId']}',
+  role: _agentRole(j['role']),
+  text: '${j['text'] ?? ''}',
+  status: _agentMessageStatus(j['status']),
+  createdAt: '${j['createdAt']}',
+  runId: j['runId'] as String?,
+  completedAt: j['completedAt'] as String?,
+  errorCode: j['errorCode'] as String?,
+  attachmentIds: [for (final id in _list(j['attachmentIds'])) '$id'],
+);
+
+AgentAttachmentVm _agentAttachment(Map<String, dynamic> j) => AgentAttachmentVm(
+  id: '${j['id']}',
+  fileName: '${j['fileName']}',
+  mimeType: '${j['mimeType']}',
+  sizeBytes: _int(j['sizeBytes']),
+  sha256: '${j['sha256']}',
+  createdAt: '${j['createdAt']}',
+);
+
+AgentMemoryStatus _agentMemoryStatus(Object? s) => switch (s) {
+  'active' => AgentMemoryStatus.active,
+  'rejected' => AgentMemoryStatus.rejected,
+  _ => AgentMemoryStatus.suggested,
+};
+
+AgentMemoryVm _agentMemory(Map<String, dynamic> j) => AgentMemoryVm(
+  id: '${j['id']}',
+  content: '${j['content']}',
+  reason: '${j['reason'] ?? ''}',
+  status: _agentMemoryStatus(j['status']),
+  createdAt: '${j['createdAt']}',
+  updatedAt: '${j['updatedAt']}',
+);
+
+AgentEventType _agentEventType(String s) => switch (s) {
+  'run.queued' => AgentEventType.runQueued,
+  'run.started' => AgentEventType.runStarted,
+  'message.delta' => AgentEventType.messageDelta,
+  'tool.started' => AgentEventType.toolStarted,
+  'tool.completed' => AgentEventType.toolCompleted,
+  'run.completed' => AgentEventType.runCompleted,
+  'run.failed' => AgentEventType.runFailed,
+  _ => AgentEventType.unknown,
+};
+
+AgentEventVm agentEventFrom(
+  int cursor,
+  String event,
+  Map<String, dynamic> data,
+) => AgentEventVm(
+  cursor: cursor,
+  type: _agentEventType(event),
+  runId: data['runId'] as String?,
+  userMessageId: data['userMessageId'] as String?,
+  assistantMessageId: data['assistantMessageId'] as String?,
+  delta: data['delta'] as String?,
+  toolName: data['name'] as String?,
+  isError: data['isError'] as bool?,
+  code: data['code'] as String?,
+);
+
+/// 供测试直接校验 wire → VM 映射。
+AgentMessageVm parseAgentMessageData(Map<String, dynamic> j) =>
+    _agentMessage(j);
+AgentConversationVm parseAgentConversationData(Map<String, dynamic> j) =>
+    _agentConversation(j);
+
+class LocalServerAgentRepository implements AgentRepository {
+  LocalServerAgentRepository(this._c);
+  final DevApiClient _c;
+
+  @override
+  Future<AgentStatusVm> getStatus() async =>
+      _agentStatus(_m(await _c.getData('/v1/agent/status')));
+
+  @override
+  Future<List<AgentModelVm>> listModels() async => [
+    for (final m in _list(await _c.getData('/v1/agent/models')))
+      _agentModel(_m(m)),
+  ];
+
+  @override
+  Future<AgentAttachmentVm> uploadAttachment({
+    required String fileName,
+    required String mimeType,
+    required Uint8List bytes,
+  }) async => _agentAttachment(
+    _m(
+      await _c.postMultipart(
+        '/v1/agent/attachments',
+        field: 'file',
+        fileName: fileName,
+        mimeType: mimeType,
+        bytes: bytes,
+      ),
+    ),
+  );
+
+  @override
+  Future<AgentAttachmentVm> getAttachment(Id attachmentId) async =>
+      _agentAttachment(
+        _m(await _c.getData('/v1/agent/attachments/$attachmentId')),
+      );
+
+  @override
+  Future<Uint8List> getAttachmentContent(Id attachmentId) async =>
+      (await _c.getBytes('/v1/agent/attachments/$attachmentId/content')).bytes;
+
+  @override
+  Future<List<AgentMemoryVm>> listMemories() async => [
+    for (final m in _list(await _c.getData('/v1/agent/memories')))
+      _agentMemory(_m(m)),
+  ];
+
+  @override
+  Future<AgentMemoryVm> reviewMemory(
+    Id memoryId, {
+    required AgentMemoryStatus decision,
+  }) async => _agentMemory(
+    _m(
+      await _c.postData(
+        '/v1/agent/memories/$memoryId/review',
+        body: {
+          'decision': decision == AgentMemoryStatus.active
+              ? 'active'
+              : 'rejected',
+        },
+      ),
+    ),
+  );
+
+  @override
+  Future<List<AgentConversationVm>> listConversations() async => [
+    for (final c in _list(await _c.getData('/v1/agent/conversations')))
+      _agentConversation(_m(c)),
+  ];
+
+  @override
+  Future<AgentConversationVm> createConversation({String? title}) async =>
+      _agentConversation(
+        _m(
+          await _c.postData(
+            '/v1/agent/conversations',
+            body: {if (title != null && title.isNotEmpty) 'title': title},
+          ),
+        ),
+      );
+
+  @override
+  Future<AgentConversationVm> updateConversation(
+    Id conversationId, {
+    String? title,
+    AgentConversationStatus? status,
+    String? modelId,
+  }) async => _agentConversation(
+    _m(
+      await _c.patchData(
+        '/v1/agent/conversations/$conversationId',
+        body: {
+          'title': ?title,
+          if (status != null)
+            'status': status == AgentConversationStatus.archived
+                ? 'archived'
+                : 'active',
+          'modelId': ?modelId,
+        },
+      ),
+    ),
+  );
+
+  @override
+  Future<List<AgentMessageVm>> listMessages(Id conversationId) async => [
+    for (final m in _list(
+      await _c.getData('/v1/agent/conversations/$conversationId/messages'),
+    ))
+      _agentMessage(_m(m)),
+  ];
+
+  @override
+  Future<AgentRunAcceptedVm> sendMessage(
+    Id conversationId, {
+    required String text,
+    List<Id> attachmentIds = const [],
+  }) async {
+    final d = _m(
+      await _c.postData(
+        '/v1/agent/conversations/$conversationId/messages',
+        body: {
+          'text': text,
+          if (attachmentIds.isNotEmpty) 'attachmentIds': attachmentIds,
+        },
+      ),
+    );
+    return AgentRunAcceptedVm(
+      runId: '${d['runId']}',
+      userMessageId: '${d['userMessageId']}',
+      assistantMessageId: '${d['assistantMessageId']}',
+    );
+  }
+
+  @override
+  Stream<AgentEventVm> events(Id conversationId, {int? after}) => _c
+      .streamEvents(
+        '/v1/agent/conversations/$conversationId/events',
+        after: after,
+      )
+      .map((f) => agentEventFrom(f.cursor, f.event, f.data));
+
+  @override
+  Future<void> cancelRun(Id runId) async {
+    await _c.postData('/v1/agent/runs/$runId/cancel');
+  }
 }
 
 class LocalServerQuoteRepository implements QuoteRepository {

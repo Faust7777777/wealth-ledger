@@ -1,5 +1,7 @@
 // Wealth Ledger — Riverpod 注入：按 DataSourceMode 切 real_local / debug_fixture。
 // 页面只 watch 这些 provider，不感知数据来源；fixture 仅在 demo 模式注入。
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart' show ThemeMode;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -253,6 +255,14 @@ final loanRepositoryProvider = Provider<LoanRepository>(
     api: () => LocalServerLoanRepository(ref.watch(devApiClientProvider)),
   ),
 );
+final agentRepositoryProvider = Provider<AgentRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalAgentRepository(),
+    fixture: () => const FixtureAgentRepository(),
+    api: () => LocalServerAgentRepository(ref.watch(devApiClientProvider)),
+  ),
+);
 final quoteRepositoryProvider = Provider<QuoteRepository>(
   (ref) => _pick(
     ref,
@@ -316,6 +326,37 @@ final instrumentsProvider = FutureProvider<List<InstrumentVm>>(
 );
 final fxRatesProvider = FutureProvider<List<FxRateVm>>(
   (ref) => ref.watch(quoteRepositoryProvider).listFxRates(),
+);
+final agentStatusProvider = FutureProvider<AgentStatusVm>(
+  (ref) => ref.watch(agentRepositoryProvider).getStatus(),
+);
+final agentModelsProvider = FutureProvider<List<AgentModelVm>>(
+  (ref) => ref.watch(agentRepositoryProvider).listModels(),
+);
+final agentConversationsProvider = FutureProvider<List<AgentConversationVm>>(
+  (ref) => ref.watch(agentRepositoryProvider).listConversations(),
+);
+final agentMemoriesProvider = FutureProvider<List<AgentMemoryVm>>(
+  (ref) => ref.watch(agentRepositoryProvider).listMemories(),
+);
+
+/// 附件原图字节（消息历史与重启后恢复预览）；失败不自动退避重试，由 UI 决定。
+final agentAttachmentBytesProvider = FutureProvider.family<Uint8List, String>(
+  (ref, attachmentId) =>
+      ref.watch(agentRepositoryProvider).getAttachmentContent(attachmentId),
+  retry: (_, _) => null,
+);
+
+/// 桌面右栏是否展开（移动端走全屏路由，不用这个开关）。
+class AgentPanelVisibility extends Notifier<bool> {
+  @override
+  bool build() => false;
+  void toggle() => state = !state;
+  void close() => state = false;
+}
+
+final agentPanelOpenProvider = NotifierProvider<AgentPanelVisibility, bool>(
+  AgentPanelVisibility.new,
 );
 final liabilityPositionsProvider = FutureProvider<List<LiabilityPositionVm>>(
   (ref) => ref.watch(loanRepositoryProvider).listLiabilityPositions(),
