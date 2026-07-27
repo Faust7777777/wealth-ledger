@@ -1057,11 +1057,58 @@ void main() {
     );
   });
 
+  const previewValuationIssues = [
+    ValuationIssueVm(
+      id: 'valuation_holding_a_okx_inst_eth',
+      accountId: 'a_okx',
+      accountName: 'OKX',
+      assetKind: ValuationAssetKind.holding,
+      assetId: 'inst_eth',
+      assetLabel: 'ETH',
+      quantity: '0.25',
+      quantityUnit: 'ETH',
+      status: ValuationIssueStatus.unpriceable,
+      reason: ValuationIssueReason.missingQuote,
+      sourceCurrency: 'USDT',
+      targetCurrency: 'CNY',
+    ),
+    ValuationIssueVm(
+      id: 'valuation_holding_a_okx_inst_btc',
+      accountId: 'a_okx',
+      accountName: 'OKX',
+      assetKind: ValuationAssetKind.holding,
+      assetId: 'inst_btc',
+      assetLabel: 'BTC',
+      quantity: '0.00076078',
+      quantityUnit: 'BTC',
+      status: ValuationIssueStatus.unpriceable,
+      reason: ValuationIssueReason.missingFxPath,
+      sourceCurrency: 'USDT',
+      targetCurrency: 'CNY',
+      asOf: '2026-07-27T03:30:00Z',
+    ),
+    ValuationIssueVm(
+      id: 'valuation_cash_a_okx_USDT',
+      accountId: 'a_okx',
+      accountName: 'OKX',
+      assetKind: ValuationAssetKind.cash,
+      assetId: 'USDT',
+      assetLabel: 'USDT',
+      quantity: '123.45',
+      quantityUnit: 'USDT',
+      status: ValuationIssueStatus.stale,
+      reason: ValuationIssueReason.staleFx,
+      sourceCurrency: 'USDT',
+      targetCurrency: 'CNY',
+      asOf: '2026-07-27T03:30:00Z',
+    ),
+  ];
+
   Widget valuationHost(ThemeData theme) => ProviderScope(
     overrides: [
-      accountsProvider.overrideWith((ref) async => const [okxAccount]),
-      holdingsProvider.overrideWith((ref) async => okxHoldings),
-      fxRatesProvider.overrideWith((ref) async => const <FxRateVm>[]),
+      valuationIssuesProvider.overrideWith(
+        (ref) async => previewValuationIssues,
+      ),
     ],
     child: MaterialApp(
       theme: theme,
@@ -1080,6 +1127,44 @@ void main() {
       matchesGoldenFile('goldens/valuation_status_dialog_dark.png'),
     );
   });
+
+  testWidgets('valuation status dialog - light', skip: !_previewEnabled, (
+    tester,
+  ) async {
+    await sized(tester, const Size(460, 700));
+    await tester.pumpWidget(valuationHost(buildLightTheme()));
+    await _settleEntrance(tester);
+    await expectLater(
+      find.byType(ValuationStatusDialog),
+      matchesGoldenFile('goldens/valuation_status_dialog_light.png'),
+    );
+  });
+
+  testWidgets(
+    'valuation status dialog load failure - dark',
+    skip: !_previewEnabled,
+    (tester) async {
+      await sized(tester, const Size(460, 700));
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            valuationIssuesProvider.overrideWith(
+              (ref) async => throw Exception('network'),
+            ),
+          ],
+          child: MaterialApp(
+            theme: buildDarkTheme(),
+            home: const Scaffold(body: Center(child: ValuationStatusDialog())),
+          ),
+        ),
+      );
+      await _settleEntrance(tester);
+      await expectLater(
+        find.byType(ValuationStatusDialog),
+        matchesGoldenFile('goldens/valuation_status_dialog_error_dark.png'),
+      );
+    },
+  );
 
   Widget subFormHost(ThemeData theme) => ProviderScope(
     overrides: [
@@ -1481,6 +1566,8 @@ class _PreviewCryptoPortfolioRepo implements PortfolioRepository {
     Id accountId,
     HoldingAdjustmentInput input,
   ) => throw UnsupportedError('preview');
+  @override
+  Future<List<ValuationIssueVm>> listValuationIssues() async => const [];
 }
 
 /// 预览用只读 movement 仓库。
@@ -1546,4 +1633,6 @@ class _PreviewPortfolioRepo implements PortfolioRepository {
     Id accountId,
     HoldingAdjustmentInput input,
   ) => throw UnsupportedError('unused');
+  @override
+  Future<List<ValuationIssueVm>> listValuationIssues() async => const [];
 }

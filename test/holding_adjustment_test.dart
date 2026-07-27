@@ -175,6 +175,8 @@ class _FakePortfolioRepo implements PortfolioRepository {
     Id accountId,
     HoldingAdjustmentInput input,
   ) => inner.proposeHoldingAdjustment(accountId, input);
+  @override
+  Future<List<ValuationIssueVm>> listValuationIssues() async => const [];
 }
 
 class _FakeAccountRepo implements AccountRepository {

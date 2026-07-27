@@ -201,6 +201,8 @@ class _FakePortfolioRepo implements PortfolioRepository {
     Id accountId,
     HoldingAdjustmentInput input,
   ) => throw UnsupportedError('unused');
+  @override
+  Future<List<ValuationIssueVm>> listValuationIssues() async => const [];
 }
 
 Widget _formHost(MovementRepository movementRepo) => ProviderScope(
