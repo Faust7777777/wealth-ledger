@@ -1,0 +1,44 @@
+# Pi Agent 控制中枢后端完成回执
+
+日期：2026-07-28
+
+## 分支与边界
+
+- 分支：`feat/pi-agent-control-center`
+- 基线：`0c55498`（`origin/feat/subscription-sync-integration`）
+- 功能提交：`70553d0 feat(agent): add Pi control center backend`
+- 未修改 Flutter `lib/**`、Flutter `test/**` 或平台客户端。
+- Claude 最新可见前端成果仍是 `origin/feat/ai-image-organization-ui @ 6abb256`；Pi Agent 前端任务另见 `2026-07-28-claude-pi-agent-frontend.md`。
+
+## 已交付
+
+1. Rust 公网网关：复用现有设备 bearer auth，代理 `/v1/agent/**` 到 loopback sidecar，注入 owner/ledger/device principal，不向 sidecar转发客户端 Authorization，支持 SSE。
+2. 内部调用：sidecar 用 constant-time 校验的内部 token 调 Rust；Rust 将其绑定为 owner principal。Agent 不能用内部 token递归调用 Agent 代理。
+3. Pi sidecar：真实 `@earendil-works/pi-coding-agent 0.82.1`、模型列表、主会话/多会话、归档、模型选择、JSONL session、排队运行、取消和可恢复 SSE cursor。
+4. 财务 tools：读取 overview/accounts/movements/holdings/liabilities/subscriptions/DCA/pending review/quotes；刷新服务器已配置的结构化报价；账务写入只调用 draft 加 submit-review，没有 confirm/approve/direct-write tool。
+5. 图片账单：multipart PNG/JPEG/WEBP，15 MiB；校验 MIME 与 magic，归档原件及工作副本，按账号隔离，原生传为 Pi `ImageContent`。
+6. 幂等：Agent 所有 POST/PATCH 要求 `Idempotency-Key`，结果持久化；同 key 同请求重放原结果，不同请求返回 409。
+7. 记忆：模型只能创建 `suggested` 通用记忆；用户经 API 批准后才成为 `active` 并注入后续提示。已明确禁止商户到账户映射和秘密记忆。
+8. 工作区：替换 Pi 不受限的内置文件/shell tools。读写路径做 canonical containment；Linux shell 经 bubblewrap，仅挂载专属 workspace，并使用环境变量 allow-list。Windows 不做不安全降级。
+9. 部署与备份：Node 22 systemd unit、环境样例、安装脚本、工作区 sandbox smoke、独立 Agent state/附件/session/模型凭据备份脚本和 VPS 文档。
+
+## 验证结果
+
+- Rust：`cargo test`，145 passed / 0 failed。
+- Node：TypeScript check/build；10 passed / 0 failed。
+- Node production audit：0 vulnerabilities。
+- `python tools/contract_check.py`：通过，OpenAPI 84 paths / 156 schemas。
+- `git diff --check`、`cargo fmt --check`：通过。
+- `tools/agent_local_smoke.ps1`：真实启动 Rust 与 Node；状态、会话、附件、空模型 503 fail-closed 通过。
+- `tools/agent_workspace_sandbox_smoke.sh`：WSL bubblewrap 边界通过，workspace 可写、宿主外部路径不可见。
+- 新增 shell 脚本 `bash -n`：通过。
+- 变更文件 credential-shaped literal 扫描：无命中；生产秘密未写入仓库。
+
+## 尚未完成 / 不应误报
+
+- 未在生产 VPS 安装、配置模型或重启现有服务；未读取或修改生产账本。
+- 尚未配置真实 Pi `auth.json` / `models.json`，因此未调用真实付费模型完成端到端账单识别。
+- PDF、CSV、XLSX、ZIP extractor 尚未实现；本轮原生附件只接受 PNG/JPEG/WEBP。
+- 网页搜索可在隔离 shell 内完成，但网页来源报价尚无“候选报价审核并入库”执行器；只有现有结构化 provider 可直接 refresh。
+- 定时任务、主动通知、插件提议/审批/安装尚未实现。
+- Flutter Agent 入口、Windows 右栏、Android 全屏、SSE UI、图片选择和记忆审批仍由 Claude 按任务单实现。
