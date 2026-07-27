@@ -14,6 +14,7 @@ import '../theme/app_typography.dart';
 import 'account_visuals.dart';
 import 'holding_adjustment_dialog.dart';
 import 'loan_section.dart';
+import 'yield_section.dart';
 
 class AccountDetailPage extends ConsumerWidget {
   const AccountDetailPage({super.key, required this.accountId});
@@ -125,7 +126,10 @@ class AccountDetailPage extends ConsumerWidget {
                       ),
                     )
                   else
-                    for (final h in holdings) _HoldingTile(h: h, account: a),
+                    for (final h in holdings) ...[
+                      _HoldingTile(h: h, account: a),
+                      YieldSection(holding: h),
+                    ],
                 ],
               ],
             );

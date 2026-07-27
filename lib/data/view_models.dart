@@ -341,6 +341,7 @@ class HoldingVm {
     this.dayChange,
     this.unrealizedPnl,
     this.unrealizedPnlRate,
+    this.yieldTerms,
   });
   final Id id;
   final Id accountId;
@@ -356,6 +357,9 @@ class HoldingVm {
   final Money? dayChange;
   final Money? unrealizedPnl;
   final DecimalString? unrealizedPnlRate;
+
+  /// 固定收益条款（仅已配置的持仓有）。
+  final YieldTermsVm? yieldTerms;
 }
 
 /// 交易金额拆分（优惠券/免单仅作字段，非功能模块）。paidAmount = gross − savings。
@@ -518,6 +522,102 @@ class HoldingAdjustmentInput {
 enum LiabilityType { studentLoan, mortgage, consumerLoan, creditCard, other }
 
 enum LiabilityRateType { fixed, floating }
+
+enum YieldRateType { fixed, floating }
+
+enum YieldInterestMethod { simple, compound }
+
+enum YieldCompoundingFrequency { none, monthly, quarterly, annual }
+
+enum YieldPositionStatus { active, matured }
+
+/// 固定收益条款输入（PATCH /v1/holdings/{id}/yield-terms；整表替换）。
+/// 年利率为 wire 十进制小数（3.65% → '0.0365'），百分比换算在 UI 层完成。
+class YieldTermsInput {
+  const YieldTermsInput({
+    required this.principal,
+    required this.annualRate,
+    required this.rateType,
+    required this.interestMethod,
+    required this.dayCountBasis,
+    required this.compoundingFrequency,
+    required this.interestStartDate,
+    required this.maturityDate,
+    required this.payoutAccountId,
+  });
+  final Money principal;
+  final DecimalString annualRate;
+  final YieldRateType rateType;
+  final YieldInterestMethod interestMethod;
+  final int dayCountBasis; // 360 | 365
+  final YieldCompoundingFrequency compoundingFrequency;
+  final IsoDate interestStartDate;
+  final IsoDate maturityDate;
+  final Id payoutAccountId;
+}
+
+/// 服务端固定收益条款（含应计指针与待确认利息指针）。
+class YieldTermsVm {
+  const YieldTermsVm({
+    required this.principal,
+    required this.annualRate,
+    required this.rateType,
+    required this.interestMethod,
+    required this.dayCountBasis,
+    required this.compoundingFrequency,
+    required this.interestStartDate,
+    required this.maturityDate,
+    required this.payoutAccountId,
+    required this.lastAccruedThrough,
+    required this.updatedAt,
+    this.pendingInterestMovementId,
+    this.pendingInterestThroughDate,
+    this.lastInterestMovementId,
+  });
+  final Money principal;
+  final DecimalString annualRate;
+  final YieldRateType rateType;
+  final YieldInterestMethod interestMethod;
+  final int dayCountBasis;
+  final YieldCompoundingFrequency compoundingFrequency;
+  final IsoDate interestStartDate;
+  final IsoDate maturityDate;
+  final Id payoutAccountId;
+  final IsoDate lastAccruedThrough;
+  final IsoDateTime updatedAt;
+  final Id? pendingInterestMovementId;
+  final IsoDate? pendingInterestThroughDate;
+  final Id? lastInterestMovementId;
+
+  /// 已有待确认利息：禁重复提交、禁改条款，引导去审核。
+  bool get hasPendingInterest => pendingInterestMovementId != null;
+}
+
+/// 固定收益头寸（GET /v1/yield-positions；本金与应计利息一律服务端计算）。
+class YieldPositionVm {
+  const YieldPositionVm({
+    required this.holdingId,
+    required this.accountId,
+    required this.instrumentId,
+    required this.instrumentName,
+    required this.terms,
+    required this.accruedThrough,
+    required this.accrualDays,
+    required this.fullCompoundingPeriods,
+    required this.accruedInterest,
+    required this.status,
+  });
+  final Id holdingId;
+  final Id accountId;
+  final Id instrumentId;
+  final String instrumentName;
+  final YieldTermsVm terms;
+  final IsoDate accruedThrough;
+  final int accrualDays;
+  final int fullCompoundingPeriods;
+  final Money accruedInterest;
+  final YieldPositionStatus status;
+}
 
 /// 贷款条款输入（PATCH /v1/accounts/{id}/liability-terms；整表替换）。
 /// 年利率为 wire 十进制小数（3.65% → '0.0365'），转换在 UI 层完成。

@@ -117,6 +117,18 @@ abstract interface class LoanRepository {
   });
 }
 
+/// 固定收益（存款/理财/债券类持仓）条款与计息。
+/// 本金、应计利息、状态一律来自服务端；「记录利息」只生成待确认候选。
+abstract interface class YieldRepository {
+  Future<List<YieldPositionVm>> listYieldPositions({IsoDate? throughDate});
+  Future<HoldingVm> updateYieldTerms(Id holdingId, YieldTermsInput input);
+  Future<AiAtomicGroupVm> proposeInterest(
+    Id holdingId, {
+    required IsoDate throughDate,
+    String? note,
+  });
+}
+
 abstract interface class QuoteRepository {
   Future<QuoteStatusSummaryVm> getQuoteSummary();
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode});

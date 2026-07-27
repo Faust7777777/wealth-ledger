@@ -181,6 +181,25 @@ class RealLocalLoanRepository implements LoanRepository {
   }) async => throw UnsupportedError('real_local 暂不支持记录利息；请用 local_server');
 }
 
+class RealLocalYieldRepository implements YieldRepository {
+  const RealLocalYieldRepository();
+  @override
+  Future<List<YieldPositionVm>> listYieldPositions({
+    IsoDate? throughDate,
+  }) async => const [];
+  @override
+  Future<HoldingVm> updateYieldTerms(
+    Id holdingId,
+    YieldTermsInput input,
+  ) async => throw UnsupportedError('real_local 暂不支持收益条款；请用 local_server');
+  @override
+  Future<AiAtomicGroupVm> proposeInterest(
+    Id holdingId, {
+    required IsoDate throughDate,
+    String? note,
+  }) async => throw UnsupportedError('real_local 暂不支持记录利息；请用 local_server');
+}
+
 class RealLocalQuoteRepository implements QuoteRepository {
   const RealLocalQuoteRepository();
   @override

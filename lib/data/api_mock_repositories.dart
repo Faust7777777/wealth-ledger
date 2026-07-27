@@ -534,8 +534,86 @@ HoldingVm _holding(Map<String, dynamic> j) {
     dayChange: _moneyOrNull(j['dayChange']),
     unrealizedPnl: _moneyOrNull(j['unrealizedPnl']),
     unrealizedPnlRate: j['unrealizedPnlRate'] as String?,
+    yieldTerms: j['yieldTerms'] == null
+        ? null
+        : _yieldTerms(_m(j['yieldTerms'])),
   );
 }
+
+// ———— 固定收益条款 / 头寸映射 ————
+YieldRateType _yieldRateType(Object? s) =>
+    s == 'floating' ? YieldRateType.floating : YieldRateType.fixed;
+
+String _yieldRateTypeWire(YieldRateType t) =>
+    t == YieldRateType.floating ? 'floating' : 'fixed';
+
+YieldInterestMethod _yieldMethod(Object? s) =>
+    s == 'compound' ? YieldInterestMethod.compound : YieldInterestMethod.simple;
+
+String _yieldMethodWire(YieldInterestMethod m) =>
+    m == YieldInterestMethod.compound ? 'compound' : 'simple';
+
+YieldCompoundingFrequency _yieldFrequency(Object? s) => switch (s) {
+  'monthly' => YieldCompoundingFrequency.monthly,
+  'quarterly' => YieldCompoundingFrequency.quarterly,
+  'annual' => YieldCompoundingFrequency.annual,
+  _ => YieldCompoundingFrequency.none,
+};
+
+String _yieldFrequencyWire(YieldCompoundingFrequency f) => switch (f) {
+  YieldCompoundingFrequency.monthly => 'monthly',
+  YieldCompoundingFrequency.quarterly => 'quarterly',
+  YieldCompoundingFrequency.annual => 'annual',
+  YieldCompoundingFrequency.none => 'none',
+};
+
+YieldTermsVm _yieldTerms(Map<String, dynamic> j) => YieldTermsVm(
+  principal: _money(j['principal']),
+  annualRate: '${j['annualRate']}',
+  rateType: _yieldRateType(j['rateType']),
+  interestMethod: _yieldMethod(j['interestMethod']),
+  dayCountBasis: _int(j['dayCountBasis']),
+  compoundingFrequency: _yieldFrequency(j['compoundingFrequency']),
+  interestStartDate: '${j['interestStartDate']}',
+  maturityDate: '${j['maturityDate']}',
+  payoutAccountId: '${j['payoutAccountId']}',
+  lastAccruedThrough: '${j['lastAccruedThrough']}',
+  updatedAt: '${j['updatedAt']}',
+  pendingInterestMovementId: j['pendingInterestMovementId'] as String?,
+  pendingInterestThroughDate: j['pendingInterestThroughDate'] as String?,
+  lastInterestMovementId: j['lastInterestMovementId'] as String?,
+);
+
+YieldPositionVm _yieldPosition(Map<String, dynamic> j) => YieldPositionVm(
+  holdingId: '${j['holdingId']}',
+  accountId: '${j['accountId']}',
+  instrumentId: '${j['instrumentId']}',
+  instrumentName: '${j['instrumentName']}',
+  terms: _yieldTerms(_m(j['terms'])),
+  accruedThrough: '${j['accruedThrough']}',
+  accrualDays: _int(j['accrualDays']),
+  fullCompoundingPeriods: _int(j['fullCompoundingPeriods']),
+  accruedInterest: _money(j['accruedInterest']),
+  status: j['status'] == 'matured'
+      ? YieldPositionStatus.matured
+      : YieldPositionStatus.active,
+);
+
+/// 供测试直接校验 wire → VM 映射。
+YieldPositionVm parseYieldPositionData(Map<String, dynamic> j) =>
+    _yieldPosition(j);
+
+Map<String, dynamic> yieldTermsBody(YieldTermsInput input) => {
+  'principal': _moneyJson(input.principal),
+  'annualRate': input.annualRate,
+  'rateType': _yieldRateTypeWire(input.rateType),
+  'interestMethod': _yieldMethodWire(input.interestMethod),
+  'dayCountBasis': input.dayCountBasis,
+  'compoundingFrequency': _yieldFrequencyWire(input.compoundingFrequency),
+  'interestStartDate': input.interestStartDate,
+  'maturityDate': input.maturityDate,
+  'payoutAccountId': input.payoutAccountId,
+};
 
 TransactionAmountBreakdownVm? _breakdown(Object? o) {
   if (o == null) return null;
@@ -1547,6 +1625,53 @@ class LocalServerLoanRepository implements LoanRepository {
     _m(
       await _c.postData(
         '/v1/accounts/$accountId/loan-interest-proposals',
+        body: {
+          'throughDate': throughDate,
+          if (note != null && note.isNotEmpty) 'note': note,
+        },
+      ),
+    ),
+  );
+}
+
+class LocalServerYieldRepository implements YieldRepository {
+  LocalServerYieldRepository(this._c);
+  final DevApiClient _c;
+
+  @override
+  Future<List<YieldPositionVm>> listYieldPositions({
+    IsoDate? throughDate,
+  }) async => [
+    for (final p in _list(
+      await _c.getData(
+        '/v1/yield-positions${throughDate == null ? '' : '?throughDate=$throughDate'}',
+      ),
+    ))
+      _yieldPosition(_m(p)),
+  ];
+
+  @override
+  Future<HoldingVm> updateYieldTerms(
+    Id holdingId,
+    YieldTermsInput input,
+  ) async => _holding(
+    _m(
+      await _c.patchData(
+        '/v1/holdings/$holdingId/yield-terms',
+        body: yieldTermsBody(input),
+      ),
+    ),
+  );
+
+  @override
+  Future<AiAtomicGroupVm> proposeInterest(
+    Id holdingId, {
+    required IsoDate throughDate,
+    String? note,
+  }) async => _group(
+    _m(
+      await _c.postData(
+        '/v1/holdings/$holdingId/interest-proposals',
         body: {
           'throughDate': throughDate,
           if (note != null && note.isNotEmpty) 'note': note,

@@ -553,6 +553,25 @@ class FixtureLoanRepository implements LoanRepository {
   }) async => throw UnsupportedError('DEMO 演示只读，不支持记录利息；请用 local_server');
 }
 
+class FixtureYieldRepository implements YieldRepository {
+  const FixtureYieldRepository();
+  @override
+  Future<List<YieldPositionVm>> listYieldPositions({
+    IsoDate? throughDate,
+  }) async => const [];
+  @override
+  Future<HoldingVm> updateYieldTerms(
+    Id holdingId,
+    YieldTermsInput input,
+  ) async => throw UnsupportedError('DEMO 演示只读，不支持收益条款；请用 local_server');
+  @override
+  Future<AiAtomicGroupVm> proposeInterest(
+    Id holdingId, {
+    required IsoDate throughDate,
+    String? note,
+  }) async => throw UnsupportedError('DEMO 演示只读，不支持记录利息；请用 local_server');
+}
+
 class FixtureQuoteRepository implements QuoteRepository {
   const FixtureQuoteRepository();
   @override
