@@ -97,6 +97,7 @@ class _AiImportCsvPageState extends ConsumerState<AiImportCsvPage> {
                 const SizedBox(height: AppSpacing.base),
                 DropdownButtonFormField<String>(
                   initialValue: _accountId,
+                  isExpanded: true,
                   decoration: const InputDecoration(
                     labelText: '默认账户',
                     border: OutlineInputBorder(),
@@ -107,6 +108,7 @@ class _AiImportCsvPageState extends ConsumerState<AiImportCsvPage> {
                         value: account.id,
                         child: Text(
                           '${account.displayName} · ${account.defaultCurrency}',
+                          overflow: TextOverflow.ellipsis,
                         ),
                       ),
                   ],

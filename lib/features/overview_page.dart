@@ -391,9 +391,14 @@ class _AllocationBar extends StatelessWidget {
                             style: AppType.caption.copyWith(color: muted),
                           ),
                           const SizedBox(width: AppSpacing.sm),
-                          Text(
-                            formatMoney(slices[i].value),
-                            style: AppType.moneyRow,
+                          // 窄屏下金额可省略，绝不撑破图例行。
+                          Flexible(
+                            child: Text(
+                              formatMoney(slices[i].value),
+                              style: AppType.moneyRow,
+                              softWrap: false,
+                              overflow: TextOverflow.ellipsis,
+                            ),
                           ),
                         ],
                       ),
