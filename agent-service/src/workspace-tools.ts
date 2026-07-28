@@ -163,6 +163,19 @@ function readPdfText(
   });
 }
 
+export async function extractWorkspacePdfText(
+  workspace: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const target = await readablePath(workspace, resolve(workspace, path));
+  if (!target.toLowerCase().endsWith(".pdf")) {
+    throw new Error("workspace_pdf_required");
+  }
+  const relativeTarget = relative(workspace, target).replaceAll("\\", "/");
+  return readPdfText(workspace, relativeTarget, signal);
+}
+
 export function createWorkspaceTools(
   workspace: string,
 ): Array<ToolDefinition<any, any, any>> {
@@ -221,12 +234,7 @@ export function createWorkspaceTools(
       path: Type.String({ description: "附件上下文中给出的工作区相对路径" }),
     }),
     async execute(_id, params, signal) {
-      const target = await readablePath(workspace, resolve(workspace, params.path));
-      if (!target.toLowerCase().endsWith(".pdf")) {
-        throw new Error("workspace_pdf_required");
-      }
-      const relativeTarget = relative(workspace, target).replaceAll("\\", "/");
-      const text = await readPdfText(workspace, relativeTarget, signal);
+      const text = await extractWorkspacePdfText(workspace, params.path, signal);
       return { content: [{ type: "text", text }], details: {} };
     },
   });

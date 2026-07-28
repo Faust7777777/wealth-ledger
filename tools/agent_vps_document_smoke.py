@@ -287,7 +287,7 @@ def main() -> None:
             pdf,
             "application/pdf",
             pdf_marker,
-            "必须调用 finwealth_read_pdf_text 读取所附 PDF；禁止用 bash、Python 或 raw read 解析 PDF。只回复文件中的标记。",
+            "读取所附 PDF，只回复文件中的标记。",
             "finwealth_read_pdf_text",
         )
         run_document(
