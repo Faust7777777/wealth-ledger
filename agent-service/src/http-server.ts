@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import Busboy from "busboy";
 import { AgentService } from "./agent-service.js";
-import type { AgentEvent, Principal } from "./types.js";
+import type { AgentAutomationKind, AgentEvent, Principal } from "./types.js";
 
 const MAX_JSON_BYTES = 1024 * 1024;
 const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;
@@ -93,6 +93,8 @@ function errorStatus(code: string): number {
     code === "primary_conversation_cannot_be_archived" ||
     code === "agent_memory_already_reviewed" ||
     code === "agent_quote_candidate_already_reviewed" ||
+    code === "agent_automation_already_exists" ||
+    code === "agent_automation_busy" ||
     code === "idempotency_key_reused"
   ) {
     return 409;
@@ -210,6 +212,51 @@ export function createAgentHttpServer(
       }
       if (request.method === "GET" && path === "/v1/agent/quote-candidates") {
         ok(response, await service.listQuoteCandidates(principal));
+        return;
+      }
+      if (path === "/v1/agent/automations") {
+        if (request.method === "GET") {
+          ok(response, await service.listAutomations(principal));
+          return;
+        }
+        if (request.method === "POST") {
+          const body = await readJson(request);
+          if (
+            body.kind !== "quote_refresh" &&
+            body.kind !== "subscription_due_scan" &&
+            body.kind !== "dca_due_check"
+          ) throw new Error("invalid_agent_automation_kind");
+          if (typeof body.intervalHours !== "number") {
+            throw new Error("invalid_agent_automation_interval");
+          }
+          if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
+            throw new Error("invalid_agent_automation_enabled");
+          }
+          const input: {
+            kind: AgentAutomationKind;
+            intervalHours: number;
+            enabled: boolean;
+            startAt?: string;
+          } = {
+            kind: body.kind as AgentAutomationKind,
+            intervalHours: body.intervalHours,
+            enabled: body.enabled === undefined ? true : body.enabled === true,
+            ...(typeof body.startAt === "string" ? { startAt: body.startAt } : {}),
+          };
+          const result = await service.idempotent(
+            principal,
+            idempotencyKey(request),
+            "POST /v1/agent/automations",
+            input,
+            () => service.createAutomation(principal, input),
+          );
+          markReplay(response, result.replayed);
+          ok(response, result.value, 201);
+          return;
+        }
+      }
+      if (request.method === "GET" && path === "/v1/agent/notifications") {
+        ok(response, await service.listNotifications(principal));
         return;
       }
       if (request.method === "POST" && path === "/v1/agent/attachments") {
@@ -409,6 +456,66 @@ export function createAgentHttpServer(
           `POST /v1/agent/quote-candidates/${candidateId}/review`,
           { decision },
           () => service.reviewQuoteCandidate(principal, candidateId, decision),
+        );
+        markReplay(response, result.replayed);
+        ok(response, result.value);
+        return;
+      }
+
+      match = path.match(/^\/v1\/agent\/automations\/([^/]+)$/);
+      if (match?.[1] && request.method === "PATCH") {
+        const automationId = match[1];
+        const body = await readJson(request);
+        const patch: { intervalHours?: number; enabled?: boolean; nextRunAt?: string } = {};
+        if (body.intervalHours !== undefined && typeof body.intervalHours !== "number") {
+          throw new Error("invalid_agent_automation_interval");
+        }
+        if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
+          throw new Error("invalid_agent_automation_enabled");
+        }
+        if (body.nextRunAt !== undefined && typeof body.nextRunAt !== "string") {
+          throw new Error("invalid_agent_automation_start");
+        }
+        if (typeof body.intervalHours === "number") patch.intervalHours = body.intervalHours;
+        if (typeof body.enabled === "boolean") patch.enabled = body.enabled;
+        if (typeof body.nextRunAt === "string") patch.nextRunAt = body.nextRunAt;
+        if (Object.keys(patch).length === 0) throw new Error("invalid_agent_automation_patch");
+        const result = await service.idempotent(
+          principal,
+          idempotencyKey(request),
+          `PATCH /v1/agent/automations/${automationId}`,
+          patch,
+          () => service.updateAutomation(principal, automationId, patch),
+        );
+        markReplay(response, result.replayed);
+        ok(response, result.value);
+        return;
+      }
+
+      match = path.match(/^\/v1\/agent\/automations\/([^/]+)\/run$/);
+      if (match?.[1] && request.method === "POST") {
+        const automationId = match[1];
+        const result = await service.idempotent(
+          principal,
+          idempotencyKey(request),
+          `POST /v1/agent/automations/${automationId}/run`,
+          {},
+          () => service.runAutomationNow(principal, automationId),
+        );
+        markReplay(response, result.replayed);
+        ok(response, result.value);
+        return;
+      }
+
+      match = path.match(/^\/v1\/agent\/notifications\/([^/]+)\/read$/);
+      if (match?.[1] && request.method === "POST") {
+        const notificationId = match[1];
+        const result = await service.idempotent(
+          principal,
+          idempotencyKey(request),
+          `POST /v1/agent/notifications/${notificationId}/read`,
+          {},
+          () => service.markNotificationRead(principal, notificationId),
         );
         markReplay(response, result.replayed);
         ok(response, result.value);

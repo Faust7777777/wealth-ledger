@@ -98,6 +98,47 @@ export interface AgentQuoteWriter {
   applyQuoteCandidate(candidate: AgentQuoteCandidate): Promise<unknown>;
 }
 
+export type AgentAutomationKind = "quote_refresh" | "subscription_due_scan" | "dca_due_check";
+
+export interface AgentAutomation {
+  id: string;
+  userId: string;
+  ledgerId: string;
+  deviceId: string;
+  kind: AgentAutomationKind;
+  intervalHours: number;
+  enabled: boolean;
+  nextRunAt: string;
+  lastRunAt?: string;
+  lastStatus?: "success" | "failed";
+  lastErrorCode?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgentNotification {
+  id: string;
+  userId: string;
+  ledgerId: string;
+  kind: AgentAutomationKind;
+  title: string;
+  body: string;
+  action?: "review" | "quotes" | "dca";
+  createdAt: string;
+  readAt?: string;
+}
+
+export interface AgentAutomationResult {
+  title: string;
+  body: string;
+  action?: AgentNotification["action"];
+  notify: boolean;
+}
+
+export interface AgentAutomationRunner {
+  runAutomation(automation: AgentAutomation, scheduledFor: string): Promise<AgentAutomationResult>;
+}
+
 export interface UserState {
   schemaVersion: 1;
   conversations: AgentConversation[];
@@ -106,6 +147,8 @@ export interface UserState {
   attachments: AgentAttachment[];
   memories: AgentMemory[];
   quoteCandidates: AgentQuoteCandidate[];
+  automations: AgentAutomation[];
+  notifications: AgentNotification[];
   idempotency: AgentIdempotencyRecord[];
   nextEventCursor: number;
 }

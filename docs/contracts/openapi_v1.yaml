@@ -1796,6 +1796,129 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
 
+  /agent/automations:
+    get:
+      tags: [Agent]
+      summary: List persisted Agent automations for the authenticated ledger.
+      responses:
+        "200":
+          description: Automation schedules and last-run status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentAutomationListResponse"
+    post:
+      tags: [Agent]
+      summary: Create one automation kind for the authenticated ledger.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAgentAutomationRequest"
+      responses:
+        "201":
+          description: Automation created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentAutomationResponse"
+        "409":
+          description: This ledger already has the requested automation kind.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/automations/{automationId}:
+    patch:
+      tags: [Agent]
+      summary: Enable, disable, or reschedule an Agent automation.
+      parameters:
+        - name: automationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateAgentAutomationRequest"
+      responses:
+        "200":
+          description: Automation updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentAutomationResponse"
+        "404":
+          description: Automation not found for this ledger.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/automations/{automationId}/run:
+    post:
+      tags: [Agent]
+      summary: Run an automation now without changing its next scheduled time.
+      parameters:
+        - name: automationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Automation after the manual run.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentAutomationResponse"
+        "409":
+          description: The same automation is already running.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/notifications:
+    get:
+      tags: [Agent]
+      summary: List newest-first Agent automation notifications.
+      responses:
+        "200":
+          description: Account-scoped notifications.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentNotificationListResponse"
+
+  /agent/notifications/{notificationId}/read:
+    post:
+      tags: [Agent]
+      summary: Mark one Agent notification as read.
+      parameters:
+        - name: notificationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Read notification.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentNotificationResponse"
+
   /agent/conversations:
     get:
       tags: [Agent]
@@ -4793,6 +4916,93 @@ components:
           $ref: "#/components/schemas/ISODateTime"
         appliedAt:
           $ref: "#/components/schemas/ISODateTime"
+    AgentAutomationKind:
+      type: string
+      enum: [quote_refresh, subscription_due_scan, dca_due_check]
+    AgentAutomation:
+      type: object
+      additionalProperties: false
+      required: [id, userId, ledgerId, deviceId, kind, intervalHours, enabled, nextRunAt, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        userId:
+          $ref: "#/components/schemas/ID"
+        ledgerId:
+          $ref: "#/components/schemas/ID"
+        deviceId:
+          $ref: "#/components/schemas/ID"
+        kind:
+          $ref: "#/components/schemas/AgentAutomationKind"
+        intervalHours:
+          type: integer
+          minimum: 1
+          maximum: 720
+        enabled:
+          type: boolean
+        nextRunAt:
+          $ref: "#/components/schemas/ISODateTime"
+        lastRunAt:
+          $ref: "#/components/schemas/ISODateTime"
+        lastStatus:
+          enum: [success, failed]
+        lastErrorCode:
+          type: string
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        updatedAt:
+          $ref: "#/components/schemas/ISODateTime"
+    CreateAgentAutomationRequest:
+      type: object
+      additionalProperties: false
+      required: [kind, intervalHours]
+      properties:
+        kind:
+          $ref: "#/components/schemas/AgentAutomationKind"
+        intervalHours:
+          type: integer
+          minimum: 1
+          maximum: 720
+        enabled:
+          type: boolean
+          default: true
+        startAt:
+          $ref: "#/components/schemas/ISODateTime"
+    UpdateAgentAutomationRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        intervalHours:
+          type: integer
+          minimum: 1
+          maximum: 720
+        enabled:
+          type: boolean
+        nextRunAt:
+          $ref: "#/components/schemas/ISODateTime"
+    AgentNotification:
+      type: object
+      additionalProperties: false
+      required: [id, userId, ledgerId, kind, title, body, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        userId:
+          $ref: "#/components/schemas/ID"
+        ledgerId:
+          $ref: "#/components/schemas/ID"
+        kind:
+          $ref: "#/components/schemas/AgentAutomationKind"
+        title:
+          type: string
+        body:
+          type: string
+        action:
+          enum: [review, quotes, dca]
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        readAt:
+          $ref: "#/components/schemas/ISODateTime"
     AgentStatusResponse:
       type: object
       required: [ok, data]
@@ -4870,6 +5080,42 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AgentQuoteCandidate"
+    AgentAutomationResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AgentAutomation"
+    AgentAutomationListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentAutomation"
+    AgentNotificationResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AgentNotification"
+    AgentNotificationListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentNotification"
     AgentConversationResponse:
       type: object
       required: [ok, data]

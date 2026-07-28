@@ -17,6 +17,9 @@ import type {
   Principal,
   AgentQuoteCandidate,
   AgentQuoteWriter,
+  AgentAutomation,
+  AgentAutomationResult,
+  AgentAutomationRunner,
   RunCallbacks,
 } from "../src/types.js";
 import { createWorkspaceTools } from "../src/workspace-tools.js";
@@ -116,6 +119,26 @@ class FakeQuoteWriter implements AgentQuoteWriter {
   }
 }
 
+class FakeAutomationRunner implements AgentAutomationRunner {
+  runs: Array<{ automation: AgentAutomation; scheduledFor: string }> = [];
+  failure?: string;
+  result: AgentAutomationResult = {
+    title: "订阅扣费等待审核",
+    body: "新增 2 条待审核记录",
+    action: "review",
+    notify: true,
+  };
+
+  async runAutomation(
+    automation: AgentAutomation,
+    scheduledFor: string,
+  ): Promise<AgentAutomationResult> {
+    if (this.failure) throw new Error(this.failure);
+    this.runs.push({ automation, scheduledFor });
+    return this.result;
+  }
+}
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true })));
 });
@@ -123,10 +146,17 @@ afterEach(async () => {
 async function serviceWith(
   engine = new FakeEngine(),
   quoteWriter?: AgentQuoteWriter,
+  automationRunner?: AgentAutomationRunner,
 ): Promise<AgentService> {
   const root = await mkdtemp(join(tmpdir(), "finwealth-agent-test-"));
   roots.push(root);
-  return new AgentService(new StateStore(root), new EventHub(), engine, quoteWriter);
+  return new AgentService(
+    new StateStore(root),
+    new EventHub(),
+    engine,
+    quoteWriter,
+    automationRunner,
+  );
 }
 
 async function waitForCompleted(
@@ -411,6 +441,74 @@ test("Finwealth client applies an approved quote with a stable candidate idempot
   });
 });
 
+test("Finwealth client maps scheduled quotes, subscription scans and DCA checks", async () => {
+  const requests: Array<{ path: string; key?: string }> = [];
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) { /* consume body */ }
+    requests.push({
+      path: request.url ?? "",
+      ...(typeof request.headers["idempotency-key"] === "string"
+        ? { key: request.headers["idempotency-key"] }
+        : {}),
+    });
+    const data = request.url === "/v1/quotes/refresh"
+      ? { quotes: [{}], fxRates: [{}], errors: [] }
+      : request.url === "/v1/subscriptions/charge-proposals/due-scan"
+      ? { createdCount: 2, blockedCount: 1, remainingEligibleCount: 0 }
+      : [{ id: "reminder_due" }];
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, data }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const base: Omit<AgentAutomation, "kind"> = {
+    id: "auto_test",
+    userId: owner.userId,
+    ledgerId: owner.ledgerId,
+    deviceId: owner.deviceId,
+    intervalHours: 24,
+    enabled: true,
+    nextRunAt: "2026-07-28T00:00:00Z",
+    createdAt: "2026-07-27T00:00:00Z",
+    updatedAt: "2026-07-27T00:00:00Z",
+  };
+  try {
+    const client = new FinwealthClient(
+      `http://127.0.0.1:${address.port}`,
+      "sidecar-secret",
+    );
+    const quote = await client.runAutomation(
+      { ...base, kind: "quote_refresh" },
+      "2026-07-28T00:00:00Z",
+    );
+    const subscription = await client.runAutomation(
+      { ...base, kind: "subscription_due_scan" },
+      "2026-07-28T00:00:00Z",
+    );
+    const dca = await client.runAutomation(
+      { ...base, kind: "dca_due_check" },
+      "2026-07-28T00:00:00Z",
+    );
+    assert.equal(quote.notify, false);
+    assert.equal(subscription.action, "review");
+    assert.equal(subscription.notify, true);
+    assert.equal(dca.action, "dca");
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+  assert.deepEqual(requests.map((item) => item.path), [
+    "/v1/quotes/refresh",
+    "/v1/subscriptions/charge-proposals/due-scan",
+    "/v1/dca/reminders/due",
+  ]);
+  assert.equal(requests[0]?.key, "agent-auto-auto_test-2026-07-28T00:00:00Z");
+  assert.equal(requests[1]?.key, "agent-auto-auto_test-2026-07-28T00:00:00Z");
+  assert.equal(requests[2]?.key, undefined);
+});
+
 test("archives an image and passes only owned attachment IDs to the model", async () => {
   const engine = new FakeEngine();
   const service = await serviceWith(engine);
@@ -689,6 +787,102 @@ test("rejecting or failing to apply a quote candidate never changes authoritativ
     /agent_quote_apply_failed/,
   );
   assert.equal((await service.listQuoteCandidates(owner))[1]?.status, "suggested");
+});
+
+test("due automations persist their next run and create account-scoped notifications", async () => {
+  const runner = new FakeAutomationRunner();
+  const service = await serviceWith(new FakeEngine(), undefined, runner);
+  const automation = await service.createAutomation(owner, {
+    kind: "subscription_due_scan",
+    intervalHours: 24,
+    enabled: true,
+    startAt: "2026-07-28T00:00:00Z",
+  });
+  await service.runDueAutomations("2026-07-28T00:01:00Z");
+  assert.equal(runner.runs.length, 1);
+  assert.equal(runner.runs[0]?.scheduledFor, "2026-07-28T00:00:00Z");
+  const latest = (await service.listAutomations(owner))[0];
+  assert.equal(latest?.lastStatus, "success");
+  assert.ok(Date.parse(latest?.nextRunAt ?? "") > Date.parse("2026-07-29T00:00:00Z"));
+  const notices = await service.listNotifications(owner);
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0]?.action, "review");
+  assert.equal(notices[0]?.readAt, undefined);
+  const read = await service.markNotificationRead(owner, notices[0]!.id);
+  assert.ok(read.readAt);
+
+  await service.runDueAutomations("2026-07-28T23:59:00Z");
+  assert.equal(runner.runs.length, 1);
+  const otherLedger = await service.listNotifications({
+    ...owner,
+    ledgerId: "ledger_other",
+  });
+  assert.deepEqual(otherLedger, []);
+  assert.equal(automation.id, latest?.id);
+});
+
+test("failed scheduled automation records a notification and retries in one hour", async () => {
+  const runner = new FakeAutomationRunner();
+  runner.failure = "quote_provider_unavailable";
+  const service = await serviceWith(new FakeEngine(), undefined, runner);
+  await service.createAutomation(owner, {
+    kind: "quote_refresh",
+    intervalHours: 12,
+    enabled: true,
+    startAt: "2026-07-28T00:00:00Z",
+  });
+  await service.runDueAutomations("2026-07-28T00:01:00Z");
+  const latest = (await service.listAutomations(owner))[0];
+  assert.equal(latest?.lastStatus, "failed");
+  assert.equal(latest?.lastErrorCode, "quote_provider_unavailable");
+  assert.match(latest?.nextRunAt ?? "", /Z$/);
+  assert.equal((await service.listNotifications(owner))[0]?.title, "自动任务未完成");
+});
+
+test("automation HTTP writes are idempotent and manual runs preserve the schedule", async () => {
+  const runner = new FakeAutomationRunner();
+  const service = await serviceWith(new FakeEngine(), undefined, runner);
+  const server = createAgentHttpServer(service, "internal-test-token");
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const base = `http://127.0.0.1:${address.port}`;
+  const headers = {
+    "x-finwealth-internal-token": "internal-test-token",
+    "x-finwealth-user-id": owner.userId,
+    "x-finwealth-ledger-id": owner.ledgerId,
+    "x-finwealth-device-id": owner.deviceId,
+    "content-type": "application/json",
+  };
+  try {
+    const create = (): Promise<Response> => fetch(`${base}/v1/agent/automations`, {
+      method: "POST",
+      headers: { ...headers, "idempotency-key": "create-auto-1" },
+      body: JSON.stringify({
+        kind: "dca_due_check",
+        intervalHours: 24,
+        startAt: "2026-08-01T00:00:00Z",
+      }),
+    });
+    const first = await create();
+    const replay = await create();
+    assert.equal(first.status, 201);
+    assert.equal(replay.headers.get("idempotency-replayed"), "true");
+    const body = await first.json() as { data: AgentAutomation };
+    const run = await fetch(`${base}/v1/agent/automations/${body.data.id}/run`, {
+      method: "POST",
+      headers: { ...headers, "idempotency-key": "run-auto-1" },
+      body: "{}",
+    });
+    assert.equal(run.status, 200);
+    assert.equal(runner.runs.length, 1);
+    const listed = await service.listAutomations(owner);
+    assert.equal(listed[0]?.nextRunAt, "2026-08-01T00:00:00Z");
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
 });
 
 test("workspace file tools reject paths outside the dedicated workspace", async () => {

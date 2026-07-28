@@ -39,8 +39,14 @@ const engine = await PiAgentEngine.create(
   agentDir,
   finwealth,
 );
-const service = new AgentService(store, new EventHub(), engine, finwealth);
+const service = new AgentService(store, new EventHub(), engine, finwealth, finwealth);
 const server = createAgentHttpServer(service, internalToken);
+
+const automationTimer = setInterval(() => {
+  void service.runDueAutomations();
+}, 60_000);
+automationTimer.unref();
+setTimeout(() => void service.runDueAutomations(), 1_000).unref();
 
 server.listen(address.port, address.host, () => {
   process.stdout.write(

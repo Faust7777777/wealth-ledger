@@ -4,7 +4,13 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { AgentQuoteCandidate, AgentQuoteWriter } from "./types.js";
+import type {
+  AgentAutomation,
+  AgentAutomationResult,
+  AgentAutomationRunner,
+  AgentQuoteCandidate,
+  AgentQuoteWriter,
+} from "./types.js";
 
 const MAX_TOOL_RESPONSE_BYTES = 256 * 1024;
 
@@ -22,7 +28,7 @@ const QUERY_PATHS = {
 
 type QueryName = keyof typeof QUERY_PATHS;
 
-export class FinwealthClient implements AgentQuoteWriter {
+export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner {
   readonly #baseUrl: string;
   readonly #internalToken: string;
 
@@ -113,6 +119,58 @@ export class FinwealthClient implements AgentQuoteWriter {
     return response;
   }
 
+  async runAutomation(
+    automation: AgentAutomation,
+    scheduledFor: string,
+  ): Promise<AgentAutomationResult> {
+    const key = `agent-auto-${automation.id}-${scheduledFor}`;
+    if (automation.kind === "quote_refresh") {
+      const response = await this.#request(
+        "POST",
+        "/v1/quotes/refresh",
+        { mode: "scheduled", requestedAt: scheduledFor },
+        key,
+      );
+      const data = responseData(response);
+      const quotes = Array.isArray(data?.quotes) ? data.quotes.length : 0;
+      const fxRates = Array.isArray(data?.fxRates) ? data.fxRates.length : 0;
+      const errors = Array.isArray(data?.errors) ? data.errors.length : 0;
+      return {
+        title: errors ? "报价刷新有未完成项" : "报价已刷新",
+        body: `更新 ${quotes} 条报价、${fxRates} 条汇率${errors ? `，${errors} 项失败` : ""}`,
+        action: "quotes",
+        notify: errors > 0,
+      };
+    }
+    if (automation.kind === "subscription_due_scan") {
+      const response = await this.#request(
+        "POST",
+        "/v1/subscriptions/charge-proposals/due-scan",
+        { throughDate: scheduledFor.slice(0, 10), limit: 100 },
+        key,
+      );
+      const data = responseData(response);
+      const created = numberField(data, "createdCount");
+      const blocked = numberField(data, "blockedCount");
+      const remaining = numberField(data, "remainingEligibleCount");
+      return {
+        title: created ? "订阅扣费等待审核" : "订阅到期扫描完成",
+        body: `新增 ${created} 条待审核记录${blocked ? `，${blocked} 项需处理` : ""}${remaining ? `，还有 ${remaining} 项待扫描` : ""}`,
+        action: "review",
+        notify: created > 0 || blocked > 0 || remaining > 0,
+      };
+    }
+    const response = await this.#request("GET", "/v1/dca/reminders/due");
+    const data = responseDataValue(response);
+    const due = Array.isArray(data) ? data.length : 0;
+    return {
+      title: due ? "定投计划到期" : "定投检查完成",
+      body: due ? `${due} 个定投计划等待处理` : "当前没有到期定投计划",
+      action: "dca",
+      notify: due > 0,
+    };
+  }
+
   async #request(
     method: "GET" | "POST",
     path: string,
@@ -146,6 +204,22 @@ export class FinwealthClient implements AgentQuoteWriter {
     }
     return value;
   }
+}
+
+function responseDataValue(value: unknown): unknown {
+  return value && typeof value === "object" ? (value as { data?: unknown }).data : undefined;
+}
+
+function responseData(value: unknown): Record<string, unknown> | undefined {
+  const data = responseDataValue(value);
+  return data && typeof data === "object" && !Array.isArray(data)
+    ? data as Record<string, unknown>
+    : undefined;
+}
+
+function numberField(value: Record<string, unknown> | undefined, field: string): number {
+  const item = value?.[field];
+  return typeof item === "number" && Number.isSafeInteger(item) && item >= 0 ? item : 0;
 }
 
 function errorCode(value: unknown): string | undefined {

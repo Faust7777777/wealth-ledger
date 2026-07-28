@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { UserState } from "./types.js";
 
@@ -26,6 +26,8 @@ function emptyState(): UserState {
     attachments: [],
     memories: [],
     quoteCandidates: [],
+    automations: [],
+    notifications: [],
     idempotency: [],
     nextEventCursor: 1,
   };
@@ -74,6 +76,8 @@ export class StateStore {
       parsed.attachments ??= [];
       parsed.memories ??= [];
       parsed.quoteCandidates ??= [];
+      parsed.automations ??= [];
+      parsed.notifications ??= [];
       return parsed;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyState();
@@ -99,11 +103,26 @@ export class StateStore {
       if (state.quoteCandidates.length > 1_000) {
         state.quoteCandidates = state.quoteCandidates.slice(-1_000);
       }
+      if (state.notifications.length > 2_000) {
+        state.notifications = state.notifications.slice(-2_000);
+      }
       await this.#write(userId, state);
     });
     this.#queues.set(userId, next.catch(() => undefined));
     await next;
     return result;
+  }
+
+  async listUserIds(): Promise<string[]> {
+    try {
+      const entries = await readdir(join(this.root, "users"), { withFileTypes: true });
+      return entries
+        .filter((entry) => entry.isDirectory() && SAFE_ID.test(entry.name))
+        .map((entry) => entry.name);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
   }
 
   #statePath(userId: string): string {

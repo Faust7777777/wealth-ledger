@@ -14,10 +14,19 @@ import type {
   Principal,
   AgentQuoteCandidate,
   AgentQuoteWriter,
+  AgentAutomation,
+  AgentAutomationKind,
+  AgentAutomationRunner,
+  AgentNotification,
 } from "./types.js";
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function validTimestamp(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) &&
+    !Number.isNaN(Date.parse(value));
 }
 
 function cleanTitle(value: string): string {
@@ -30,6 +39,8 @@ export class AgentService {
   readonly events: EventHub;
   readonly engine: AgentEngine;
   readonly #quoteWriter: AgentQuoteWriter | undefined;
+  readonly #automationRunner: AgentAutomationRunner | undefined;
+  readonly #automationRuns = new Set<string>();
   readonly #runQueues = new Map<string, Promise<void>>();
   readonly #idempotencyQueues = new Map<string, Promise<unknown>>();
 
@@ -38,11 +49,13 @@ export class AgentService {
     events: EventHub,
     engine: AgentEngine,
     quoteWriter?: AgentQuoteWriter,
+    automationRunner?: AgentAutomationRunner,
   ) {
     this.store = store;
     this.events = events;
     this.engine = engine;
     this.#quoteWriter = quoteWriter;
+    this.#automationRunner = automationRunner;
   }
 
   async status(principal: Principal): Promise<Record<string, unknown>> {
@@ -119,6 +132,177 @@ export class AgentService {
 
   async listModels(): Promise<unknown[]> {
     return this.engine.listModels();
+  }
+
+  async listAutomations(principal: Principal): Promise<AgentAutomation[]> {
+    const state = await this.store.read(principal.userId);
+    return state.automations.filter((item) => item.ledgerId === principal.ledgerId);
+  }
+
+  async createAutomation(
+    principal: Principal,
+    input: { kind: AgentAutomationKind; intervalHours: number; enabled: boolean; startAt?: string },
+  ): Promise<AgentAutomation> {
+    if (!Number.isInteger(input.intervalHours) || input.intervalHours < 1 || input.intervalHours > 720) {
+      throw new Error("invalid_agent_automation_interval");
+    }
+    const timestamp = now();
+    const startAt = input.startAt ?? new Date(Date.parse(timestamp) + input.intervalHours * 3_600_000).toISOString();
+    if (!validTimestamp(startAt)) throw new Error("invalid_agent_automation_start");
+    return this.store.update(principal.userId, (state) => {
+      if (state.automations.some(
+        (item) => item.ledgerId === principal.ledgerId && item.kind === input.kind,
+      )) throw new Error("agent_automation_already_exists");
+      const automation: AgentAutomation = {
+        id: `auto_${randomUUID()}`,
+        userId: principal.userId,
+        ledgerId: principal.ledgerId,
+        deviceId: principal.deviceId,
+        kind: input.kind,
+        intervalHours: input.intervalHours,
+        enabled: input.enabled,
+        nextRunAt: startAt,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      state.automations.push(automation);
+      return { ...automation };
+    });
+  }
+
+  async updateAutomation(
+    principal: Principal,
+    automationId: string,
+    patch: { intervalHours?: number; enabled?: boolean; nextRunAt?: string },
+  ): Promise<AgentAutomation> {
+    if (patch.intervalHours !== undefined && (
+      !Number.isInteger(patch.intervalHours) || patch.intervalHours < 1 || patch.intervalHours > 720
+    )) throw new Error("invalid_agent_automation_interval");
+    if (patch.nextRunAt !== undefined && !validTimestamp(patch.nextRunAt)) {
+      throw new Error("invalid_agent_automation_start");
+    }
+    return this.store.update(principal.userId, (state) => {
+      const item = state.automations.find(
+        (value) => value.id === automationId && value.ledgerId === principal.ledgerId,
+      );
+      if (!item) throw new Error("agent_automation_not_found");
+      if (patch.intervalHours !== undefined) item.intervalHours = patch.intervalHours;
+      if (patch.enabled !== undefined) item.enabled = patch.enabled;
+      if (patch.nextRunAt !== undefined) item.nextRunAt = patch.nextRunAt;
+      item.updatedAt = now();
+      return { ...item };
+    });
+  }
+
+  async listNotifications(principal: Principal): Promise<AgentNotification[]> {
+    const state = await this.store.read(principal.userId);
+    return state.notifications
+      .filter((item) => item.ledgerId === principal.ledgerId)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  async markNotificationRead(
+    principal: Principal,
+    notificationId: string,
+  ): Promise<AgentNotification> {
+    return this.store.update(principal.userId, (state) => {
+      const item = state.notifications.find(
+        (value) => value.id === notificationId && value.ledgerId === principal.ledgerId,
+      );
+      if (!item) throw new Error("agent_notification_not_found");
+      item.readAt ??= now();
+      return { ...item };
+    });
+  }
+
+  async runAutomationNow(principal: Principal, automationId: string): Promise<AgentAutomation> {
+    const state = await this.store.read(principal.userId);
+    const item = state.automations.find(
+      (value) => value.id === automationId && value.ledgerId === principal.ledgerId,
+    );
+    if (!item) throw new Error("agent_automation_not_found");
+    await this.#executeAutomation(item, now(), false);
+    const latest = await this.listAutomations(principal);
+    return latest.find((value) => value.id === automationId)!;
+  }
+
+  async runDueAutomations(at = now()): Promise<void> {
+    for (const userId of await this.store.listUserIds()) {
+      const state = await this.store.read(userId);
+      for (const item of state.automations) {
+        if (item.enabled && item.nextRunAt <= at) {
+          await this.#executeAutomation(item, item.nextRunAt, true).catch(() => undefined);
+        }
+      }
+    }
+  }
+
+  async #executeAutomation(
+    automation: AgentAutomation,
+    scheduledFor: string,
+    advanceSchedule: boolean,
+  ): Promise<void> {
+    if (!this.#automationRunner) throw new Error("agent_automation_unavailable");
+    if (this.#automationRuns.has(automation.id)) throw new Error("agent_automation_busy");
+    this.#automationRuns.add(automation.id);
+    try {
+      const result = await this.#automationRunner.runAutomation(automation, scheduledFor);
+      await this.store.update(automation.userId, (state) => {
+        const current = state.automations.find((item) => item.id === automation.id);
+        if (!current) return;
+        const timestamp = now();
+        current.lastRunAt = timestamp;
+        current.lastStatus = "success";
+        delete current.lastErrorCode;
+        current.updatedAt = timestamp;
+        if (advanceSchedule) {
+          current.nextRunAt = new Date(
+            Math.max(Date.parse(scheduledFor), Date.parse(timestamp)) +
+              current.intervalHours * 3_600_000,
+          ).toISOString();
+        }
+        if (result.notify) {
+          state.notifications.push({
+            id: `notice_${randomUUID()}`,
+            userId: current.userId,
+            ledgerId: current.ledgerId,
+            kind: current.kind,
+            title: result.title,
+            body: result.body,
+            ...(result.action ? { action: result.action } : {}),
+            createdAt: timestamp,
+          });
+        }
+      });
+    } catch (error) {
+      const code = error instanceof Error && /^[a-z0-9_]+$/.test(error.message)
+        ? error.message
+        : "agent_automation_failed";
+      await this.store.update(automation.userId, (state) => {
+        const current = state.automations.find((item) => item.id === automation.id);
+        if (!current) return;
+        const timestamp = now();
+        current.lastRunAt = timestamp;
+        current.lastStatus = "failed";
+        current.lastErrorCode = code;
+        current.updatedAt = timestamp;
+        if (advanceSchedule) {
+          current.nextRunAt = new Date(Date.parse(timestamp) + 3_600_000).toISOString();
+        }
+        state.notifications.push({
+          id: `notice_${randomUUID()}`,
+          userId: current.userId,
+          ledgerId: current.ledgerId,
+          kind: current.kind,
+          title: "自动任务未完成",
+          body: "任务将在稍后重试",
+          createdAt: timestamp,
+        });
+      });
+      throw error;
+    } finally {
+      this.#automationRuns.delete(automation.id);
+    }
   }
 
   async createAttachment(
