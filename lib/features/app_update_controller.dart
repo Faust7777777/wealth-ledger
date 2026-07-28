@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../core/env.dart';
 import '../data/client_update.dart';
 import '../data/providers.dart';
 
@@ -145,6 +146,17 @@ class AppUpdateController extends Notifier<AppUpdateState> {
   ClientUpdatePlatform? get _platform => ref.read(clientUpdatePlatformProvider);
   ClientUpdateService? get _service => ref.read(clientUpdateServiceProvider);
 
+  /// 只读取已安装版本（纯本地调用，不发任何网络请求）。
+  Future<void> loadInstalledVersion() async {
+    final platform = _platform;
+    if (platform == null || state.installed != null) return;
+    try {
+      state = state.copyWith(installed: await platform.installedVersion());
+    } catch (_) {
+      // 读不到版本不影响其他功能。
+    }
+  }
+
   /// 启动后静默检查一次，之后最多 24 小时一次；静默失败不打扰用户。
   Future<void> checkSilently() async {
     final last = _lastCheck;
@@ -258,6 +270,21 @@ class AppUpdateController extends Notifier<AppUpdateState> {
     if (cancel != null && !cancel.isCompleted) cancel.complete();
   }
 
+  /// 从系统授权页返回时重新判定权限：已授权就直接回到可安装态，
+  /// 用户看到的是「继续安装」而不是还停在「去授权」。
+  Future<void> refreshInstallPermission() async {
+    if (state.phase != AppUpdatePhase.needsPermission) return;
+    final platform = _platform;
+    if (platform == null) return;
+    try {
+      if (await platform.canInstallPackages()) {
+        state = state.copyWith(phase: AppUpdatePhase.readyToInstall);
+      }
+    } catch (_) {
+      // 权限查询失败保持原状，用户仍可再点一次。
+    }
+  }
+
   /// 拉起系统安装器。没有"安装未知应用"权限时先跳授权页。
   /// 安装是否完成只能由重启后的真实 versionCode 判断，这里不做任何断言。
   Future<void> install() async {
@@ -309,10 +336,19 @@ final clientUpdatePlatformProvider = Provider<ClientUpdatePlatform?>((ref) {
   return const AndroidClientUpdatePlatform();
 });
 
+/// 更新服务只在 Android + 远端 HTTPS 模式下存在：
+/// local_server/DEMO 不向 loopback HTTP 检查更新，也不绕过生产门禁。
 final clientUpdateServiceProvider = Provider<ClientUpdateService?>((ref) {
   final platform = ref.watch(clientUpdatePlatformProvider);
   if (platform == null) return null;
   final env = ref.watch(effectiveAppEnvironmentProvider);
+  if (env.dataSourceMode != DataSourceMode.apiRemote) return null;
+  if (!env.hasConfiguredRemoteApi) return null;
+  try {
+    requireHttpsOrigin(env.apiBaseUrl);
+  } on ClientUpdateRejected {
+    return null;
+  }
   return ClientUpdateService(
     apiBaseUrl: env.apiBaseUrl,
     platform: 'android',

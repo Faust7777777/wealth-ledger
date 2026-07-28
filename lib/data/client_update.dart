@@ -60,9 +60,26 @@ class ClientUpdateRejected implements Exception {
   String toString() => reason;
 }
 
+/// API origin 必须是干净的 HTTPS origin：
+/// https、host 非空、无 userInfo/query/fragment，且不带业务路径。
+Uri requireHttpsOrigin(String apiBaseUrl) {
+  final base = Uri.tryParse(apiBaseUrl.trim());
+  if (base == null ||
+      base.scheme != 'https' ||
+      base.host.isEmpty ||
+      base.userInfo.isNotEmpty ||
+      base.hasQuery ||
+      base.hasFragment ||
+      (base.path.isNotEmpty && base.path != '/')) {
+    throw ClientUpdateRejected('服务器地址不可用于更新');
+  }
+  return base.replace(path: '', query: null, fragment: null);
+}
+
 /// 只接受与当前 API origin 同源的相对 URL。
-/// 绝对 URL、协议相对、路径穿越一律拒绝。
+/// 非 HTTPS origin、绝对 URL、协议相对、路径穿越一律拒绝。
 Uri resolveUpdateAssetUrl(String apiBaseUrl, String assetUrl) {
+  final base = requireHttpsOrigin(apiBaseUrl);
   final raw = assetUrl.trim();
   if (raw.isEmpty || !raw.startsWith('/') || raw.startsWith('//')) {
     throw ClientUpdateRejected('更新包地址无效');
@@ -74,24 +91,41 @@ Uri resolveUpdateAssetUrl(String apiBaseUrl, String assetUrl) {
   if (segments.contains('..') || segments.contains('.')) {
     throw ClientUpdateRejected('更新包地址无效');
   }
-  final base = Uri.parse(apiBaseUrl);
   return base.replace(path: raw, query: null, fragment: null);
 }
 
+final RegExp _sha256Hex = RegExp(r'^[a-f0-9]{64}$');
+final RegExp _androidAssetName = RegExp(r'^[A-Za-z0-9][A-Za-z0-9._-]*\.apk$');
+
 ClientUpdateManifestVm parseClientUpdateManifest(Map<String, dynamic> j) {
   final asset = (j['asset'] as Map).cast<String, dynamic>();
+  final versionCode = (j['versionCode'] as num?)?.toInt() ?? 0;
+  final sizeBytes = (asset['sizeBytes'] as num?)?.toInt() ?? 0;
+  final sha = '${asset['sha256']}'.toLowerCase();
+  final fileName = '${asset['fileName']}';
+  // 窄校验：数值必须为正、摘要必须是 64 位十六进制、
+  // Android 资源必须是安全的 .apk 文件名。失败只停在更新行错误态。
+  if (versionCode <= 0 || sizeBytes <= 0) {
+    throw ClientUpdateRejected('更新信息不完整');
+  }
+  if (!_sha256Hex.hasMatch(sha)) {
+    throw ClientUpdateRejected('更新信息不完整');
+  }
+  if (j['platform'] == 'android' && !_androidAssetName.hasMatch(fileName)) {
+    throw ClientUpdateRejected('更新信息不完整');
+  }
   return ClientUpdateManifestVm(
     platform: '${j['platform']}',
     channel: '${j['channel']}',
     versionName: '${j['versionName']}',
-    versionCode: (j['versionCode'] as num).toInt(),
+    versionCode: versionCode,
     mandatory: j['mandatory'] == true,
     notes: [for (final n in (j['notes'] as List? ?? const [])) '$n'],
     asset: ClientUpdateAssetVm(
       url: '${asset['url']}',
-      fileName: '${asset['fileName']}',
-      sizeBytes: (asset['sizeBytes'] as num).toInt(),
-      sha256: '${asset['sha256']}'.toLowerCase(),
+      fileName: fileName,
+      sizeBytes: sizeBytes,
+      sha256: sha,
     ),
   );
 }
@@ -136,7 +170,8 @@ class ClientUpdateService {
   }
 
   /// 流式下载到 App 私有 cache，并在写入过程中增量计算 SHA-256。
-  /// 大小或摘要不符会删除临时文件并抛错；取消同样删除。
+  /// 网络错误、流错误、取消、大小/SHA 不符：一律先停订阅、关 sink，
+  /// 再删除半包，绝不把不完整文件留在私有 cache 里。
   Future<File> download(
     ClientUpdateManifestVm manifest, {
     UpdateProgress? onProgress,
@@ -151,62 +186,100 @@ class ClientUpdateService {
     );
     if (file.existsSync()) file.deleteSync();
 
-    final response = await _client.send(http.Request('GET', uri));
-    if (response.statusCode != 200) {
-      throw ClientUpdateRejected('下载失败，请重试');
-    }
-    final sink = file.openWrite();
-    final digest = _DigestSink();
-    final hasher = sha256.startChunkedConversion(digest);
-    var received = 0;
     var cancelled = false;
-    StreamSubscription<List<int>>? sub;
-    final done = Completer<void>();
-
+    final cancelSignal = Completer<void>();
     unawaited(
       cancel?.then((_) {
-        cancelled = true;
-        sub?.cancel();
-        if (!done.isCompleted) done.complete();
-      }),
+            cancelled = true;
+            if (!cancelSignal.isCompleted) cancelSignal.complete();
+          }) ??
+          Future<void>.value(),
     );
+    // 极早取消：请求还没发出就已经被取消。
+    if (cancelled) throw ClientUpdateRejected('已取消下载');
 
-    sub = response.stream.listen(
-      (chunk) {
-        received += chunk.length;
-        sink.add(chunk);
-        hasher.add(chunk);
-        onProgress?.call(received, response.contentLength);
-      },
-      onError: (Object error) {
-        if (!done.isCompleted) done.completeError(error);
-      },
-      onDone: () {
-        if (!done.isCompleted) done.complete();
-      },
-      cancelOnError: true,
-    );
-
+    IOSink? sink;
+    StreamSubscription<List<int>>? sub;
     try {
+      final response = await _client.send(http.Request('GET', uri));
+      if (response.statusCode != 200) {
+        await response.stream.drain<void>();
+        throw ClientUpdateRejected('下载失败，请重试');
+      }
+      // 订阅建立前被取消：直接丢弃响应体，不落任何文件。
+      if (cancelled) {
+        await response.stream.drain<void>();
+        throw ClientUpdateRejected('已取消下载');
+      }
+
+      sink = file.openWrite();
+      final digest = _DigestSink();
+      final hasher = sha256.startChunkedConversion(digest);
+      var received = 0;
+      final done = Completer<void>();
+
+      sub = response.stream.listen(
+        (chunk) {
+          if (cancelled) return;
+          received += chunk.length;
+          sink!.add(chunk);
+          hasher.add(chunk);
+          onProgress?.call(received, response.contentLength);
+        },
+        onError: (Object error) {
+          if (!done.isCompleted) done.completeError(error);
+        },
+        onDone: () {
+          if (!done.isCompleted) done.complete();
+        },
+        cancelOnError: true,
+      );
+
+      // 取消：先等订阅真正终止，再让下载流程收尾。
+      unawaited(
+        cancelSignal.future.then((_) async {
+          await sub?.cancel();
+          sub = null;
+          if (!done.isCompleted) done.complete();
+        }),
+      );
+
       await done.future;
-    } finally {
+      await sub?.cancel();
+      sub = null;
       await sink.close();
-    }
+      sink = null;
 
-    if (cancelled) {
-      if (file.existsSync()) file.deleteSync();
-      throw ClientUpdateRejected('已取消下载');
-    }
+      if (cancelled) throw ClientUpdateRejected('已取消下载');
 
-    hasher.close();
-    final actual = digest.value?.toString().toLowerCase() ?? '';
-    final actualSize = file.existsSync() ? file.lengthSync() : 0;
-    if (actualSize != manifest.asset.sizeBytes ||
-        actual != manifest.asset.sha256) {
-      if (file.existsSync()) file.deleteSync();
-      throw ClientUpdateRejected('更新包校验未通过，请重试');
+      hasher.close();
+      final actual = digest.value?.toString().toLowerCase() ?? '';
+      final actualSize = file.existsSync() ? file.lengthSync() : 0;
+      if (actualSize != manifest.asset.sizeBytes ||
+          actual != manifest.asset.sha256) {
+        throw ClientUpdateRejected('更新包校验未通过，请重试');
+      }
+      return file;
+    } catch (error) {
+      await sub?.cancel();
+      if (sink != null) {
+        try {
+          await sink.close();
+        } catch (_) {
+          // sink 已因错误关闭时忽略二次关闭。
+        }
+      }
+      if (file.existsSync()) {
+        try {
+          file.deleteSync();
+        } catch (_) {
+          // 删不掉也不能把半包当成可安装结果。
+        }
+      }
+      throw error is ClientUpdateRejected
+          ? error
+          : ClientUpdateRejected('下载失败，请重试');
     }
-    return file;
   }
 
   /// 清掉 cache 里除当前包外的旧更新文件。

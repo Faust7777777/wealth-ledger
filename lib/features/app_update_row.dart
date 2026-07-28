@@ -15,20 +15,37 @@ class AppUpdateRow extends ConsumerStatefulWidget {
   ConsumerState<AppUpdateRow> createState() => _AppUpdateRowState();
 }
 
-class _AppUpdateRowState extends ConsumerState<AppUpdateRow> {
+class _AppUpdateRowState extends ConsumerState<AppUpdateRow>
+    with WidgetsBindingObserver {
+  // 静默检查由 App 启动生命周期统一触发，这里只读本地已安装版本，不发请求。
   @override
   void initState() {
     super.initState();
-    // 打开设置时顺带静默检查一次（受 24 小时节流约束）。
+    WidgetsBinding.instance.addObserver(this);
     Future.microtask(
-      () => ref.read(appUpdateControllerProvider.notifier).checkSilently(),
+      () =>
+          ref.read(appUpdateControllerProvider.notifier).loadInstalledVersion(),
     );
   }
 
   @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  /// 从系统授权页返回：重新判定权限，已授权就直接进入「继续安装」。
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState lifecycle) {
+    if (lifecycle != AppLifecycleState.resumed) return;
+    ref.read(appUpdateControllerProvider.notifier).refreshInstallPermission();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    // 非 Android 不提供应用内更新，这一行整体不显示。
-    if (ref.watch(clientUpdatePlatformProvider) == null) {
+    // 只有具备更新能力的平台与模式才显示这一行
+    // （非 Android、本地服务模式、未配置远端都不显示）。
+    if (ref.watch(clientUpdateServiceProvider) == null) {
       return const SizedBox.shrink();
     }
     final state = ref.watch(appUpdateControllerProvider);
@@ -122,7 +139,7 @@ class _AppUpdateRowState extends ConsumerState<AppUpdateRow> {
                 ] else if (state.phase == AppUpdatePhase.needsPermission)
                   FilledButton(
                     onPressed: notifier.install,
-                    child: const Text('去授权'),
+                    child: const Text('继续安装'),
                   )
                 else if (manifest != null)
                   FilledButton(

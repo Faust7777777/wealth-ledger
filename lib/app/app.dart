@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/env.dart';
 import '../data/providers.dart';
+import '../features/app_update_controller.dart';
 import '../features/remote_server_setup_page.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_theme.dart';
@@ -22,6 +23,7 @@ class _WealthLedgerAppState extends ConsumerState<WealthLedgerApp> {
   static const Duration _scheduledQuoteRefreshInterval = Duration(minutes: 15);
 
   bool _startupRefreshScheduled = false;
+  bool _startupUpdateCheckScheduled = false;
   bool _scheduledRefreshRunning = false;
   Timer? _scheduledQuoteRefreshTimer;
 
@@ -94,6 +96,20 @@ class _WealthLedgerAppState extends ConsumerState<WealthLedgerApp> {
       _startupRefreshScheduled = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _startupRefreshQuotes();
+      });
+    }
+    // 应用内更新的静默检查：只在远端已配置且该平台/模式支持更新时触发一次。
+    // 用 State 上的一次性闩锁，rebuild、切主题、切路由都不会再发第二个请求；
+    // 未配置远端时上面已经提前 return，配置完成后这里才会第一次命中。
+    if (!_startupUpdateCheckScheduled &&
+        ref.read(clientUpdateServiceProvider) != null) {
+      _startupUpdateCheckScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        // 不阻塞首屏；失败不弹窗、不改登录态。
+        unawaited(
+          ref.read(appUpdateControllerProvider.notifier).checkSilently(),
+        );
       });
     }
 
