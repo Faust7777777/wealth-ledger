@@ -10,6 +10,7 @@
 - 契约补全：`b4a8745 fix(agent): formalize SSE and attachment retrieval`
 - 网页报价候选：`ad371ae feat(agent): add reviewed web quote candidates`
 - 工作区文档附件：`ddfdb54 feat(agent): support workspace document attachments`
+- 自动任务与通知：`142951b feat(agent): schedule reminders and in-app notifications`
 - 未修改 Flutter `lib/**`、Flutter `test/**` 或平台客户端。
 - Claude 最新可见前端成果仍是 `origin/feat/ai-image-organization-ui @ 6abb256`；Pi Agent 前端任务另见 `2026-07-28-claude-pi-agent-frontend.md`。
 
@@ -27,13 +28,14 @@
 10. 附件回读：提供归属校验后的安全元数据与原图接口，元数据不暴露存储路径；原图响应包含正确 MIME、SHA-256 ETag、private/no-store 与 nosniff，供历史消息和 App 重启后恢复预览。
 11. SSE 正式契约：OpenAPI 明确 `run.queued`、`run.started`、`message.delta`、tool 与结束事件字段，并规定 `after` / `Last-Event-ID` 的 cursor 续接语义。
 12. 网页报价候选：Agent 可把有来源和时间的网页报价/汇率保存为 `suggested`，只有用户调用审核接口 `apply` 后才经权威 `/v1/quotes/refresh` 写入；拒绝、提议和失败均不改变估值。
+13. 自动任务与通知：持久化结构化报价、订阅到期扫描和 DCA 到期检查，失败一小时重试；订阅只生成待审核候选，DCA 不执行交易，通知仅保存在 App 内。
 
 ## 验证结果
 
 - Rust：`cargo test`，145 passed / 0 failed。
-- Node：TypeScript check/build；14 passed / 0 failed。
+- Node：TypeScript check/build；18 passed / 0 failed。
 - Node production audit：0 vulnerabilities。
-- `python tools/contract_check.py`：通过，OpenAPI 88 paths / 159 schemas。
+- `python tools/contract_check.py`：通过，OpenAPI 93 paths / 168 schemas。
 - `git diff --check`、`cargo fmt --check`：通过。
 - `tools/agent_local_smoke.ps1`：真实启动 Rust 与 Node；状态、会话、附件上传/安全元数据/原图响应头与字节、空模型 503 fail-closed 通过。
 - `tools/agent_workspace_sandbox_smoke.sh`：WSL bubblewrap 边界通过，workspace 可写、宿主外部路径不可见。
@@ -46,5 +48,5 @@
 - 尚未配置真实 Pi `auth.json` / `models.json`，因此未调用真实付费模型完成端到端账单识别。
 - PDF、CSV、XLSX、ZIP 与 TXT 已支持原样上传到 Agent 工作区，由 Agent 选择对应读取工具并交给模型理解；未另做固定账单解析器。真实模型端到端仍待生产配置后验证。
 - 网页搜索可在隔离 shell 内完成，并已支持候选报价审核入库；真实模型在目标网站上的可访问性与端到端来源质量仍待生产配置后验证。
-- 定时任务、主动通知、插件提议/审批/安装尚未实现。
+- App 内定时任务与通知已实现；系统级 push、模型周期报告、插件提议/审批/安装尚未实现。
 - Flutter Agent 入口、Windows 右栏、Android 全屏、SSE UI、图片选择和记忆审批仍由 Claude 按任务单实现。

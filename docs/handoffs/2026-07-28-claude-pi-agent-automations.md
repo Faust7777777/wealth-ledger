@@ -1,0 +1,28 @@
+# Claude 前端任务：Agent 自动任务与通知
+
+日期：2026-07-28
+
+## 基线
+
+后端功能提交为 `142951b`。先完成报价多候选紧凑修正，并将 `feat/pi-agent-frontend-followup` rebase 到 `origin/feat/pi-agent-control-center` 最新 HEAD，再接本任务与非图片附件 UI。
+
+## 后端接口
+
+- `GET/POST /v1/agent/automations`
+- `PATCH /v1/agent/automations/{automationId}`
+- `POST /v1/agent/automations/{automationId}/run`
+- `GET /v1/agent/notifications`
+- `POST /v1/agent/notifications/{notificationId}/read`
+
+完整字段以 OpenAPI 为准；所有 POST/PATCH 继续使用既有 Idempotency-Key 与 401 同 key 重放。
+
+## UI 要求
+
+1. Agent 面板只放一个低强调通知入口和未读数，不常驻展示任务实现说明。
+2. 通知列表 newest-first，显示标题、正文、时间；根据 `action` 前往审核、报价或 DCA，打开后幂等标记已读。
+3. Agent 设置中提供三行任务：结构化报价刷新、订阅到期扫描、定投到期检查。每行只展示开关、频率、下次时间、上次结果和“立即运行”。
+4. 频率用易懂预设加自定义小时，范围 1–720；首次运行时间用日期+时间选择器。不要暴露 cron、sidecar、timer、内部错误码。
+5. 失败只显示“上次未完成”和重试时间；立即运行 busy 时按钮禁用，同一次点击只能发一个请求。
+6. 不提供“自动采用网页报价”“自动确认订阅扣费”“自动执行定投”的开关，后端也不支持这些行为。
+7. fixture 不伪造权威写入成功。真实 smoke 验证创建/关闭/重开计划后仍存在、立即运行不改变 nextRunAt、跨重启到期任务生成 App 内通知。
+8. 360/1200/1440 与明暗主题覆盖无任务、三任务、未读通知、失败任务；不要加入防御性常驻文案。
