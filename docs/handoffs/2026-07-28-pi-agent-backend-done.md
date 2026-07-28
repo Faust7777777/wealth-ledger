@@ -9,6 +9,7 @@
 - 功能提交：`70553d0 feat(agent): add Pi control center backend`
 - 契约补全：`b4a8745 fix(agent): formalize SSE and attachment retrieval`
 - 网页报价候选：`ad371ae feat(agent): add reviewed web quote candidates`
+- 工作区文档附件：`ddfdb54 feat(agent): support workspace document attachments`
 - 未修改 Flutter `lib/**`、Flutter `test/**` 或平台客户端。
 - Claude 最新可见前端成果仍是 `origin/feat/ai-image-organization-ui @ 6abb256`；Pi Agent 前端任务另见 `2026-07-28-claude-pi-agent-frontend.md`。
 
@@ -30,7 +31,7 @@
 ## 验证结果
 
 - Rust：`cargo test`，145 passed / 0 failed。
-- Node：TypeScript check/build；13 passed / 0 failed。
+- Node：TypeScript check/build；14 passed / 0 failed。
 - Node production audit：0 vulnerabilities。
 - `python tools/contract_check.py`：通过，OpenAPI 88 paths / 159 schemas。
 - `git diff --check`、`cargo fmt --check`：通过。
@@ -43,7 +44,7 @@
 
 - 未在生产 VPS 安装、配置模型或重启现有服务；未读取或修改生产账本。
 - 尚未配置真实 Pi `auth.json` / `models.json`，因此未调用真实付费模型完成端到端账单识别。
-- PDF、CSV、XLSX、ZIP 非图片附件上传与工作区读取尚未实现；文件应原样进入 Agent 工作区，由 Agent 选择对应读取工具并交给模型理解，不另做固定账单解析器。本轮原生附件只接受 PNG/JPEG/WEBP。
+- PDF、CSV、XLSX、ZIP 与 TXT 已支持原样上传到 Agent 工作区，由 Agent 选择对应读取工具并交给模型理解；未另做固定账单解析器。真实模型端到端仍待生产配置后验证。
 - 网页搜索可在隔离 shell 内完成，并已支持候选报价审核入库；真实模型在目标网站上的可访问性与端到端来源质量仍待生产配置后验证。
 - 定时任务、主动通知、插件提议/审批/安装尚未实现。
 - Flutter Agent 入口、Windows 右栏、Android 全屏、SSE UI、图片选择和记忆审批仍由 Claude 按任务单实现。
