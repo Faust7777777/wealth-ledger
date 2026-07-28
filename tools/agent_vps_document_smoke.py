@@ -256,6 +256,17 @@ def run_document(
 
 
 def main() -> None:
+    ready_deadline = time.monotonic() + 30
+    while True:
+        try:
+            status = request("GET", "/status")
+            if isinstance(status, dict) and status.get("configured") is True:
+                break
+        except (urllib.error.URLError, ConnectionError):
+            pass
+        if time.monotonic() >= ready_deadline:
+            raise TimeoutError("production Agent did not become ready")
+        time.sleep(0.25)
     with tempfile.TemporaryDirectory(prefix="finwealth-vps-document-") as directory:
         root = Path(directory)
         pdf_marker = "FINWEALTH_PDF_7P3"
