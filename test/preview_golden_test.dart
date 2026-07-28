@@ -24,6 +24,7 @@ import 'package:finwealth/features/dca_execution_dialog.dart';
 import 'package:finwealth/data/api_mock_repositories.dart'
     show
         ApiServiceUnavailableException,
+        ApiUnauthorizedException,
         parseAiProposalData,
         parseLiabilityPositionData,
         parseMovementData;
@@ -1420,6 +1421,7 @@ void main() {
     List<AgentQuoteCandidateVm> candidates = const [],
     AgentAttachmentVm? attachmentMeta,
     List<AgentNotificationVm> notifications = const [],
+    Object? statusFailure,
   }) => ProviderScope(
     overrides: [
       if (picker != null)
@@ -1448,6 +1450,7 @@ void main() {
           candidates: candidates,
           attachmentMeta: attachmentMeta,
           notifications: notifications,
+          statusFailure: statusFailure,
         ),
       ),
     ],
@@ -1801,6 +1804,28 @@ void main() {
     });
   }
 
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('agent panel needs login - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(360, 640));
+      await tester.pumpWidget(
+        agentHost(
+          theme,
+          statusFailure: ApiUnauthorizedException('/v1/agent/status'),
+        ),
+      );
+      await _settleEntrance(tester);
+      await expectLater(
+        find.byType(AgentPanel),
+        matchesGoldenFile('goldens/agent_panel_needs_login_$name.png'),
+      );
+    });
+  }
+
   testWidgets('agent panel unconfigured - dark', skip: !_previewEnabled, (
     tester,
   ) async {
@@ -1867,6 +1892,7 @@ class _PreviewAgentRepo implements AgentRepository {
     this.attachmentMeta,
     this.automations = const [],
     this.notifications = const [],
+    this.statusFailure,
   });
 
   final bool configured;
@@ -1878,10 +1904,17 @@ class _PreviewAgentRepo implements AgentRepository {
   final AgentAttachmentVm? attachmentMeta;
   final List<AgentAutomationVm> automations;
   final List<AgentNotificationVm> notifications;
+  final Object? statusFailure;
 
   @override
-  Future<AgentStatusVm> getStatus() async =>
-      AgentStatusVm(configured: configured, modelCount: configured ? 1 : 0);
+  Future<AgentStatusVm> getStatus() async {
+    if (statusFailure != null) throw statusFailure!;
+    return AgentStatusVm(
+      configured: configured,
+      modelCount: configured ? 1 : 0,
+    );
+  }
+
   @override
   Future<List<AgentModelVm>> listModels() async => configured
       ? const [

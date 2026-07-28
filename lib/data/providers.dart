@@ -59,6 +59,9 @@ final devApiClientProvider = Provider<DevApiClient>((ref) {
     env.apiBaseUrl,
     scenario: env.apiScenario,
     tokenStore: ref.watch(authTokenStoreProvider),
+    // 延迟 read：避免与 authRepositoryProvider 形成构建期循环依赖。
+    onSessionExpired: () =>
+        ref.read(authControllerProvider.notifier).markSessionExpired(),
   );
 });
 
@@ -149,6 +152,16 @@ class AuthController extends AsyncNotifier<AuthSessionVm?> {
     state = const AsyncData(null);
     ref.invalidate(authDevicesProvider);
     // 登出后写能力随会话失效，重取（auth-on 时会回落只读）。
+    ref.invalidate(capabilitiesProvider);
+  }
+
+  /// 会话已被服务端判定失效（refresh 也 401）：只清本地登录态，不再调用服务端。
+  /// 幂等：已经是未登录就直接返回。
+  Future<void> markSessionExpired() async {
+    if (state.asData?.value == null && state is AsyncData) return;
+    await ref.read(authTokenStoreProvider).clear();
+    state = const AsyncData(null);
+    ref.invalidate(authDevicesProvider);
     ref.invalidate(capabilitiesProvider);
   }
 

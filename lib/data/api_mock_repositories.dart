@@ -78,12 +78,17 @@ class DevApiClient {
     this.baseUrl, {
     this.scenario = '',
     this.tokenStore,
+    this.onSessionExpired,
     http.Client? client,
   }) : _client = client ?? http.Client();
 
   final String baseUrl;
   final String scenario;
   final AuthTokenStore? tokenStore;
+
+  /// refresh 也明确 401 时回调一次：清除失效 token 并把登录态同步为未登录。
+  /// 网络失败、超时与 5xx 不触发。
+  final Future<void> Function()? onSessionExpired;
   final http.Client _client;
   final Random _rng = Random.secure();
 
@@ -394,6 +399,7 @@ class DevApiClient {
     final store = tokenStore;
     if (store == null) return false;
     final session = await store.read();
+    // token 已被清掉：不再重复判定失效，也不重复回调。
     if (session == null || session.refreshToken.isEmpty) return false;
     try {
       final res = await _client.post(
@@ -401,6 +407,11 @@ class DevApiClient {
         headers: {'content-type': 'application/json'},
         body: jsonEncode({'refreshToken': session.refreshToken}),
       );
+      // 只有服务端明确拒绝这张 refresh token 才算会话失效。
+      if (res.statusCode == 401 || res.statusCode == 403) {
+        await _invalidateSession();
+        return false;
+      }
       if (res.statusCode != 200) return false;
       final decoded = jsonDecode(utf8.decode(res.bodyBytes));
       final data = decoded is Map<String, dynamic>
@@ -417,8 +428,16 @@ class DevApiClient {
       await store.write(next);
       return true;
     } catch (_) {
+      // 网络失败/超时：保留登录态，交给调用方按普通错误处理。
       return false;
     }
+  }
+
+  /// 清除失效 token 并通知上层同步登录态。单飞的 refresh 保证只走一次。
+  Future<void> _invalidateSession() async {
+    await tokenStore?.clear();
+    final notify = onSessionExpired;
+    if (notify != null) await notify();
   }
 }
 
