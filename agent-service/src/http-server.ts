@@ -224,7 +224,8 @@ export function createAgentHttpServer(
           if (
             body.kind !== "quote_refresh" &&
             body.kind !== "subscription_due_scan" &&
-            body.kind !== "dca_due_check"
+            body.kind !== "dca_due_check" &&
+            body.kind !== "financial_summary"
           ) throw new Error("invalid_agent_automation_kind");
           if (typeof body.intervalHours !== "number") {
             throw new Error("invalid_agent_automation_interval");

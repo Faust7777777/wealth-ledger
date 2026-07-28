@@ -160,6 +160,9 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
         notify: created > 0 || blocked > 0 || remaining > 0,
       };
     }
+    if (automation.kind !== "dca_due_check") {
+      throw new Error("unsupported_agent_automation");
+    }
     const response = await this.#request("GET", "/v1/dca/reminders/due");
     const data = responseDataValue(response);
     const due = Array.isArray(data) ? data.length : 0;

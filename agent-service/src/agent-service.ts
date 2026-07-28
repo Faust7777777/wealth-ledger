@@ -242,11 +242,14 @@ export class AgentService {
     scheduledFor: string,
     advanceSchedule: boolean,
   ): Promise<void> {
-    if (!this.#automationRunner) throw new Error("agent_automation_unavailable");
     if (this.#automationRuns.has(automation.id)) throw new Error("agent_automation_busy");
     this.#automationRuns.add(automation.id);
     try {
-      const result = await this.#automationRunner.runAutomation(automation, scheduledFor);
+      const result = automation.kind === "financial_summary"
+        ? await this.#startFinancialSummary(automation, scheduledFor)
+        : this.#automationRunner
+        ? await this.#automationRunner.runAutomation(automation, scheduledFor)
+        : (() => { throw new Error("agent_automation_unavailable"); })();
       await this.store.update(automation.userId, (state) => {
         const current = state.automations.find((item) => item.id === automation.id);
         if (!current) return;
@@ -303,6 +306,38 @@ export class AgentService {
     } finally {
       this.#automationRuns.delete(automation.id);
     }
+  }
+
+  async #startFinancialSummary(
+    automation: AgentAutomation,
+    scheduledFor: string,
+  ): Promise<{
+    title: string;
+    body: string;
+    action: "agent";
+    notify: true;
+  }> {
+    const principal: Principal = {
+      userId: automation.userId,
+      ledgerId: automation.ledgerId,
+      deviceId: automation.deviceId,
+    };
+    const conversations = await this.listConversations(principal);
+    const primary = conversations.find((item) => item.isPrimary);
+    if (!primary) throw new Error("agent_primary_conversation_not_found");
+    const hours = automation.intervalHours;
+    const period = hours <= 24 ? "过去一天" : hours <= 168 ? "过去一周" : "过去一个月";
+    await this.sendMessage(
+      principal,
+      primary.id,
+      `请生成${period}的财务总结。读取权威账本数据，概括消费分类与变化、订阅支出、投资仓位和盈亏，并给出简短可执行建议。报告截止时间：${scheduledFor}。不要创建或确认任何账务记录。`,
+    );
+    return {
+      title: "财务总结正在生成",
+      body: `${period}的报告已加入主会话`,
+      action: "agent",
+      notify: true,
+    };
   }
 
   async createAttachment(

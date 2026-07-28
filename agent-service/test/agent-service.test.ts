@@ -885,6 +885,27 @@ test("automation HTTP writes are idempotent and manual runs preserve the schedul
   }
 });
 
+test("financial summary automation queues a read-only report in the primary conversation", async () => {
+  const service = await serviceWith(new FakeEngine());
+  const automation = await service.createAutomation(owner, {
+    kind: "financial_summary",
+    intervalHours: 168,
+    enabled: true,
+    startAt: "2026-08-01T00:00:00Z",
+  });
+  await service.runAutomationNow(owner, automation.id);
+  const primary = (await service.listConversations(owner)).find((item) => item.isPrimary);
+  assert.ok(primary);
+  await waitForCompleted(service, primary.id);
+  const messages = await service.listMessages(owner, primary.id);
+  const request = messages.find((item) => item.role === "user");
+  assert.match(request?.text ?? "", /过去一周/);
+  assert.match(request?.text ?? "", /不要创建或确认任何账务记录/);
+  const notice = (await service.listNotifications(owner))[0];
+  assert.equal(notice?.action, "agent");
+  assert.equal(notice?.title, "财务总结正在生成");
+});
+
 test("workspace file tools reject paths outside the dedicated workspace", async () => {
   const root = await mkdtemp(join(tmpdir(), "finwealth-workspace-test-"));
   roots.push(root);

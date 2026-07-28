@@ -98,7 +98,11 @@ export interface AgentQuoteWriter {
   applyQuoteCandidate(candidate: AgentQuoteCandidate): Promise<unknown>;
 }
 
-export type AgentAutomationKind = "quote_refresh" | "subscription_due_scan" | "dca_due_check";
+export type AgentAutomationKind =
+  | "quote_refresh"
+  | "subscription_due_scan"
+  | "dca_due_check"
+  | "financial_summary";
 
 export interface AgentAutomation {
   id: string;
@@ -123,7 +127,7 @@ export interface AgentNotification {
   kind: AgentAutomationKind;
   title: string;
   body: string;
-  action?: "review" | "quotes" | "dca";
+  action?: "review" | "quotes" | "dca" | "agent";
   createdAt: string;
   readAt?: string;
 }

@@ -4918,7 +4918,7 @@ components:
           $ref: "#/components/schemas/ISODateTime"
     AgentAutomationKind:
       type: string
-      enum: [quote_refresh, subscription_due_scan, dca_due_check]
+      enum: [quote_refresh, subscription_due_scan, dca_due_check, financial_summary]
     AgentAutomation:
       type: object
       additionalProperties: false
@@ -4998,7 +4998,7 @@ components:
         body:
           type: string
         action:
-          enum: [review, quotes, dca]
+          enum: [review, quotes, dca, agent]
         createdAt:
           $ref: "#/components/schemas/ISODateTime"
         readAt:
