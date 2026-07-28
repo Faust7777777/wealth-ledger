@@ -14,13 +14,52 @@ from pathlib import Path
 
 
 ROUTE = "/v1/agent/*"
+LIVE_CONFIG = "/etc/caddy/Caddyfile"
+CANDIDATE_CONFIG = "/tmp/finwealth-caddy-candidate"
 
 
-def run_caddy(container: str, command: str) -> None:
+def run_caddy(container: str, command: str, config: str = LIVE_CONFIG) -> None:
     subprocess.run(
-        ["docker", "exec", container, "caddy", command, "--config", "/etc/caddy/Caddyfile"],
+        ["docker", "exec", container, "caddy", command, "--config", config],
         check=True,
         stdout=subprocess.DEVNULL,
+    )
+
+
+def validate_candidate(container: str, path: Path) -> None:
+    subprocess.run(
+        ["docker", "cp", str(path), f"{container}:{CANDIDATE_CONFIG}"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+    try:
+        run_caddy(container, "validate", CANDIDATE_CONFIG)
+    finally:
+        subprocess.run(
+            ["docker", "exec", container, "rm", "-f", CANDIDATE_CONFIG],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def restart_container(container: str) -> None:
+    subprocess.run(
+        ["docker", "restart", container],
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
+
+
+def route_is_loaded(container: str) -> bool:
+    return (
+        subprocess.run(
+            ["docker", "exec", container, "grep", "-Fq", ROUTE, LIVE_CONFIG],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
     )
 
 
@@ -71,6 +110,11 @@ def main() -> None:
     if "/v1/health" not in block or "path /v1/accounts" not in block:
         raise RuntimeError("Finwealth matcher is missing its expected anchor paths")
     if ROUTE in block:
+        if not route_is_loaded(args.container):
+            validate_candidate(args.container, path)
+            restart_container(args.container)
+        if not route_is_loaded(args.container):
+            raise RuntimeError("Caddy container did not mount the Agent route")
         run_caddy(args.container, "validate")
         print("OK: shared Caddyfile already routes the Finwealth Agent API.")
         return
@@ -87,8 +131,11 @@ def main() -> None:
     mode = stat.S_IMODE(metadata.st_mode)
     try:
         write_atomic(path, updated, mode, metadata.st_uid, metadata.st_gid)
+        validate_candidate(args.container, path)
+        restart_container(args.container)
+        if not route_is_loaded(args.container):
+            raise RuntimeError("Caddy container did not mount the Agent route")
         run_caddy(args.container, "validate")
-        run_caddy(args.container, "reload")
     except Exception:
         write_atomic(
             path,
@@ -97,8 +144,8 @@ def main() -> None:
             metadata.st_uid,
             metadata.st_gid,
         )
+        restart_container(args.container)
         run_caddy(args.container, "validate")
-        run_caddy(args.container, "reload")
         raise
     print(f"OK: added {ROUTE}; backup={backup}")
 

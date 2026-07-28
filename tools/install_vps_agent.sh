@@ -12,7 +12,10 @@ SERVICE_FILE="${FINWEALTH_AGENT_SERVICE_FILE:-/etc/systemd/system/finwealth-agen
 start_proxy_sockets() {
   local socket
   while read -r socket; do
-    [ -n "$socket" ] && systemctl start "$socket"
+    if [ -n "$socket" ] && ! systemctl is-active --quiet "$socket"; then
+      systemctl stop "${socket%.socket}.service"
+      systemctl start "$socket"
+    fi
   done < <(
     find /etc/systemd/system -maxdepth 3 -type l \
       -name 'finwealth-docker-proxy@*.socket' -printf '%f\n' | sort -u

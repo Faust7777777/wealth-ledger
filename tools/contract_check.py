@@ -1680,6 +1680,7 @@ def check_deploy_security_defaults() -> None:
             "start_proxy_sockets",
             "find /etc/systemd/system",
             "finwealth-docker-proxy@*.socket",
+            'systemctl stop "${socket%.socket}.service"',
             "sort -u",
         ):
             if snippet not in installer_text:
@@ -1690,7 +1691,9 @@ def check_deploy_security_defaults() -> None:
         'ROUTE = "/v1/agent/*"',
         "before-finwealth-agent-",
         'run_caddy(args.container, "validate")',
-        'run_caddy(args.container, "reload")',
+        "validate_candidate(args.container, path)",
+        "restart_container(args.container)",
+        "route_is_loaded(args.container)",
         "backup.read_text(encoding=\"utf-8\")",
         'line.strip() == "wuwaidut.com {"',
     ):
