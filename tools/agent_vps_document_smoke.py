@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import subprocess
 import tempfile
 import time
 import urllib.error
@@ -143,6 +144,32 @@ def upload(path: Path, mime_type: str, key: str) -> str:
     return metadata["id"]
 
 
+def run_event_summary(conversation_id: str, run_id: str) -> list[str]:
+    result: list[str] = []
+    event_type = ""
+    with urllib.request.urlopen(
+        urllib.request.Request(
+            f"{BASE}/conversations/{conversation_id}/events?after=0",
+            headers=headers(),
+            method="GET",
+        ),
+        timeout=30,
+    ) as response:
+        for raw_line in response:
+            line = raw_line.decode("utf-8").rstrip("\r\n")
+            if line.startswith("event: "):
+                event_type = line[7:]
+            elif line.startswith("data: "):
+                data = json.loads(line[6:])
+                if data.get("runId") != run_id:
+                    continue
+                if event_type == "tool.completed":
+                    result.append(f"{data.get('name', 'unknown')}:{data.get('isError') is True}")
+                if event_type in {"run.completed", "run.failed"}:
+                    return result
+    return result
+
+
 def run_document(file_path: Path, mime_type: str, marker: str, instructions: str) -> None:
     nonce = secrets.token_hex(8)
     conversation = request(
@@ -181,8 +208,13 @@ def run_document(file_path: Path, mime_type: str, marker: str, instructions: str
         if assistant and assistant.get("status") == "failed":
             raise RuntimeError(f"document Agent run failed: {assistant.get('errorCode', 'unknown')}")
         if assistant and assistant.get("status") == "completed":
+            tool_summary = run_event_summary(conversation["id"], accepted["runId"])
             if marker not in assistant.get("text", ""):
-                raise RuntimeError("document marker was not returned")
+                tools = ",".join(tool_summary) if tool_summary else "none"
+                raise RuntimeError(f"document marker was not returned (tools={tools})")
+            if "bash:False" not in tool_summary:
+                tools = ",".join(tool_summary) if tool_summary else "none"
+                raise RuntimeError(f"document was not read by successful isolated bash (tools={tools})")
             return
         time.sleep(0.25)
     raise TimeoutError("document Agent run timed out")
@@ -194,6 +226,14 @@ def main() -> None:
         pdf_marker = "FINWEALTH_PDF_7P3"
         pdf = root / "smoke.pdf"
         pdf.write_bytes(pdf_bytes(pdf_marker))
+        extracted = subprocess.run(
+            ["pdftotext", str(pdf), "-"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if pdf_marker not in extracted:
+            raise RuntimeError("synthetic PDF preflight failed")
         xlsx_marker = "FINWEALTH_XLSX_4M8"
         xlsx = root / "smoke.xlsx"
         write_xlsx(xlsx, xlsx_marker)
