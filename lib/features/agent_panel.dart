@@ -28,6 +28,28 @@ String? agentImageMimeType(String fileName) {
   return kAgentImageMimeTypes[fileName.substring(dot + 1).toLowerCase()];
 }
 
+/// 用户选中的一张待上传图片。
+typedef AgentPickedImage = ({String fileName, Uint8List bytes});
+
+/// 选图入口的可注入接缝：默认弹系统选择器；测试与预览覆盖它，
+/// 因此不需要在测试里驱动真实文件对话框。
+typedef AgentImagePicker = Future<AgentPickedImage?> Function();
+
+Future<AgentPickedImage?> _pickImageFromSystem() async {
+  const typeGroup = XTypeGroup(
+    label: 'images',
+    extensions: ['png', 'jpg', 'jpeg', 'webp'],
+    mimeTypes: ['image/png', 'image/jpeg', 'image/webp'],
+  );
+  final file = await openFile(acceptedTypeGroups: const [typeGroup]);
+  if (file == null) return null;
+  return (fileName: file.name, bytes: await file.readAsBytes());
+}
+
+final agentImagePickerProvider = Provider<AgentImagePicker>(
+  (ref) => _pickImageFromSystem,
+);
+
 /// 附件上传失败的用户可见短提示（不外露内部标识与实现细节）。
 String agentAttachmentErrorMessage(String? code) => switch (code) {
   'invalid_attachment_size' => '图片超过 15 MiB，请压缩后再试。',
@@ -78,24 +100,22 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
       _composerError = null;
     });
     try {
-      const typeGroup = XTypeGroup(
-        label: 'images',
-        extensions: ['png', 'jpg', 'jpeg', 'webp'],
-        mimeTypes: ['image/png', 'image/jpeg', 'image/webp'],
-      );
-      final file = await openFile(acceptedTypeGroups: const [typeGroup]);
-      if (file == null) return;
-      final mime = agentImageMimeType(file.name);
+      final picked = await ref.read(agentImagePickerProvider)();
+      if (picked == null) return;
+      final mime = agentImageMimeType(picked.fileName);
       if (mime == null) {
         setState(() => _composerError = '只支持 PNG、JPEG、WEBP 图片。');
         return;
       }
-      final bytes = await file.readAsBytes();
       final meta = await ref
           .read(agentRepositoryProvider)
-          .uploadAttachment(fileName: file.name, mimeType: mime, bytes: bytes);
+          .uploadAttachment(
+            fileName: picked.fileName,
+            mimeType: mime,
+            bytes: picked.bytes,
+          );
       if (!mounted) return;
-      setState(() => _pending.add((meta: meta, bytes: bytes)));
+      setState(() => _pending.add((meta: meta, bytes: picked.bytes)));
     } on ApiValidationException catch (e) {
       // 400/413 保留已选图片列表，允许直接重试。
       if (mounted) {

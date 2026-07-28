@@ -9,6 +9,8 @@ import 'dart:typed_data';
 import 'package:finwealth/app/app.dart';
 import 'package:finwealth/app/home_shell.dart';
 import 'package:finwealth/core/types.dart';
+import 'package:finwealth/data/api_mock_repositories.dart'
+    show ApiValidationException;
 import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/repositories.dart';
 import 'package:finwealth/data/view_models.dart';
@@ -53,13 +55,16 @@ class _FakeAgentRepo implements AgentRepository {
     this.messages = const [],
     this.memories = const [],
     this.attachmentFails = false,
+    this.uploadFailure,
   });
 
   final bool configured;
   final List<AgentMessageVm> messages;
   List<AgentMemoryVm> memories;
   final bool attachmentFails;
+  final Object? uploadFailure;
   final List<({String id, AgentMemoryStatus decision})> reviews = [];
+  final List<({String fileName, String mimeType, int size})> uploads = [];
   int attachmentReads = 0;
 
   @override
@@ -125,7 +130,19 @@ class _FakeAgentRepo implements AgentRepository {
     required String fileName,
     required String mimeType,
     required Uint8List bytes,
-  }) => throw UnsupportedError('unused');
+  }) async {
+    uploads.add((fileName: fileName, mimeType: mimeType, size: bytes.length));
+    if (uploadFailure != null) throw uploadFailure!;
+    return AgentAttachmentVm(
+      id: 'att_${uploads.length}',
+      fileName: fileName,
+      mimeType: mimeType,
+      sizeBytes: bytes.length,
+      sha256: 'b' * 64,
+      createdAt: '2026-07-28T00:00:00Z',
+    );
+  }
+
   @override
   Future<AgentRunAcceptedVm> sendMessage(
     Id conversationId, {
@@ -150,10 +167,12 @@ class _FakeAgentRepo implements AgentRepository {
 Widget _scope(
   _FakeAgentRepo repo, {
   List<AiProposalVm> pending = const [],
+  AgentImagePicker? picker,
   required Widget child,
 }) => ProviderScope(
   overrides: [
     agentRepositoryProvider.overrideWithValue(repo),
+    if (picker != null) agentImagePickerProvider.overrideWithValue(picker),
     aiPendingProvider.overrideWith((ref) async => pending),
     overviewProvider.overrideWith(
       (ref) async => const PortfolioOverviewVm(
@@ -171,9 +190,11 @@ Widget _scope(
 Widget _panelHost(
   _FakeAgentRepo repo, {
   List<AiProposalVm> pending = const [],
+  AgentImagePicker? picker,
 }) => _scope(
   repo,
   pending: pending,
+  picker: picker,
   child: MaterialApp.router(
     routerConfig: GoRouter(
       routes: [
@@ -408,6 +429,90 @@ void main() {
       expect(panel.left, greaterThan(railBefore.right));
       expect(panel.width, kAgentRailWidth);
       expect(tester.takeException(), isNull);
+    });
+  });
+
+  group('待发送图片草稿区', () {
+    Future<void> pick(WidgetTester tester) async {
+      await tester.tap(find.byIcon(Icons.image_outlined));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('选图后：缩略图 + 文件名 + 可移除，不显示实现细节', (tester) async {
+      final repo = _FakeAgentRepo();
+      await tester.pumpWidget(
+        _panelHost(
+          repo,
+          picker: () async => (fileName: 'bill.png', bytes: _png),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await pick(tester);
+
+      expect(repo.uploads.single.fileName, 'bill.png');
+      expect(repo.uploads.single.mimeType, 'image/png');
+      expect(find.widgetWithText(Chip, 'bill.png'), findsOneWidget);
+      expect(find.byType(Image), findsOneWidget);
+      // 不外露 Base64 / MIME / 哈希 / 路径。
+      expect(find.textContaining('image/png'), findsNothing);
+      expect(find.textContaining('base64'), findsNothing);
+      expect(find.textContaining('bbbb'), findsNothing);
+
+      await tester.tap(find.byIcon(Icons.cancel));
+      await tester.pumpAndSettle();
+      expect(find.widgetWithText(Chip, 'bill.png'), findsNothing);
+    });
+
+    testWidgets('不支持的扩展名：不上传并给一句中文', (tester) async {
+      final repo = _FakeAgentRepo();
+      await tester.pumpWidget(
+        _panelHost(
+          repo,
+          picker: () async => (fileName: 'bill.heic', bytes: _png),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await pick(tester);
+      expect(repo.uploads, isEmpty);
+      expect(find.text('只支持 PNG、JPEG、WEBP 图片。'), findsOneWidget);
+    });
+
+    testWidgets('413：不加入草稿区，显示可重试的短提示', (tester) async {
+      final repo = _FakeAgentRepo(
+        uploadFailure: ApiValidationException(
+          '/v1/agent/attachments',
+          code: 'invalid_attachment_size',
+        ),
+      );
+      await tester.pumpWidget(
+        _panelHost(
+          repo,
+          picker: () async => (fileName: 'big.png', bytes: _png),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await pick(tester);
+      expect(find.text('图片超过 15 MiB，请压缩后再试。'), findsOneWidget);
+      expect(find.widgetWithText(Chip, 'big.png'), findsNothing);
+      expect(find.textContaining('413'), findsNothing);
+      // 可以直接再选一次。
+      expect(
+        tester
+            .widget<IconButton>(
+              find.widgetWithIcon(IconButton, Icons.image_outlined),
+            )
+            .onPressed,
+        isNotNull,
+      );
+    });
+
+    testWidgets('取消选择：什么都不发生', (tester) async {
+      final repo = _FakeAgentRepo();
+      await tester.pumpWidget(_panelHost(repo, picker: () async => null));
+      await tester.pumpAndSettle();
+      await pick(tester);
+      expect(repo.uploads, isEmpty);
+      expect(find.byType(Chip), findsNothing);
     });
   });
 
