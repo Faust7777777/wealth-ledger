@@ -48,6 +48,7 @@ Android：1 通过；2 ...
 - Agent 登录后能加载生产模型和历史会话；历史 XLSX 显示为文件 chip，没有图片解码空白框。
 - 输入法顶起通过：composer 保持在键盘上方、消息区仍可见、无 overflow；第一次返回隐藏键盘并保留 Agent 页，第二次返回主界面。
 - CSV 草稿附件通过：文件图标、文件名、大小和移除入口均可见，未发送消息；窄屏下 `41 B` 被截为 `4…`，已作为 P1 写入前端修正单。
-- 新发现 P0：会话菜单项虽然在语义树中可点击，但 Android 真触摸只关闭菜单，并可能把事件落到 composer；未能切换会话。任务单：`2026-07-28-claude-agent-session-menu-touch-fix.md`。
+- 会话菜单 P0 已修复并合入：Android 36.1 AVD 上的设备版 integration test 9/9 通过，覆盖真实 overlay 触摸切换会话及消息快照、新建、模型选择、菜单外点击、返回键、输入框不获焦、长列表滚动与窄屏 `41 B` 完整显示。
+- 首次设备测试发现 `testTextInput.isVisible` 不适用于 IntegrationTest binding；集成线只把该断言改为读取设备窗口 `MediaQuery.viewInsets.bottom`，未修改前端功能，复跑全绿。
 - 断线续接的 cursor/正文去重已有自动化测试；本次模拟器进入飞行模式后，既有 SSE TCP 未及时报错，因此没有把真机断线重连误报为通过，仍需在修复包上人工复验。
 - Windows 右栏、自动任务/通知页面及 Android 会话切换仍待最终人工验收。

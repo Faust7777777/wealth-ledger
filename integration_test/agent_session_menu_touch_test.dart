@@ -295,7 +295,13 @@ void main() {
         isFalse,
         reason: '切换会话不应把焦点交给输入框',
       );
-      expect(tester.testTextInput.isVisible, isFalse, reason: '不应弹出键盘');
+      // IntegrationTestWidgetsFlutterBinding 不注册 TestTextInput；用设备窗口
+      // 实际传入的 viewInsets 判断软键盘是否占据了界面。
+      expect(
+        MediaQuery.viewInsetsOf(tester.element(find.byType(TextField))).bottom,
+        0,
+        reason: '不应弹出键盘',
+      );
     });
 
     testWidgets('点菜单外区域只关闭菜单，不切换会话', (tester) async {
