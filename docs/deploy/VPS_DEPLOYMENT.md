@@ -52,6 +52,19 @@ model configuration with `0600` permissions, and deletes the input file without
 printing any value. Start the Agent and restart the Rust gateway only after this
 configuration step succeeds.
 
+After the service is configured, run the real-model Linux document smoke as
+root with `/etc/finwealth/agent.env` loaded:
+
+```bash
+set -a; . /etc/finwealth/agent.env; set +a
+python3 tools/agent_vps_document_smoke.py
+```
+
+It generates synthetic PDF/XLSX files, uploads them through the authenticated
+sidecar surface, and requires the model to recover file-only markers using
+`pdftotext` and Python/ZIP inside bubblewrap. It does not print model responses
+or credentials and does not write the ledger.
+
 Pi provider credentials and model configuration live under
 `/var/lib/finwealth-agent/pi/` and must remain owned by `finwealth` with mode
 `0700`/`0600`. The service removes the Rust internal token from its process
