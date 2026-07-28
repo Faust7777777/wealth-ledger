@@ -74,6 +74,8 @@ class _FakeAgentRepo implements AgentRepository {
   final List<({String id, AgentMemoryStatus decision})> reviews = [];
   final List<({String fileName, String mimeType, int size})> uploads = [];
   int attachmentReads = 0;
+  int metaReads = 0;
+  AgentAttachmentVm? attachmentMeta;
 
   @override
   Future<AgentStatusVm> getStatus() async =>
@@ -131,8 +133,20 @@ class _FakeAgentRepo implements AgentRepository {
   }
 
   @override
-  Future<AgentAttachmentVm> getAttachment(Id attachmentId) =>
-      throw UnsupportedError('unused');
+  Future<AgentAttachmentVm> getAttachment(Id attachmentId) async {
+    metaReads += 1;
+    if (attachmentFails) throw Exception('offline');
+    return attachmentMeta ??
+        AgentAttachmentVm(
+          id: attachmentId,
+          fileName: 'bill.png',
+          mimeType: 'image/png',
+          sizeBytes: _png.length,
+          sha256: 'b' * 64,
+          createdAt: '2026-07-28T00:00:00Z',
+        );
+  }
+
   @override
   Future<AgentAttachmentVm> uploadAttachment({
     required String fileName,
@@ -212,13 +226,13 @@ class _FakeAgentRepo implements AgentRepository {
 Widget _scope(
   _FakeAgentRepo repo, {
   List<AiProposalVm> pending = const [],
-  AgentImagePicker? picker,
+  AgentFilePicker? picker,
   VoidCallback? onHoldings,
   required Widget child,
 }) => ProviderScope(
   overrides: [
     agentRepositoryProvider.overrideWithValue(repo),
-    if (picker != null) agentImagePickerProvider.overrideWithValue(picker),
+    if (picker != null) agentAttachmentPickerProvider.overrideWithValue(picker),
     aiPendingProvider.overrideWith((ref) async => pending),
     overviewProvider.overrideWith(
       (ref) async => const PortfolioOverviewVm(
@@ -259,7 +273,7 @@ Widget _scope(
 Widget _panelHost(
   _FakeAgentRepo repo, {
   List<AiProposalVm> pending = const [],
-  AgentImagePicker? picker,
+  AgentFilePicker? picker,
   VoidCallback? onHoldings,
 }) => _scope(
   repo,
@@ -300,30 +314,6 @@ class _HoldingsWatcher extends ConsumerWidget {
 }
 
 void main() {
-  group('附件格式与错误文案', () {
-    test('只接受 PNG/JPEG/WEBP，HEIC 不可选', () {
-      expect(agentImageMimeType('a.png'), 'image/png');
-      expect(agentImageMimeType('a.JPG'), 'image/jpeg');
-      expect(agentImageMimeType('a.webp'), 'image/webp');
-      expect(agentImageMimeType('a.heic'), isNull);
-      expect(kAgentImageMimeTypes.containsValue('image/heic'), isFalse);
-    });
-
-    test('附件失败只给一句中文，不外露内部标识', () {
-      expect(
-        agentAttachmentErrorMessage('invalid_attachment_size'),
-        '图片超过 15 MiB，请压缩后再试。',
-      );
-      expect(
-        agentAttachmentErrorMessage('invalid_attachment_type'),
-        '只支持 PNG、JPEG、WEBP 图片。',
-      );
-      final fallback = agentAttachmentErrorMessage('some_internal_code');
-      expect(fallback, '图片未通过校验，请重新选择。');
-      expect(RegExp(r'[a-z_]{6,}').hasMatch(fallback), isFalse);
-    });
-  });
-
   group('面板', () {
     testWidgets('无模型：输入区不可发送并给出简短说明', (tester) async {
       await tester.pumpWidget(_panelHost(_FakeAgentRepo(configured: false)));
@@ -389,33 +379,6 @@ void main() {
       await tester.tap(action);
       await tester.pumpAndSettle();
       expect(find.text('review-page'), findsOneWidget);
-    });
-
-    testWidgets('历史图片从附件接口恢复，不依赖本地字节', (tester) async {
-      final repo = _FakeAgentRepo(
-        messages: [
-          _message(attachmentIds: const ['att_1']),
-        ],
-      );
-      await tester.pumpWidget(_panelHost(repo));
-      await tester.pumpAndSettle();
-      expect(repo.attachmentReads, 1);
-      expect(find.byType(Image), findsOneWidget);
-    });
-
-    testWidgets('图片回读失败：给重试而不是空白', (tester) async {
-      final repo = _FakeAgentRepo(
-        messages: [
-          _message(attachmentIds: const ['att_1']),
-        ],
-        attachmentFails: true,
-      );
-      await tester.pumpWidget(_panelHost(repo));
-      await tester.pumpAndSettle();
-      expect(find.byIcon(Icons.refresh), findsOneWidget);
-      await tester.tap(find.byIcon(Icons.refresh));
-      await tester.pumpAndSettle();
-      expect(repo.attachmentReads, 2);
     });
   });
 
@@ -520,13 +483,67 @@ void main() {
     });
   });
 
-  group('待发送图片草稿区', () {
+  group('待发送附件草稿区', () {
     Future<void> pick(WidgetTester tester) async {
-      await tester.tap(find.byIcon(Icons.image_outlined));
+      await tester.tap(find.byIcon(Icons.attach_file));
       await tester.pumpAndSettle();
     }
 
-    testWidgets('选图后：缩略图 + 文件名 + 可移除，不显示实现细节', (tester) async {
+    test('扩展名 → 准确 MIME；白名单外返回 null', () {
+      expect(agentAttachmentMimeType('a.png'), 'image/png');
+      expect(agentAttachmentMimeType('a.JPG'), 'image/jpeg');
+      expect(agentAttachmentMimeType('a.webp'), 'image/webp');
+      expect(agentAttachmentMimeType('a.txt'), 'text/plain');
+      expect(agentAttachmentMimeType('a.csv'), 'text/csv');
+      expect(agentAttachmentMimeType('a.pdf'), 'application/pdf');
+      expect(
+        agentAttachmentMimeType('a.xlsx'),
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      );
+      expect(agentAttachmentMimeType('a.zip'), 'application/zip');
+      expect(agentAttachmentMimeType('a.heic'), isNull);
+      expect(agentAttachmentMimeType('a.docx'), isNull);
+      expect(agentAttachmentMimeType('a'), isNull);
+      expect(agentMimeIsImage('image/png'), isTrue);
+      expect(agentMimeIsImage('application/pdf'), isFalse);
+    });
+
+    test('失败文案：413 / 格式不符 / UTF-8 不合法各一句，不外露内部标识', () {
+      expect(
+        agentAttachmentErrorMessage('invalid_attachment_size'),
+        '文件超过 15 MiB，请压缩后再试。',
+      );
+      expect(
+        agentAttachmentErrorMessage('unsupported_attachment_type'),
+        '只支持图片、TXT、CSV、PDF、XLSX 与 ZIP。',
+      );
+      expect(
+        agentAttachmentErrorMessage(
+          'attachment_mime_mismatch',
+          fileName: 'bill.pdf',
+        ),
+        '文件内容与扩展名不一致，请重新选择。',
+      );
+      expect(
+        agentAttachmentErrorMessage(
+          'attachment_mime_mismatch',
+          fileName: 'bill.csv',
+        ),
+        '文本内容不是有效的 UTF-8，请另存后再试。',
+      );
+      for (final code in [
+        'invalid_attachment_size',
+        'attachment_mime_mismatch',
+        null,
+      ]) {
+        expect(
+          RegExp(r'[a-z_]{6,}').hasMatch(agentAttachmentErrorMessage(code)),
+          isFalse,
+        );
+      }
+    });
+
+    testWidgets('图片：缩略图 chip，可移除，不显示实现细节', (tester) async {
       final repo = _FakeAgentRepo();
       await tester.pumpWidget(
         _panelHost(
@@ -541,7 +558,6 @@ void main() {
       expect(repo.uploads.single.mimeType, 'image/png');
       expect(find.widgetWithText(Chip, 'bill.png'), findsOneWidget);
       expect(find.byType(Image), findsOneWidget);
-      // 不外露 Base64 / MIME / 哈希 / 路径。
       expect(find.textContaining('image/png'), findsNothing);
       expect(find.textContaining('base64'), findsNothing);
       expect(find.textContaining('bbbb'), findsNothing);
@@ -549,6 +565,50 @@ void main() {
       await tester.tap(find.byIcon(Icons.cancel));
       await tester.pumpAndSettle();
       expect(find.widgetWithText(Chip, 'bill.png'), findsNothing);
+    });
+
+    testWidgets('文档：类型图标 + 文件名 + 大小的紧凑 chip，不读正文', (tester) async {
+      final repo = _FakeAgentRepo();
+      final csv = Uint8List.fromList(
+        utf8.encode('date,amount\n2026-07-28,18.00\n'),
+      );
+      await tester.pumpWidget(
+        _panelHost(
+          repo,
+          picker: () async => (fileName: 'wechat.csv', bytes: csv),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await pick(tester);
+
+      expect(repo.uploads.single.mimeType, 'text/csv');
+      expect(find.byIcon(Icons.grid_on_outlined), findsOneWidget);
+      expect(
+        find.textContaining('wechat.csv · ${agentFileSize(csv.length)}'),
+        findsOneWidget,
+      );
+      // 不把文件正文读出来展示，也不宣称已解析。
+      expect(find.textContaining('date,amount'), findsNothing);
+      expect(find.textContaining('已解析'), findsNothing);
+      expect(find.byType(Image), findsNothing);
+    });
+
+    testWidgets('PDF / XLSX / ZIP 各自的类型图标', (tester) async {
+      for (final (name, icon) in [
+        ('bill.pdf', Icons.picture_as_pdf_outlined),
+        ('book.xlsx', Icons.table_chart_outlined),
+        ('pack.zip', Icons.folder_zip_outlined),
+      ]) {
+        await tester.pumpWidget(
+          _panelHost(
+            _FakeAgentRepo(),
+            picker: () async => (fileName: name, bytes: _png),
+          ),
+        );
+        await tester.pumpAndSettle();
+        await pick(tester);
+        expect(find.byIcon(icon), findsOneWidget, reason: name);
+      }
     });
 
     testWidgets('不支持的扩展名：不上传并给一句中文', (tester) async {
@@ -562,7 +622,7 @@ void main() {
       await tester.pumpAndSettle();
       await pick(tester);
       expect(repo.uploads, isEmpty);
-      expect(find.text('只支持 PNG、JPEG、WEBP 图片。'), findsOneWidget);
+      expect(find.text('只支持图片、TXT、CSV、PDF、XLSX 与 ZIP。'), findsOneWidget);
     });
 
     testWidgets('413：不加入草稿区，显示可重试的短提示', (tester) async {
@@ -575,23 +635,40 @@ void main() {
       await tester.pumpWidget(
         _panelHost(
           repo,
-          picker: () async => (fileName: 'big.png', bytes: _png),
+          picker: () async => (fileName: 'big.pdf', bytes: _png),
         ),
       );
       await tester.pumpAndSettle();
       await pick(tester);
-      expect(find.text('图片超过 15 MiB，请压缩后再试。'), findsOneWidget);
-      expect(find.widgetWithText(Chip, 'big.png'), findsNothing);
+      expect(find.text('文件超过 15 MiB，请压缩后再试。'), findsOneWidget);
+      expect(find.widgetWithText(Chip, 'big.pdf'), findsNothing);
       expect(find.textContaining('413'), findsNothing);
-      // 可以直接再选一次。
       expect(
         tester
             .widget<IconButton>(
-              find.widgetWithIcon(IconButton, Icons.image_outlined),
+              find.widgetWithIcon(IconButton, Icons.attach_file),
             )
             .onPressed,
         isNotNull,
       );
+    });
+
+    testWidgets('UTF-8 不合法：按所选文本文件给出对应提示', (tester) async {
+      final repo = _FakeAgentRepo(
+        uploadFailure: ApiValidationException(
+          '/v1/agent/attachments',
+          code: 'attachment_mime_mismatch',
+        ),
+      );
+      await tester.pumpWidget(
+        _panelHost(
+          repo,
+          picker: () async => (fileName: 'broken.csv', bytes: _png),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await pick(tester);
+      expect(find.text('文本内容不是有效的 UTF-8，请另存后再试。'), findsOneWidget);
     });
 
     testWidgets('取消选择：什么都不发生', (tester) async {
@@ -604,11 +681,66 @@ void main() {
     });
   });
 
+  group('历史附件', () {
+    testWidgets('图片：先读元数据再解码字节', (tester) async {
+      final repo = _FakeAgentRepo(
+        messages: [
+          _message(attachmentIds: const ['att_1']),
+        ],
+      );
+      await tester.pumpWidget(_panelHost(repo));
+      await tester.pumpAndSettle();
+      expect(repo.metaReads, 1);
+      expect(repo.attachmentReads, 1);
+      expect(find.byType(Image), findsOneWidget);
+    });
+
+    testWidgets('文档：只显示文件 chip，绝不去取字节', (tester) async {
+      final repo =
+          _FakeAgentRepo(
+              messages: [
+                _message(attachmentIds: const ['att_1']),
+              ],
+            )
+            ..attachmentMeta = const AgentAttachmentVm(
+              id: 'att_1',
+              fileName: 'statement.pdf',
+              mimeType: 'application/pdf',
+              sizeBytes: 240000,
+              sha256: 'c',
+              createdAt: '2026-07-28T00:00:00Z',
+            );
+      await tester.pumpWidget(_panelHost(repo));
+      await tester.pumpAndSettle();
+      expect(repo.metaReads, 1);
+      expect(repo.attachmentReads, 0, reason: 'PDF 字节不该交给图片解码器');
+      expect(find.byIcon(Icons.picture_as_pdf_outlined), findsOneWidget);
+      expect(find.textContaining('statement.pdf'), findsOneWidget);
+      expect(find.byType(Image), findsNothing);
+    });
+
+    testWidgets('元数据失败：给重试而不是空白', (tester) async {
+      final repo = _FakeAgentRepo(
+        messages: [
+          _message(attachmentIds: const ['att_1']),
+        ],
+        attachmentFails: true,
+      );
+      await tester.pumpWidget(_panelHost(repo));
+      await tester.pumpAndSettle();
+      expect(find.byIcon(Icons.refresh), findsOneWidget);
+      await tester.tap(find.byIcon(Icons.refresh));
+      await tester.pumpAndSettle();
+      expect(repo.metaReads, 2);
+    });
+  });
+
   group('报价候选', () {
     AgentQuoteCandidateVm instrumentCandidate({
+      String id = 'qc_1',
       AgentQuoteCandidateStatus status = AgentQuoteCandidateStatus.suggested,
     }) => AgentQuoteCandidateVm(
-      id: 'qc_1',
+      id: id,
       kind: AgentQuoteCandidateKind.instrument,
       instrumentId: 'inst_btc',
       price: '61234.50',
@@ -635,6 +767,11 @@ void main() {
       updatedAt: '2026-07-28T09:31:00Z',
     );
 
+    Future<void> openSheet(WidgetTester tester) async {
+      await tester.tap(find.textContaining('报价建议'));
+      await tester.pumpAndSettle();
+    }
+
     test('主体、数值与来源域名的纯函数映射', () {
       const instruments = [
         InstrumentVm(
@@ -656,20 +793,24 @@ void main() {
         agentSourceHost('https://www.coingecko.com/en/coins/bitcoin'),
         'www.coingecko.com',
       );
-      // 不外露内部 ID。
       expect(
         agentQuoteSubject(instrumentCandidate(), const []),
         isNot(contains('inst_')),
       );
     });
 
-    testWidgets('只对 suggested 显示紧凑卡片，展示数值/时间/来源', (tester) async {
+    testWidgets('外层只有一条紧凑入口；卡片在可滚动 sheet 里', (tester) async {
       final repo = _FakeAgentRepo(
         candidates: [instrumentCandidate(), fxCandidate],
       );
       await tester.pumpWidget(_panelHost(repo));
       await tester.pumpAndSettle();
-      expect(find.text('报价建议'), findsNWidgets(2));
+      // 外层不直接展开候选。
+      expect(find.text('报价建议 2'), findsOneWidget);
+      expect(find.text('Bitcoin · BTC'), findsNothing);
+      expect(find.byType(Card), findsNothing);
+
+      await openSheet(tester);
       expect(find.text('Bitcoin · BTC'), findsOneWidget);
       expect(find.text('61234.50 USDT'), findsOneWidget);
       expect(find.text('USD / CNY'), findsOneWidget);
@@ -686,7 +827,7 @@ void main() {
       expect(find.textContaining('可能不准'), findsNothing);
     });
 
-    testWidgets('已处理的候选不再出现', (tester) async {
+    testWidgets('已处理的候选不进入入口计数', (tester) async {
       await tester.pumpWidget(
         _panelHost(
           _FakeAgentRepo(
@@ -697,7 +838,7 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
-      expect(find.text('报价建议'), findsNothing);
+      expect(find.textContaining('报价建议'), findsNothing);
     });
 
     testWidgets('采用：发 apply、刷新估值视图、候选消失', (tester) async {
@@ -708,6 +849,7 @@ void main() {
       );
       await tester.pumpAndSettle();
       final before = holdingBuilds;
+      await openSheet(tester);
       await tester.tap(find.text('采用'));
       await tester.pumpAndSettle();
       expect(
@@ -715,7 +857,7 @@ void main() {
         AgentQuoteCandidateStatus.applied,
       );
       expect(find.text('已采用这条报价'), findsOneWidget);
-      expect(find.text('报价建议'), findsNothing);
+      expect(find.textContaining('报价建议'), findsNothing);
       expect(holdingBuilds, greaterThan(before), reason: '采用后须刷新报价派生视图');
     });
 
@@ -727,13 +869,14 @@ void main() {
       );
       await tester.pumpAndSettle();
       final before = holdingBuilds;
+      await openSheet(tester);
       await tester.tap(find.text('忽略'));
       await tester.pumpAndSettle();
       expect(
         repo.quoteReviews.single.decision,
         AgentQuoteCandidateStatus.rejected,
       );
-      expect(find.text('报价建议'), findsNothing);
+      expect(find.textContaining('报价建议'), findsNothing);
       expect(holdingBuilds, before, reason: '忽略永不写入，不该刷新估值');
       expect(find.text('已采用这条报价'), findsNothing);
     });
@@ -745,10 +888,11 @@ void main() {
       );
       await tester.pumpWidget(_panelHost(repo));
       await tester.pumpAndSettle();
+      await openSheet(tester);
       await tester.tap(find.text('采用'));
       await tester.pumpAndSettle();
       expect(find.text('操作失败，请重试'), findsOneWidget);
-      expect(find.text('报价建议'), findsOneWidget);
+      expect(find.text('Bitcoin · BTC'), findsOneWidget);
       expect(find.textContaining('boom'), findsNothing);
     });
 
@@ -762,6 +906,7 @@ void main() {
       );
       await tester.pumpWidget(_panelHost(repo));
       await tester.pumpAndSettle();
+      await openSheet(tester);
       await tester.tap(find.text('采用'));
       await tester.pumpAndSettle();
       expect(find.text('这条建议已被处理，已重新加载'), findsOneWidget);
@@ -776,6 +921,7 @@ void main() {
       );
       await tester.pumpWidget(_panelHost(repo));
       await tester.pumpAndSettle();
+      await openSheet(tester);
       await tester.tap(find.text('采用'));
       await tester.pump();
       await tester.tap(find.text('采用'), warnIfMissed: false);
@@ -784,6 +930,48 @@ void main() {
       gate.complete();
       await tester.pumpAndSettle();
       expect(repo.quoteReviews, hasLength(1));
+    });
+
+    testWidgets('10 条候选在窄屏与桌面矮窗口下都不挤掉聊天区', (tester) async {
+      final many = [
+        for (var i = 0; i < 10; i += 1) instrumentCandidate(id: 'qc_$i'),
+      ];
+      for (final size in const [Size(360, 560), Size(1200, 520)]) {
+        tester.view.physicalSize = size;
+        tester.view.devicePixelRatio = 1.0;
+        addTearDown(tester.view.reset);
+        await tester.pumpWidget(
+          _panelHost(
+            _FakeAgentRepo(
+              candidates: many,
+              messages: [_message(text: '这是会话里的一条历史消息')],
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull, reason: '入口态 ${size.width}');
+
+        // 外层只有一条入口，聊天消息仍然可见且有可用高度。
+        expect(find.text('报价建议 10'), findsOneWidget);
+        expect(find.text('这是会话里的一条历史消息'), findsOneWidget);
+        final list = tester.getRect(find.byType(ListView).first);
+        expect(
+          list.height,
+          greaterThan(120),
+          reason: '聊天区高度被挤压：${list.height} @ ${size.width}',
+        );
+
+        await openSheet(tester);
+        expect(tester.takeException(), isNull, reason: 'sheet ${size.width}');
+        // sheet 有高度上限且可滚动，不会一路铺开 10 张卡。
+        final sheet = tester.getRect(find.byType(AgentQuoteCandidateSheet));
+        expect(sheet.height, lessThanOrEqualTo(size.height));
+        await tester.drag(find.byType(ListView).last, const Offset(0, -200));
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull, reason: '滚动 ${size.width}');
+        await tester.binding.handlePopRoute();
+        await tester.pumpAndSettle();
+      }
     });
   });
 

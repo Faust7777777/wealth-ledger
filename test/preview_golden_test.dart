@@ -1415,11 +1415,13 @@ void main() {
     List<AgentMessageVm> messages = const [],
     List<AgentMemoryVm> memories = const [],
     List<AgentEventVm> events = const [],
-    AgentImagePicker? picker,
+    AgentFilePicker? picker,
     List<AgentQuoteCandidateVm> candidates = const [],
+    AgentAttachmentVm? attachmentMeta,
   }) => ProviderScope(
     overrides: [
-      if (picker != null) agentImagePickerProvider.overrideWithValue(picker),
+      if (picker != null)
+        agentAttachmentPickerProvider.overrideWithValue(picker),
       capabilitiesProvider.overrideWith((ref) async => tradeCaps),
       accountsProvider.overrideWith((ref) async => const <AccountVm>[]),
       aiPendingProvider.overrideWith((ref) async => const <AiProposalVm>[]),
@@ -1442,11 +1444,13 @@ void main() {
           frames: events,
           conversations: const [agentConversation],
           candidates: candidates,
+          attachmentMeta: attachmentMeta,
         ),
       ),
     ],
     child: MaterialApp(
       theme: theme,
+      debugShowCheckedModeBanner: false,
       home: const Scaffold(body: AgentPanel()),
     ),
   );
@@ -1543,7 +1547,7 @@ void main() {
         ),
       );
       await _settleEntrance(tester);
-      await tester.tap(find.byIcon(Icons.image_outlined));
+      await tester.tap(find.byIcon(Icons.attach_file));
       await tester.pumpAndSettle();
       await decodeImages(tester);
       await expectLater(
@@ -1582,11 +1586,77 @@ void main() {
         ),
       );
       await _settleEntrance(tester);
+      await tester.tap(find.textContaining('报价建议'));
+      await tester.pumpAndSettle();
       await expectLater(
-        find.byType(AgentPanel),
+        find.byType(MaterialApp),
         matchesGoldenFile('goldens/agent_panel_quote_candidate_$name.png'),
       );
     });
+  }
+
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('agent panel draft document - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(400, 560));
+      await tester.pumpWidget(
+        agentHost(
+          theme,
+          picker: () async => (
+            fileName: 'wechat-2026-07.csv',
+            bytes: Uint8List.fromList(
+              utf8.encode('date,amount\n2026-07-28,18.00\n'),
+            ),
+          ),
+        ),
+      );
+      await _settleEntrance(tester);
+      await tester.tap(find.byIcon(Icons.attach_file));
+      await tester.pumpAndSettle();
+      await expectLater(
+        find.byType(AgentPanel),
+        matchesGoldenFile('goldens/agent_panel_draft_document_$name.png'),
+      );
+    });
+
+    testWidgets(
+      'agent panel history document - $name',
+      skip: !_previewEnabled,
+      (tester) async {
+        await sized(tester, const Size(400, 560));
+        await tester.pumpWidget(
+          agentHost(
+            theme,
+            messages: [
+              agentMessage(
+                'm1',
+                AgentMessageRole.user,
+                '这份对账单帮我看看',
+                attachmentIds: const ['att_pdf'],
+              ),
+              agentMessage('m2', AgentMessageRole.assistant, '我已经拿到这份文件了。'),
+            ],
+            attachmentMeta: const AgentAttachmentVm(
+              id: 'att_pdf',
+              fileName: 'statement-2026-07.pdf',
+              mimeType: 'application/pdf',
+              sizeBytes: 243712,
+              sha256: 'e',
+              createdAt: '2026-07-28T00:00:00Z',
+            ),
+          ),
+        );
+        await _settleEntrance(tester);
+        await expectLater(
+          find.byType(AgentPanel),
+          matchesGoldenFile('goldens/agent_panel_history_document_$name.png'),
+        );
+      },
+    );
   }
 
   testWidgets('agent panel unconfigured - dark', skip: !_previewEnabled, (
@@ -1652,6 +1722,7 @@ class _PreviewAgentRepo implements AgentRepository {
     required this.frames,
     required this.conversations,
     this.candidates = const [],
+    this.attachmentMeta,
   });
 
   final bool configured;
@@ -1660,6 +1731,7 @@ class _PreviewAgentRepo implements AgentRepository {
   final List<AgentEventVm> frames;
   final List<AgentConversationVm> conversations;
   final List<AgentQuoteCandidateVm> candidates;
+  final AgentAttachmentVm? attachmentMeta;
 
   @override
   Future<AgentStatusVm> getStatus() async =>
@@ -1696,8 +1768,16 @@ class _PreviewAgentRepo implements AgentRepository {
     'oXogJCQkVA+EhISE6oGQkNBjFzYGUPE+ORsjAAAAAElFTkSuQmCC',
   );
   @override
-  Future<AgentAttachmentVm> getAttachment(Id attachmentId) =>
-      throw UnsupportedError('preview');
+  Future<AgentAttachmentVm> getAttachment(Id attachmentId) async =>
+      attachmentMeta ??
+      AgentAttachmentVm(
+        id: attachmentId,
+        fileName: 'bill.png',
+        mimeType: 'image/png',
+        sizeBytes: 4096,
+        sha256: 'd' * 64,
+        createdAt: '2026-07-28T00:00:00Z',
+      );
   @override
   Future<AgentAttachmentVm> uploadAttachment({
     required String fileName,

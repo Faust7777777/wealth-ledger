@@ -15,6 +15,30 @@ final Uint8List _png = base64Decode(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
 );
 
+/// 最小但合法的工作区文档样本（服务端会做文件头/结构校验）。
+final Uint8List _csv = Uint8List.fromList(
+  utf8.encode('date,amount\n2026-07-28,18.00\n'),
+);
+final Uint8List _txt = Uint8List.fromList(utf8.encode('账单备注：午餐 18 元\n'));
+final Uint8List _pdf = base64Decode(
+  'JVBERi0xLjQKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZz4+ZW5kb2JqCnRyYWls'
+  'ZXI8PC9Sb290IDEgMCBSPj4KJSVFT0YK',
+);
+final Uint8List _zip = base64Decode(
+  'UEsDBBQAAAAIALNr/Fw1CU0iEQAAAA8AAAAJAAAAbm90ZXMudHh0y0jNyclX'
+  'SCvKz1WoyizgAgBQSwECFAAUAAAACACza/xcNQlNIhEAAAAPAAAACQAAAAAA'
+  'AAAAAAAAgAEAAAAAbm90ZXMudHh0UEsFBgAAAAABAAEANwAAADgAAAAAAA==',
+);
+final Uint8List _xlsx = base64Decode(
+  'UEsDBBQAAAAIALNr/FzuR1hmHwAAAB0AAAATAAAAW0NvbnRlbnRfVHlwZXNd'
+  'LnhtbLOxr8jNUShLLSrOzM+zVTLUM1Cyt7MJqSxILda3AwBQSwMEFAAAAAgA'
+  's2v8XGU7KJsiAAAAIAAAAA8AAAB4bC93b3JrYm9vay54bWyzsa/IzVEoSy0q'
+  'zszPs1Uy1DNQsrezKc8vyk7Kz8/WtwMAUEsBAhQAFAAAAAgAs2v8XO5HWGYf'
+  'AAAAHQAAABMAAAAAAAAAAAAAAIABAAAAAFtDb250ZW50X1R5cGVzXS54bWxQ'
+  'SwECFAAUAAAACACza/xcZTsomyIAAAAgAAAADwAAAAAAAAAAAAAAgAFQAAAA'
+  'eGwvd29ya2Jvb2sueG1sUEsFBgAAAAACAAIAfgAAAJ8AAAAAAA==',
+);
+
 void main() {
   test(
     'agent proxy, conversations and attachments work through the Rust origin',
@@ -65,6 +89,47 @@ void main() {
       final content = await repo.getAttachmentContent(attachment.id);
       expect(content, _png, reason: '原图回读必须与上传字节一致');
 
+      // —— 工作区文档：CSV / TXT / PDF / XLSX / ZIP 上传后原样回读 ——
+      for (final (fileName, mimeType, bytes) in [
+        ('wechat.csv', 'text/csv', _csv),
+        ('note.txt', 'text/plain', _txt),
+        ('statement.pdf', 'application/pdf', _pdf),
+        (
+          'book.xlsx',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          _xlsx,
+        ),
+        ('pack.zip', 'application/zip', _zip),
+      ]) {
+        final doc = await repo.uploadAttachment(
+          fileName: fileName,
+          mimeType: mimeType,
+          bytes: bytes,
+        );
+        expect(doc.mimeType, mimeType, reason: fileName);
+        expect(doc.sizeBytes, bytes.length, reason: fileName);
+        expect(
+          await repo.getAttachmentContent(doc.id),
+          bytes,
+          reason: '$fileName 回读字节必须与上传一致',
+        );
+        // 元数据不含服务端存储路径。
+        final meta = await repo.getAttachment(doc.id);
+        expect(meta.fileName, fileName);
+        expect(meta.sha256, doc.sha256);
+      }
+
+      // MIME 与内容不符会被拒绝（这里用 PNG 字节冒充 PDF）。
+      await expectLater(
+        repo.uploadAttachment(
+          fileName: 'fake.pdf',
+          mimeType: 'application/pdf',
+          bytes: _png,
+        ),
+        throwsA(isA<Exception>()),
+      );
+
+      // configured=false 时不声称模型已经读取内容：发送直接 fail-closed。
       // —— 无模型：发送消息 fail-closed 为 503，不伪造回复 ——
       await expectLater(
         repo.sendMessage(created.id, text: '整理这张账单'),
