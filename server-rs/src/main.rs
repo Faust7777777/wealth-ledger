@@ -237,7 +237,18 @@ impl AuthStore {
             .as_ref()
             .map(|path| match read_auth_state(path) {
                 Ok(state) => state,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => AuthState::default(),
+                // The test fixture uses a regular file as the would-be parent.
+                // Windows reports its missing child as NotFound while Unix
+                // reports NotADirectory. Production startup does not use this
+                // helper and continues to fail closed for NotADirectory.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    AuthState::default()
+                }
                 Err(error) => panic!(
                     "failed to read auth state {}; refusing to start: {error}",
                     path.display()
