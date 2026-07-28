@@ -69,6 +69,6 @@
 - PDF、CSV、XLSX、ZIP 与 TXT 均原样上传到 Agent 工作区。PDF/XLSX 的格式解码现在由 sidecar 确定性完成，语义理解仍由模型完成；没有固定账单字段 parser。
 - 网页搜索、候选生成和“建议不改变权威估值”已在生产真实模型验证；不同网站的长期可用性仍取决于外部站点。
 - App 内自动任务、通知和周期模型报告的前后端均已合入；系统级 push、插件提议/审批/安装不在当前用户需求范围，尚未实现。
-- Android 36.1 AVD 已完成生产连接、过期会话五态、重新登录、主账本、历史 XLSX chip、输入法 resize、返回键与 CSV 草稿附件的真实交互验收。最新验收 APK 为 `dist/finwealth-1.0.0+1-20260728-173249-android-server-client-debug.apk`（SHA-256 `b848208f86428592c332b853338d3b23825e7ac314d3a9d2325d99e5db3febaa`）。
+- Android 36.1 AVD 已完成生产连接、过期会话五态、重新登录、主账本、历史 XLSX chip、输入法 resize、返回键与 CSV 草稿附件的真实交互验收。最终 APK 为 `dist/finwealth-1.0.0+1-20260728-194850-android-server-client-debug.apk`（SHA-256 `4edba008b27cd98da961154ebacf96fd9d100b9e82ff9338d890dc81785151c3`）。
 - Android 会话菜单发布阻断已由 `fix/agent-session-menu-touch@24142fb` 修复并合入。Android 36.1 AVD 设备版 integration test 9/9 通过：真实 overlay 触摸能够切换会话及其快照，菜单事件不进入 composer，返回键、新建、模型选择、长列表和窄屏 `41 B` 均通过。
 - 断线 cursor 续接和正文去重已有专项自动化；本次 AVD 飞行模式没有让既有 SSE TCP 及时失败，故真机断线/恢复仍未验收通过。Windows 右栏、自动任务/通知页面也仍待最终人工目验。

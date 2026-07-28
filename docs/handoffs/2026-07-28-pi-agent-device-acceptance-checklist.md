@@ -7,8 +7,8 @@
 ## 使用产物
 
 - Windows：`dist/finwealth-1.0.0+1-20260728-163344-windows-server-client-x64.zip`
-- Android：`dist/finwealth-1.0.0+1-20260728-173249-android-server-client-debug.apk`
-  - SHA-256：`b848208f86428592c332b853338d3b23825e7ac314d3a9d2325d99e5db3febaa`
+- Android：`dist/finwealth-1.0.0+1-20260728-194850-android-server-client-debug.apk`
+  - SHA-256：`4edba008b27cd98da961154ebacf96fd9d100b9e82ff9338d890dc81785151c3`
 - 服务器地址：`https://wuwaidut.com`
 
 ## Windows
@@ -50,5 +50,6 @@ Android：1 通过；2 ...
 - CSV 草稿附件通过：文件图标、文件名、大小和移除入口均可见，未发送消息；窄屏下 `41 B` 被截为 `4…`，已作为 P1 写入前端修正单。
 - 会话菜单 P0 已修复并合入：Android 36.1 AVD 上的设备版 integration test 9/9 通过，覆盖真实 overlay 触摸切换会话及消息快照、新建、模型选择、菜单外点击、返回键、输入框不获焦、长列表滚动与窄屏 `41 B` 完整显示。
 - 首次设备测试发现 `testTextInput.isVisible` 不适用于 IntegrationTest binding；集成线只把该断言改为读取设备窗口 `MediaQuery.viewInsets.bottom`，未修改前端功能，复跑全绿。
+- 从干净集成 HEAD 重建并安装最终 APK，运行时连接 `https://wuwaidut.com` 成功；无会话时 Agent 仍只显示“需要登录 / 去登录”，没有误报模型未配置、空会话或断线。
 - 断线续接的 cursor/正文去重已有自动化测试；本次模拟器进入飞行模式后，既有 SSE TCP 未及时报错，因此没有把真机断线重连误报为通过，仍需在修复包上人工复验。
 - Windows 右栏、自动任务/通知页面及 Android 会话切换仍待最终人工验收。
