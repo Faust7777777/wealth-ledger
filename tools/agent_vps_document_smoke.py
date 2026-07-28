@@ -170,6 +170,32 @@ def run_event_summary(conversation_id: str, run_id: str) -> list[str]:
     return result
 
 
+def session_tool_diagnostic(marker: str) -> str:
+    state_dir = Path(os.environ.get("FINWEALTH_AGENT_STATE_DIR", "/var/lib/finwealth-agent"))
+    sessions = sorted((state_dir / "users" / "usr_owner" / "sessions").glob("*.jsonl"))
+    if not sessions:
+        return "session=false"
+    command_uses_pdftotext = False
+    command_uses_python = False
+    tool_result_has_marker = False
+    for line in sessions[-1].read_text(encoding="utf-8").splitlines():
+        try:
+            message = json.loads(line).get("message", {})
+        except json.JSONDecodeError:
+            continue
+        for part in message.get("content", []):
+            if message.get("role") == "assistant" and part.get("type") == "toolCall":
+                command = part.get("arguments", {}).get("command", "")
+                command_uses_pdftotext |= "pdftotext" in command
+                command_uses_python |= "python" in command
+            if message.get("role") == "toolResult" and part.get("type") == "text":
+                tool_result_has_marker |= marker in part.get("text", "")
+    return (
+        f"pdftotext={command_uses_pdftotext},python={command_uses_python},"
+        f"toolMarker={tool_result_has_marker}"
+    )
+
+
 def run_document(file_path: Path, mime_type: str, marker: str, instructions: str) -> None:
     nonce = secrets.token_hex(8)
     conversation = request(
@@ -211,7 +237,10 @@ def run_document(file_path: Path, mime_type: str, marker: str, instructions: str
             tool_summary = run_event_summary(conversation["id"], accepted["runId"])
             if marker not in assistant.get("text", ""):
                 tools = ",".join(tool_summary) if tool_summary else "none"
-                raise RuntimeError(f"document marker was not returned (tools={tools})")
+                diagnostic = session_tool_diagnostic(marker)
+                raise RuntimeError(
+                    f"document marker was not returned (tools={tools}; {diagnostic})"
+                )
             if "bash:False" not in tool_summary:
                 tools = ",".join(tool_summary) if tool_summary else "none"
                 raise RuntimeError(f"document was not read by successful isolated bash (tools={tools})")
