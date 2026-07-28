@@ -16,7 +16,9 @@
 - 隔离文档读取：`ededc1f`、`ffcf560`、`ec60f41`（PDF/XLSX 在模型运行前确定性提取）。
 - 调度与取消恢复：`81de050`、`8846108`。
 - 生产公网报价 smoke：`12e6391`；跨重启自动任务 smoke：`3aa9f70`。
+- 公网路由与部署恢复：`3130234`、`90be932`、`74f3656`、`ea60b12`。
 - 后端功能提交未直接修改 Flutter；Claude 的自动任务/通知 UI 已通过 `a5cd42c` 合入本集成线。
+- Claude 的报价候选紧凑化与非图片附件前端分支 `feat/pi-agent-frontend-followup@6d34fc3` 也是当前集成线祖先，无需再次合并。
 
 ## 已交付
 
@@ -55,8 +57,10 @@
 - `tools/agent_vps_web_quote_smoke.py` 验证真实模型经隔离 `bash` 读取公开 USD/CNY 报价并生成恰好一条 `suggested` 候选；权威报价摘要前后相同，临时用户状态已清除。
 - `tools/agent_vps_automation_restart_smoke.py` 用独立端口和 `/tmp` 状态验证：计划在 sidecar 停机期间到期，重启后真实模型完成总结、推进下次时间并生成 `action=agent` 通知；临时状态已清除。
 - 合并 Claude 自动任务 UI 后，Flutter format/analyze 与全量测试、Rust 145 条、Node 24 条、契约检查、两套真实本地 smoke 和 Windows readiness 均通过。
-- 最新通用服务器客户端已从干净的 `3aa9f70` 构建：Windows zip 与 Android debug APK 均通过运行时 endpoint/auth、包完整性和 Android 网络策略检查，产物位于本工作树 `dist/`。
-- VPS 上 `finwealth-server`、`finwealth-agent` 均为 active，Rust `/v1/health` 正常。Agent 状态最新备份为 `/var/backups/finwealth-agent/20260728-081043Z`，归档和 manifest 校验通过。
+- 上一版通用服务器客户端从干净的 `3aa9f70` 构建：Windows zip 与 Android debug APK 均通过运行时 endpoint/auth、包完整性和 Android 网络策略检查，产物位于本工作树 `dist/`。它早于后续前端提交，下一次交付应从当前集成线重新打包。
+- VPS 源码与 Agent 已部署到 `ea60b12`。完整安装脚本在人工构造的“socket inactive、proxy service active”状态下能自行恢复 `finwealth-docker-proxy@172.19.0.1:8791.socket`，bridge `/v1/health` 返回 200。
+- 共享 Caddyfile 仅在根域 `@finwealth` matcher 中增加 `/v1/agent/*`，原子更新备份为 `/home/opc/sub2api-deploy/Caddyfile.before-finwealth-agent-20260728T082624Z`。工具会验证候选配置、重启单文件 bind mount 的 Caddy 容器并核对实际加载内容；失败会恢复备份。`sub2api.wuwaidut.com`、Cloudflare Access/2FA 与中转站容器配置均未修改。
+- 公网无凭据反馈环：`/v1/health` 为 200，`/v1/agent/status` 为 Rust 401（不再落到中转站 404），`/v1/models` 继续返回中转站既有 401。VPS 上 `finwealth-server`、`finwealth-agent` 和 bridge socket 均正常；Agent 状态最新备份为 `/var/backups/finwealth-agent/20260728-081043Z`，归档和 manifest 校验通过。
 
 ## 尚未完成 / 不应误报
 
