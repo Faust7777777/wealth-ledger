@@ -12,7 +12,8 @@
 - 工作区文档附件：`ddfdb54 feat(agent): support workspace document attachments`
 - 自动任务与通知：`142951b feat(agent): schedule reminders and in-app notifications`
 - 周期财务总结：`ebe1be9 feat(agent): schedule periodic financial summaries`
-- 真实模型联调与终态兼容修复：见该分支在本回执之后的最新提交。
+- 真实模型联调与终态兼容修复：`38936d3` 至 `258b589`。
+- 隔离文档读取：`ededc1f`、`ffcf560`、`ec60f41`（PDF/XLSX 在模型运行前确定性提取）。
 - 未修改 Flutter `lib/**`、Flutter `test/**` 或平台客户端。
 - Claude 最新可见前端成果仍是 `origin/feat/ai-image-organization-ui @ 6abb256`；Pi Agent 前端任务另见 `2026-07-28-claude-pi-agent-frontend.md`。
 
@@ -31,11 +32,12 @@
 11. SSE 正式契约：OpenAPI 明确 `run.queued`、`run.started`、`message.delta`、tool 与结束事件字段，并规定 `after` / `Last-Event-ID` 的 cursor 续接语义。
 12. 网页报价候选：Agent 可把有来源和时间的网页报价/汇率保存为 `suggested`，只有用户调用审核接口 `apply` 后才经权威 `/v1/quotes/refresh` 写入；拒绝、提议和失败均不改变估值。
 13. 自动任务与通知：持久化结构化报价、订阅到期扫描、DCA 到期检查和周期财务总结，失败一小时重试；订阅只生成待审核候选，DCA 不执行交易，总结只在主会话排队只读请求，通知仅保存在 App 内。
+14. 文档解码：PDF 原文件固定经 bubblewrap + `pdftotext`，XLSX 固定经 bubblewrap + Python 标准库 `zipfile`/XML 提取单元格；提取结果作为不可信上下文交给模型理解。原文件仍保存在用户专属 Agent 工作区，没有固定账单字段 parser。
 
 ## 验证结果
 
 - Rust：`cargo test`，145 passed / 0 failed。
-- Node：TypeScript check/build；19 passed / 0 failed。
+- Node：TypeScript check/build；21 passed / 0 failed。
 - Node production audit：0 vulnerabilities。
 - `python tools/contract_check.py`：通过，OpenAPI 93 paths / 168 schemas。
 - `git diff --check`、`cargo fmt --check`：通过。
@@ -48,12 +50,13 @@
 - 同一 smoke 的 `-IncludeVisionAttachment -CreateVisionDraft` 已真实生成并上传含商户、时间和 CNY 88.20 的测试票据图。模型原生读取图片、查询临时账户并调用 `finwealth_propose_movement`；最终恰好生成 1 条 pending proposal，账户确认余额保持 100.00，测试全程不调用 approve/confirm。
 - 真实视觉联调发现模型会给纯现金 expense 分录附带多余 `instrumentId`。sidecar 现在只对 expense/fee/income/dividend/interest 这类纯现金提案确定性移除该可选字段；账户、金额、币种、方向、角色和时间继续由账本严格校验，buy/sell 等持仓腿不做此归一化。
 - 真实联调发现并修复 Pi 终态兼容问题：provider 只在最终 `message_end` 给出文本时会补齐缺失 delta；中间自动重试的 `stopReason=error` 不再覆盖后续成功终态；真正最终的模型错误和取消分别落为 `agent_model_request_failed` / `agent_run_aborted`，不再产生“成功但正文为空”的消息。
+- 生产 VPS 已部署到 `ec60f41`。`tools/agent_vps_document_smoke.py` 使用生产配置的真实模型验证 PDF 与 XLSX：两者均从隔离工作区确定性提取，模型返回只存在于合成文件中的随机标记，工具事件分别为 `finwealth_read_pdf_text` 和 `finwealth_read_xlsx_text` 且无错误。
+- VPS 上 `finwealth-server`、`finwealth-agent` 均为 active，Rust `/v1/health` 正常。Agent 状态已备份到 `/var/backups/finwealth-agent/20260728-073539Z`，归档和 manifest 校验通过。
 
 ## 尚未完成 / 不应误报
 
-- 未在生产 VPS 安装、配置模型或重启现有服务；未读取或修改生产账本。
-- 已用本机现有的 OpenAI-compatible 模型环境变量完成纯文本、CSV 工作区读取、原生图片票据到待审核记录、财务查询工具、SSE 与周期财务总结的真实端到端；配置仅存在于 smoke 临时目录。尚未完成 PDF/XLSX 模型读取，也未把任何模型凭据写入仓库或生产服务器。
-- PDF、CSV、XLSX、ZIP 与 TXT 已支持原样上传到 Agent 工作区，由 Agent 选择对应读取工具并交给模型理解；未另做固定账单解析器。真实模型端到端仍待生产配置后验证。
+- 生产模型已配置在服务器受限环境文件中，但任何模型凭据、模型端点和模型 ID 都没有写入仓库或回执。
+- PDF、CSV、XLSX、ZIP 与 TXT 均原样上传到 Agent 工作区。PDF/XLSX 的格式解码现在由 sidecar 确定性完成，语义理解仍由模型完成；没有固定账单字段 parser。
 - 网页搜索可在隔离 shell 内完成，并已支持候选报价审核入库；真实模型在目标网站上的可访问性与端到端来源质量仍待生产配置后验证。
-- App 内定时任务与通知已实现；系统级 push、模型周期报告、插件提议/审批/安装尚未实现。
-- Flutter Agent 入口、Windows 右栏、Android 全屏、SSE UI、图片选择和记忆审批仍由 Claude 按任务单实现。
+- App 内定时任务、通知和周期模型报告的后端已实现；系统级 push、插件提议/审批/安装尚未实现。
+- Flutter Agent 主界面、附件、报价候选已由 Claude 交付并合入；自动任务与通知 UI 仍由 Claude 按 `2026-07-28-claude-pi-agent-automations.md` 实现。
