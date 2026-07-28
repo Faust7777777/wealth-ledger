@@ -1553,6 +1553,11 @@ def check_deploy_security_defaults() -> None:
     if "FINWEALTH_CLIENT_UPDATE_DIR=/var/lib/finwealth-updates" not in env_text:
         fail("Deploy env example must configure the root-owned client update directory")
 
+    for route_patch in (CADDY_AGENT_ROUTE_PATCH, CADDY_CLIENT_UPDATE_ROUTE_PATCH):
+        route_patch_text = route_patch.read_text(encoding="utf-8")
+        if '"--adapter"' not in route_patch_text or '"caddyfile"' not in route_patch_text:
+            fail(f"{route_patch.name} must validate temporary Caddyfiles with the caddyfile adapter")
+
     install_text = VPS_INSTALL.read_text(encoding="utf-8")
     if "--check-production-config" not in install_text or "EnvironmentFile" not in install_text:
         fail("VPS installer must validate production configuration through systemd")

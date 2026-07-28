@@ -20,7 +20,17 @@ CANDIDATE_CONFIG = "/tmp/finwealth-caddy-candidate"
 
 def run_caddy(container: str, command: str, config: str = LIVE_CONFIG) -> None:
     subprocess.run(
-        ["docker", "exec", container, "caddy", command, "--config", config],
+        [
+            "docker",
+            "exec",
+            container,
+            "caddy",
+            command,
+            "--config",
+            config,
+            "--adapter",
+            "caddyfile",
+        ],
         check=True,
         stdout=subprocess.DEVNULL,
     )
