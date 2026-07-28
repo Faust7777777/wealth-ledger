@@ -38,3 +38,10 @@ Android：1 通过；2 ...
 ```
 
 收到结果后，将结论补入 `2026-07-28-pi-agent-backend-done.md`；如有异常，按设备和步骤建立最小复现后修复。
+
+## 2026-07-28 自动验收进度
+
+- 已修复本机 Android SDK 路径偏差，并启动 Android 36.1 `Small_Phone` 无窗口 AVD。
+- 最新 APK 安装成功，运行时服务器地址连接成功，主界面真实渲染无 overflow。
+- Android 返回键从 Agent 全屏页回到主界面：通过。
+- 发现旧 Keystore 会话失效时 Agent 错误显示“服务器尚未配置模型”；已生成 `2026-07-28-claude-agent-expired-session-fix.md`。其余 Android Agent 交互项待该 P0 修复后复验。
