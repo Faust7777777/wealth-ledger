@@ -1854,7 +1854,14 @@ void main() {
           clientUpdatePlatformProvider.overrideWithValue(
             const _PreviewUpdatePlatform(),
           ),
-          clientUpdateServiceProvider.overrideWithValue(null),
+          // 行的显示门控看的是"有没有更新能力"，预览里给一个不会被调用的实例。
+          clientUpdateServiceProvider.overrideWithValue(
+            ClientUpdateService(
+              apiBaseUrl: 'https://example.invalid',
+              platform: 'android',
+              cacheDirProvider: () async => '',
+            ),
+          ),
           appUpdateControllerProvider.overrideWith(
             () => _PreviewUpdateController(hasUpdate ? updateManifest : null),
           ),

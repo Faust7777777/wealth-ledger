@@ -127,7 +127,7 @@ Widget _host({
 );
 
 void main() {
-  testWidgets('非 Android：整行不显示', (tester) async {
+  testWidgets('无更新能力（非 Android / 本地模式）：整行不显示', (tester) async {
     await tester.pumpWidget(_host(platform: null));
     await tester.pumpAndSettle();
     expect(find.text('应用更新'), findsNothing);
@@ -139,6 +139,9 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('应用更新'), findsOneWidget);
     expect(find.text('当前版本 1.0.0'), findsOneWidget);
+    // 静默检查由 App 启动生命周期触发；这里显式手动检查一次。
+    await tester.tap(find.text('检查更新'));
+    await tester.pumpAndSettle();
     expect(find.text('已是最新版本'), findsOneWidget);
     expect(find.text('下载更新'), findsNothing);
   });
@@ -153,6 +156,8 @@ void main() {
         filePath: '${dir.path}${Platform.pathSeparator}app.apk',
       ),
     );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('检查更新'));
     await tester.pumpAndSettle();
     expect(find.text('发现 1.1.0'), findsOneWidget);
     expect(find.textContaining('加入应用内更新'), findsOneWidget);
@@ -180,6 +185,8 @@ void main() {
       ),
     );
     await tester.pumpAndSettle();
+    await tester.tap(find.text('检查更新'));
+    await tester.pumpAndSettle();
     await tester.tap(find.text('下载更新'));
     await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(FilledButton, '安装更新'));
@@ -190,7 +197,7 @@ void main() {
 
     // 返回后授权到位：可以再次安装。
     platform.canInstall = true;
-    await tester.tap(find.widgetWithText(FilledButton, '去授权'));
+    await tester.tap(find.widgetWithText(FilledButton, '继续安装'));
     await tester.pumpAndSettle();
     expect(platform.installed, hasLength(1));
   });
@@ -205,6 +212,8 @@ void main() {
         downloadFailure: '更新包校验未通过，请重试',
       ),
     );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('检查更新'));
     await tester.pumpAndSettle();
     await tester.tap(find.text('下载更新'));
     await tester.pumpAndSettle();
@@ -222,6 +231,8 @@ void main() {
         manifest: parseClientUpdateManifest(_manifestJson(notes: notes)),
       ),
     );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('检查更新'));
     await tester.pumpAndSettle();
     // 主页面只显示第一条摘要。
     expect(find.textContaining('第 0 条更新说明'), findsOneWidget);
@@ -250,6 +261,12 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
+      // 两次迭代复用同一个 ProviderScope 容器：已检查过就不会再有该按钮。
+      if (find.text('检查更新').evaluate().isNotEmpty) {
+        await tester.tap(find.text('检查更新'));
+        await tester.pumpAndSettle();
+      }
+      expect(find.text('发现 1.1.0'), findsOneWidget);
       expect(tester.takeException(), isNull, reason: '${size.width}');
     }
   });
