@@ -357,6 +357,7 @@ dependencies = [
  "subtle",
  "time",
  "tokio",
+ "tokio-util",
  "tower",
  "yahoo_finance_api",
 ]

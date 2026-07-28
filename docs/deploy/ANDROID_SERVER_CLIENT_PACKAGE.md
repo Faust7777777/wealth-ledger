@@ -17,6 +17,10 @@ current package is debug-signed for private installation. Keep the same local
 Android debug keystore when building upgrades; packages produced with a
 different key cannot update an existing installation.
 
+For application-delivered updates, increment the positive build number after
+`+` in `pubspec.yaml` before every published package. The stable channel rejects
+equal or lower Android `versionCode` values. See `CLIENT_SELF_UPDATE.md`.
+
 The main Android manifest permits Internet access, rejects cleartext HTTP, and
 disables Android system backup. The app accepts only an HTTPS origin without
 credentials, path, query, or fragment. Changing the server clears the previous

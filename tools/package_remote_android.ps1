@@ -69,6 +69,17 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $versionLine = (Select-String -Path (Join-Path $Root "pubspec.yaml") -Pattern "^version:\s*(.+)$").Matches.Groups[1].Value.Trim()
+$versionParts = $versionLine -split '\+', 2
+$versionCode = 0
+if (
+  $versionParts.Count -ne 2 -or
+  [string]::IsNullOrWhiteSpace($versionParts[0]) -or
+  ![int]::TryParse($versionParts[1], [ref]$versionCode) -or
+  $versionCode -lt 1
+) {
+  throw "pubspec version must include a positive Android build number, for example 1.1.0+2."
+}
+$versionName = $versionParts[0]
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $dist = if ([System.IO.Path]::IsPathRooted($OutputDir)) { $OutputDir } else { Join-Path $Root $OutputDir }
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
@@ -112,6 +123,8 @@ $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToLowerInvaria
 $manifest = [ordered]@{
   packageFormat = 3
   clientVersion = $versionLine
+  versionName = $versionName
+  versionCode = $versionCode
   createdAt = (Get-Date).ToUniversalTime().ToString("o")
   sourceCommit = $sourceCommit
   sourceDirty = $sourceDirty
@@ -122,6 +135,7 @@ $manifest = [ordered]@{
   signing = "debug-self-use"
   networkPolicyVerified = $true
   apk = (Split-Path -Leaf $target)
+  apkSizeBytes = (Get-Item -LiteralPath $target).Length
   apkSha256 = $sha
 } | ConvertTo-Json -Compress
 [System.IO.File]::WriteAllText("$target.manifest.json", $manifest, [System.Text.UTF8Encoding]::new($false))

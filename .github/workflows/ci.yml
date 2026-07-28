@@ -31,13 +31,16 @@ jobs:
         run: python -m pip install --disable-pip-version-check -r tools/requirements.txt
 
       - name: Check Python syntax
-        run: python -m py_compile tools/contract_check.py tools/mock_api_server.py tools/server_smoke.py tools/local_ledger_smoke.py server/dev_server.py
+        run: python -m py_compile tools/contract_check.py tools/mock_api_server.py tools/server_smoke.py tools/local_ledger_smoke.py tools/publish_client_update.py tools/client_update_publish_smoke.py tools/patch_vps_caddy_client_update_route.py server/dev_server.py
 
       - name: Run contract checks
         run: python tools/contract_check.py
 
       - name: Check shell scripts
-        run: bash -n tools/install_vps_systemd.sh tools/check_vps_readiness.sh tools/backup_vps_ledger.sh tools/restore_vps_ledger.sh tools/vps_backup_restore_smoke.sh
+        run: bash -n tools/install_vps_systemd.sh tools/install_vps_bundle.sh tools/package_vps_server.sh tools/check_vps_readiness.sh tools/backup_vps_ledger.sh tools/restore_vps_ledger.sh tools/vps_backup_restore_smoke.sh
+
+      - name: Run client update publication smoke
+        run: python tools/client_update_publish_smoke.py
 
       - name: Run VPS backup and restore smoke
         run: bash tools/vps_backup_restore_smoke.sh

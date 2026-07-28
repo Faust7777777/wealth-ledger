@@ -66,6 +66,15 @@ GET /v1/health
 }
 ```
 
+### 1.1 Client updates
+
+```http
+GET /v1/client-updates/{platform}/{channel}/latest
+GET /v1/client-updates/{platform}/{channel}/assets/{fileName}
+```
+
+客户端更新端点公开可读，使未登录、登录过期和首次设置状态仍可升级。`latest` 返回不带通用 `ok/data` envelope 的 `ClientUpdateManifest`，并使用 `Cache-Control: no-store`；版本化 APK/ZIP 流使用 SHA-256 `ETag` 和 immutable cache。完整字段、发布原子性及客户端校验规则见 `CLIENT_UPDATE_V1.md`。
+
 ## 2. Auth
 
 ```http

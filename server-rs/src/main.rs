@@ -15,9 +15,12 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
+mod client_updates;
 mod ledger_lease;
 mod ledger_migrations;
 mod local_ledger;
+
+use client_updates::{ClientUpdateError, ClientUpdateStore};
 
 use rand_core::{OsRng, RngCore};
 use serde_json::{Value, json};
@@ -40,6 +43,7 @@ use time::{
     Date, Duration, OffsetDateTime,
     format_description::well_known::{Iso8601, Rfc3339},
 };
+use tokio_util::io::ReaderStream;
 use yahoo_finance_api as yahoo;
 
 const EMPTY_BOOTSTRAP: &str =
@@ -73,6 +77,7 @@ struct AppState {
     allow_ledger_scenario: bool,
     allowed_hosts: Vec<String>,
     agent_gateway: AgentGateway,
+    client_updates: ClientUpdateStore,
 }
 
 #[derive(Clone)]
@@ -109,6 +114,7 @@ impl AppState {
             allow_ledger_scenario: env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
             allowed_hosts: allowed_hosts_from_env(),
             agent_gateway: AgentGateway::from_env(),
+            client_updates: ClientUpdateStore::from_env(),
         }
     }
 
@@ -131,6 +137,7 @@ impl AppState {
             allow_ledger_scenario: env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
             allowed_hosts: allowed_hosts_from_env(),
             agent_gateway: AgentGateway::from_env(),
+            client_updates: ClientUpdateStore::from_env(),
         }
     }
 
@@ -149,6 +156,12 @@ impl AppState {
     #[cfg(test)]
     fn with_agent_gateway(mut self, base_url: String, internal_token: &str) -> Self {
         self.agent_gateway = AgentGateway::new(Some(base_url), Some(internal_token.to_string()));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_client_update_dir(mut self, root: PathBuf) -> Self {
+        self.client_updates = ClientUpdateStore::new(Some(root));
         self
     }
 
@@ -1260,6 +1273,14 @@ fn app_with_state(state: AppState) -> Router {
     let middleware_state = state.clone();
     Router::new()
         .route("/v1/health", get(health))
+        .route(
+            "/v1/client-updates/{platform}/{channel}/latest",
+            get(client_update_latest),
+        )
+        .route(
+            "/v1/client-updates/{platform}/{channel}/assets/{file_name}",
+            get(client_update_asset),
+        )
         .route("/v1/auth/login", post(auth_login))
         .route("/v1/auth/refresh", post(auth_refresh))
         .route("/v1/auth/logout", post(auth_logout))
@@ -1609,10 +1630,11 @@ async fn agent_proxy(
 }
 
 fn is_public_auth_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/v1/health" | "/v1/auth/login" | "/v1/auth/refresh" | "/v1/auth/logout"
-    )
+    path.starts_with("/v1/client-updates/")
+        || matches!(
+            path,
+            "/v1/health" | "/v1/auth/login" | "/v1/auth/refresh" | "/v1/auth/logout"
+        )
 }
 
 fn query_has_non_empty_scenario(query: Option<&str>) -> bool {
@@ -1720,6 +1742,116 @@ async fn health() -> Json<Value> {
         "serverTime": current_timestamp(),
         "version": env!("CARGO_PKG_VERSION")
     }))
+}
+
+async fn client_update_latest(
+    State(state): State<AppState>,
+    Path((platform, channel)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    match state.client_updates.latest(&platform, &channel).await {
+        Ok(manifest) => {
+            if if_none_match_matches(&headers, &manifest.etag) {
+                return StatusCode::NOT_MODIFIED.into_response();
+            }
+            let mut response = Response::new(Body::from(manifest.bytes));
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json; charset=utf-8"),
+            );
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            );
+            if let Ok(value) = HeaderValue::from_str(&manifest.etag) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::ETAG, value);
+            }
+            response
+        }
+        Err(error) => client_update_error_response(error),
+    }
+}
+
+async fn client_update_asset(
+    State(state): State<AppState>,
+    Path((platform, channel, file_name)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    match state
+        .client_updates
+        .asset(&platform, &channel, &file_name)
+        .await
+    {
+        Ok(asset) => {
+            let etag = format!("\"{}\"", asset.sha256);
+            if if_none_match_matches(&headers, &etag) {
+                return StatusCode::NOT_MODIFIED.into_response();
+            }
+            let stream = ReaderStream::new(asset.file);
+            let mut response = Response::new(Body::from_stream(stream));
+            let response_headers = response.headers_mut();
+            response_headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static(asset.content_type),
+            );
+            if let Ok(value) = HeaderValue::from_str(&asset.size.to_string()) {
+                response_headers.insert(axum::http::header::CONTENT_LENGTH, value);
+            }
+            if let Ok(value) = HeaderValue::from_str(&etag) {
+                response_headers.insert(axum::http::header::ETAG, value);
+            }
+            response_headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            );
+            response_headers.insert(
+                axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            );
+            if let Ok(value) =
+                HeaderValue::from_str(&format!("attachment; filename=\"{file_name}\""))
+            {
+                response_headers.insert(axum::http::header::CONTENT_DISPOSITION, value);
+            }
+            response
+        }
+        Err(error) => client_update_error_response(error),
+    }
+}
+
+fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
+}
+
+fn client_update_error_response(error: ClientUpdateError) -> Response {
+    match error {
+        ClientUpdateError::InvalidPath => bad_request(
+            "client_update_path_invalid",
+            "Client update platform, channel, or file name is invalid.",
+            json!({}),
+        ),
+        ClientUpdateError::NotConfigured | ClientUpdateError::NotFound => not_found(
+            "client_update_not_found",
+            "No client update is published for this platform and channel.",
+        ),
+        ClientUpdateError::InvalidManifest => service_unavailable(
+            "client_update_manifest_invalid",
+            "The published client update manifest is invalid.",
+            json!({}),
+            false,
+        ),
+        ClientUpdateError::Io => service_unavailable(
+            "client_update_storage_unavailable",
+            "Client update storage could not be read.",
+            json!({}),
+            true,
+        ),
+    }
 }
 
 async fn auth_login(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
@@ -6477,6 +6609,132 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = test_response_json(response).await;
         assert_eq!(body["error"]["code"], "agent_service_unavailable");
+    }
+
+    #[tokio::test]
+    async fn client_updates_are_public_streamed_and_cache_safe() {
+        let ledger_path = unique_test_ledger_path("client_updates");
+        let root = ledger_path
+            .parent()
+            .expect("test update root")
+            .join("updates");
+        let channel = root.join("android/stable");
+        let releases = channel.join("releases");
+        fs::create_dir_all(&releases).expect("update release directory");
+        let file_name = "finwealth-1.1.0-android.apk";
+        let asset_bytes = b"test-apk-bytes";
+        let sha256 = Sha256::digest(asset_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let manifest = json!({
+            "schemaVersion": 1,
+            "platform": "android",
+            "channel": "stable",
+            "versionName": "1.1.0",
+            "versionCode": 2,
+            "releasedAt": "2026-07-28T12:00:00Z",
+            "sourceCommit": "0123456789abcdef0123456789abcdef01234567",
+            "mandatory": false,
+            "minimumVersionCode": 1,
+            "notes": ["应用内更新"],
+            "asset": {
+                "url": format!(
+                    "/v1/client-updates/android/stable/assets/{file_name}"
+                ),
+                "fileName": file_name,
+                "sizeBytes": asset_bytes.len(),
+                "sha256": sha256,
+                "contentType": "application/vnd.android.package-archive"
+            }
+        });
+        fs::write(
+            channel.join("latest.json"),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("latest manifest");
+        fs::write(releases.join(file_name), asset_bytes).expect("update asset");
+        fs::write(
+            releases.join(format!("{file_name}.sha256")),
+            format!("{sha256}  {file_name}\n"),
+        )
+        .expect("update hash sidecar");
+
+        let auth = AuthStore::configured("owner", hash_password_for_test("password"), true);
+        let router = app_with_state(
+            AppState::dev()
+                .with_auth(auth)
+                .with_client_update_dir(root.clone()),
+        );
+        let protected = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/accounts")
+                    .header("host", "127.0.0.1")
+                    .body(Body::empty())
+                    .expect("protected request"),
+            )
+            .await
+            .expect("protected response");
+        assert_eq!(protected.status(), StatusCode::UNAUTHORIZED);
+
+        let latest = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/client-updates/android/stable/latest")
+                    .header("host", "127.0.0.1")
+                    .body(Body::empty())
+                    .expect("latest request"),
+            )
+            .await
+            .expect("latest response");
+        assert_eq!(latest.status(), StatusCode::OK);
+        assert_eq!(latest.headers()["cache-control"], "no-store");
+        let latest_etag = latest.headers()["etag"].clone();
+        let latest_body = test_response_json(latest).await;
+        assert_eq!(latest_body["versionCode"], 2);
+
+        let unchanged = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/client-updates/android/stable/latest")
+                    .header("host", "127.0.0.1")
+                    .header("if-none-match", latest_etag)
+                    .body(Body::empty())
+                    .expect("conditional latest request"),
+            )
+            .await
+            .expect("conditional latest response");
+        assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+
+        let asset = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/v1/client-updates/android/stable/assets/{file_name}"
+                    ))
+                    .header("host", "127.0.0.1")
+                    .body(Body::empty())
+                    .expect("asset request"),
+            )
+            .await
+            .expect("asset response");
+        assert_eq!(asset.status(), StatusCode::OK);
+        assert_eq!(
+            asset.headers()["content-type"],
+            "application/vnd.android.package-archive"
+        );
+        assert_eq!(asset.headers()["etag"], format!("\"{sha256}\""));
+        let downloaded = to_bytes(asset.into_body(), 1024)
+            .await
+            .expect("streamed asset body");
+        assert_eq!(downloaded.as_ref(), asset_bytes);
+
+        fs::remove_dir_all(ledger_path.parent().expect("test root should have parent"))
+            .expect("remove update test root");
     }
 
     #[tokio::test]

@@ -49,6 +49,11 @@ CADDY_FINWEALTH_SITE = ROOT / "deploy" / "caddy" / "finwealth-wuwaidut.com.caddy
 VPS_INSTALL = ROOT / "tools" / "install_vps_systemd.sh"
 AGENT_VPS_INSTALL = ROOT / "tools" / "install_vps_agent.sh"
 CADDY_AGENT_ROUTE_PATCH = ROOT / "tools" / "patch_vps_caddy_agent_route.py"
+CADDY_CLIENT_UPDATE_ROUTE_PATCH = (
+    ROOT / "tools" / "patch_vps_caddy_client_update_route.py"
+)
+CLIENT_UPDATE_PUBLISHER = ROOT / "tools" / "publish_client_update.py"
+CLIENT_UPDATE_PUBLISH_SMOKE = ROOT / "tools" / "client_update_publish_smoke.py"
 VPS_BUNDLE_INSTALL = ROOT / "tools" / "install_vps_bundle.sh"
 VPS_PACKAGE = ROOT / "tools" / "package_vps_server.sh"
 VPS_AUTH_CONFIGURE = ROOT / "tools" / "configure_vps_auth.sh"
@@ -1531,6 +1536,9 @@ def check_deploy_security_defaults() -> None:
         LOCAL_BACKUP,
         LOCAL_RESTORE,
         LOCAL_BACKUP_RESTORE_SMOKE,
+        CADDY_CLIENT_UPDATE_ROUTE_PATCH,
+        CLIENT_UPDATE_PUBLISHER,
+        CLIENT_UPDATE_PUBLISH_SMOKE,
     ):
         if not required.exists():
             fail(f"Missing deploy safety artifact: {required}")
@@ -1540,6 +1548,8 @@ def check_deploy_security_defaults() -> None:
         fail("Deploy env example must default FINWEALTH_QUOTE_PROVIDER to none")
     if "FINWEALTH_AI_PROVIDER=none" not in env_text:
         fail("Deploy env example must default FINWEALTH_AI_PROVIDER to none")
+    if "FINWEALTH_CLIENT_UPDATE_DIR=/var/lib/finwealth-updates" not in env_text:
+        fail("Deploy env example must configure the root-owned client update directory")
 
     install_text = VPS_INSTALL.read_text(encoding="utf-8")
     if "--check-production-config" not in install_text or "EnvironmentFile" not in install_text:
@@ -1661,6 +1671,7 @@ def check_deploy_security_defaults() -> None:
         "@finwealth",
         "path /v1/accounts",
         "/v1/agent/*",
+        "/v1/client-updates/*",
         "reverse_proxy cli-proxy-api:8317",
         "@relayManagement path /management.html",
         'respond "Not Found" 404',
@@ -1699,6 +1710,34 @@ def check_deploy_security_defaults() -> None:
     ):
         if snippet not in caddy_patch_text:
             fail(f"Caddy Agent route patch lacks rollback safeguard: {snippet}")
+
+    client_update_caddy_patch = CADDY_CLIENT_UPDATE_ROUTE_PATCH.read_text(
+        encoding="utf-8"
+    )
+    for snippet in (
+        'ROUTE = "/v1/client-updates/*"',
+        "before-finwealth-client-update-",
+        'run_caddy(args.container, "validate")',
+        "validate_candidate(args.container, path)",
+        "restart_container(args.container)",
+        "route_is_loaded(args.container)",
+        "backup.read_text(encoding=\"utf-8\")",
+    ):
+        if snippet not in client_update_caddy_patch:
+            fail(f"Caddy client-update route patch lacks rollback safeguard: {snippet}")
+
+    publisher_text = CLIENT_UPDATE_PUBLISHER.read_text(encoding="utf-8")
+    for snippet in (
+        "sourceDirty",
+        "apkSizeBytes",
+        "apkSha256",
+        "versionCode must increase monotonically",
+        "os.replace(temp, destination)",
+        "atomic_write(latest_path, encoded)",
+        "sha256_file(temp)",
+    ):
+        if snippet not in publisher_text:
+            fail(f"Client update publisher lacks integrity/atomicity gate: {snippet}")
 
     backup_text = VPS_BACKUP.read_text(encoding="utf-8")
     backup_snippets = [
@@ -1931,6 +1970,9 @@ def check_release_packaging() -> None:
         "debug-self-use",
         "apkanalyzer",
         "networkPolicyVerified",
+        "versionName",
+        "versionCode",
+        "apkSizeBytes",
         "apkSha256",
         "manifest.json",
     ]
@@ -1971,6 +2013,7 @@ def check_release_packaging() -> None:
         "verify-linux-server:",
         "cargo clippy",
         "python tools/contract_check.py",
+        "python tools/client_update_publish_smoke.py",
         "tools/requirements.txt",
         "python tools/local_ledger_smoke.py",
         "python tools/production_topology_smoke.py",

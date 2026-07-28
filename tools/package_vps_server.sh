@@ -49,7 +49,10 @@ cp "$ROOT/tools/check_vps_readiness.sh" "$BUNDLE/tools/"
 cp "$ROOT/tools/configure_vps_auth.sh" "$BUNDLE/tools/"
 cp "$ROOT/tools/backup_vps_ledger.sh" "$BUNDLE/tools/"
 cp "$ROOT/tools/restore_vps_ledger.sh" "$BUNDLE/tools/"
+cp "$ROOT/tools/publish_client_update.py" "$BUNDLE/tools/"
+cp "$ROOT/tools/patch_vps_caddy_client_update_route.py" "$BUNDLE/tools/"
 cp "$ROOT/docs/deploy/VPS_DEPLOYMENT.md" "$BUNDLE/docs/"
+cp "$ROOT/docs/deploy/CLIENT_SELF_UPDATE.md" "$BUNDLE/docs/"
 
 cat >"$BUNDLE/package-manifest.json" <<EOF
 {"packageFormat":1,"serverVersion":"$VERSION","createdAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","sourceCommit":"$SOURCE_COMMIT","sourceDirty":false,"platform":"linux","architecture":"$ARCH","target":"$TARGET","libc":"musl","linkage":"static"}
