@@ -7,7 +7,8 @@
 ## 使用产物
 
 - Windows：`dist/finwealth-1.0.0+1-20260728-163344-windows-server-client-x64.zip`
-- Android：`dist/finwealth-1.0.0+1-20260728-163454-android-server-client-debug.apk`
+- Android：`dist/finwealth-1.0.0+1-20260728-173249-android-server-client-debug.apk`
+  - SHA-256：`b848208f86428592c332b853338d3b23825e7ac314d3a9d2325d99e5db3febaa`
 - 服务器地址：`https://wuwaidut.com`
 
 ## Windows
@@ -42,6 +43,11 @@ Android：1 通过；2 ...
 ## 2026-07-28 自动验收进度
 
 - 已修复本机 Android SDK 路径偏差，并启动 Android 36.1 `Small_Phone` 无窗口 AVD。
-- 最新 APK 安装成功，运行时服务器地址连接成功，主界面真实渲染无 overflow。
-- Android 返回键从 Agent 全屏页回到主界面：通过。
-- 发现旧 Keystore 会话失效时 Agent 错误显示“服务器尚未配置模型”；已生成 `2026-07-28-claude-agent-expired-session-fix.md`。其余 Android Agent 交互项待该 P0 修复后复验。
+- 最新 APK 安装成功，生产服务器连接与登录后主账本真实加载均通过。
+- 过期会话复验通过：Agent 只显示“需要登录 / 去登录”，不再误报模型未配置、空会话或断线；“去登录”能进入设置登录区。
+- Agent 登录后能加载生产模型和历史会话；历史 XLSX 显示为文件 chip，没有图片解码空白框。
+- 输入法顶起通过：composer 保持在键盘上方、消息区仍可见、无 overflow；第一次返回隐藏键盘并保留 Agent 页，第二次返回主界面。
+- CSV 草稿附件通过：文件图标、文件名、大小和移除入口均可见，未发送消息；窄屏下 `41 B` 被截为 `4…`，已作为 P1 写入前端修正单。
+- 新发现 P0：会话菜单项虽然在语义树中可点击，但 Android 真触摸只关闭菜单，并可能把事件落到 composer；未能切换会话。任务单：`2026-07-28-claude-agent-session-menu-touch-fix.md`。
+- 断线续接的 cursor/正文去重已有自动化测试；本次模拟器进入飞行模式后，既有 SSE TCP 未及时报错，因此没有把真机断线重连误报为通过，仍需在修复包上人工复验。
+- Windows 右栏、自动任务/通知页面及 Android 会话切换仍待最终人工验收。

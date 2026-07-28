@@ -69,4 +69,6 @@
 - PDF、CSV、XLSX、ZIP 与 TXT 均原样上传到 Agent 工作区。PDF/XLSX 的格式解码现在由 sidecar 确定性完成，语义理解仍由模型完成；没有固定账单字段 parser。
 - 网页搜索、候选生成和“建议不改变权威估值”已在生产真实模型验证；不同网站的长期可用性仍取决于外部站点。
 - App 内自动任务、通知和周期模型报告的前后端均已合入；系统级 push、插件提议/审批/安装不在当前用户需求范围，尚未实现。
-- Windows/Android 真机的人机交互目验仍需用户实际打开新包完成；自动化已覆盖布局、导航、返回、断线续接、附件、通知和自动任务页。
+- Android 36.1 AVD 已完成生产连接、过期会话五态、重新登录、主账本、历史 XLSX chip、输入法 resize、返回键与 CSV 草稿附件的真实交互验收。最新验收 APK 为 `dist/finwealth-1.0.0+1-20260728-173249-android-server-client-debug.apk`（SHA-256 `b848208f86428592c332b853338d3b23825e7ac314d3a9d2325d99e5db3febaa`）。
+- Android 真触摸发现会话菜单项只关闭 overlay、不能切换会话，并可能把焦点落到 composer；这是发布阻断项，已交给 Claude：`2026-07-28-claude-agent-session-menu-touch-fix.md`。CSV 草稿 chip 功能通过，但窄屏文件大小显示存在低优先级截断。
+- 断线 cursor 续接和正文去重已有专项自动化；本次 AVD 飞行模式没有让既有 SSE TCP 及时失败，故真机断线/恢复仍未验收通过。Windows 右栏、自动任务/通知页面也仍待最终人工目验。
