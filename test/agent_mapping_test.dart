@@ -467,6 +467,171 @@ void main() {
     });
   });
 
+  group('自动任务与通知', () {
+    Map<String, dynamic> automationJson({
+      String kind = 'quote_refresh',
+      int intervalHours = 24,
+      bool enabled = true,
+    }) => {
+      'id': 'auto_1',
+      'userId': 'u_1',
+      'ledgerId': 'l_1',
+      'deviceId': 'd_1',
+      'kind': kind,
+      'intervalHours': intervalHours,
+      'enabled': enabled,
+      'nextRunAt': '2026-07-29T02:00:00Z',
+      'createdAt': '2026-07-28T00:00:00Z',
+      'updatedAt': '2026-07-28T00:00:00Z',
+    };
+
+    test('列表映射四种类型', () async {
+      final repo = LocalServerAgentRepository(
+        DevApiClient(
+          'http://127.0.0.1:8790',
+          client: MockClient(
+            (_) async => _ok([
+              automationJson(),
+              automationJson(kind: 'subscription_due_scan'),
+              automationJson(kind: 'dca_due_check'),
+              automationJson(kind: 'financial_summary'),
+            ]),
+          ),
+        ),
+      );
+      final list = await repo.listAutomations();
+      expect(list.map((a) => a.kind).toList(), [
+        AgentAutomationKind.quoteRefresh,
+        AgentAutomationKind.subscriptionDueScan,
+        AgentAutomationKind.dcaDueCheck,
+        AgentAutomationKind.financialSummary,
+      ]);
+      expect(list.first.intervalHours, 24);
+      expect(list.first.enabled, isTrue);
+    });
+
+    test('创建带 kind/intervalHours/startAt 与 Idempotency-Key', () async {
+      Map<String, dynamic>? body;
+      String? key;
+      final repo = LocalServerAgentRepository(
+        DevApiClient(
+          'http://127.0.0.1:8790',
+          client: MockClient((request) async {
+            expect(request.url.path, '/v1/agent/automations');
+            key = request.headers['idempotency-key'];
+            body = jsonDecode(request.body) as Map<String, dynamic>;
+            return _ok(automationJson(), status: 201);
+          }),
+        ),
+      );
+      await repo.createAutomation(
+        kind: AgentAutomationKind.financialSummary,
+        intervalHours: 168,
+        startAt: '2026-07-29T01:00:00Z',
+      );
+      expect(body, {
+        'kind': 'financial_summary',
+        'intervalHours': 168,
+        'enabled': true,
+        'startAt': '2026-07-29T01:00:00Z',
+      });
+      expect(key, isNotNull);
+    });
+
+    test('更新只发变化字段', () async {
+      final bodies = <Map<String, dynamic>>[];
+      final repo = LocalServerAgentRepository(
+        DevApiClient(
+          'http://127.0.0.1:8790',
+          client: MockClient((request) async {
+            bodies.add(jsonDecode(request.body) as Map<String, dynamic>);
+            return _ok(automationJson());
+          }),
+        ),
+      );
+      await repo.updateAutomation('auto_1', enabled: false);
+      await repo.updateAutomation('auto_1', intervalHours: 6);
+      await repo.updateAutomation('auto_1', nextRunAt: '2026-07-30T00:00:00Z');
+      expect(bodies[0], {'enabled': false});
+      expect(bodies[1], {'intervalHours': 6});
+      expect(bodies[2], {'nextRunAt': '2026-07-30T00:00:00Z'});
+    });
+
+    test('立即运行走 /run；409 映射为冲突', () async {
+      var calls = 0;
+      final repo = LocalServerAgentRepository(
+        DevApiClient(
+          'http://127.0.0.1:8790',
+          client: MockClient((request) async {
+            calls += 1;
+            expect(request.url.path, '/v1/agent/automations/auto_1/run');
+            expect(request.headers['idempotency-key'], isNotNull);
+            return _ok(automationJson());
+          }),
+        ),
+      );
+      await repo.runAutomation('auto_1');
+      expect(calls, 1);
+
+      final conflicting = LocalServerAgentRepository(
+        DevApiClient(
+          'http://127.0.0.1:8790',
+          client: MockClient(
+            (_) async => _err(409, 'agent_automation_already_running'),
+          ),
+        ),
+      );
+      await expectLater(
+        conflicting.runAutomation('auto_1'),
+        throwsA(isA<ApiConflictException>()),
+      );
+    });
+
+    test('通知列表与标记已读', () async {
+      final paths = <String>[];
+      final repo = LocalServerAgentRepository(
+        DevApiClient(
+          'http://127.0.0.1:8790',
+          client: MockClient((request) async {
+            paths.add(request.url.path);
+            if (request.method == 'POST') {
+              expect(request.headers['idempotency-key'], isNotNull);
+              return _ok({
+                'id': 'note_1',
+                'userId': 'u_1',
+                'ledgerId': 'l_1',
+                'kind': 'subscription_due_scan',
+                'title': '订阅到期扫描完成',
+                'body': '生成了 2 条待确认扣费',
+                'action': 'review',
+                'createdAt': '2026-07-28T09:30:00Z',
+                'readAt': '2026-07-28T10:00:00Z',
+              });
+            }
+            return _ok([
+              {
+                'id': 'note_1',
+                'userId': 'u_1',
+                'ledgerId': 'l_1',
+                'kind': 'subscription_due_scan',
+                'title': '订阅到期扫描完成',
+                'body': '生成了 2 条待确认扣费',
+                'action': 'review',
+                'createdAt': '2026-07-28T09:30:00Z',
+              },
+            ]);
+          }),
+        ),
+      );
+      final list = await repo.listNotifications();
+      expect(list.single.isUnread, isTrue);
+      expect(list.single.action, AgentNotificationAction.review);
+      final read = await repo.markNotificationRead('note_1');
+      expect(read.isUnread, isFalse);
+      expect(paths.last, '/v1/agent/notifications/note_1/read');
+    });
+  });
+
   group('SSE', () {
     test('解析 id/event/data 帧，跳过 keep-alive', () async {
       final frames = <AgentEventVm>[];

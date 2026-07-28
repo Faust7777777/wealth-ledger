@@ -140,6 +140,56 @@ void main() {
       // 记忆列表可读且此时为空（模型未运行，不会产生建议）。
       expect(await repo.listMemories(), isA<List<AgentMemoryVm>>());
 
+      // —— 自动任务：创建 → 关闭 → 重开后计划仍在；立即运行不改 nextRunAt ——
+      final automation = await repo.createAutomation(
+        kind: AgentAutomationKind.quoteRefresh,
+        intervalHours: 6,
+      );
+      expect(automation.kind, AgentAutomationKind.quoteRefresh);
+      expect(automation.intervalHours, 6);
+      expect(automation.enabled, isTrue);
+
+      final disabled = await repo.updateAutomation(
+        automation.id,
+        enabled: false,
+      );
+      expect(disabled.enabled, isFalse);
+      expect(
+        (await repo.listAutomations()).where((a) => a.id == automation.id),
+        hasLength(1),
+        reason: '关闭后计划仍然存在',
+      );
+
+      final reenabled = await repo.updateAutomation(
+        automation.id,
+        enabled: true,
+      );
+      expect(reenabled.enabled, isTrue);
+      expect(reenabled.intervalHours, 6, reason: '重开不丢频率');
+
+      final beforeRun = (await repo.listAutomations()).firstWhere(
+        (a) => a.id == automation.id,
+      );
+      final ranNow = await repo.runAutomation(automation.id);
+      expect(ranNow.nextRunAt, beforeRun.nextRunAt, reason: '立即运行不得改变下次计划时间');
+      expect(ranNow.lastRunAt, isNotNull, reason: '手动运行会留下上次运行时间');
+
+      // 同一类型重复创建返回 409。
+      await expectLater(
+        repo.createAutomation(
+          kind: AgentAutomationKind.quoteRefresh,
+          intervalHours: 24,
+        ),
+        throwsA(isA<ApiConflictException>()),
+      );
+
+      // 通知列表可读；未读数由 readAt 决定。
+      final notifications = await repo.listNotifications();
+      expect(notifications, isA<List<AgentNotificationVm>>());
+      for (final n in notifications) {
+        expect(n.title, isNotEmpty);
+      }
+
       // —— 报价候选：没有模型就不会有候选，估值也不该被任何东西改动 ——
       final quoteRepo = LocalServerQuoteRepository(client);
       final summaryBefore = await quoteRepo.getQuoteSummary();

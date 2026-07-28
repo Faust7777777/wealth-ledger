@@ -1787,6 +1787,60 @@ AgentMemoryVm _agentMemory(Map<String, dynamic> j) => AgentMemoryVm(
   updatedAt: '${j['updatedAt']}',
 );
 
+AgentAutomationKind _agentAutomationKind(Object? s) => switch (s) {
+  'subscription_due_scan' => AgentAutomationKind.subscriptionDueScan,
+  'dca_due_check' => AgentAutomationKind.dcaDueCheck,
+  'financial_summary' => AgentAutomationKind.financialSummary,
+  _ => AgentAutomationKind.quoteRefresh,
+};
+
+String agentAutomationKindWire(AgentAutomationKind kind) => switch (kind) {
+  AgentAutomationKind.quoteRefresh => 'quote_refresh',
+  AgentAutomationKind.subscriptionDueScan => 'subscription_due_scan',
+  AgentAutomationKind.dcaDueCheck => 'dca_due_check',
+  AgentAutomationKind.financialSummary => 'financial_summary',
+};
+
+AgentAutomationVm _agentAutomation(Map<String, dynamic> j) => AgentAutomationVm(
+  id: '${j['id']}',
+  kind: _agentAutomationKind(j['kind']),
+  intervalHours: _int(j['intervalHours']),
+  enabled: _bool(j['enabled'], fallback: true),
+  nextRunAt: '${j['nextRunAt']}',
+  createdAt: '${j['createdAt']}',
+  updatedAt: '${j['updatedAt']}',
+  lastRunAt: j['lastRunAt'] as String?,
+  lastStatus: switch (j['lastStatus']) {
+    'success' => AgentAutomationRunStatus.success,
+    'failed' => AgentAutomationRunStatus.failed,
+    _ => null,
+  },
+  lastErrorCode: j['lastErrorCode'] as String?,
+);
+
+AgentNotificationVm _agentNotification(Map<String, dynamic> j) =>
+    AgentNotificationVm(
+      id: '${j['id']}',
+      kind: _agentAutomationKind(j['kind']),
+      title: '${j['title']}',
+      body: '${j['body'] ?? ''}',
+      createdAt: '${j['createdAt']}',
+      action: switch (j['action']) {
+        'review' => AgentNotificationAction.review,
+        'quotes' => AgentNotificationAction.quotes,
+        'dca' => AgentNotificationAction.dca,
+        'agent' => AgentNotificationAction.agent,
+        _ => null,
+      },
+      readAt: j['readAt'] as String?,
+    );
+
+/// 供测试直接校验 wire → VM 映射。
+AgentAutomationVm parseAgentAutomationData(Map<String, dynamic> j) =>
+    _agentAutomation(j);
+AgentNotificationVm parseAgentNotificationData(Map<String, dynamic> j) =>
+    _agentNotification(j);
+
 AgentQuoteCandidateVm _agentQuoteCandidate(Map<String, dynamic> j) =>
     AgentQuoteCandidateVm(
       id: '${j['id']}',
@@ -1981,6 +2035,69 @@ class LocalServerAgentRepository implements AgentRepository {
       assistantMessageId: '${d['assistantMessageId']}',
     );
   }
+
+  @override
+  Future<List<AgentAutomationVm>> listAutomations() async => [
+    for (final a in _list(await _c.getData('/v1/agent/automations')))
+      _agentAutomation(_m(a)),
+  ];
+
+  @override
+  Future<AgentAutomationVm> createAutomation({
+    required AgentAutomationKind kind,
+    required int intervalHours,
+    bool enabled = true,
+    IsoDateTime? startAt,
+  }) async => _agentAutomation(
+    _m(
+      await _c.postData(
+        '/v1/agent/automations',
+        body: {
+          'kind': agentAutomationKindWire(kind),
+          'intervalHours': intervalHours,
+          'enabled': enabled,
+          'startAt': ?startAt,
+        },
+      ),
+    ),
+  );
+
+  @override
+  Future<AgentAutomationVm> updateAutomation(
+    Id automationId, {
+    int? intervalHours,
+    bool? enabled,
+    IsoDateTime? nextRunAt,
+  }) async => _agentAutomation(
+    _m(
+      await _c.patchData(
+        '/v1/agent/automations/$automationId',
+        body: {
+          'intervalHours': ?intervalHours,
+          'enabled': ?enabled,
+          'nextRunAt': ?nextRunAt,
+        },
+      ),
+    ),
+  );
+
+  @override
+  Future<AgentAutomationVm> runAutomation(Id automationId) async =>
+      _agentAutomation(
+        _m(await _c.postData('/v1/agent/automations/$automationId/run')),
+      );
+
+  @override
+  Future<List<AgentNotificationVm>> listNotifications() async => [
+    for (final n in _list(await _c.getData('/v1/agent/notifications')))
+      _agentNotification(_m(n)),
+  ];
+
+  @override
+  Future<AgentNotificationVm> markNotificationRead(Id notificationId) async =>
+      _agentNotification(
+        _m(await _c.postData('/v1/agent/notifications/$notificationId/read')),
+      );
 
   @override
   Future<List<AgentQuoteCandidateVm>> listQuoteCandidates() async => [

@@ -339,6 +339,19 @@ final agentConversationsProvider = FutureProvider<List<AgentConversationVm>>(
 final agentMemoriesProvider = FutureProvider<List<AgentMemoryVm>>(
   (ref) => ref.watch(agentRepositoryProvider).listMemories(),
 );
+final agentAutomationsProvider = FutureProvider<List<AgentAutomationVm>>(
+  (ref) => ref.watch(agentRepositoryProvider).listAutomations(),
+);
+final agentNotificationsProvider = FutureProvider<List<AgentNotificationVm>>(
+  (ref) => ref.watch(agentRepositoryProvider).listNotifications(),
+);
+
+/// 未读数：入口只显示这个数字。
+final agentUnreadNotificationCountProvider = Provider<int>((ref) {
+  final list = ref.watch(agentNotificationsProvider).asData?.value ?? const [];
+  return list.where((n) => n.isUnread).length;
+});
+
 final agentQuoteCandidatesProvider =
     FutureProvider<List<AgentQuoteCandidateVm>>(
       (ref) => ref.watch(agentRepositoryProvider).listQuoteCandidates(),

@@ -605,6 +605,30 @@ class FixtureAgentRepository implements AgentRepository {
     List<Id> attachmentIds = const [],
   }) async => _unsupported();
   @override
+  Future<List<AgentAutomationVm>> listAutomations() async => const [];
+  @override
+  Future<List<AgentNotificationVm>> listNotifications() async => const [];
+  @override
+  Future<AgentAutomationVm> createAutomation({
+    required AgentAutomationKind kind,
+    required int intervalHours,
+    bool enabled = true,
+    IsoDateTime? startAt,
+  }) async => _unsupported();
+  @override
+  Future<AgentAutomationVm> updateAutomation(
+    Id automationId, {
+    int? intervalHours,
+    bool? enabled,
+    IsoDateTime? nextRunAt,
+  }) async => _unsupported();
+  @override
+  Future<AgentAutomationVm> runAutomation(Id automationId) async =>
+      _unsupported();
+  @override
+  Future<AgentNotificationVm> markNotificationRead(Id notificationId) async =>
+      _unsupported();
+  @override
   Future<List<AgentQuoteCandidateVm>> listQuoteCandidates() async => const [];
   @override
   Future<AgentQuoteCandidateVm> reviewQuoteCandidate(

@@ -9,6 +9,7 @@ import '../dev/tokens_preview.dart';
 import '../features/account_detail_page.dart';
 import '../features/account_form_page.dart';
 import '../features/accounts_page.dart';
+import '../features/agent_automations_page.dart';
 import '../features/agent_page.dart';
 import '../features/ai_edit_page.dart';
 import '../features/ai_import_csv_page.dart';
@@ -71,6 +72,10 @@ final appRouter = GoRouter(
       ],
     ),
     GoRoute(path: '/agent', builder: (c, s) => const AgentPage()),
+    GoRoute(
+      path: '/agent/automations',
+      builder: (c, s) => const AgentAutomationsPage(),
+    ),
     GoRoute(path: '/ai-review', builder: (c, s) => const AiReviewPage()),
     GoRoute(
       path: '/ai-import/text',
