@@ -92,6 +92,10 @@ class AgentChatController extends Notifier<AgentChatState> {
 
   @override
   AgentChatState build() {
+    // Riverpod 会跨重建复用同一个 Notifier 实例，因此每次 build 都要把失效标记
+    // 复位：否则provider 一旦重建过，之后所有 open() 都会被误判成"已销毁"
+    // 而静默失败（Android 上表现为点了会话却不切换）。
+    _closed = false;
     ref.onDispose(() {
       _closed = true;
       _sub?.cancel();
@@ -104,7 +108,8 @@ class AgentChatController extends Notifier<AgentChatState> {
   /// 打开（或切换到）一个会话：重置状态 → 拉快照 → 接 SSE。
   Future<void> open(Id conversationId) async {
     if (_closed) return;
-    await _sub?.cancel();
+    // 不 await 取消：旧订阅的收尾不该挡住会话切换（真机上表现为点了没反应）。
+    unawaited(_sub?.cancel() ?? Future<void>.value());
     _sub = null;
     _finalized.clear();
     if (_closed) return; // 面板已销毁：不再触碰已释放的 Ref
