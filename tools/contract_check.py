@@ -54,6 +54,7 @@ CADDY_CLIENT_UPDATE_ROUTE_PATCH = (
 )
 CLIENT_UPDATE_PUBLISHER = ROOT / "tools" / "publish_client_update.py"
 CLIENT_UPDATE_PUBLISH_SMOKE = ROOT / "tools" / "client_update_publish_smoke.py"
+CLIENT_UPDATE_LOCAL_SMOKE = ROOT / "tools" / "client_update_local_smoke.ps1"
 VPS_BUNDLE_INSTALL = ROOT / "tools" / "install_vps_bundle.sh"
 VPS_PACKAGE = ROOT / "tools" / "package_vps_server.sh"
 VPS_AUTH_CONFIGURE = ROOT / "tools" / "configure_vps_auth.sh"
@@ -1539,6 +1540,7 @@ def check_deploy_security_defaults() -> None:
         CADDY_CLIENT_UPDATE_ROUTE_PATCH,
         CLIENT_UPDATE_PUBLISHER,
         CLIENT_UPDATE_PUBLISH_SMOKE,
+        CLIENT_UPDATE_LOCAL_SMOKE,
     ):
         if not required.exists():
             fail(f"Missing deploy safety artifact: {required}")
@@ -2014,6 +2016,7 @@ def check_release_packaging() -> None:
         "cargo clippy",
         "python tools/contract_check.py",
         "python tools/client_update_publish_smoke.py",
+        "client_update_local_smoke.ps1",
         "tools/requirements.txt",
         "python tools/local_ledger_smoke.py",
         "python tools/production_topology_smoke.py",

@@ -111,6 +111,10 @@ jobs:
         shell: pwsh
         run: ./tools/package_integrity_smoke.ps1
 
+      - name: Run client update local-server smoke
+        shell: pwsh
+        run: ./tools/client_update_local_smoke.ps1
+
       - name: Analyze Flutter
         run: flutter analyze
 
