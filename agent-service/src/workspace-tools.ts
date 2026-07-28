@@ -14,8 +14,12 @@ import {
   createEditToolDefinition,
   createReadToolDefinition,
   createWriteToolDefinition,
+  defineTool,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+
+const MAX_DOCUMENT_TEXT_BYTES = 256 * 1024;
 
 function isInside(root: string, target: string): boolean {
   const value = relative(root, target);
@@ -98,6 +102,67 @@ function bubblewrapArguments(workspace: string, command: string): string[] {
   return args;
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function readPdfText(
+  workspace: string,
+  relativePath: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (process.platform !== "linux") {
+    return Promise.reject(new Error("workspace_shell_requires_linux_bubblewrap"));
+  }
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(
+      "bwrap",
+      bubblewrapArguments(workspace, `pdftotext -- ${shellQuote(relativePath)} -`),
+      {
+        cwd: workspace,
+        env: safeShellEnvironment(),
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    const finish = (error?: Error, value?: string): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (error) reject(error);
+      else resolvePromise(value ?? "");
+    };
+    const abort = (): void => {
+      child.kill("SIGKILL");
+    };
+    const timer = setTimeout(abort, 30_000);
+    signal?.addEventListener("abort", abort, { once: true });
+    child.stdout.on("data", (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes > MAX_DOCUMENT_TEXT_BYTES) {
+        child.kill("SIGKILL");
+        finish(new Error("workspace_document_too_large"));
+        return;
+      }
+      chunks.push(Buffer.from(chunk));
+    });
+    child.on("error", (error) => finish(error));
+    child.on("close", (exitCode) => {
+      if (settled) return;
+      if (signal?.aborted) {
+        finish(new Error("agent_run_aborted"));
+      } else if (exitCode !== 0) {
+        finish(new Error("workspace_pdf_read_failed"));
+      } else {
+        finish(undefined, Buffer.concat(chunks).toString("utf8"));
+      }
+    });
+  });
+}
+
 export function createWorkspaceTools(
   workspace: string,
 ): Array<ToolDefinition<any, any, any>> {
@@ -146,10 +211,30 @@ export function createWorkspaceTools(
       },
     },
   });
+  const pdf = defineTool({
+    name: "finwealth_read_pdf_text",
+    label: "读取 PDF",
+    description:
+      "从 Agent 专属工作区读取 PDF 的文字。PDF 附件必须用此工具，不要用 read、Python 或自写解析器。",
+    promptSnippet: "用固定的 pdftotext 沙箱工具读取 PDF 附件。",
+    parameters: Type.Object({
+      path: Type.String({ description: "附件上下文中给出的工作区相对路径" }),
+    }),
+    async execute(_id, params, signal) {
+      const target = await readablePath(workspace, resolve(workspace, params.path));
+      if (!target.toLowerCase().endsWith(".pdf")) {
+        throw new Error("workspace_pdf_required");
+      }
+      const relativeTarget = relative(workspace, target).replaceAll("\\", "/");
+      const text = await readPdfText(workspace, relativeTarget, signal);
+      return { content: [{ type: "text", text }], details: {} };
+    },
+  });
   return [
     createReadToolDefinition(workspace, { operations: readOperations }),
     createWriteToolDefinition(workspace, { operations: writeOperations }),
     createEditToolDefinition(workspace, { operations: editOperations }),
+    pdf,
     bash,
   ];
 }

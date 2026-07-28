@@ -196,7 +196,13 @@ def session_tool_diagnostic(marker: str) -> str:
     )
 
 
-def run_document(file_path: Path, mime_type: str, marker: str, instructions: str) -> None:
+def run_document(
+    file_path: Path,
+    mime_type: str,
+    marker: str,
+    instructions: str,
+    expected_tool: str,
+) -> None:
     nonce = secrets.token_hex(8)
     conversation = request(
         "POST",
@@ -241,7 +247,7 @@ def run_document(file_path: Path, mime_type: str, marker: str, instructions: str
                 raise RuntimeError(
                     f"document marker was not returned (tools={tools}; {diagnostic})"
                 )
-            if "bash:False" not in tool_summary:
+            if f"{expected_tool}:False" not in tool_summary:
                 tools = ",".join(tool_summary) if tool_summary else "none"
                 raise RuntimeError(f"document was not read by successful isolated bash (tools={tools})")
             return
@@ -270,13 +276,15 @@ def main() -> None:
             pdf,
             "application/pdf",
             pdf_marker,
-            "必须调用隔离 bash 工具，并在 command 中使用 pdftotext 读取所附 PDF；禁止用 Python 或 raw read 解析 PDF。只回复文件中的标记。",
+            "必须调用 finwealth_read_pdf_text 读取所附 PDF；禁止用 bash、Python 或 raw read 解析 PDF。只回复文件中的标记。",
+            "finwealth_read_pdf_text",
         )
         run_document(
             xlsx,
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             xlsx_marker,
             "必须调用隔离 bash 工具，并在 command 中使用 python3 zipfile/XML 读取所附 XLSX。只回复第一个单元格的标记。",
+            "bash",
         )
     print("OK: production Pi model read PDF and XLSX inside the isolated workspace.")
 

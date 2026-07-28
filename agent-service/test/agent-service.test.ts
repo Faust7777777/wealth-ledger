@@ -949,7 +949,8 @@ test("workspace file tools reject paths outside the dedicated workspace", async 
   const tools = createWorkspaceTools(workspace);
   const write = tools.find((tool) => tool.name === "write");
   const read = tools.find((tool) => tool.name === "read");
-  assert.ok(write && read);
+  const pdf = tools.find((tool) => tool.name === "finwealth_read_pdf_text");
+  assert.ok(write && read && pdf);
 
   await write.execute(
     "write-1",
@@ -973,6 +974,16 @@ test("workspace file tools reject paths outside the dedicated workspace", async 
     write.execute(
       "write-escape",
       { path: outside, content: "overwrite" },
+      undefined,
+      undefined,
+      {} as never,
+    ),
+    /workspace_path_forbidden/,
+  );
+  await assert.rejects(
+    pdf.execute(
+      "pdf-escape",
+      { path: outside },
       undefined,
       undefined,
       {} as never,
