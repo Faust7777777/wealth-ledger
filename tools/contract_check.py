@@ -48,6 +48,7 @@ SYSTEMD_DOCKER_PROXY_SERVICE = (
 CADDY_FINWEALTH_SITE = ROOT / "deploy" / "caddy" / "finwealth-wuwaidut.com.caddy"
 VPS_INSTALL = ROOT / "tools" / "install_vps_systemd.sh"
 AGENT_VPS_INSTALL = ROOT / "tools" / "install_vps_agent.sh"
+CADDY_AGENT_ROUTE_PATCH = ROOT / "tools" / "patch_vps_caddy_agent_route.py"
 VPS_BUNDLE_INSTALL = ROOT / "tools" / "install_vps_bundle.sh"
 VPS_PACKAGE = ROOT / "tools" / "package_vps_server.sh"
 VPS_AUTH_CONFIGURE = ROOT / "tools" / "configure_vps_auth.sh"
@@ -1678,6 +1679,17 @@ def check_deploy_security_defaults() -> None:
         for snippet in ("start_proxy_sockets", "finwealth-docker-proxy@*.socket"):
             if snippet not in installer_text:
                 fail(f"{installer.name} does not restore the Docker proxy: {snippet}")
+
+    caddy_patch_text = CADDY_AGENT_ROUTE_PATCH.read_text(encoding="utf-8")
+    for snippet in (
+        'ROUTE = "/v1/agent/*"',
+        "before-finwealth-agent-",
+        'run_caddy(args.container, "validate")',
+        'run_caddy(args.container, "reload")',
+        "backup.read_text(encoding=\"utf-8\")",
+    ):
+        if snippet not in caddy_patch_text:
+            fail(f"Caddy Agent route patch lacks rollback safeguard: {snippet}")
 
     backup_text = VPS_BACKUP.read_text(encoding="utf-8")
     backup_snippets = [
