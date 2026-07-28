@@ -44,6 +44,14 @@ Then install and start the sidecar from a reviewed source checkout:
 sudo bash tools/install_vps_agent.sh
 ```
 
+For non-interactive self-use deployment, `tools/configure_vps_agent.py` accepts
+a root-only temporary JSON file whose `apiKey`, `baseUrl`, and `model` fields are
+base64-encoded UTF-8. It validates a public HTTPS model endpoint, generates the
+shared internal token, atomically updates both environment files, writes the Pi
+model configuration with `0600` permissions, and deletes the input file without
+printing any value. Start the Agent and restart the Rust gateway only after this
+configuration step succeeds.
+
 Pi provider credentials and model configuration live under
 `/var/lib/finwealth-agent/pi/` and must remain owned by `finwealth` with mode
 `0700`/`0600`. The service removes the Rust internal token from its process

@@ -85,5 +85,6 @@ systemd-run \
   --property="EnvironmentFile=$ENV_FILE" \
   "$APP_DIR/$BIN_NAME" --check-production-config
 
-systemctl enable --now "$SERVICE_NAME"
+systemctl enable "$SERVICE_NAME"
+systemctl restart "$SERVICE_NAME"
 systemctl status "$SERVICE_NAME" --no-pager
