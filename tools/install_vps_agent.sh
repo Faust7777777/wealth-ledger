@@ -13,9 +13,9 @@ if [ "$(id -u)" -ne 0 ]; then
   echo "Run as root: sudo bash tools/install_vps_agent.sh" >&2
   exit 2
 fi
-for command in node npm bwrap; do
+for command in node npm bwrap pdftotext unzip python3; do
   command -v "$command" >/dev/null 2>&1 || {
-    echo "$command is required for the Finwealth Agent service." >&2
+    echo "$command is required for the Finwealth Agent service (Debian/Ubuntu packages: bubblewrap poppler-utils unzip python3)." >&2
     exit 2
   }
 done

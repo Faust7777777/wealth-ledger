@@ -1586,7 +1586,7 @@ paths:
   /agent/attachments:
     post:
       tags: [Agent]
-      summary: Archive one image attachment for a later Agent message.
+      summary: Archive one image or workspace document for a later Agent message.
       parameters:
         - $ref: "#/components/parameters/idempotencyKey"
       requestBody:
@@ -1600,7 +1600,7 @@ paths:
                 file:
                   type: string
                   format: binary
-                  description: PNG, JPEG, or WEBP, at most 15 MiB.
+                  description: PNG, JPEG, WEBP, UTF-8 TXT/CSV, PDF, XLSX, or ZIP, at most 15 MiB.
       responses:
         "201":
           description: Attachment archived in the authenticated account workspace.
@@ -1636,7 +1636,7 @@ paths:
   /agent/attachments/{attachmentId}/content:
     get:
       tags: [Agent]
-      summary: Read the authenticated account's archived image bytes.
+      summary: Read the authenticated account's original archived attachment bytes.
       parameters:
         - name: attachmentId
           in: path
@@ -1645,7 +1645,7 @@ paths:
             $ref: "#/components/schemas/ID"
       responses:
         "200":
-          description: Original validated image with private no-store caching.
+          description: Original validated attachment with private no-store caching.
           headers:
             ETag:
               description: SHA-256 validator for the original archived bytes.
@@ -1669,6 +1669,26 @@ paths:
                 type: string
                 format: binary
             image/webp:
+              schema:
+                type: string
+                format: binary
+            text/plain:
+              schema:
+                type: string
+                format: binary
+            text/csv:
+              schema:
+                type: string
+                format: binary
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            application/zip:
               schema:
                 type: string
                 format: binary
@@ -4694,7 +4714,15 @@ components:
         fileName:
           type: string
         mimeType:
-          enum: [image/png, image/jpeg, image/webp]
+          enum:
+            - image/png
+            - image/jpeg
+            - image/webp
+            - text/plain
+            - text/csv
+            - application/pdf
+            - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+            - application/zip
         sizeBytes:
           type: integer
           minimum: 1

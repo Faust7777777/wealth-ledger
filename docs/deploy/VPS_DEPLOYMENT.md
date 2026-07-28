@@ -22,7 +22,8 @@ sudo bash tools/install_vps_systemd.sh
 ## Pi Agent sidecar
 
 The Agent is a separate Node.js 22 service behind the Rust API. The app never
-connects to its loopback port directly. Install `bubblewrap` first; shell commands
+connects to its loopback port directly. Install `bubblewrap`, `poppler-utils`,
+`unzip`, and `python3` first; shell commands
 run with only the per-user workspace mounted writable, while model credentials
 and the rest of the host filesystem remain outside that mount.
 

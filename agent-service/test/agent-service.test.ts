@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -28,6 +29,38 @@ const owner: Principal = {
   ledgerId: "ledger_default",
   deviceId: "dev_test",
 };
+
+function storedZip(fileNames: string[]): Buffer {
+  const locals: Buffer[] = [];
+  const centrals: Buffer[] = [];
+  let localOffset = 0;
+  for (const fileName of fileNames) {
+    const name = Buffer.from(fileName, "utf8");
+    const local = Buffer.alloc(30 + name.length);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(name.length, 26);
+    name.copy(local, 30);
+    locals.push(local);
+    const central = Buffer.alloc(46 + name.length);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt32LE(localOffset, 42);
+    name.copy(central, 46);
+    centrals.push(central);
+    localOffset += local.length;
+  }
+  const centralBytes = Buffer.concat(centrals);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(fileNames.length, 8);
+  eocd.writeUInt16LE(fileNames.length, 10);
+  eocd.writeUInt32LE(centralBytes.length, 12);
+  eocd.writeUInt32LE(localOffset, 16);
+  return Buffer.concat([...locals, centralBytes, eocd]);
+}
 
 class FakeEngine implements AgentEngine {
   readonly models: AgentModelInfo[];
@@ -472,6 +505,57 @@ test("archives an image and passes only owned attachment IDs to the model", asyn
       server.close((error) => (error ? reject(error) : resolve())),
     );
   }
+});
+
+test("archives validated workspace documents and attaches them to an Agent run", async () => {
+  const engine = new FakeEngine();
+  const service = await serviceWith(engine);
+  const conversation = (await service.listConversations(owner))[0];
+  assert.ok(conversation);
+  const cases = [
+    { fileName: "note.txt", mimeType: "text/plain", bytes: Buffer.from("账单备注\n", "utf8") },
+    { fileName: "bill.csv", mimeType: "text/csv", bytes: Buffer.from("date,amount\n2026-07-28,12.50\n") },
+    { fileName: "bill.pdf", mimeType: "application/pdf", bytes: Buffer.from("%PDF-1.4\n1 0 obj\nendobj\n%%EOF\n") },
+    { fileName: "files.zip", mimeType: "application/zip", bytes: storedZip(["bill.csv"]) },
+    {
+      fileName: "book.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      bytes: storedZip(["[Content_Types].xml", "xl/workbook.xml"]),
+    },
+  ];
+  const ids: string[] = [];
+  for (const item of cases) {
+    const metadata = await service.createAttachment(owner, {
+      ...item,
+      sha256: createHash("sha256").update(item.bytes).digest("hex"),
+    });
+    ids.push(metadata.id);
+    assert.equal(metadata.mimeType, item.mimeType);
+    const content = await service.getAttachmentContent(owner, metadata.id);
+    assert.deepEqual(content.bytes, item.bytes);
+  }
+  await service.sendMessage(owner, conversation.id, "读取这些文件", ids);
+  await waitForCompleted(service, conversation.id);
+  assert.equal(engine.lastAttachmentCount, cases.length);
+
+  await assert.rejects(
+    service.createAttachment(owner, {
+      fileName: "fake.xlsx",
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      bytes: storedZip(["random.txt"]),
+      sha256: "0".repeat(64),
+    }),
+    /attachment_mime_mismatch/,
+  );
+  await assert.rejects(
+    service.createAttachment(owner, {
+      fileName: "traversal.zip",
+      mimeType: "application/zip",
+      bytes: storedZip(["../outside.txt"]),
+      sha256: "0".repeat(64),
+    }),
+    /attachment_mime_mismatch/,
+  );
 });
 
 test("web quote candidates remain suggested until an idempotent user review applies them", async () => {

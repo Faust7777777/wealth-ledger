@@ -3,6 +3,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { EventHub } from "./event-hub.js";
 import { StateStore } from "./state-store.js";
+import { ATTACHMENT_EXTENSIONS, attachmentMatchesMime } from "./attachment-formats.js";
 import type {
   AgentConversation,
   AgentEngine,
@@ -124,30 +125,14 @@ export class AgentService {
     principal: Principal,
     file: { fileName: string; mimeType: string; bytes: Buffer; sha256: string },
   ): Promise<Omit<AgentAttachment, "originalPath" | "workingPath">> {
-    const extensions: Record<string, string> = {
-      "image/png": ".png",
-      "image/jpeg": ".jpg",
-      "image/webp": ".webp",
-    };
-    const extension = extensions[file.mimeType];
+    const extension = ATTACHMENT_EXTENSIONS[file.mimeType];
     if (!extension) throw new Error("unsupported_attachment_type");
     if (file.bytes.length === 0 || file.bytes.length > 15 * 1024 * 1024) {
       throw new Error("invalid_attachment_size");
     }
-    const matchesMime =
-      (file.mimeType === "image/png" &&
-        file.bytes.length >= 24 &&
-        file.bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) &&
-        file.bytes.subarray(12, 16).toString("ascii") === "IHDR") ||
-      (file.mimeType === "image/jpeg" &&
-        file.bytes.length >= 4 &&
-        file.bytes[0] === 0xff && file.bytes[1] === 0xd8 &&
-        file.bytes.at(-2) === 0xff && file.bytes.at(-1) === 0xd9) ||
-      (file.mimeType === "image/webp" &&
-        file.bytes.length >= 12 &&
-        file.bytes.subarray(0, 4).toString("ascii") === "RIFF" &&
-        file.bytes.subarray(8, 12).toString("ascii") === "WEBP");
-    if (!matchesMime) throw new Error("attachment_mime_mismatch");
+    if (!attachmentMatchesMime(file.mimeType, file.bytes)) {
+      throw new Error("attachment_mime_mismatch");
+    }
     await this.store.prepareUser(principal.userId);
     const id = `att_${randomUUID()}`;
     const root = this.store.userRoot(principal.userId);
