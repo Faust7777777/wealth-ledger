@@ -1676,7 +1676,12 @@ def check_deploy_security_defaults() -> None:
 
     for installer in (VPS_INSTALL, AGENT_VPS_INSTALL):
         installer_text = installer.read_text(encoding="utf-8")
-        for snippet in ("start_proxy_sockets", "finwealth-docker-proxy@*.socket"):
+        for snippet in (
+            "start_proxy_sockets",
+            "find /etc/systemd/system",
+            "finwealth-docker-proxy@*.socket",
+            "sort -u",
+        ):
             if snippet not in installer_text:
                 fail(f"{installer.name} does not restore the Docker proxy: {snippet}")
 
@@ -1687,6 +1692,7 @@ def check_deploy_security_defaults() -> None:
         'run_caddy(args.container, "validate")',
         'run_caddy(args.container, "reload")',
         "backup.read_text(encoding=\"utf-8\")",
+        'line.strip() == "wuwaidut.com {"',
     ):
         if snippet not in caddy_patch_text:
             fail(f"Caddy Agent route patch lacks rollback safeguard: {snippet}")

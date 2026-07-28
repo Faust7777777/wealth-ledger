@@ -57,7 +57,11 @@ def main() -> None:
     if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
         raise RuntimeError("Caddyfile must be a regular non-symlink file")
     original = path.read_text(encoding="utf-8")
-    if original.count("wuwaidut.com {") != 1 or original.count("@finwealth {") != 1:
+    lines = original.splitlines()
+    if (
+        sum(line.strip() == "wuwaidut.com {" for line in lines) != 1
+        or sum(line.strip() == "@finwealth {" for line in lines) != 1
+    ):
         raise RuntimeError("shared Caddyfile does not have one expected Finwealth matcher")
     start = original.index("@finwealth {")
     end = original.find("\n\t}", start)
