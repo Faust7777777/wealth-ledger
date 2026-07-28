@@ -339,6 +339,18 @@ final agentConversationsProvider = FutureProvider<List<AgentConversationVm>>(
 final agentMemoriesProvider = FutureProvider<List<AgentMemoryVm>>(
   (ref) => ref.watch(agentRepositoryProvider).listMemories(),
 );
+final agentQuoteCandidatesProvider =
+    FutureProvider<List<AgentQuoteCandidateVm>>(
+      (ref) => ref.watch(agentRepositoryProvider).listQuoteCandidates(),
+    );
+
+/// 附件安全元数据：历史消息先读它再决定怎么呈现，避免把非图片字节交给解码器。
+final agentAttachmentMetaProvider =
+    FutureProvider.family<AgentAttachmentVm, String>(
+      (ref, attachmentId) =>
+          ref.watch(agentRepositoryProvider).getAttachment(attachmentId),
+      retry: (_, _) => null,
+    );
 
 /// 附件原图字节（消息历史与重启后恢复预览）；失败不自动退避重试，由 UI 决定。
 final agentAttachmentBytesProvider = FutureProvider.family<Uint8List, String>(

@@ -350,6 +350,123 @@ void main() {
     });
   });
 
+  group('报价候选', () {
+    test('列表映射：标的与汇率两种形态', () async {
+      final repo = LocalServerAgentRepository(
+        DevApiClient(
+          'http://127.0.0.1:8790',
+          client: MockClient(
+            (request) async => _ok([
+              {
+                'id': 'qc_1',
+                'userId': 'u_1',
+                'ledgerId': 'l_1',
+                'kind': 'instrument',
+                'instrumentId': 'inst_btc',
+                'price': '61234.50',
+                'currency': 'USDT',
+                'asOf': '2026-07-28T09:30:00Z',
+                'source': 'CoinGecko',
+                'sourceUrl': 'https://www.coingecko.com/en/coins/bitcoin',
+                'status': 'suggested',
+                'createdAt': '2026-07-28T09:31:00Z',
+                'updatedAt': '2026-07-28T09:31:00Z',
+              },
+              {
+                'id': 'qc_2',
+                'userId': 'u_1',
+                'ledgerId': 'l_1',
+                'kind': 'fx',
+                'baseCurrency': 'USD',
+                'quoteCurrency': 'CNY',
+                'rate': '7.1832',
+                'asOf': '2026-07-28T09:30:00Z',
+                'source': '中国外汇交易中心',
+                'sourceUrl': 'https://www.chinamoney.com.cn/rate',
+                'status': 'applied',
+                'createdAt': '2026-07-28T09:31:00Z',
+                'updatedAt': '2026-07-28T09:32:00Z',
+                'appliedAt': '2026-07-28T09:32:00Z',
+              },
+            ]),
+          ),
+        ),
+      );
+      final list = await repo.listQuoteCandidates();
+      expect(list, hasLength(2));
+      expect(list[0].kind, AgentQuoteCandidateKind.instrument);
+      expect(list[0].instrumentId, 'inst_btc');
+      expect(list[0].price, '61234.50');
+      expect(list[0].currency, 'USDT');
+      expect(list[0].status, AgentQuoteCandidateStatus.suggested);
+      expect(list[1].kind, AgentQuoteCandidateKind.fx);
+      expect(list[1].rate, '7.1832');
+      expect(list[1].baseCurrency, 'USD');
+      expect(list[1].status, AgentQuoteCandidateStatus.applied);
+      expect(list[1].appliedAt, '2026-07-28T09:32:00Z');
+    });
+
+    test('审核发送 apply / reject 并带 Idempotency-Key', () async {
+      final bodies = <Map<String, dynamic>>[];
+      final keys = <String>[];
+      final repo = LocalServerAgentRepository(
+        DevApiClient(
+          'http://127.0.0.1:8790',
+          client: MockClient((request) async {
+            expect(request.url.path, '/v1/agent/quote-candidates/qc_1/review');
+            keys.add(request.headers['idempotency-key']!);
+            bodies.add(jsonDecode(request.body) as Map<String, dynamic>);
+            return _ok({
+              'id': 'qc_1',
+              'userId': 'u_1',
+              'ledgerId': 'l_1',
+              'kind': 'instrument',
+              'instrumentId': 'inst_btc',
+              'price': '61234.50',
+              'currency': 'USDT',
+              'asOf': '2026-07-28T09:30:00Z',
+              'source': 'CoinGecko',
+              'sourceUrl': 'https://www.coingecko.com/en/coins/bitcoin',
+              'status': 'applied',
+              'createdAt': '2026-07-28T09:31:00Z',
+              'updatedAt': '2026-07-28T09:32:00Z',
+            });
+          }),
+        ),
+      );
+      await repo.reviewQuoteCandidate(
+        'qc_1',
+        decision: AgentQuoteCandidateStatus.applied,
+      );
+      await repo.reviewQuoteCandidate(
+        'qc_1',
+        decision: AgentQuoteCandidateStatus.rejected,
+      );
+      expect(bodies[0], {'decision': 'apply'});
+      expect(bodies[1], {'decision': 'reject'});
+      expect(keys, hasLength(2));
+      expect(keys[0], isNot(keys[1]), reason: '两次独立写入用不同 key');
+    });
+
+    test('409 已处理映射为冲突异常', () async {
+      final repo = LocalServerAgentRepository(
+        DevApiClient(
+          'http://127.0.0.1:8790',
+          client: MockClient(
+            (_) async => _err(409, 'agent_quote_candidate_already_reviewed'),
+          ),
+        ),
+      );
+      await expectLater(
+        repo.reviewQuoteCandidate(
+          'qc_1',
+          decision: AgentQuoteCandidateStatus.applied,
+        ),
+        throwsA(isA<ApiConflictException>()),
+      );
+    });
+  });
+
   group('SSE', () {
     test('解析 id/event/data 帧，跳过 keep-alive', () async {
       final frames = <AgentEventVm>[];

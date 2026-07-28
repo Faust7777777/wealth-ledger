@@ -155,6 +155,13 @@ abstract interface class AgentRepository {
     List<Id> attachmentIds,
   });
 
+  /// 网页报价候选：suggested 不改变估值；只有「采用」才写入权威报价。
+  Future<List<AgentQuoteCandidateVm>> listQuoteCandidates();
+  Future<AgentQuoteCandidateVm> reviewQuoteCandidate(
+    Id candidateId, {
+    required AgentQuoteCandidateStatus decision,
+  });
+
   /// SSE：`after` 为已应用的最大 cursor，重连时只补发之后的事件。
   Stream<AgentEventVm> events(Id conversationId, {int? after});
 

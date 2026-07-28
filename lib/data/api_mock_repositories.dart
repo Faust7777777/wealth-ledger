@@ -1787,6 +1787,35 @@ AgentMemoryVm _agentMemory(Map<String, dynamic> j) => AgentMemoryVm(
   updatedAt: '${j['updatedAt']}',
 );
 
+AgentQuoteCandidateVm _agentQuoteCandidate(Map<String, dynamic> j) =>
+    AgentQuoteCandidateVm(
+      id: '${j['id']}',
+      kind: j['kind'] == 'fx'
+          ? AgentQuoteCandidateKind.fx
+          : AgentQuoteCandidateKind.instrument,
+      asOf: '${j['asOf']}',
+      source: '${j['source']}',
+      sourceUrl: '${j['sourceUrl']}',
+      status: switch (j['status']) {
+        'applied' => AgentQuoteCandidateStatus.applied,
+        'rejected' => AgentQuoteCandidateStatus.rejected,
+        _ => AgentQuoteCandidateStatus.suggested,
+      },
+      createdAt: '${j['createdAt']}',
+      updatedAt: '${j['updatedAt']}',
+      instrumentId: j['instrumentId'] as String?,
+      price: j['price'] as String?,
+      currency: j['currency'] as String?,
+      baseCurrency: j['baseCurrency'] as String?,
+      quoteCurrency: j['quoteCurrency'] as String?,
+      rate: j['rate'] as String?,
+      appliedAt: j['appliedAt'] as String?,
+    );
+
+/// 供测试直接校验 wire → VM 映射。
+AgentQuoteCandidateVm parseAgentQuoteCandidateData(Map<String, dynamic> j) =>
+    _agentQuoteCandidate(j);
+
 AgentEventType _agentEventType(String s) => switch (s) {
   'run.queued' => AgentEventType.runQueued,
   'run.started' => AgentEventType.runStarted,
@@ -1952,6 +1981,29 @@ class LocalServerAgentRepository implements AgentRepository {
       assistantMessageId: '${d['assistantMessageId']}',
     );
   }
+
+  @override
+  Future<List<AgentQuoteCandidateVm>> listQuoteCandidates() async => [
+    for (final c in _list(await _c.getData('/v1/agent/quote-candidates')))
+      _agentQuoteCandidate(_m(c)),
+  ];
+
+  @override
+  Future<AgentQuoteCandidateVm> reviewQuoteCandidate(
+    Id candidateId, {
+    required AgentQuoteCandidateStatus decision,
+  }) async => _agentQuoteCandidate(
+    _m(
+      await _c.postData(
+        '/v1/agent/quote-candidates/$candidateId/review',
+        body: {
+          'decision': decision == AgentQuoteCandidateStatus.applied
+              ? 'apply'
+              : 'reject',
+        },
+      ),
+    ),
+  );
 
   @override
   Stream<AgentEventVm> events(Id conversationId, {int? after}) => _c

@@ -1395,17 +1395,47 @@ void main() {
     attachmentIds: attachmentIds,
   );
 
+  // Image.memory 的解码是异步的：golden 里必须先 precache 再 pump，否则只画出空位。
+  Future<void> decodeImages(WidgetTester tester) async {
+    final context = tester.element(find.byType(AgentPanel));
+    for (var round = 0; round < 3; round += 1) {
+      await tester.runAsync(() async {
+        for (final image in tester.widgetList<Image>(find.byType(Image))) {
+          await precacheImage(image.image, context);
+        }
+      });
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+    }
+  }
+
   Widget agentHost(
     ThemeData theme, {
     bool configured = true,
     List<AgentMessageVm> messages = const [],
     List<AgentMemoryVm> memories = const [],
     List<AgentEventVm> events = const [],
+    AgentFilePicker? picker,
+    List<AgentQuoteCandidateVm> candidates = const [],
+    AgentAttachmentVm? attachmentMeta,
   }) => ProviderScope(
     overrides: [
+      if (picker != null)
+        agentAttachmentPickerProvider.overrideWithValue(picker),
       capabilitiesProvider.overrideWith((ref) async => tradeCaps),
       accountsProvider.overrideWith((ref) async => const <AccountVm>[]),
       aiPendingProvider.overrideWith((ref) async => const <AiProposalVm>[]),
+      instrumentsProvider.overrideWith(
+        (ref) async => const [
+          InstrumentVm(
+            id: 'inst_btc',
+            type: InstrumentType.crypto,
+            displayName: 'Bitcoin',
+            symbol: 'BTC',
+            quoteCurrency: 'USDT',
+          ),
+        ],
+      ),
       agentRepositoryProvider.overrideWithValue(
         _PreviewAgentRepo(
           configured: configured,
@@ -1413,11 +1443,14 @@ void main() {
           memories: memories,
           frames: events,
           conversations: const [agentConversation],
+          candidates: candidates,
+          attachmentMeta: attachmentMeta,
         ),
       ),
     ],
     child: MaterialApp(
       theme: theme,
+      debugShowCheckedModeBanner: false,
       home: const Scaffold(body: AgentPanel()),
     ),
   );
@@ -1489,6 +1522,143 @@ void main() {
     });
   }
 
+  // 草稿区（待发送图片）：用注入的选图器，不驱动真实系统文件对话框。
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('agent panel draft image - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(400, 560));
+      await tester.pumpWidget(
+        agentHost(
+          theme,
+          picker: () async => (
+            fileName: 'wechat-bill.png',
+            bytes: base64Decode(
+              'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAeklEQVR4'
+              'nO3PUQkAIBTAwJfbJKYxmyH8OITBAtxm7fN1wwUNaEEDWtCAFjSgBQ1o'
+              'QQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAF'
+              'DWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWPHYB8LwBtMtZwAUA'
+              'AAAASUVORK5CYII=',
+            ),
+          ),
+        ),
+      );
+      await _settleEntrance(tester);
+      await tester.tap(find.byIcon(Icons.attach_file));
+      await tester.pumpAndSettle();
+      await decodeImages(tester);
+      await expectLater(
+        find.byType(AgentPanel),
+        matchesGoldenFile('goldens/agent_panel_draft_image_$name.png'),
+      );
+    });
+  }
+
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('agent panel quote candidate - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(400, 560));
+      await tester.pumpWidget(
+        agentHost(
+          theme,
+          candidates: const [
+            AgentQuoteCandidateVm(
+              id: 'qc_1',
+              kind: AgentQuoteCandidateKind.instrument,
+              instrumentId: 'inst_btc',
+              price: '61234.50',
+              currency: 'USDT',
+              asOf: '2026-07-28T09:30:00Z',
+              source: 'CoinGecko',
+              sourceUrl: 'https://www.coingecko.com/en/coins/bitcoin',
+              status: AgentQuoteCandidateStatus.suggested,
+              createdAt: '2026-07-28T09:31:00Z',
+              updatedAt: '2026-07-28T09:31:00Z',
+            ),
+          ],
+        ),
+      );
+      await _settleEntrance(tester);
+      await tester.tap(find.textContaining('报价建议'));
+      await tester.pumpAndSettle();
+      await expectLater(
+        find.byType(MaterialApp),
+        matchesGoldenFile('goldens/agent_panel_quote_candidate_$name.png'),
+      );
+    });
+  }
+
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('agent panel draft document - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(400, 560));
+      await tester.pumpWidget(
+        agentHost(
+          theme,
+          picker: () async => (
+            fileName: 'wechat-2026-07.csv',
+            bytes: Uint8List.fromList(
+              utf8.encode('date,amount\n2026-07-28,18.00\n'),
+            ),
+          ),
+        ),
+      );
+      await _settleEntrance(tester);
+      await tester.tap(find.byIcon(Icons.attach_file));
+      await tester.pumpAndSettle();
+      await expectLater(
+        find.byType(AgentPanel),
+        matchesGoldenFile('goldens/agent_panel_draft_document_$name.png'),
+      );
+    });
+
+    testWidgets(
+      'agent panel history document - $name',
+      skip: !_previewEnabled,
+      (tester) async {
+        await sized(tester, const Size(400, 560));
+        await tester.pumpWidget(
+          agentHost(
+            theme,
+            messages: [
+              agentMessage(
+                'm1',
+                AgentMessageRole.user,
+                '这份对账单帮我看看',
+                attachmentIds: const ['att_pdf'],
+              ),
+              agentMessage('m2', AgentMessageRole.assistant, '我已经拿到这份文件了。'),
+            ],
+            attachmentMeta: const AgentAttachmentVm(
+              id: 'att_pdf',
+              fileName: 'statement-2026-07.pdf',
+              mimeType: 'application/pdf',
+              sizeBytes: 243712,
+              sha256: 'e',
+              createdAt: '2026-07-28T00:00:00Z',
+            ),
+          ),
+        );
+        await _settleEntrance(tester);
+        await expectLater(
+          find.byType(AgentPanel),
+          matchesGoldenFile('goldens/agent_panel_history_document_$name.png'),
+        );
+      },
+    );
+  }
+
   testWidgets('agent panel unconfigured - dark', skip: !_previewEnabled, (
     tester,
   ) async {
@@ -1514,12 +1684,7 @@ void main() {
           agentHost(
             theme,
             messages: [
-              agentMessage(
-                'm1',
-                AgentMessageRole.user,
-                '这张微信账单帮我整理一下',
-                attachmentIds: const ['att_1'],
-              ),
+              agentMessage('m1', AgentMessageRole.user, '这张微信账单帮我整理一下'),
               agentMessage(
                 'm2',
                 AgentMessageRole.assistant,
@@ -1556,6 +1721,8 @@ class _PreviewAgentRepo implements AgentRepository {
     required this.memories,
     required this.frames,
     required this.conversations,
+    this.candidates = const [],
+    this.attachmentMeta,
   });
 
   final bool configured;
@@ -1563,6 +1730,8 @@ class _PreviewAgentRepo implements AgentRepository {
   final List<AgentMemoryVm> memories;
   final List<AgentEventVm> frames;
   final List<AgentConversationVm> conversations;
+  final List<AgentQuoteCandidateVm> candidates;
+  final AgentAttachmentVm? attachmentMeta;
 
   @override
   Future<AgentStatusVm> getStatus() async =>
@@ -1595,18 +1764,33 @@ class _PreviewAgentRepo implements AgentRepository {
   @override
   Future<Uint8List> getAttachmentContent(Id attachmentId) async => base64Decode(
     'iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAIAAADYYG7QAAAAQklEQVR4'
-    'nO3OQQ0AIAwAsYlGFErQhQuOR5MK6Jy9vjL5QEhISKgeCAkJCdUDISEh'
-    'oXogJCQkVA+EhISE6oGQkNBjFy1m8vF2AlEMAAAAAElFTkSuQmCC',
+    'nO3OQQ0AIAwAselGCWrQhguOR5MK6Kx9vjL5QEhISKgeCAkJCdUDISEh'
+    'oXogJCQkVA+EhISE6oGQkNBjFzYGUPE+ORsjAAAAAElFTkSuQmCC',
   );
   @override
-  Future<AgentAttachmentVm> getAttachment(Id attachmentId) =>
-      throw UnsupportedError('preview');
+  Future<AgentAttachmentVm> getAttachment(Id attachmentId) async =>
+      attachmentMeta ??
+      AgentAttachmentVm(
+        id: attachmentId,
+        fileName: 'bill.png',
+        mimeType: 'image/png',
+        sizeBytes: 4096,
+        sha256: 'd' * 64,
+        createdAt: '2026-07-28T00:00:00Z',
+      );
   @override
   Future<AgentAttachmentVm> uploadAttachment({
     required String fileName,
     required String mimeType,
     required Uint8List bytes,
-  }) => throw UnsupportedError('preview');
+  }) async => AgentAttachmentVm(
+    id: 'att_preview',
+    fileName: fileName,
+    mimeType: mimeType,
+    sizeBytes: bytes.length,
+    sha256: 'c' * 64,
+    createdAt: '2026-07-28T00:00:00Z',
+  );
   @override
   Future<AgentMemoryVm> reviewMemory(
     Id memoryId, {
@@ -1627,6 +1811,13 @@ class _PreviewAgentRepo implements AgentRepository {
     Id conversationId, {
     required String text,
     List<Id> attachmentIds = const [],
+  }) => throw UnsupportedError('preview');
+  @override
+  Future<List<AgentQuoteCandidateVm>> listQuoteCandidates() async => candidates;
+  @override
+  Future<AgentQuoteCandidateVm> reviewQuoteCandidate(
+    Id candidateId, {
+    required AgentQuoteCandidateStatus decision,
   }) => throw UnsupportedError('preview');
   @override
   Future<void> cancelRun(Id runId) => throw UnsupportedError('preview');

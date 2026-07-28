@@ -99,6 +99,13 @@ class _FakeAgentRepo implements AgentRepository {
   }
 
   @override
+  Future<List<AgentQuoteCandidateVm>> listQuoteCandidates() async => const [];
+  @override
+  Future<AgentQuoteCandidateVm> reviewQuoteCandidate(
+    Id candidateId, {
+    required AgentQuoteCandidateStatus decision,
+  }) => throw UnsupportedError('unused');
+  @override
   Future<void> cancelRun(Id runId) async => cancelled.add(runId);
 
   @override

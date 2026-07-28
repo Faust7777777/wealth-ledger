@@ -1,20 +1,21 @@
 // Wealth Ledger — Agent 面板（Windows 右栏 / Android 全屏共用同一份实现）。
 // 只经 /v1/agent/**；账务产出落到既有 AI 待审核列表，这里只提供低强调入口。
-import 'dart:typed_data';
-
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import '../data/api_mock_repositories.dart' show ApiValidationException;
+import '../core/types.dart';
+import '../data/api_mock_repositories.dart'
+    show ApiConflictException, ApiValidationException;
 import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
 import 'agent_controller.dart';
 
-/// 附件白名单（与服务端一致）；HEIC 不在范围内。
+/// 图片白名单（作为模型视觉输入）；HEIC 不在范围内。
 const Map<String, String> kAgentImageMimeTypes = {
   'png': 'image/png',
   'jpg': 'image/jpeg',
@@ -22,18 +23,131 @@ const Map<String, String> kAgentImageMimeTypes = {
   'webp': 'image/webp',
 };
 
-String? agentImageMimeType(String fileName) {
-  final dot = fileName.lastIndexOf('.');
-  if (dot < 0) return null;
-  return kAgentImageMimeTypes[fileName.substring(dot + 1).toLowerCase()];
+/// 文档白名单（进 Agent 工作区，由 Agent 自行选择工具读取）。
+const Map<String, String> kAgentDocumentMimeTypes = {
+  'txt': 'text/plain',
+  'csv': 'text/csv',
+  'pdf': 'application/pdf',
+  'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'zip': 'application/zip',
+};
+
+String? agentImageMimeType(String fileName) =>
+    kAgentImageMimeTypes[_extensionOf(fileName)];
+
+/// 按真实扩展名给出准确 MIME；不在白名单内返回 null。
+String? agentAttachmentMimeType(String fileName) {
+  final ext = _extensionOf(fileName);
+  return kAgentImageMimeTypes[ext] ?? kAgentDocumentMimeTypes[ext];
 }
 
-/// 附件上传失败的用户可见短提示（不外露内部标识与实现细节）。
-String agentAttachmentErrorMessage(String? code) => switch (code) {
-  'invalid_attachment_size' => '图片超过 15 MiB，请压缩后再试。',
-  'invalid_attachment_type' => '只支持 PNG、JPEG、WEBP 图片。',
-  _ => '图片未通过校验，请重新选择。',
+String _extensionOf(String fileName) {
+  final dot = fileName.lastIndexOf('.');
+  return dot < 0 ? '' : fileName.substring(dot + 1).toLowerCase();
+}
+
+bool agentMimeIsImage(String mimeType) =>
+    kAgentImageMimeTypes.containsValue(mimeType);
+
+/// 文档类型的小图标（不显示 MIME 本身）。
+IconData agentAttachmentIcon(String mimeType) => switch (mimeType) {
+  'application/pdf' => Icons.picture_as_pdf_outlined,
+  'text/csv' => Icons.grid_on_outlined,
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' =>
+    Icons.table_chart_outlined,
+  'application/zip' => Icons.folder_zip_outlined,
+  'text/plain' => Icons.description_outlined,
+  _ => Icons.insert_drive_file_outlined,
 };
+
+/// 人类可读的文件大小。
+String agentFileSize(int bytes) {
+  if (bytes < 1024) return '$bytes B';
+  if (bytes < 1024 * 1024) return '${(bytes / 1024).round()} KB';
+  return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+}
+
+/// 用户选中的一个待上传文件。
+typedef AgentPickedFile = ({String fileName, Uint8List bytes});
+
+/// 选文件入口的可注入接缝：默认弹系统选择器；测试与预览覆盖它，
+/// 因此不需要在测试里驱动真实文件对话框。
+typedef AgentFilePicker = Future<AgentPickedFile?> Function();
+
+Future<AgentPickedFile?> _pickFileFromSystem() async {
+  final extensions = [
+    ...kAgentImageMimeTypes.keys,
+    ...kAgentDocumentMimeTypes.keys,
+  ];
+  final typeGroup = XTypeGroup(
+    label: 'attachments',
+    extensions: extensions,
+    mimeTypes: [
+      ...kAgentImageMimeTypes.values.toSet(),
+      ...kAgentDocumentMimeTypes.values,
+    ],
+  );
+  final file = await openFile(acceptedTypeGroups: [typeGroup]);
+  if (file == null) return null;
+  return (fileName: file.name, bytes: await file.readAsBytes());
+}
+
+final agentAttachmentPickerProvider = Provider<AgentFilePicker>(
+  (ref) => _pickFileFromSystem,
+);
+
+/// 附件失败的用户可见短提示。UTF-8 不合法与格式不符在服务端同码，
+/// 用本地选中的文件类型区分成两句话。
+String agentAttachmentErrorMessage(String? code, {String? fileName}) {
+  final ext = fileName == null ? '' : _extensionOf(fileName);
+  final isText = ext == 'txt' || ext == 'csv';
+  return switch (code) {
+    'invalid_attachment_size' => '文件超过 15 MiB，请压缩后再试。',
+    'unsupported_attachment_type' => '只支持图片、TXT、CSV、PDF、XLSX 与 ZIP。',
+    'attachment_mime_mismatch' when isText => '文本内容不是有效的 UTF-8，请另存后再试。',
+    'attachment_mime_mismatch' => '文件内容与扩展名不一致，请重新选择。',
+    _ => '文件未通过校验，请重新选择。',
+  };
+}
+
+/// 候选主体：标的用可读名称（不显示内部 ID），汇率用币对。
+String agentQuoteSubject(
+  AgentQuoteCandidateVm candidate,
+  List<InstrumentVm> instruments,
+) {
+  if (candidate.kind == AgentQuoteCandidateKind.fx) {
+    return '${candidate.baseCurrency} / ${candidate.quoteCurrency}';
+  }
+  for (final i in instruments) {
+    if (i.id != candidate.instrumentId) continue;
+    final symbol = i.symbol ?? '';
+    return symbol.isEmpty ? i.displayName : '${i.displayName} · $symbol';
+  }
+  return '标的';
+}
+
+/// 数值 + 计价单位。
+String agentQuoteValue(AgentQuoteCandidateVm candidate) =>
+    candidate.kind == AgentQuoteCandidateKind.fx
+    ? '${candidate.rate} ${candidate.quoteCurrency}'
+    : '${candidate.price} ${candidate.currency}';
+
+/// 来源域名（只显示 host）。
+String agentSourceHost(String url) {
+  final uri = Uri.tryParse(url);
+  final host = uri?.host ?? '';
+  return host.isEmpty ? url : host;
+}
+
+/// 报价时间按本地时区显示到分钟。
+String formatLocalDateTime(String iso) {
+  final parsed = DateTime.tryParse(iso);
+  if (parsed == null) return iso;
+  final local = parsed.toLocal();
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${local.year}-${two(local.month)}-${two(local.day)} '
+      '${two(local.hour)}:${two(local.minute)}';
+}
 
 class AgentPanel extends ConsumerStatefulWidget {
   const AgentPanel({super.key, this.onClose});
@@ -77,32 +191,37 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
       _uploading = true;
       _composerError = null;
     });
+    String? pickedName;
     try {
-      const typeGroup = XTypeGroup(
-        label: 'images',
-        extensions: ['png', 'jpg', 'jpeg', 'webp'],
-        mimeTypes: ['image/png', 'image/jpeg', 'image/webp'],
-      );
-      final file = await openFile(acceptedTypeGroups: const [typeGroup]);
-      if (file == null) return;
-      final mime = agentImageMimeType(file.name);
+      final picked = await ref.read(agentAttachmentPickerProvider)();
+      if (picked == null) return;
+      pickedName = picked.fileName;
+      final mime = agentAttachmentMimeType(picked.fileName);
       if (mime == null) {
-        setState(() => _composerError = '只支持 PNG、JPEG、WEBP 图片。');
+        setState(() => _composerError = '只支持图片、TXT、CSV、PDF、XLSX 与 ZIP。');
         return;
       }
-      final bytes = await file.readAsBytes();
       final meta = await ref
           .read(agentRepositoryProvider)
-          .uploadAttachment(fileName: file.name, mimeType: mime, bytes: bytes);
+          .uploadAttachment(
+            fileName: picked.fileName,
+            mimeType: mime,
+            bytes: picked.bytes,
+          );
       if (!mounted) return;
-      setState(() => _pending.add((meta: meta, bytes: bytes)));
+      setState(() => _pending.add((meta: meta, bytes: picked.bytes)));
     } on ApiValidationException catch (e) {
-      // 400/413 保留已选图片列表，允许直接重试。
+      // 400/413 保留用户仍可重新选择。
       if (mounted) {
-        setState(() => _composerError = agentAttachmentErrorMessage(e.code));
+        setState(
+          () => _composerError = agentAttachmentErrorMessage(
+            e.code,
+            fileName: pickedName,
+          ),
+        );
       }
     } catch (_) {
-      if (mounted) setState(() => _composerError = '图片上传失败，请重试。');
+      if (mounted) setState(() => _composerError = '文件上传失败，请重试。');
     } finally {
       if (mounted) setState(() => _uploading = false);
     }
@@ -153,6 +272,7 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
           onClose: widget.onClose,
         ),
         const Divider(height: 1),
+        const _QuoteCandidatesEntry(),
         const _MemorySuggestions(),
         Expanded(
           child: chat.loading
@@ -346,6 +466,252 @@ class _Header extends ConsumerWidget {
   }
 }
 
+/// 报价候选入口：外层只留一条固定高度的低强调摘要，
+/// 候选卡片放进有高度上限、可滚动的 sheet，避免挤掉聊天区。
+class _QuoteCandidatesEntry extends ConsumerWidget {
+  const _QuoteCandidatesEntry();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final suggested = ref.watch(agentSuggestedQuoteCandidatesProvider);
+    if (suggested.isEmpty) return const SizedBox.shrink();
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: TextButton.icon(
+        onPressed: () => showAgentQuoteCandidateSheet(context),
+        icon: const Icon(Icons.link_outlined, size: 18),
+        label: Text('报价建议 ${suggested.length}'),
+      ),
+    );
+  }
+}
+
+/// 只保留 suggested；applied / rejected 不进入界面。
+final agentSuggestedQuoteCandidatesProvider =
+    Provider<List<AgentQuoteCandidateVm>>((ref) {
+      final all =
+          ref.watch(agentQuoteCandidatesProvider).asData?.value ?? const [];
+      return [
+        for (final c in all)
+          if (c.status == AgentQuoteCandidateStatus.suggested) c,
+      ];
+    });
+
+Future<void> showAgentQuoteCandidateSheet(BuildContext context) =>
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (_) => const AgentQuoteCandidateSheet(),
+    );
+
+class AgentQuoteCandidateSheet extends ConsumerStatefulWidget {
+  const AgentQuoteCandidateSheet({super.key});
+
+  @override
+  ConsumerState<AgentQuoteCandidateSheet> createState() =>
+      _AgentQuoteCandidateSheetState();
+}
+
+class _AgentQuoteCandidateSheetState
+    extends ConsumerState<AgentQuoteCandidateSheet> {
+  final _busy = <Id>{};
+  final _errors = <Id, String>{};
+
+  Future<void> _review(
+    AgentQuoteCandidateVm candidate,
+    AgentQuoteCandidateStatus decision,
+  ) async {
+    // 重复点击只产生一次请求。
+    if (!_busy.add(candidate.id)) return;
+    setState(() => _errors.remove(candidate.id));
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await ref
+          .read(agentRepositoryProvider)
+          .reviewQuoteCandidate(candidate.id, decision: decision);
+      ref.invalidate(agentQuoteCandidatesProvider);
+      if (decision == AgentQuoteCandidateStatus.applied) {
+        // 采用是唯一会改变估值的动作：刷新所有报价派生视图。
+        ref.invalidate(holdingsProvider);
+        ref.invalidate(accountsProvider);
+        ref.invalidate(overviewProvider);
+        ref.invalidate(allocationProvider);
+        messenger.showSnackBar(const SnackBar(content: Text('已采用这条报价')));
+      }
+    } on ApiConflictException {
+      // 409：状态已变，重新拉列表。
+      ref.invalidate(agentQuoteCandidatesProvider);
+      if (mounted) {
+        setState(() => _errors[candidate.id] = '这条建议已被处理，已重新加载');
+      }
+    } on ApiValidationException catch (e) {
+      if (mounted) setState(() => _errors[candidate.id] = e.userMessage);
+    } catch (_) {
+      // 失败保留候选，可再试一次。
+      if (mounted) setState(() => _errors[candidate.id] = '操作失败，请重试');
+    } finally {
+      _busy.remove(candidate.id);
+      if (mounted) setState(() {});
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final suggested = ref.watch(agentSuggestedQuoteCandidatesProvider);
+    // 处理完最后一条就收起，不留空 sheet。
+    if (suggested.isEmpty) {
+      final navigator = Navigator.of(context);
+      Future.microtask(() {
+        if (mounted) navigator.maybePop();
+      });
+    }
+    final instruments =
+        ref.watch(instrumentsProvider).asData?.value ?? const <InstrumentVm>[];
+    final maxHeight = (MediaQuery.sizeOf(context).height * 0.7).clamp(
+      200.0,
+      560.0,
+    );
+
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: maxHeight),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppSpacing.base,
+                vertical: AppSpacing.xs,
+              ),
+              child: Text('报价建议', style: AppType.bodyStrong),
+            ),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                padding: const EdgeInsets.only(bottom: AppSpacing.base),
+                itemCount: suggested.length,
+                itemBuilder: (context, index) => _QuoteCandidateCard(
+                  candidate: suggested[index],
+                  instruments: instruments,
+                  busy: _busy.contains(suggested[index].id),
+                  error: _errors[suggested[index].id],
+                  onReview: _review,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _QuoteCandidateCard extends StatelessWidget {
+  const _QuoteCandidateCard({
+    required this.candidate,
+    required this.instruments,
+    required this.busy,
+    required this.error,
+    required this.onReview,
+  });
+
+  final AgentQuoteCandidateVm candidate;
+  final List<InstrumentVm> instruments;
+  final bool busy;
+  final String? error;
+  final void Function(AgentQuoteCandidateVm, AgentQuoteCandidateStatus)
+  onReview;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: const EdgeInsets.fromLTRB(
+        AppSpacing.base,
+        AppSpacing.xs,
+        AppSpacing.base,
+        0,
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.sm),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    agentQuoteSubject(candidate, instruments),
+                    style: AppType.bodyStrong,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                Text(agentQuoteValue(candidate), style: AppType.moneyRow),
+              ],
+            ),
+            Text(
+              '${formatLocalDateTime(candidate.asOf)} · ${candidate.source}',
+              style: AppType.caption,
+            ),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton(
+                onPressed: () async {
+                  await Clipboard.setData(
+                    ClipboardData(text: candidate.sourceUrl),
+                  );
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(
+                      context,
+                    ).showSnackBar(const SnackBar(content: Text('已复制来源链接')));
+                  }
+                },
+                style: TextButton.styleFrom(
+                  padding: EdgeInsets.zero,
+                  textStyle: AppType.caption,
+                ),
+                child: Text(agentSourceHost(candidate.sourceUrl)),
+              ),
+            ),
+            if (error != null)
+              Text(
+                error!,
+                style: AppType.caption.copyWith(
+                  color: Theme.of(context).colorScheme.error,
+                ),
+              ),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton(
+                  onPressed: busy
+                      ? null
+                      : () => onReview(
+                          candidate,
+                          AgentQuoteCandidateStatus.rejected,
+                        ),
+                  child: const Text('忽略'),
+                ),
+                const SizedBox(width: AppSpacing.xs),
+                FilledButton(
+                  onPressed: busy
+                      ? null
+                      : () => onReview(
+                          candidate,
+                          AgentQuoteCandidateStatus.applied,
+                        ),
+                  child: const Text('采用'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _MemorySuggestions extends ConsumerWidget {
   const _MemorySuggestions();
 
@@ -478,7 +844,7 @@ class _MessageBubble extends StatelessWidget {
                   runSpacing: AppSpacing.xs,
                   children: [
                     for (final id in message.attachmentIds)
-                      AgentAttachmentThumb(attachmentId: id),
+                      AgentAttachmentPreview(attachmentId: id),
                   ],
                 ),
               ),
@@ -493,9 +859,46 @@ class _MessageBubble extends StatelessWidget {
   }
 }
 
-/// 历史消息缩略图：从附件 content 接口恢复，不在本地持久化字节。
-class AgentAttachmentThumb extends ConsumerWidget {
-  const AgentAttachmentThumb({super.key, required this.attachmentId});
+/// 历史附件：先读安全元数据，图片才走 Image.memory，
+/// 其他文件只显示紧凑文件 chip，避免把 PDF/ZIP 字节交给图片解码器。
+class AgentAttachmentPreview extends ConsumerWidget {
+  const AgentAttachmentPreview({super.key, required this.attachmentId});
+  final String attachmentId;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final metaAsync = ref.watch(agentAttachmentMetaProvider(attachmentId));
+    return metaAsync.when(
+      loading: () => const SizedBox(
+        width: 72,
+        height: 72,
+        child: Center(
+          child: SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      ),
+      error: (_, _) => IconButton(
+        tooltip: '重试',
+        onPressed: () =>
+            ref.invalidate(agentAttachmentMetaProvider(attachmentId)),
+        icon: const Icon(Icons.refresh, size: 18),
+      ),
+      data: (meta) => agentMimeIsImage(meta.mimeType)
+          ? _ImageAttachment(attachmentId: attachmentId)
+          : _FileChip(
+              fileName: meta.fileName,
+              mimeType: meta.mimeType,
+              sizeBytes: meta.sizeBytes,
+            ),
+    );
+  }
+}
+
+class _ImageAttachment extends ConsumerWidget {
+  const _ImageAttachment({required this.attachmentId});
   final String attachmentId;
 
   @override
@@ -525,6 +928,33 @@ class AgentAttachmentThumb extends ConsumerWidget {
       ),
     );
   }
+}
+
+/// 紧凑文件 chip：类型图标 + 文件名 + 大小。不读取也不展示文件正文。
+class _FileChip extends StatelessWidget {
+  const _FileChip({
+    required this.fileName,
+    required this.mimeType,
+    required this.sizeBytes,
+    this.onRemove,
+  });
+  final String fileName;
+  final String mimeType;
+  final int sizeBytes;
+  final VoidCallback? onRemove;
+
+  @override
+  Widget build(BuildContext context) => Chip(
+    avatar: Icon(agentAttachmentIcon(mimeType), size: 18),
+    label: ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 180),
+      child: Text(
+        '$fileName · ${agentFileSize(sizeBytes)}',
+        overflow: TextOverflow.ellipsis,
+      ),
+    ),
+    onDeleted: onRemove,
+  );
 }
 
 class _Composer extends StatelessWidget {
@@ -569,19 +999,27 @@ class _Composer extends StatelessWidget {
                 runSpacing: AppSpacing.xs,
                 children: [
                   for (final a in pending)
-                    Chip(
-                      avatar: ClipRRect(
-                        borderRadius: BorderRadius.circular(4),
-                        child: Image.memory(
-                          a.bytes,
-                          width: 24,
-                          height: 24,
-                          fit: BoxFit.cover,
+                    if (agentMimeIsImage(a.meta.mimeType))
+                      Chip(
+                        avatar: ClipRRect(
+                          borderRadius: BorderRadius.circular(4),
+                          child: Image.memory(
+                            a.bytes,
+                            width: 24,
+                            height: 24,
+                            fit: BoxFit.cover,
+                          ),
                         ),
+                        label: Text(a.meta.fileName),
+                        onDeleted: () => onRemove(a.meta.id),
+                      )
+                    else
+                      _FileChip(
+                        fileName: a.meta.fileName,
+                        mimeType: a.meta.mimeType,
+                        sizeBytes: a.meta.sizeBytes,
+                        onRemove: () => onRemove(a.meta.id),
                       ),
-                      label: Text(a.meta.fileName),
-                      onDeleted: () => onRemove(a.meta.id),
-                    ),
                 ],
               ),
             ),
@@ -605,8 +1043,8 @@ class _Composer extends StatelessWidget {
             children: [
               IconButton(
                 onPressed: configured && !uploading ? onPick : null,
-                icon: const Icon(Icons.image_outlined),
-                tooltip: '选择图片',
+                icon: const Icon(Icons.attach_file),
+                tooltip: '添加文件',
               ),
               Expanded(
                 child: TextField(
