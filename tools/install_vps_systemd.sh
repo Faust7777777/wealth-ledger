@@ -7,6 +7,16 @@ DATA_DIR="${FINWEALTH_DATA_DIR:-/var/lib/finwealth}"
 CONFIG_DIR="${FINWEALTH_CONFIG_DIR:-/etc/finwealth}"
 ENV_FILE="${FINWEALTH_ENV_FILE:-$CONFIG_DIR/server.env}"
 SERVICE_FILE="${FINWEALTH_SERVICE_FILE:-/etc/systemd/system/finwealth-server.service}"
+
+start_proxy_sockets() {
+  local socket
+  while read -r socket _; do
+    [ -n "$socket" ] && systemctl start "$socket"
+  done < <(
+    systemctl list-unit-files --type=socket --state=enabled --no-legend \
+      'finwealth-docker-proxy@*.socket'
+  )
+}
 SERVICE_NAME="${FINWEALTH_SERVICE_NAME:-finwealth-server.service}"
 BIN_NAME="finwealth-server"
 
@@ -87,4 +97,5 @@ systemd-run \
 
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
+start_proxy_sockets
 systemctl status "$SERVICE_NAME" --no-pager

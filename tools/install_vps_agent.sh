@@ -9,6 +9,16 @@ APP_USER="${FINWEALTH_DEPLOY_USER:-finwealth}"
 ENV_FILE="${FINWEALTH_AGENT_ENV_FILE:-$CONFIG_DIR/agent.env}"
 SERVICE_FILE="${FINWEALTH_AGENT_SERVICE_FILE:-/etc/systemd/system/finwealth-agent.service}"
 
+start_proxy_sockets() {
+  local socket
+  while read -r socket _; do
+    [ -n "$socket" ] && systemctl start "$socket"
+  done < <(
+    systemctl list-unit-files --type=socket --state=enabled --no-legend \
+      'finwealth-docker-proxy@*.socket'
+  )
+}
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "Run as root: sudo bash tools/install_vps_agent.sh" >&2
   exit 2
@@ -65,4 +75,5 @@ if ! grep -q '^FINWEALTH_AGENT_INTERNAL_TOKEN=' "$CONFIG_DIR/server.env"; then
 fi
 systemctl enable --now finwealth-agent.service
 systemctl restart finwealth-server.service
+start_proxy_sockets
 systemctl status finwealth-agent.service --no-pager

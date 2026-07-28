@@ -47,6 +47,7 @@ SYSTEMD_DOCKER_PROXY_SERVICE = (
 )
 CADDY_FINWEALTH_SITE = ROOT / "deploy" / "caddy" / "finwealth-wuwaidut.com.caddy"
 VPS_INSTALL = ROOT / "tools" / "install_vps_systemd.sh"
+AGENT_VPS_INSTALL = ROOT / "tools" / "install_vps_agent.sh"
 VPS_BUNDLE_INSTALL = ROOT / "tools" / "install_vps_bundle.sh"
 VPS_PACKAGE = ROOT / "tools" / "package_vps_server.sh"
 VPS_AUTH_CONFIGURE = ROOT / "tools" / "configure_vps_auth.sh"
@@ -1658,6 +1659,7 @@ def check_deploy_security_defaults() -> None:
         "reverse_proxy 172.19.0.1:8791",
         "@finwealth",
         "path /v1/accounts",
+        "/v1/agent/*",
         "reverse_proxy cli-proxy-api:8317",
         "@relayManagement path /management.html",
         'respond "Not Found" 404',
@@ -1670,6 +1672,12 @@ def check_deploy_security_defaults() -> None:
     ]
     if missing:
         fail("Finwealth Caddy site missing origin safeguards: " + ", ".join(missing))
+
+    for installer in (VPS_INSTALL, AGENT_VPS_INSTALL):
+        installer_text = installer.read_text(encoding="utf-8")
+        for snippet in ("start_proxy_sockets", "finwealth-docker-proxy@*.socket"):
+            if snippet not in installer_text:
+                fail(f"{installer.name} does not restore the Docker proxy: {snippet}")
 
     backup_text = VPS_BACKUP.read_text(encoding="utf-8")
     backup_snippets = [
