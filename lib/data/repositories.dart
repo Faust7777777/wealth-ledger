@@ -155,6 +155,28 @@ abstract interface class AgentRepository {
     List<Id> attachmentIds,
   });
 
+  /// 自动任务：调度与执行都在服务端；前端只读状态、改开关/频率、手动触发。
+  Future<List<AgentAutomationVm>> listAutomations();
+  Future<AgentAutomationVm> createAutomation({
+    required AgentAutomationKind kind,
+    required int intervalHours,
+    bool enabled = true,
+    IsoDateTime? startAt,
+  });
+  Future<AgentAutomationVm> updateAutomation(
+    Id automationId, {
+    int? intervalHours,
+    bool? enabled,
+    IsoDateTime? nextRunAt,
+  });
+
+  /// 立即运行一次；不改变下次计划时间。
+  Future<AgentAutomationVm> runAutomation(Id automationId);
+
+  /// App 内通知（newest-first 由服务端保证）。
+  Future<List<AgentNotificationVm>> listNotifications();
+  Future<AgentNotificationVm> markNotificationRead(Id notificationId);
+
   /// 网页报价候选：suggested 不改变估值；只有「采用」才写入权威报价。
   Future<List<AgentQuoteCandidateVm>> listQuoteCandidates();
   Future<AgentQuoteCandidateVm> reviewQuoteCandidate(

@@ -1498,3 +1498,68 @@ class AgentQuoteCandidateVm {
   final DecimalString? rate;
   final IsoDateTime? appliedAt;
 }
+
+// ———— Agent 自动任务与通知 ————
+
+enum AgentAutomationKind {
+  quoteRefresh,
+  subscriptionDueScan,
+  dcaDueCheck,
+  financialSummary,
+}
+
+enum AgentAutomationRunStatus { success, failed }
+
+enum AgentNotificationAction { review, quotes, dca, agent }
+
+/// 一条自动任务计划。执行与调度都在服务端；前端只读状态并改开关/频率。
+class AgentAutomationVm {
+  const AgentAutomationVm({
+    required this.id,
+    required this.kind,
+    required this.intervalHours,
+    required this.enabled,
+    required this.nextRunAt,
+    required this.createdAt,
+    required this.updatedAt,
+    this.lastRunAt,
+    this.lastStatus,
+    this.lastErrorCode,
+  });
+  final Id id;
+  final AgentAutomationKind kind;
+  final int intervalHours;
+  final bool enabled;
+  final IsoDateTime nextRunAt;
+  final IsoDateTime createdAt;
+  final IsoDateTime updatedAt;
+  final IsoDateTime? lastRunAt;
+  final AgentAutomationRunStatus? lastStatus;
+
+  /// 只作诊断，不进用户可见文案。
+  final String? lastErrorCode;
+
+  bool get lastRunFailed => lastStatus == AgentAutomationRunStatus.failed;
+}
+
+/// App 内通知（自动任务产出）。newest-first 由服务端保证。
+class AgentNotificationVm {
+  const AgentNotificationVm({
+    required this.id,
+    required this.kind,
+    required this.title,
+    required this.body,
+    required this.createdAt,
+    this.action,
+    this.readAt,
+  });
+  final Id id;
+  final AgentAutomationKind kind;
+  final String title;
+  final String body;
+  final IsoDateTime createdAt;
+  final AgentNotificationAction? action;
+  final IsoDateTime? readAt;
+
+  bool get isUnread => readAt == null;
+}

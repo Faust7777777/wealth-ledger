@@ -14,6 +14,11 @@ import '../data/view_models.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
 import 'agent_controller.dart';
+import 'agent_notifications.dart'
+    show
+        AgentNotificationsEntry,
+        agentOpenQuoteSuggestionsProvider,
+        formatLocalDateTime;
 
 /// 图片白名单（作为模型视觉输入）；HEIC 不在范围内。
 const Map<String, String> kAgentImageMimeTypes = {
@@ -139,16 +144,6 @@ String agentSourceHost(String url) {
   return host.isEmpty ? url : host;
 }
 
-/// 报价时间按本地时区显示到分钟。
-String formatLocalDateTime(String iso) {
-  final parsed = DateTime.tryParse(iso);
-  if (parsed == null) return iso;
-  final local = parsed.toLocal();
-  String two(int n) => n.toString().padLeft(2, '0');
-  return '${local.year}-${two(local.month)}-${two(local.day)} '
-      '${two(local.hour)}:${two(local.minute)}';
-}
-
 class AgentPanel extends ConsumerStatefulWidget {
   const AgentPanel({super.key, this.onClose});
 
@@ -251,6 +246,10 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
 
   @override
   Widget build(BuildContext context) {
+    // 通知里的「去看报价」请求：在面板层打开报价建议 sheet。
+    ref.listen(agentOpenQuoteSuggestionsProvider, (_, _) {
+      if (mounted) showAgentQuoteCandidateSheet(context);
+    });
     final statusAsync = ref.watch(agentStatusProvider);
     final conversationsAsync = ref.watch(agentConversationsProvider);
     final chat = ref.watch(agentChatProvider);
@@ -272,6 +271,7 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
           onClose: widget.onClose,
         ),
         const Divider(height: 1),
+        const AgentNotificationsEntry(),
         const _QuoteCandidatesEntry(),
         const _MemorySuggestions(),
         Expanded(

@@ -86,6 +86,14 @@ class SettingsPage extends ConsumerWidget {
             trailing: const Icon(Icons.chevron_right),
             onTap: () => context.push('/taxonomy'),
           ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.schedule_outlined),
+            title: const Text('Agent 自动任务'),
+            subtitle: const Text('报价刷新、订阅到期、定投到期与周期总结的运行安排'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => context.push('/agent/automations'),
+          ),
           const Divider(),
           const ListTile(
             contentPadding: EdgeInsets.zero,
