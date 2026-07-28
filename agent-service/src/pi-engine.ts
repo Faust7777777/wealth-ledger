@@ -26,6 +26,22 @@ interface CachedSession {
   modelId: string;
 }
 
+function messageText(message: unknown): string {
+  if (!message || typeof message !== "object") return "";
+  const value = message as { role?: unknown; content?: unknown };
+  if (value.role !== "assistant" || !Array.isArray(value.content)) return "";
+  return value.content
+    .filter(
+      (item): item is { type: "text"; text: string } =>
+        !!item &&
+        typeof item === "object" &&
+        (item as { type?: unknown }).type === "text" &&
+        typeof (item as { text?: unknown }).text === "string",
+    )
+    .map((item) => item.text)
+    .join("");
+}
+
 export class PiAgentEngine implements AgentEngine {
   readonly #store: StateStore;
   readonly #agentDir: string;
@@ -76,13 +92,36 @@ export class PiAgentEngine implements AgentEngine {
   ): Promise<{ text: string; piSessionFile?: string }> {
     const cached = await this.#session(conversation);
     let output = "";
+    let currentMessageText = "";
+    let terminalError: "agent_model_request_failed" | "agent_run_aborted" | undefined;
     const unsubscribe = cached.session.subscribe((event) => {
-      if (
+      if (event.type === "message_start" && event.message.role === "assistant") {
+        currentMessageText = "";
+      } else if (
         event.type === "message_update" &&
         event.assistantMessageEvent.type === "text_delta"
       ) {
-        output += event.assistantMessageEvent.delta;
-        callbacks.onDelta(event.assistantMessageEvent.delta);
+        const delta = event.assistantMessageEvent.delta;
+        output += delta;
+        currentMessageText += delta;
+        callbacks.onDelta(delta);
+      } else if (event.type === "message_end") {
+        if (event.message.role === "assistant") {
+          if (event.message.stopReason === "error") {
+            terminalError = "agent_model_request_failed";
+          } else if (event.message.stopReason === "aborted") {
+            terminalError = "agent_run_aborted";
+          } else {
+            terminalError = undefined;
+          }
+        }
+        const finalized = messageText(event.message);
+        if (finalized && finalized.startsWith(currentMessageText)) {
+          const missing = finalized.slice(currentMessageText.length);
+          output += missing;
+          if (missing) callbacks.onDelta(missing);
+        }
+        currentMessageText = "";
       } else if (event.type === "tool_execution_start") {
         callbacks.onToolStarted(event.toolName);
       } else if (event.type === "tool_execution_end") {
@@ -129,6 +168,7 @@ export class PiAgentEngine implements AgentEngine {
         text,
       ].join("\n\n");
       await cached.session.prompt(prompt, images.length ? { images } : undefined);
+      if (terminalError) throw new Error(terminalError);
       if (cached.session.sessionFile) {
         cached.sessionFile = cached.session.sessionFile;
       }

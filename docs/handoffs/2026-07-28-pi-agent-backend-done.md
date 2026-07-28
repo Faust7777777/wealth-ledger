@@ -12,6 +12,7 @@
 - 工作区文档附件：`ddfdb54 feat(agent): support workspace document attachments`
 - 自动任务与通知：`142951b feat(agent): schedule reminders and in-app notifications`
 - 周期财务总结：`ebe1be9 feat(agent): schedule periodic financial summaries`
+- 真实模型联调与终态兼容修复：见该分支在本回执之后的最新提交。
 - 未修改 Flutter `lib/**`、Flutter `test/**` 或平台客户端。
 - Claude 最新可见前端成果仍是 `origin/feat/ai-image-organization-ui @ 6abb256`；Pi Agent 前端任务另见 `2026-07-28-claude-pi-agent-frontend.md`。
 
@@ -42,11 +43,13 @@
 - `tools/agent_workspace_sandbox_smoke.sh`：WSL bubblewrap 边界通过，workspace 可写、宿主外部路径不可见。
 - 新增 shell 脚本 `bash -n`：通过。
 - 变更文件 credential-shaped literal 扫描：无命中；生产秘密未写入仓库。
+- `tools/agent_real_model_smoke.ps1`：使用临时账本、临时 Pi 目录和环境变量引用的模型凭据，真实验证 Rust 代理、LORE OpenAI-compatible 模型、`finwealth_query` 工具、SSE delta/tool/completion 事件及周期财务总结；通过后删除全部临时状态。脚本不输出模型回答、密钥、模型 ID或端点。
+- 真实联调发现并修复 Pi 终态兼容问题：provider 只在最终 `message_end` 给出文本时会补齐缺失 delta；中间自动重试的 `stopReason=error` 不再覆盖后续成功终态；真正最终的模型错误和取消分别落为 `agent_model_request_failed` / `agent_run_aborted`，不再产生“成功但正文为空”的消息。
 
 ## 尚未完成 / 不应误报
 
 - 未在生产 VPS 安装、配置模型或重启现有服务；未读取或修改生产账本。
-- 尚未配置真实 Pi `auth.json` / `models.json`，因此未调用真实付费模型完成端到端账单识别。
+- 已用本机现有的 OpenAI-compatible 模型环境变量完成纯文本、财务查询工具、SSE 与周期财务总结的真实端到端；配置仅存在于 smoke 临时目录。尚未完成真实图片账单和 PDF/XLSX 模型读取，也未把任何模型凭据写入仓库或生产服务器。
 - PDF、CSV、XLSX、ZIP 与 TXT 已支持原样上传到 Agent 工作区，由 Agent 选择对应读取工具并交给模型理解；未另做固定账单解析器。真实模型端到端仍待生产配置后验证。
 - 网页搜索可在隔离 shell 内完成，并已支持候选报价审核入库；真实模型在目标网站上的可访问性与端到端来源质量仍待生产配置后验证。
 - App 内定时任务与通知已实现；系统级 push、模型周期报告、插件提议/审批/安装尚未实现。
