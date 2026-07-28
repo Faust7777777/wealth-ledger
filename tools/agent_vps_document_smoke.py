@@ -294,8 +294,8 @@ def main() -> None:
             xlsx,
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             xlsx_marker,
-            "必须调用隔离 bash 工具，并在 command 中使用 python3 zipfile/XML 读取所附 XLSX。只回复第一个单元格的标记。",
-            "bash",
+            "读取所附 XLSX，只回复第一个单元格的标记。",
+            "finwealth_read_xlsx_text",
         )
     print("OK: production Pi model read PDF and XLSX inside the isolated workspace.")
 

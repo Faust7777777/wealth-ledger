@@ -177,24 +177,38 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true })));
 });
 
-test("pre-extracts PDF text before the model prompt without model tool selection", async () => {
+test("pre-extracts PDF and XLSX text before the model prompt", async () => {
   const workspace = join(tmpdir(), "finwealth-pdf-prompt-test");
   const calls: string[] = [];
   const events: Array<[string, boolean?]> = [];
   const prompt = await prepareFileAttachmentPrompt(
     workspace,
-    [{
-      id: "att_pdf",
-      userId: owner.userId,
-      ledgerId: owner.ledgerId,
-      fileName: "statement.pdf",
-      mimeType: "application/pdf",
-      sizeBytes: 123,
-      sha256: "0".repeat(64),
-      originalPath: join(workspace, "original", "statement.pdf"),
-      workingPath: join(workspace, "attachments", "att_pdf", "statement.pdf"),
-      createdAt: "2026-07-28T00:00:00Z",
-    }],
+    [
+      {
+        id: "att_pdf",
+        userId: owner.userId,
+        ledgerId: owner.ledgerId,
+        fileName: "statement.pdf",
+        mimeType: "application/pdf",
+        sizeBytes: 123,
+        sha256: "0".repeat(64),
+        originalPath: join(workspace, "original", "statement.pdf"),
+        workingPath: join(workspace, "attachments", "att_pdf", "statement.pdf"),
+        createdAt: "2026-07-28T00:00:00Z",
+      },
+      {
+        id: "att_xlsx",
+        userId: owner.userId,
+        ledgerId: owner.ledgerId,
+        fileName: "statement.xlsx",
+        mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        sizeBytes: 456,
+        sha256: "1".repeat(64),
+        originalPath: join(workspace, "original", "statement.xlsx"),
+        workingPath: join(workspace, "attachments", "att_xlsx", "statement.xlsx"),
+        createdAt: "2026-07-28T00:00:00Z",
+      },
+    ],
     {
       onToolStarted(name) { events.push([name]); },
       onToolCompleted(name, isError) { events.push([name, isError]); },
@@ -203,16 +217,27 @@ test("pre-extracts PDF text before the model prompt without model tool selection
       calls.push(path);
       return "PDF_MARKER_123";
     },
+    async (_workspace, path) => {
+      calls.push(path);
+      return "XLSX_MARKER_456";
+    },
   );
 
-  assert.deepEqual(calls, [join(workspace, "attachments", "att_pdf", "statement.pdf")]);
+  assert.deepEqual(calls, [
+    join(workspace, "attachments", "att_pdf", "statement.pdf"),
+    join(workspace, "attachments", "att_xlsx", "statement.xlsx"),
+  ]);
   assert.deepEqual(events, [
     ["finwealth_read_pdf_text"],
     ["finwealth_read_pdf_text", false],
+    ["finwealth_read_xlsx_text"],
+    ["finwealth_read_xlsx_text", false],
   ]);
   assert.match(prompt.join("\n"), /<finwealth_pdf_text>/);
   assert.match(prompt.join("\n"), /PDF_MARKER_123/);
-  assert.match(prompt.join("\n"), /不要再解析 PDF 原文件/);
+  assert.match(prompt.join("\n"), /<finwealth_xlsx_text>/);
+  assert.match(prompt.join("\n"), /XLSX_MARKER_456/);
+  assert.match(prompt.join("\n"), /不要再解析这些原文件/);
 });
 
 async function serviceWith(

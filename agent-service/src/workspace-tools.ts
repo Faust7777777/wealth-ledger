@@ -20,6 +20,42 @@ import {
 import { Type } from "typebox";
 
 const MAX_DOCUMENT_TEXT_BYTES = 256 * 1024;
+const XLSX_READER = String.raw`
+import posixpath, sys, zipfile
+import xml.etree.ElementTree as ET
+
+MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+REL = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+PKG_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+
+with zipfile.ZipFile(sys.argv[1]) as book:
+    names = set(book.namelist())
+    shared = []
+    if "xl/sharedStrings.xml" in names:
+        root = ET.fromstring(book.read("xl/sharedStrings.xml"))
+        shared = ["".join(node.text or "" for node in item.iter(MAIN + "t")) for item in root]
+    workbook = ET.fromstring(book.read("xl/workbook.xml"))
+    relationships = ET.fromstring(book.read("xl/_rels/workbook.xml.rels"))
+    targets = {item.attrib["Id"]: item.attrib["Target"] for item in relationships.iter(PKG_REL + "Relationship")}
+    for sheet in workbook.iter(MAIN + "sheet"):
+        target = targets.get(sheet.attrib.get(REL + "id", ""), "")
+        path = posixpath.normpath(posixpath.join("xl", target))
+        if not path.startswith("xl/") or path not in names:
+            continue
+        print("[" + sheet.attrib.get("name", "Sheet") + "]")
+        root = ET.fromstring(book.read(path))
+        for cell in root.iter(MAIN + "c"):
+            kind = cell.attrib.get("t", "")
+            if kind == "inlineStr":
+                value = "".join(node.text or "" for node in cell.iter(MAIN + "t"))
+            else:
+                node = cell.find(MAIN + "v")
+                value = node.text if node is not None and node.text is not None else ""
+                if kind == "s" and value:
+                    value = shared[int(value)]
+            if value:
+                print(cell.attrib.get("r", "?") + "\t" + value.replace("\n", " "))
+`;
 
 function isInside(root: string, target: string): boolean {
   const value = relative(root, target);
@@ -163,6 +199,54 @@ function readPdfText(
   });
 }
 
+function readXlsxText(
+  workspace: string,
+  relativePath: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const command = `python3 -c ${shellQuote(XLSX_READER)} ${shellQuote(relativePath)}`;
+  if (process.platform !== "linux") {
+    return Promise.reject(new Error("workspace_shell_requires_linux_bubblewrap"));
+  }
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn("bwrap", bubblewrapArguments(workspace, command), {
+      cwd: workspace,
+      env: safeShellEnvironment(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    const finish = (error?: Error, value?: string): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (error) reject(error);
+      else resolvePromise(value ?? "");
+    };
+    const abort = (): void => { child.kill("SIGKILL"); };
+    const timer = setTimeout(abort, 30_000);
+    signal?.addEventListener("abort", abort, { once: true });
+    child.stdout.on("data", (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes > MAX_DOCUMENT_TEXT_BYTES) {
+        child.kill("SIGKILL");
+        finish(new Error("workspace_document_too_large"));
+        return;
+      }
+      chunks.push(Buffer.from(chunk));
+    });
+    child.on("error", (error) => finish(error));
+    child.on("close", (exitCode) => {
+      if (settled) return;
+      if (signal?.aborted) finish(new Error("agent_run_aborted"));
+      else if (exitCode !== 0) finish(new Error("workspace_xlsx_read_failed"));
+      else finish(undefined, Buffer.concat(chunks).toString("utf8"));
+    });
+  });
+}
+
 export async function extractWorkspacePdfText(
   workspace: string,
   path: string,
@@ -174,6 +258,19 @@ export async function extractWorkspacePdfText(
   }
   const relativeTarget = relative(workspace, target).replaceAll("\\", "/");
   return readPdfText(workspace, relativeTarget, signal);
+}
+
+export async function extractWorkspaceXlsxText(
+  workspace: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const target = await readablePath(workspace, resolve(workspace, path));
+  if (!target.toLowerCase().endsWith(".xlsx")) {
+    throw new Error("workspace_xlsx_required");
+  }
+  const relativeTarget = relative(workspace, target).replaceAll("\\", "/");
+  return readXlsxText(workspace, relativeTarget, signal);
 }
 
 export function createWorkspaceTools(
@@ -238,11 +335,25 @@ export function createWorkspaceTools(
       return { content: [{ type: "text", text }], details: {} };
     },
   });
+  const xlsx = defineTool({
+    name: "finwealth_read_xlsx_text",
+    label: "读取表格",
+    description: "从 Agent 专属工作区确定性读取 XLSX 单元格文字。",
+    promptSnippet: "用固定的隔离工具读取 XLSX 附件。",
+    parameters: Type.Object({
+      path: Type.String({ description: "附件上下文中给出的工作区相对路径" }),
+    }),
+    async execute(_id, params, signal) {
+      const text = await extractWorkspaceXlsxText(workspace, params.path, signal);
+      return { content: [{ type: "text", text }], details: {} };
+    },
+  });
   return [
     createReadToolDefinition(workspace, { operations: readOperations }),
     createWriteToolDefinition(workspace, { operations: writeOperations }),
     createEditToolDefinition(workspace, { operations: editOperations }),
     pdf,
+    xlsx,
     bash,
   ];
 }
