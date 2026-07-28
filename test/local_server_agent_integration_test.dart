@@ -74,6 +74,23 @@ void main() {
 
       // 记忆列表可读且此时为空（模型未运行，不会产生建议）。
       expect(await repo.listMemories(), isA<List<AgentMemoryVm>>());
+
+      // —— 报价候选：没有模型就不会有候选，估值也不该被任何东西改动 ——
+      final quoteRepo = LocalServerQuoteRepository(client);
+      final summaryBefore = await quoteRepo.getQuoteSummary();
+      expect(await repo.listQuoteCandidates(), isEmpty, reason: '未运行模型时不应存在候选');
+      // 审核不存在的候选不会写入任何报价。
+      await expectLater(
+        repo.reviewQuoteCandidate(
+          'qc_missing',
+          decision: AgentQuoteCandidateStatus.applied,
+        ),
+        throwsA(isA<Exception>()),
+      );
+      final summaryAfter = await quoteRepo.getQuoteSummary();
+      expect(summaryAfter.freshCount, summaryBefore.freshCount);
+      expect(summaryAfter.staleCount, summaryBefore.staleCount);
+      expect(summaryAfter.unpriceableCount, summaryBefore.unpriceableCount);
     },
     skip: _baseUrl.isEmpty
         ? 'Set LOCAL_SERVER_API_BASE through --dart-define; run tools/frontend_agent_smoke.ps1.'

@@ -10,7 +10,7 @@ import 'package:finwealth/app/app.dart';
 import 'package:finwealth/app/home_shell.dart';
 import 'package:finwealth/core/types.dart';
 import 'package:finwealth/data/api_mock_repositories.dart'
-    show ApiValidationException;
+    show ApiConflictException, ApiValidationException;
 import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/repositories.dart';
 import 'package:finwealth/data/view_models.dart';
@@ -56,6 +56,9 @@ class _FakeAgentRepo implements AgentRepository {
     this.memories = const [],
     this.attachmentFails = false,
     this.uploadFailure,
+    this.candidates = const [],
+    this.reviewFailure,
+    this.reviewGate,
   });
 
   final bool configured;
@@ -63,6 +66,11 @@ class _FakeAgentRepo implements AgentRepository {
   List<AgentMemoryVm> memories;
   final bool attachmentFails;
   final Object? uploadFailure;
+  List<AgentQuoteCandidateVm> candidates;
+  final Object? reviewFailure;
+  final Completer<void>? reviewGate;
+  final List<({String id, AgentQuoteCandidateStatus decision})> quoteReviews =
+      [];
   final List<({String id, AgentMemoryStatus decision})> reviews = [];
   final List<({String fileName, String mimeType, int size})> uploads = [];
   int attachmentReads = 0;
@@ -160,6 +168,43 @@ class _FakeAgentRepo implements AgentRepository {
     String? modelId,
   }) => throw UnsupportedError('unused');
   @override
+  Future<List<AgentQuoteCandidateVm>> listQuoteCandidates() async => candidates;
+
+  @override
+  Future<AgentQuoteCandidateVm> reviewQuoteCandidate(
+    Id candidateId, {
+    required AgentQuoteCandidateStatus decision,
+  }) async {
+    quoteReviews.add((id: candidateId, decision: decision));
+    if (reviewGate != null) await reviewGate!.future;
+    if (reviewFailure != null) throw reviewFailure!;
+    final reviewed = [
+      for (final c in candidates)
+        if (c.id == candidateId)
+          AgentQuoteCandidateVm(
+            id: c.id,
+            kind: c.kind,
+            asOf: c.asOf,
+            source: c.source,
+            sourceUrl: c.sourceUrl,
+            status: decision,
+            createdAt: c.createdAt,
+            updatedAt: c.updatedAt,
+            instrumentId: c.instrumentId,
+            price: c.price,
+            currency: c.currency,
+            baseCurrency: c.baseCurrency,
+            quoteCurrency: c.quoteCurrency,
+            rate: c.rate,
+          )
+        else
+          c,
+    ];
+    candidates = reviewed;
+    return reviewed.firstWhere((c) => c.id == candidateId);
+  }
+
+  @override
   Future<void> cancelRun(Id runId) => throw UnsupportedError('unused');
 }
 
@@ -168,6 +213,7 @@ Widget _scope(
   _FakeAgentRepo repo, {
   List<AiProposalVm> pending = const [],
   AgentImagePicker? picker,
+  VoidCallback? onHoldings,
   required Widget child,
 }) => ProviderScope(
   overrides: [
@@ -183,6 +229,29 @@ Widget _scope(
       ),
     ),
     accountsProvider.overrideWith((ref) async => const <AccountVm>[]),
+    holdingsProvider.overrideWith((ref) async {
+      onHoldings?.call();
+      return const <HoldingVm>[];
+    }),
+    allocationProvider.overrideWith(
+      (ref) async => const AssetAllocationVm(
+        slices: [],
+        totalAssets: Money(amount: '0', currency: 'CNY'),
+        totalLiabilities: Money(amount: '0', currency: 'CNY'),
+        netWorth: Money(amount: '0', currency: 'CNY'),
+      ),
+    ),
+    instrumentsProvider.overrideWith(
+      (ref) async => const [
+        InstrumentVm(
+          id: 'inst_btc',
+          type: InstrumentType.crypto,
+          displayName: 'Bitcoin',
+          symbol: 'BTC',
+          quoteCurrency: 'USDT',
+        ),
+      ],
+    ),
   ],
   child: child,
 );
@@ -191,16 +260,26 @@ Widget _panelHost(
   _FakeAgentRepo repo, {
   List<AiProposalVm> pending = const [],
   AgentImagePicker? picker,
+  VoidCallback? onHoldings,
 }) => _scope(
   repo,
   pending: pending,
   picker: picker,
+  onHoldings: onHoldings,
   child: MaterialApp.router(
     routerConfig: GoRouter(
       routes: [
         GoRoute(
           path: '/',
-          builder: (_, _) => const Scaffold(body: AgentPanel()),
+          builder: (_, _) => Scaffold(
+            body: Column(
+              children: [
+                // 让 holdingsProvider 保持存活，才能观察到 invalidate 的效果。
+                if (onHoldings != null) const _HoldingsWatcher(),
+                const Expanded(child: AgentPanel()),
+              ],
+            ),
+          ),
         ),
         GoRoute(
           path: '/ai-review',
@@ -210,6 +289,15 @@ Widget _panelHost(
     ),
   ),
 );
+
+class _HoldingsWatcher extends ConsumerWidget {
+  const _HoldingsWatcher();
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    ref.watch(holdingsProvider);
+    return const SizedBox.shrink();
+  }
+}
 
 void main() {
   group('附件格式与错误文案', () {
@@ -513,6 +601,189 @@ void main() {
       await pick(tester);
       expect(repo.uploads, isEmpty);
       expect(find.byType(Chip), findsNothing);
+    });
+  });
+
+  group('报价候选', () {
+    AgentQuoteCandidateVm instrumentCandidate({
+      AgentQuoteCandidateStatus status = AgentQuoteCandidateStatus.suggested,
+    }) => AgentQuoteCandidateVm(
+      id: 'qc_1',
+      kind: AgentQuoteCandidateKind.instrument,
+      instrumentId: 'inst_btc',
+      price: '61234.50',
+      currency: 'USDT',
+      asOf: '2026-07-28T09:30:00Z',
+      source: 'CoinGecko',
+      sourceUrl: 'https://www.coingecko.com/en/coins/bitcoin',
+      status: status,
+      createdAt: '2026-07-28T09:31:00Z',
+      updatedAt: '2026-07-28T09:31:00Z',
+    );
+
+    const fxCandidate = AgentQuoteCandidateVm(
+      id: 'qc_fx',
+      kind: AgentQuoteCandidateKind.fx,
+      baseCurrency: 'USD',
+      quoteCurrency: 'CNY',
+      rate: '7.1832',
+      asOf: '2026-07-28T09:30:00Z',
+      source: '中国外汇交易中心',
+      sourceUrl: 'https://www.chinamoney.com.cn/rate',
+      status: AgentQuoteCandidateStatus.suggested,
+      createdAt: '2026-07-28T09:31:00Z',
+      updatedAt: '2026-07-28T09:31:00Z',
+    );
+
+    test('主体、数值与来源域名的纯函数映射', () {
+      const instruments = [
+        InstrumentVm(
+          id: 'inst_btc',
+          type: InstrumentType.crypto,
+          displayName: 'Bitcoin',
+          symbol: 'BTC',
+          quoteCurrency: 'USDT',
+        ),
+      ];
+      expect(
+        agentQuoteSubject(instrumentCandidate(), instruments),
+        'Bitcoin · BTC',
+      );
+      expect(agentQuoteSubject(fxCandidate, instruments), 'USD / CNY');
+      expect(agentQuoteValue(instrumentCandidate()), '61234.50 USDT');
+      expect(agentQuoteValue(fxCandidate), '7.1832 CNY');
+      expect(
+        agentSourceHost('https://www.coingecko.com/en/coins/bitcoin'),
+        'www.coingecko.com',
+      );
+      // 不外露内部 ID。
+      expect(
+        agentQuoteSubject(instrumentCandidate(), const []),
+        isNot(contains('inst_')),
+      );
+    });
+
+    testWidgets('只对 suggested 显示紧凑卡片，展示数值/时间/来源', (tester) async {
+      final repo = _FakeAgentRepo(
+        candidates: [instrumentCandidate(), fxCandidate],
+      );
+      await tester.pumpWidget(_panelHost(repo));
+      await tester.pumpAndSettle();
+      expect(find.text('报价建议'), findsNWidgets(2));
+      expect(find.text('Bitcoin · BTC'), findsOneWidget);
+      expect(find.text('61234.50 USDT'), findsOneWidget);
+      expect(find.text('USD / CNY'), findsOneWidget);
+      expect(find.text('7.1832 CNY'), findsOneWidget);
+      expect(find.textContaining('CoinGecko'), findsOneWidget);
+      expect(find.text('www.coingecko.com'), findsOneWidget);
+      // 不显示内部 ID、哈希、tool 名或存储字段。
+      expect(find.textContaining('inst_btc'), findsNothing);
+      expect(find.textContaining('qc_1'), findsNothing);
+      expect(find.textContaining('finwealth_'), findsNothing);
+      // 不出现常驻防御性文案。
+      expect(find.textContaining('仅供参考'), findsNothing);
+      expect(find.textContaining('自行核'), findsNothing);
+      expect(find.textContaining('可能不准'), findsNothing);
+    });
+
+    testWidgets('已处理的候选不再出现', (tester) async {
+      await tester.pumpWidget(
+        _panelHost(
+          _FakeAgentRepo(
+            candidates: [
+              instrumentCandidate(status: AgentQuoteCandidateStatus.applied),
+            ],
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('报价建议'), findsNothing);
+    });
+
+    testWidgets('采用：发 apply、刷新估值视图、候选消失', (tester) async {
+      var holdingBuilds = 0;
+      final repo = _FakeAgentRepo(candidates: [instrumentCandidate()]);
+      await tester.pumpWidget(
+        _panelHost(repo, onHoldings: () => holdingBuilds += 1),
+      );
+      await tester.pumpAndSettle();
+      final before = holdingBuilds;
+      await tester.tap(find.text('采用'));
+      await tester.pumpAndSettle();
+      expect(
+        repo.quoteReviews.single.decision,
+        AgentQuoteCandidateStatus.applied,
+      );
+      expect(find.text('已采用这条报价'), findsOneWidget);
+      expect(find.text('报价建议'), findsNothing);
+      expect(holdingBuilds, greaterThan(before), reason: '采用后须刷新报价派生视图');
+    });
+
+    testWidgets('忽略：发 reject 且不刷新估值视图', (tester) async {
+      var holdingBuilds = 0;
+      final repo = _FakeAgentRepo(candidates: [instrumentCandidate()]);
+      await tester.pumpWidget(
+        _panelHost(repo, onHoldings: () => holdingBuilds += 1),
+      );
+      await tester.pumpAndSettle();
+      final before = holdingBuilds;
+      await tester.tap(find.text('忽略'));
+      await tester.pumpAndSettle();
+      expect(
+        repo.quoteReviews.single.decision,
+        AgentQuoteCandidateStatus.rejected,
+      );
+      expect(find.text('报价建议'), findsNothing);
+      expect(holdingBuilds, before, reason: '忽略永不写入，不该刷新估值');
+      expect(find.text('已采用这条报价'), findsNothing);
+    });
+
+    testWidgets('采用失败：保留候选并显示简短错误', (tester) async {
+      final repo = _FakeAgentRepo(
+        candidates: [instrumentCandidate()],
+        reviewFailure: Exception('boom'),
+      );
+      await tester.pumpWidget(_panelHost(repo));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('采用'));
+      await tester.pumpAndSettle();
+      expect(find.text('操作失败，请重试'), findsOneWidget);
+      expect(find.text('报价建议'), findsOneWidget);
+      expect(find.textContaining('boom'), findsNothing);
+    });
+
+    testWidgets('409：提示已处理并重新拉取列表', (tester) async {
+      final repo = _FakeAgentRepo(
+        candidates: [instrumentCandidate()],
+        reviewFailure: ApiConflictException(
+          '/v1/agent/quote-candidates/qc_1/review',
+          code: 'agent_quote_candidate_already_reviewed',
+        ),
+      );
+      await tester.pumpWidget(_panelHost(repo));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('采用'));
+      await tester.pumpAndSettle();
+      expect(find.text('这条建议已被处理，已重新加载'), findsOneWidget);
+      expect(find.textContaining('agent_quote'), findsNothing);
+    });
+
+    testWidgets('重复点击只产生一次请求', (tester) async {
+      final gate = Completer<void>();
+      final repo = _FakeAgentRepo(
+        candidates: [instrumentCandidate()],
+        reviewGate: gate,
+      );
+      await tester.pumpWidget(_panelHost(repo));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('采用'));
+      await tester.pump();
+      await tester.tap(find.text('采用'), warnIfMissed: false);
+      await tester.pump();
+      expect(repo.quoteReviews, hasLength(1));
+      gate.complete();
+      await tester.pumpAndSettle();
+      expect(repo.quoteReviews, hasLength(1));
     });
   });
 

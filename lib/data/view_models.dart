@@ -1453,3 +1453,48 @@ class AgentEventVm {
   final bool? isError;
   final String? code;
 }
+
+enum AgentQuoteCandidateKind { instrument, fx }
+
+enum AgentQuoteCandidateStatus { suggested, applied, rejected }
+
+/// Agent 从网页整理出的单条报价/汇率候选。
+/// suggested 不改变任何估值；只有用户「采用」才会写入权威报价缓存。
+class AgentQuoteCandidateVm {
+  const AgentQuoteCandidateVm({
+    required this.id,
+    required this.kind,
+    required this.asOf,
+    required this.source,
+    required this.sourceUrl,
+    required this.status,
+    required this.createdAt,
+    required this.updatedAt,
+    this.instrumentId,
+    this.price,
+    this.currency,
+    this.baseCurrency,
+    this.quoteCurrency,
+    this.rate,
+    this.appliedAt,
+  });
+  final Id id;
+  final AgentQuoteCandidateKind kind;
+  final IsoDateTime asOf;
+  final String source;
+  final String sourceUrl;
+  final AgentQuoteCandidateStatus status;
+  final IsoDateTime createdAt;
+  final IsoDateTime updatedAt;
+
+  /// kind=instrument 时给出标的与报价。
+  final Id? instrumentId;
+  final DecimalString? price;
+  final CurrencyCode? currency;
+
+  /// kind=fx 时给出币对与汇率。
+  final CurrencyCode? baseCurrency;
+  final CurrencyCode? quoteCurrency;
+  final DecimalString? rate;
+  final IsoDateTime? appliedAt;
+}

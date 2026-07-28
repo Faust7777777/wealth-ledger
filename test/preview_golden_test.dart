@@ -1416,12 +1416,24 @@ void main() {
     List<AgentMemoryVm> memories = const [],
     List<AgentEventVm> events = const [],
     AgentImagePicker? picker,
+    List<AgentQuoteCandidateVm> candidates = const [],
   }) => ProviderScope(
     overrides: [
       if (picker != null) agentImagePickerProvider.overrideWithValue(picker),
       capabilitiesProvider.overrideWith((ref) async => tradeCaps),
       accountsProvider.overrideWith((ref) async => const <AccountVm>[]),
       aiPendingProvider.overrideWith((ref) async => const <AiProposalVm>[]),
+      instrumentsProvider.overrideWith(
+        (ref) async => const [
+          InstrumentVm(
+            id: 'inst_btc',
+            type: InstrumentType.crypto,
+            displayName: 'Bitcoin',
+            symbol: 'BTC',
+            quoteCurrency: 'USDT',
+          ),
+        ],
+      ),
       agentRepositoryProvider.overrideWithValue(
         _PreviewAgentRepo(
           configured: configured,
@@ -1429,6 +1441,7 @@ void main() {
           memories: memories,
           frames: events,
           conversations: const [agentConversation],
+          candidates: candidates,
         ),
       ),
     ],
@@ -1540,6 +1553,42 @@ void main() {
     });
   }
 
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('agent panel quote candidate - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(400, 560));
+      await tester.pumpWidget(
+        agentHost(
+          theme,
+          candidates: const [
+            AgentQuoteCandidateVm(
+              id: 'qc_1',
+              kind: AgentQuoteCandidateKind.instrument,
+              instrumentId: 'inst_btc',
+              price: '61234.50',
+              currency: 'USDT',
+              asOf: '2026-07-28T09:30:00Z',
+              source: 'CoinGecko',
+              sourceUrl: 'https://www.coingecko.com/en/coins/bitcoin',
+              status: AgentQuoteCandidateStatus.suggested,
+              createdAt: '2026-07-28T09:31:00Z',
+              updatedAt: '2026-07-28T09:31:00Z',
+            ),
+          ],
+        ),
+      );
+      await _settleEntrance(tester);
+      await expectLater(
+        find.byType(AgentPanel),
+        matchesGoldenFile('goldens/agent_panel_quote_candidate_$name.png'),
+      );
+    });
+  }
+
   testWidgets('agent panel unconfigured - dark', skip: !_previewEnabled, (
     tester,
   ) async {
@@ -1602,6 +1651,7 @@ class _PreviewAgentRepo implements AgentRepository {
     required this.memories,
     required this.frames,
     required this.conversations,
+    this.candidates = const [],
   });
 
   final bool configured;
@@ -1609,6 +1659,7 @@ class _PreviewAgentRepo implements AgentRepository {
   final List<AgentMemoryVm> memories;
   final List<AgentEventVm> frames;
   final List<AgentConversationVm> conversations;
+  final List<AgentQuoteCandidateVm> candidates;
 
   @override
   Future<AgentStatusVm> getStatus() async =>
@@ -1680,6 +1731,13 @@ class _PreviewAgentRepo implements AgentRepository {
     Id conversationId, {
     required String text,
     List<Id> attachmentIds = const [],
+  }) => throw UnsupportedError('preview');
+  @override
+  Future<List<AgentQuoteCandidateVm>> listQuoteCandidates() async => candidates;
+  @override
+  Future<AgentQuoteCandidateVm> reviewQuoteCandidate(
+    Id candidateId, {
+    required AgentQuoteCandidateStatus decision,
   }) => throw UnsupportedError('preview');
   @override
   Future<void> cancelRun(Id runId) => throw UnsupportedError('preview');

@@ -339,6 +339,10 @@ final agentConversationsProvider = FutureProvider<List<AgentConversationVm>>(
 final agentMemoriesProvider = FutureProvider<List<AgentMemoryVm>>(
   (ref) => ref.watch(agentRepositoryProvider).listMemories(),
 );
+final agentQuoteCandidatesProvider =
+    FutureProvider<List<AgentQuoteCandidateVm>>(
+      (ref) => ref.watch(agentRepositoryProvider).listQuoteCandidates(),
+    );
 
 /// 附件原图字节（消息历史与重启后恢复预览）；失败不自动退避重试，由 UI 决定。
 final agentAttachmentBytesProvider = FutureProvider.family<Uint8List, String>(

@@ -1,13 +1,14 @@
 // Wealth Ledger — Agent 面板（Windows 右栏 / Android 全屏共用同一份实现）。
 // 只经 /v1/agent/**；账务产出落到既有 AI 待审核列表，这里只提供低强调入口。
-import 'dart:typed_data';
-
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import '../data/api_mock_repositories.dart' show ApiValidationException;
+import '../core/types.dart';
+import '../data/api_mock_repositories.dart'
+    show ApiConflictException, ApiValidationException;
 import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../theme/app_dimens.dart';
@@ -56,6 +57,45 @@ String agentAttachmentErrorMessage(String? code) => switch (code) {
   'invalid_attachment_type' => '只支持 PNG、JPEG、WEBP 图片。',
   _ => '图片未通过校验，请重新选择。',
 };
+
+/// 候选主体：标的用可读名称（不显示内部 ID），汇率用币对。
+String agentQuoteSubject(
+  AgentQuoteCandidateVm candidate,
+  List<InstrumentVm> instruments,
+) {
+  if (candidate.kind == AgentQuoteCandidateKind.fx) {
+    return '${candidate.baseCurrency} / ${candidate.quoteCurrency}';
+  }
+  for (final i in instruments) {
+    if (i.id != candidate.instrumentId) continue;
+    final symbol = i.symbol ?? '';
+    return symbol.isEmpty ? i.displayName : '${i.displayName} · $symbol';
+  }
+  return '标的';
+}
+
+/// 数值 + 计价单位。
+String agentQuoteValue(AgentQuoteCandidateVm candidate) =>
+    candidate.kind == AgentQuoteCandidateKind.fx
+    ? '${candidate.rate} ${candidate.quoteCurrency}'
+    : '${candidate.price} ${candidate.currency}';
+
+/// 来源域名（只显示 host）。
+String agentSourceHost(String url) {
+  final uri = Uri.tryParse(url);
+  final host = uri?.host ?? '';
+  return host.isEmpty ? url : host;
+}
+
+/// 报价时间按本地时区显示到分钟。
+String formatLocalDateTime(String iso) {
+  final parsed = DateTime.tryParse(iso);
+  if (parsed == null) return iso;
+  final local = parsed.toLocal();
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${local.year}-${two(local.month)}-${two(local.day)} '
+      '${two(local.hour)}:${two(local.minute)}';
+}
 
 class AgentPanel extends ConsumerStatefulWidget {
   const AgentPanel({super.key, this.onClose});
@@ -173,6 +213,7 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
           onClose: widget.onClose,
         ),
         const Divider(height: 1),
+        const _QuoteCandidates(),
         const _MemorySuggestions(),
         Expanded(
           child: chat.loading
@@ -362,6 +403,159 @@ class _Header extends ConsumerWidget {
             ),
         ],
       ),
+    );
+  }
+}
+
+/// 报价候选：只对 suggested 显示紧凑卡片，不把审核表单常驻占满聊天区。
+class _QuoteCandidates extends ConsumerStatefulWidget {
+  const _QuoteCandidates();
+
+  @override
+  ConsumerState<_QuoteCandidates> createState() => _QuoteCandidatesState();
+}
+
+class _QuoteCandidatesState extends ConsumerState<_QuoteCandidates> {
+  final _busy = <Id>{};
+  final _errors = <Id, String>{};
+
+  Future<void> _review(
+    AgentQuoteCandidateVm candidate,
+    AgentQuoteCandidateStatus decision,
+  ) async {
+    // 重复点击只产生一次请求。
+    if (!_busy.add(candidate.id)) return;
+    setState(() => _errors.remove(candidate.id));
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await ref
+          .read(agentRepositoryProvider)
+          .reviewQuoteCandidate(candidate.id, decision: decision);
+      ref.invalidate(agentQuoteCandidatesProvider);
+      if (decision == AgentQuoteCandidateStatus.applied) {
+        // 采用是唯一会改变估值的动作：刷新所有报价派生视图。
+        ref.invalidate(holdingsProvider);
+        ref.invalidate(accountsProvider);
+        ref.invalidate(overviewProvider);
+        ref.invalidate(allocationProvider);
+        messenger.showSnackBar(const SnackBar(content: Text('已采用这条报价')));
+      }
+    } on ApiConflictException {
+      // 409：状态已变，重新拉列表。
+      ref.invalidate(agentQuoteCandidatesProvider);
+      if (mounted) {
+        setState(() => _errors[candidate.id] = '这条建议已被处理，已重新加载');
+      }
+    } on ApiValidationException catch (e) {
+      if (mounted) setState(() => _errors[candidate.id] = e.userMessage);
+    } catch (_) {
+      // 失败保留候选，可再试一次。
+      if (mounted) setState(() => _errors[candidate.id] = '操作失败，请重试');
+    } finally {
+      _busy.remove(candidate.id);
+      if (mounted) setState(() {});
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final candidates =
+        ref.watch(agentQuoteCandidatesProvider).asData?.value ?? const [];
+    final suggested = [
+      for (final c in candidates)
+        if (c.status == AgentQuoteCandidateStatus.suggested) c,
+    ];
+    if (suggested.isEmpty) return const SizedBox.shrink();
+    final instruments =
+        ref.watch(instrumentsProvider).asData?.value ?? const <InstrumentVm>[];
+
+    return Column(
+      children: [
+        for (final c in suggested)
+          Card(
+            margin: const EdgeInsets.fromLTRB(
+              AppSpacing.base,
+              AppSpacing.sm,
+              AppSpacing.base,
+              0,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(AppSpacing.sm),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('报价建议', style: AppType.caption),
+                  const SizedBox(height: AppSpacing.xxs),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          agentQuoteSubject(c, instruments),
+                          style: AppType.bodyStrong,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      Text(agentQuoteValue(c), style: AppType.moneyRow),
+                    ],
+                  ),
+                  Text(
+                    '${formatLocalDateTime(c.asOf)} · ${c.source}',
+                    style: AppType.caption,
+                  ),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton(
+                      onPressed: () async {
+                        await Clipboard.setData(
+                          ClipboardData(text: c.sourceUrl),
+                        );
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('已复制来源链接')),
+                          );
+                        }
+                      },
+                      style: TextButton.styleFrom(
+                        padding: EdgeInsets.zero,
+                        textStyle: AppType.caption,
+                      ),
+                      child: Text(agentSourceHost(c.sourceUrl)),
+                    ),
+                  ),
+                  if (_errors[c.id] != null)
+                    Text(
+                      _errors[c.id]!,
+                      style: AppType.caption.copyWith(
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                    ),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      TextButton(
+                        onPressed: _busy.contains(c.id)
+                            ? null
+                            : () => _review(
+                                c,
+                                AgentQuoteCandidateStatus.rejected,
+                              ),
+                        child: const Text('忽略'),
+                      ),
+                      const SizedBox(width: AppSpacing.xs),
+                      FilledButton(
+                        onPressed: _busy.contains(c.id)
+                            ? null
+                            : () =>
+                                  _review(c, AgentQuoteCandidateStatus.applied),
+                        child: const Text('采用'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
     );
   }
 }

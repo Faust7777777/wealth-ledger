@@ -233,6 +233,13 @@ class RealLocalAgentRepository implements AgentRepository {
     List<Id> attachmentIds = const [],
   }) async => _unsupported();
   @override
+  Future<List<AgentQuoteCandidateVm>> listQuoteCandidates() async => const [];
+  @override
+  Future<AgentQuoteCandidateVm> reviewQuoteCandidate(
+    Id candidateId, {
+    required AgentQuoteCandidateStatus decision,
+  }) async => _unsupported();
+  @override
   Stream<AgentEventVm> events(Id conversationId, {int? after}) =>
       const Stream.empty();
   @override
