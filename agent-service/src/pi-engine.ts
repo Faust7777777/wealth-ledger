@@ -16,6 +16,7 @@ import type {
 import { StateStore } from "./state-store.js";
 import { createWorkspaceTools } from "./workspace-tools.js";
 import { createMemoryTools } from "./memory-tools.js";
+import { createQuoteCandidateTools } from "./quote-candidate-tools.js";
 
 interface CachedSession {
   session: AgentSession;
@@ -160,6 +161,7 @@ export class PiAgentEngine implements AgentEngine {
         ...createWorkspaceTools(cwd),
         ...createFinwealthTools(this.#finwealth),
         ...createMemoryTools(this.#store, conversation),
+        ...createQuoteCandidateTools(this.#store, conversation),
       ],
     });
     const cached: CachedSession = {

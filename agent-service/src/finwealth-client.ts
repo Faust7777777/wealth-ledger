@@ -4,6 +4,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { AgentQuoteCandidate, AgentQuoteWriter } from "./types.js";
 
 const MAX_TOOL_RESPONSE_BYTES = 256 * 1024;
 
@@ -21,7 +22,7 @@ const QUERY_PATHS = {
 
 type QueryName = keyof typeof QUERY_PATHS;
 
-export class FinwealthClient {
+export class FinwealthClient implements AgentQuoteWriter {
   readonly #baseUrl: string;
   readonly #internalToken: string;
 
@@ -67,6 +68,49 @@ export class FinwealthClient {
       `agent-quotes-${randomUUID()}`,
       signal,
     );
+  }
+
+  async applyQuoteCandidate(candidate: AgentQuoteCandidate): Promise<unknown> {
+    const item = candidate.kind === "instrument"
+      ? {
+        instrumentId: candidate.instrumentId,
+        price: candidate.price,
+        currency: candidate.currency,
+        asOf: candidate.asOf,
+        source: candidate.source,
+        sourceUrl: candidate.sourceUrl,
+      }
+      : {
+        baseCurrency: candidate.baseCurrency,
+        quoteCurrency: candidate.quoteCurrency,
+        rate: candidate.rate,
+        asOf: candidate.asOf,
+        source: candidate.source,
+        sourceUrl: candidate.sourceUrl,
+      };
+    const body = {
+      mode: "manual",
+      requestedAt: candidate.createdAt,
+      ...(candidate.kind === "instrument" ? { quotes: [item] } : { fxRates: [item] }),
+    };
+    const response = await this.#request(
+      "POST",
+      "/v1/quotes/refresh",
+      body,
+      `agent-quote-${candidate.id}`,
+    );
+    const data = response && typeof response === "object"
+      ? (response as { data?: unknown }).data
+      : undefined;
+    const applied = data && typeof data === "object"
+      ? candidate.kind === "instrument"
+        ? (data as { quotes?: unknown }).quotes
+        : (data as { fxRates?: unknown }).fxRates
+      : undefined;
+    if (!Array.isArray(applied) || applied.length !== 1) {
+      throw new Error("agent_quote_apply_failed");
+    }
+    return response;
   }
 
   async #request(

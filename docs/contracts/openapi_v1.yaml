@@ -1721,6 +1721,61 @@ paths:
               schema:
                 $ref: "#/components/schemas/AgentMemoryResponse"
 
+  /agent/quote-candidates:
+    get:
+      tags: [Agent]
+      summary: List account-scoped web quote candidates and their review status.
+      responses:
+        "200":
+          description: Quote candidates; suggested entries have not changed authoritative valuation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentQuoteCandidateListResponse"
+
+  /agent/quote-candidates/{candidateId}/review:
+    post:
+      tags: [Agent]
+      summary: Apply or reject one Agent-proposed web quote candidate.
+      description: Applying is the only transition that writes the candidate through the authoritative quote refresh API.
+      parameters:
+        - name: candidateId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [decision]
+              properties:
+                decision:
+                  enum: [apply, reject]
+      responses:
+        "200":
+          description: Reviewed candidate. `applied` means the authoritative quote cache accepted exactly one item.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentQuoteCandidateResponse"
+        "404":
+          description: Candidate is absent or belongs to another account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: Candidate was already applied or rejected.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
   /agent/conversations:
     get:
       tags: [Agent]
@@ -4669,6 +4724,47 @@ components:
           $ref: "#/components/schemas/ISODateTime"
         updatedAt:
           $ref: "#/components/schemas/ISODateTime"
+    AgentQuoteCandidate:
+      type: object
+      additionalProperties: false
+      required: [id, userId, ledgerId, kind, asOf, source, sourceUrl, status, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        userId:
+          $ref: "#/components/schemas/ID"
+        ledgerId:
+          $ref: "#/components/schemas/ID"
+        kind:
+          enum: [instrument, fx]
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        price:
+          $ref: "#/components/schemas/DecimalString"
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+        baseCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        quoteCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        rate:
+          $ref: "#/components/schemas/DecimalString"
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+        source:
+          type: string
+          maxLength: 120
+        sourceUrl:
+          type: string
+          format: uri
+        status:
+          enum: [suggested, applied, rejected]
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        updatedAt:
+          $ref: "#/components/schemas/ISODateTime"
+        appliedAt:
+          $ref: "#/components/schemas/ISODateTime"
     AgentStatusResponse:
       type: object
       required: [ok, data]
@@ -4728,6 +4824,24 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AgentMemory"
+    AgentQuoteCandidateResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AgentQuoteCandidate"
+    AgentQuoteCandidateListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentQuoteCandidate"
     AgentConversationResponse:
       type: object
       required: [ok, data]

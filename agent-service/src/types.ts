@@ -74,6 +74,30 @@ export interface AgentMemory {
   updatedAt: string;
 }
 
+export interface AgentQuoteCandidate {
+  id: string;
+  userId: string;
+  ledgerId: string;
+  kind: "instrument" | "fx";
+  instrumentId?: string;
+  price?: string;
+  currency?: string;
+  baseCurrency?: string;
+  quoteCurrency?: string;
+  rate?: string;
+  asOf: string;
+  source: string;
+  sourceUrl: string;
+  status: "suggested" | "applied" | "rejected";
+  createdAt: string;
+  updatedAt: string;
+  appliedAt?: string;
+}
+
+export interface AgentQuoteWriter {
+  applyQuoteCandidate(candidate: AgentQuoteCandidate): Promise<unknown>;
+}
+
 export interface UserState {
   schemaVersion: 1;
   conversations: AgentConversation[];
@@ -81,6 +105,7 @@ export interface UserState {
   events: AgentEvent[];
   attachments: AgentAttachment[];
   memories: AgentMemory[];
+  quoteCandidates: AgentQuoteCandidate[];
   idempotency: AgentIdempotencyRecord[];
   nextEventCursor: number;
 }

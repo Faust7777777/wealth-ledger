@@ -25,6 +25,7 @@ function emptyState(): UserState {
     events: [],
     attachments: [],
     memories: [],
+    quoteCandidates: [],
     idempotency: [],
     nextEventCursor: 1,
   };
@@ -72,6 +73,7 @@ export class StateStore {
       parsed.idempotency ??= [];
       parsed.attachments ??= [];
       parsed.memories ??= [];
+      parsed.quoteCandidates ??= [];
       return parsed;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyState();
@@ -93,6 +95,9 @@ export class StateStore {
       }
       if (state.idempotency.length > 1_000) {
         state.idempotency = state.idempotency.slice(-1_000);
+      }
+      if (state.quoteCandidates.length > 1_000) {
+        state.quoteCandidates = state.quoteCandidates.slice(-1_000);
       }
       await this.#write(userId, state);
     });

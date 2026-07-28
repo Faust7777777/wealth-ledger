@@ -14,10 +14,13 @@ import type {
   AgentEngine,
   AgentModelInfo,
   Principal,
+  AgentQuoteCandidate,
+  AgentQuoteWriter,
   RunCallbacks,
 } from "../src/types.js";
 import { createWorkspaceTools } from "../src/workspace-tools.js";
 import { createMemoryTools } from "../src/memory-tools.js";
+import { suggestQuoteCandidate } from "../src/quote-candidate-tools.js";
 
 const roots: string[] = [];
 const owner: Principal = {
@@ -69,14 +72,28 @@ class FakeEngine implements AgentEngine {
   }
 }
 
+class FakeQuoteWriter implements AgentQuoteWriter {
+  applied: AgentQuoteCandidate[] = [];
+  failure?: string;
+
+  async applyQuoteCandidate(candidate: AgentQuoteCandidate): Promise<unknown> {
+    if (this.failure) throw new Error(this.failure);
+    this.applied.push(candidate);
+    return { ok: true };
+  }
+}
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true })));
 });
 
-async function serviceWith(engine = new FakeEngine()): Promise<AgentService> {
+async function serviceWith(
+  engine = new FakeEngine(),
+  quoteWriter?: AgentQuoteWriter,
+): Promise<AgentService> {
   const root = await mkdtemp(join(tmpdir(), "finwealth-agent-test-"));
   roots.push(root);
-  return new AgentService(new StateStore(root), new EventHub(), engine);
+  return new AgentService(new StateStore(root), new EventHub(), engine, quoteWriter);
 }
 
 async function waitForCompleted(
@@ -302,6 +319,65 @@ test("Finwealth client reads data and submits a draft only to review", async () 
   assert.ok(requests.every((item) => !item.path?.includes("approve")));
 });
 
+test("Finwealth client applies an approved quote with a stable candidate idempotency key", async () => {
+  let capturedBody: Record<string, unknown> | undefined;
+  let capturedKey: string | undefined;
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    capturedBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    capturedKey = typeof request.headers["idempotency-key"] === "string"
+      ? request.headers["idempotency-key"]
+      : undefined;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      ok: true,
+      data: { quotes: [{ id: "quote_applied" }], fxRates: [], errors: [] },
+    }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    const client = new FinwealthClient(
+      `http://127.0.0.1:${address.port}`,
+      "sidecar-secret",
+    );
+    await client.applyQuoteCandidate({
+      id: "aqc_stable",
+      userId: owner.userId,
+      ledgerId: owner.ledgerId,
+      kind: "instrument",
+      instrumentId: "inst_btc",
+      price: "118234.25",
+      currency: "USDT",
+      asOf: "2026-07-28T10:00:00Z",
+      source: "Example Exchange",
+      sourceUrl: "https://example.test/markets/btc-usdt",
+      status: "suggested",
+      createdAt: "2026-07-28T10:01:00Z",
+      updatedAt: "2026-07-28T10:01:00Z",
+    });
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+  assert.equal(capturedKey, "agent-quote-aqc_stable");
+  assert.deepEqual(capturedBody, {
+    mode: "manual",
+    requestedAt: "2026-07-28T10:01:00Z",
+    quotes: [{
+      instrumentId: "inst_btc",
+      price: "118234.25",
+      currency: "USDT",
+      asOf: "2026-07-28T10:00:00Z",
+      source: "Example Exchange",
+      sourceUrl: "https://example.test/markets/btc-usdt",
+    }],
+  });
+});
+
 test("archives an image and passes only owned attachment IDs to the model", async () => {
   const engine = new FakeEngine();
   const service = await serviceWith(engine);
@@ -396,6 +472,139 @@ test("archives an image and passes only owned attachment IDs to the model", asyn
       server.close((error) => (error ? reject(error) : resolve())),
     );
   }
+});
+
+test("web quote candidates remain suggested until an idempotent user review applies them", async () => {
+  const writer = new FakeQuoteWriter();
+  const service = await serviceWith(new FakeEngine(), writer);
+  const conversation = (await service.listConversations(owner))[0];
+  assert.ok(conversation);
+  const candidate = await suggestQuoteCandidate(service.store, conversation, {
+    kind: "instrument",
+    instrumentId: "inst_btc",
+    price: "118234.25",
+    currency: "USDT",
+    asOf: "2026-07-28T10:00:00Z",
+    source: "Example Exchange",
+    sourceUrl: "https://example.test/markets/btc-usdt",
+  });
+  assert.equal(candidate.status, "suggested");
+  assert.equal(writer.applied.length, 0);
+  const duplicate = await suggestQuoteCandidate(service.store, conversation, {
+    kind: "instrument",
+    instrumentId: "inst_btc",
+    price: "118234.25",
+    currency: "USDT",
+    asOf: "2026-07-28T10:00:00Z",
+    source: "Example Exchange mirror label",
+    sourceUrl: "https://example.test/markets/btc-usdt",
+  });
+  assert.equal(duplicate.id, candidate.id);
+  assert.equal((await service.listQuoteCandidates(owner)).length, 1);
+
+  const server = createAgentHttpServer(service, "internal-test-token");
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const base = `http://127.0.0.1:${address.port}`;
+  const headers = {
+    "x-finwealth-internal-token": "internal-test-token",
+    "x-finwealth-user-id": owner.userId,
+    "x-finwealth-ledger-id": owner.ledgerId,
+    "x-finwealth-device-id": owner.deviceId,
+  };
+  try {
+    const listed = await fetch(`${base}/v1/agent/quote-candidates`, { headers });
+    assert.equal(listed.status, 200);
+    const listedBody = await listed.json() as { data: AgentQuoteCandidate[] };
+    assert.equal(listedBody.data.length, 1);
+    assert.equal(listedBody.data[0]?.status, "suggested");
+
+    const crossLedgerReview = await fetch(
+      `${base}/v1/agent/quote-candidates/${candidate.id}/review`,
+      {
+        method: "POST",
+        headers: {
+          ...headers,
+          "x-finwealth-ledger-id": "ledger_other",
+          "content-type": "application/json",
+          "idempotency-key": "cross-ledger-quote-review",
+        },
+        body: JSON.stringify({ decision: "apply" }),
+      },
+    );
+    assert.equal(crossLedgerReview.status, 404);
+    assert.equal(writer.applied.length, 0);
+
+    const apply = (): Promise<Response> => fetch(
+      `${base}/v1/agent/quote-candidates/${candidate.id}/review`,
+      {
+        method: "POST",
+        headers: {
+          ...headers,
+          "content-type": "application/json",
+          "idempotency-key": "apply-web-quote-1",
+        },
+        body: JSON.stringify({ decision: "apply" }),
+      },
+    );
+    const first = await apply();
+    const replay = await apply();
+    assert.equal(first.status, 200);
+    assert.equal(replay.status, 200);
+    assert.equal(replay.headers.get("idempotency-replayed"), "true");
+    assert.equal(writer.applied.length, 1);
+    assert.equal((await service.listQuoteCandidates(owner))[0]?.status, "applied");
+
+    const otherLedger = await fetch(`${base}/v1/agent/quote-candidates`, {
+      headers: { ...headers, "x-finwealth-ledger-id": "ledger_other" },
+    });
+    const otherBody = await otherLedger.json() as { data: unknown[] };
+    assert.deepEqual(otherBody.data, []);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+test("rejecting or failing to apply a quote candidate never changes authoritative quotes", async () => {
+  const writer = new FakeQuoteWriter();
+  const service = await serviceWith(new FakeEngine(), writer);
+  const conversation = (await service.listConversations(owner))[0];
+  assert.ok(conversation);
+  const rejected = await suggestQuoteCandidate(service.store, conversation, {
+    kind: "fx",
+    baseCurrency: "USD",
+    quoteCurrency: "CNY",
+    rate: "7.21",
+    asOf: "2026-07-28T10:00:00Z",
+    source: "Example Bank",
+    sourceUrl: "https://example.test/fx/usd-cny",
+  });
+  const rejectedResult = await service.reviewQuoteCandidate(
+    owner,
+    rejected.id,
+    "reject",
+  );
+  assert.equal(rejectedResult.status, "rejected");
+  assert.equal(writer.applied.length, 0);
+
+  const failed = await suggestQuoteCandidate(service.store, conversation, {
+    kind: "fx",
+    baseCurrency: "EUR",
+    quoteCurrency: "CNY",
+    rate: "8.42",
+    asOf: "2026-07-28T10:05:00Z",
+    source: "Example Bank",
+    sourceUrl: "https://example.test/fx/eur-cny",
+  });
+  writer.failure = "agent_quote_apply_failed";
+  await assert.rejects(
+    service.reviewQuoteCandidate(owner, failed.id, "apply"),
+    /agent_quote_apply_failed/,
+  );
+  assert.equal((await service.listQuoteCandidates(owner))[1]?.status, "suggested");
 });
 
 test("workspace file tools reject paths outside the dedicated workspace", async () => {

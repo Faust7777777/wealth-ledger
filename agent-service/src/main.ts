@@ -33,12 +33,13 @@ const address = parseAddress(
   process.env.FINWEALTH_AGENT_ADDR ?? "127.0.0.1:8792",
 );
 const store = new StateStore(stateRoot);
+const finwealth = new FinwealthClient(serverBaseUrl, internalToken);
 const engine = await PiAgentEngine.create(
   store,
   agentDir,
-  new FinwealthClient(serverBaseUrl, internalToken),
+  finwealth,
 );
-const service = new AgentService(store, new EventHub(), engine);
+const service = new AgentService(store, new EventHub(), engine, finwealth);
 const server = createAgentHttpServer(service, internalToken);
 
 server.listen(address.port, address.host, () => {

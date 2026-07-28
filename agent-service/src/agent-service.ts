@@ -11,6 +11,8 @@ import type {
   AgentMemory,
   AgentMessage,
   Principal,
+  AgentQuoteCandidate,
+  AgentQuoteWriter,
 } from "./types.js";
 
 function now(): string {
@@ -26,13 +28,20 @@ export class AgentService {
   readonly store: StateStore;
   readonly events: EventHub;
   readonly engine: AgentEngine;
+  readonly #quoteWriter: AgentQuoteWriter | undefined;
   readonly #runQueues = new Map<string, Promise<void>>();
   readonly #idempotencyQueues = new Map<string, Promise<unknown>>();
 
-  constructor(store: StateStore, events: EventHub, engine: AgentEngine) {
+  constructor(
+    store: StateStore,
+    events: EventHub,
+    engine: AgentEngine,
+    quoteWriter?: AgentQuoteWriter,
+  ) {
     this.store = store;
     this.events = events;
     this.engine = engine;
+    this.#quoteWriter = quoteWriter;
   }
 
   async status(principal: Principal): Promise<Record<string, unknown>> {
@@ -234,6 +243,46 @@ export class AgentService {
       memory.status = decision;
       memory.updatedAt = now();
       return { ...memory };
+    });
+  }
+
+  async listQuoteCandidates(principal: Principal): Promise<AgentQuoteCandidate[]> {
+    const state = await this.store.read(principal.userId);
+    return state.quoteCandidates.filter(
+      (item) => item.ledgerId === principal.ledgerId,
+    );
+  }
+
+  async reviewQuoteCandidate(
+    principal: Principal,
+    candidateId: string,
+    decision: "apply" | "reject",
+  ): Promise<AgentQuoteCandidate> {
+    const state = await this.store.read(principal.userId);
+    const candidate = state.quoteCandidates.find(
+      (item) => item.id === candidateId && item.ledgerId === principal.ledgerId,
+    );
+    if (!candidate) throw new Error("agent_quote_candidate_not_found");
+    if (candidate.status !== "suggested") {
+      throw new Error("agent_quote_candidate_already_reviewed");
+    }
+    if (decision === "apply") {
+      if (!this.#quoteWriter) throw new Error("agent_quote_apply_unavailable");
+      await this.#quoteWriter.applyQuoteCandidate(candidate);
+    }
+    return this.store.update(principal.userId, (latest) => {
+      const current = latest.quoteCandidates.find(
+        (item) => item.id === candidateId && item.ledgerId === principal.ledgerId,
+      );
+      if (!current) throw new Error("agent_quote_candidate_not_found");
+      if (current.status !== "suggested") {
+        throw new Error("agent_quote_candidate_already_reviewed");
+      }
+      const timestamp = now();
+      current.status = decision === "apply" ? "applied" : "rejected";
+      current.updatedAt = timestamp;
+      if (decision === "apply") current.appliedAt = timestamp;
+      return { ...current };
     });
   }
 

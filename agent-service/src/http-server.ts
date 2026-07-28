@@ -92,6 +92,7 @@ function errorStatus(code: string): number {
     code === "conversation_archived" ||
     code === "primary_conversation_cannot_be_archived" ||
     code === "agent_memory_already_reviewed" ||
+    code === "agent_quote_candidate_already_reviewed" ||
     code === "idempotency_key_reused"
   ) {
     return 409;
@@ -205,6 +206,10 @@ export function createAgentHttpServer(
       }
       if (request.method === "GET" && path === "/v1/agent/memories") {
         ok(response, await service.listMemories(principal));
+        return;
+      }
+      if (request.method === "GET" && path === "/v1/agent/quote-candidates") {
+        ok(response, await service.listQuoteCandidates(principal));
         return;
       }
       if (request.method === "POST" && path === "/v1/agent/attachments") {
@@ -384,6 +389,26 @@ export function createAgentHttpServer(
           `POST /v1/agent/memories/${memoryId}/review`,
           { decision },
           () => service.reviewMemory(principal, memoryId, decision),
+        );
+        markReplay(response, result.replayed);
+        ok(response, result.value);
+        return;
+      }
+
+      match = path.match(/^\/v1\/agent\/quote-candidates\/([^/]+)\/review$/);
+      if (match?.[1] && request.method === "POST") {
+        const candidateId = match[1];
+        const body = await readJson(request);
+        if (body.decision !== "apply" && body.decision !== "reject") {
+          throw new Error("invalid_agent_quote_decision");
+        }
+        const decision = body.decision;
+        const result = await service.idempotent(
+          principal,
+          idempotencyKey(request),
+          `POST /v1/agent/quote-candidates/${candidateId}/review`,
+          { decision },
+          () => service.reviewQuoteCandidate(principal, candidateId, decision),
         );
         markReplay(response, result.replayed);
         ok(response, result.value);
