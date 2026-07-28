@@ -36,6 +36,7 @@ import 'package:finwealth/features/subscription_form_page.dart';
 import 'package:finwealth/features/valuation_status_sheet.dart';
 import 'package:finwealth/features/liability_terms_page.dart';
 import 'package:finwealth/features/loan_section.dart';
+import 'package:finwealth/features/agent_automations_page.dart';
 import 'package:finwealth/features/agent_panel.dart';
 import 'package:finwealth/features/ai_import_text_page.dart';
 import 'package:finwealth/features/liabilities_page.dart';
@@ -1418,6 +1419,7 @@ void main() {
     AgentFilePicker? picker,
     List<AgentQuoteCandidateVm> candidates = const [],
     AgentAttachmentVm? attachmentMeta,
+    List<AgentNotificationVm> notifications = const [],
   }) => ProviderScope(
     overrides: [
       if (picker != null)
@@ -1445,6 +1447,7 @@ void main() {
           conversations: const [agentConversation],
           candidates: candidates,
           attachmentMeta: attachmentMeta,
+          notifications: notifications,
         ),
       ),
     ],
@@ -1659,6 +1662,145 @@ void main() {
     );
   }
 
+  // —— 2026-07-28 批：自动任务与通知 ——
+  AgentAutomationVm previewAutomation(
+    AgentAutomationKind kind, {
+    required int intervalHours,
+    bool enabled = true,
+    String? lastRunAt,
+    AgentAutomationRunStatus? lastStatus,
+  }) => AgentAutomationVm(
+    id: 'auto_${kind.name}',
+    kind: kind,
+    intervalHours: intervalHours,
+    enabled: enabled,
+    nextRunAt: '2026-07-29T02:00:00Z',
+    createdAt: '2026-07-28T00:00:00Z',
+    updatedAt: '2026-07-28T00:00:00Z',
+    lastRunAt: lastRunAt,
+    lastStatus: lastStatus,
+  );
+
+  Widget automationHost(
+    ThemeData theme, {
+    List<AgentAutomationVm> automations = const [],
+  }) => ProviderScope(
+    overrides: [
+      agentRepositoryProvider.overrideWithValue(
+        _PreviewAgentRepo(
+          configured: true,
+          messages: const [],
+          memories: const [],
+          frames: const [],
+          conversations: const [],
+          automations: automations,
+        ),
+      ),
+    ],
+    child: MaterialApp(
+      theme: theme,
+      debugShowCheckedModeBanner: false,
+      home: const AgentAutomationsPage(),
+    ),
+  );
+
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('agent automations empty - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(420, 620));
+      await tester.pumpWidget(automationHost(theme));
+      await _settleEntrance(tester);
+      await expectLater(
+        find.byType(AgentAutomationsPage),
+        matchesGoldenFile('goldens/agent_automations_empty_$name.png'),
+      );
+    });
+
+    testWidgets(
+      'agent automations configured - $name',
+      skip: !_previewEnabled,
+      (tester) async {
+        await sized(tester, const Size(420, 900));
+        await tester.pumpWidget(
+          automationHost(
+            theme,
+            automations: [
+              previewAutomation(
+                AgentAutomationKind.quoteRefresh,
+                intervalHours: 6,
+                lastRunAt: '2026-07-28T02:00:00Z',
+                lastStatus: AgentAutomationRunStatus.success,
+              ),
+              previewAutomation(
+                AgentAutomationKind.subscriptionDueScan,
+                intervalHours: 24,
+                lastRunAt: '2026-07-28T01:00:00Z',
+                lastStatus: AgentAutomationRunStatus.failed,
+              ),
+              previewAutomation(
+                AgentAutomationKind.dcaDueCheck,
+                intervalHours: 24,
+                enabled: false,
+              ),
+              previewAutomation(
+                AgentAutomationKind.financialSummary,
+                intervalHours: 168,
+                lastRunAt: '2026-07-27T02:00:00Z',
+                lastStatus: AgentAutomationRunStatus.success,
+              ),
+            ],
+          ),
+        );
+        await _settleEntrance(tester);
+        await expectLater(
+          find.byType(AgentAutomationsPage),
+          matchesGoldenFile('goldens/agent_automations_configured_$name.png'),
+        );
+      },
+    );
+
+    testWidgets('agent notifications - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(400, 620));
+      await tester.pumpWidget(
+        agentHost(
+          theme,
+          notifications: [
+            const AgentNotificationVm(
+              id: 'note_1',
+              kind: AgentAutomationKind.subscriptionDueScan,
+              title: '订阅到期扫描完成',
+              body: '生成了 2 条待确认扣费',
+              action: AgentNotificationAction.review,
+              createdAt: '2026-07-28T09:30:00Z',
+            ),
+            const AgentNotificationVm(
+              id: 'note_2',
+              kind: AgentAutomationKind.financialSummary,
+              title: '本周财务总结',
+              body: '净资产较上周 +1.2%',
+              action: AgentNotificationAction.agent,
+              createdAt: '2026-07-27T09:30:00Z',
+              readAt: '2026-07-27T10:00:00Z',
+            ),
+          ],
+        ),
+      );
+      await _settleEntrance(tester);
+      await tester.tap(find.textContaining('通知'));
+      await tester.pumpAndSettle();
+      await expectLater(
+        find.byType(MaterialApp),
+        matchesGoldenFile('goldens/agent_notifications_$name.png'),
+      );
+    });
+  }
+
   testWidgets('agent panel unconfigured - dark', skip: !_previewEnabled, (
     tester,
   ) async {
@@ -1723,6 +1865,8 @@ class _PreviewAgentRepo implements AgentRepository {
     required this.conversations,
     this.candidates = const [],
     this.attachmentMeta,
+    this.automations = const [],
+    this.notifications = const [],
   });
 
   final bool configured;
@@ -1732,6 +1876,8 @@ class _PreviewAgentRepo implements AgentRepository {
   final List<AgentConversationVm> conversations;
   final List<AgentQuoteCandidateVm> candidates;
   final AgentAttachmentVm? attachmentMeta;
+  final List<AgentAutomationVm> automations;
+  final List<AgentNotificationVm> notifications;
 
   @override
   Future<AgentStatusVm> getStatus() async =>
@@ -1819,6 +1965,30 @@ class _PreviewAgentRepo implements AgentRepository {
     Id candidateId, {
     required AgentQuoteCandidateStatus decision,
   }) => throw UnsupportedError('preview');
+  @override
+  Future<List<AgentAutomationVm>> listAutomations() async => automations;
+  @override
+  Future<List<AgentNotificationVm>> listNotifications() async => notifications;
+  @override
+  Future<AgentAutomationVm> createAutomation({
+    required AgentAutomationKind kind,
+    required int intervalHours,
+    bool enabled = true,
+    IsoDateTime? startAt,
+  }) => throw UnsupportedError('preview');
+  @override
+  Future<AgentAutomationVm> updateAutomation(
+    Id automationId, {
+    int? intervalHours,
+    bool? enabled,
+    IsoDateTime? nextRunAt,
+  }) => throw UnsupportedError('preview');
+  @override
+  Future<AgentAutomationVm> runAutomation(Id automationId) =>
+      throw UnsupportedError('preview');
+  @override
+  Future<AgentNotificationVm> markNotificationRead(Id notificationId) =>
+      throw UnsupportedError('preview');
   @override
   Future<void> cancelRun(Id runId) => throw UnsupportedError('preview');
 }

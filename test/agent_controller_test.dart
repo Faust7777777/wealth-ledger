@@ -106,6 +106,30 @@ class _FakeAgentRepo implements AgentRepository {
     required AgentQuoteCandidateStatus decision,
   }) => throw UnsupportedError('unused');
   @override
+  Future<List<AgentAutomationVm>> listAutomations() async => const [];
+  @override
+  Future<List<AgentNotificationVm>> listNotifications() async => const [];
+  @override
+  Future<AgentAutomationVm> createAutomation({
+    required AgentAutomationKind kind,
+    required int intervalHours,
+    bool enabled = true,
+    IsoDateTime? startAt,
+  }) => throw UnsupportedError('unused');
+  @override
+  Future<AgentAutomationVm> updateAutomation(
+    Id automationId, {
+    int? intervalHours,
+    bool? enabled,
+    IsoDateTime? nextRunAt,
+  }) => throw UnsupportedError('unused');
+  @override
+  Future<AgentAutomationVm> runAutomation(Id automationId) =>
+      throw UnsupportedError('unused');
+  @override
+  Future<AgentNotificationVm> markNotificationRead(Id notificationId) =>
+      throw UnsupportedError('unused');
+  @override
   Future<void> cancelRun(Id runId) async => cancelled.add(runId);
 
   @override
