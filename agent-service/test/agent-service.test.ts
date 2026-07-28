@@ -103,6 +103,7 @@ class FakeEngine implements AgentEngine {
   readonly models: AgentModelInfo[];
   cancelled: string[] = [];
   lastAttachmentCount = 0;
+  failure?: string;
 
   constructor(models: AgentModelInfo[] = [
     {
@@ -126,6 +127,7 @@ class FakeEngine implements AgentEngine {
     callbacks: RunCallbacks,
   ): Promise<{ text: string; piSessionFile?: string }> {
     this.lastAttachmentCount = _attachments.length;
+    if (this.failure) throw new Error(this.failure);
     callbacks.onToolStarted("finwealth_overview");
     callbacks.onToolCompleted("finwealth_overview", false);
     callbacks.onDelta("已处理：");
@@ -262,8 +264,14 @@ async function waitForCompleted(
 ): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const messages = await service.listMessages(owner, conversationId);
-    if (messages.some((message) => message.role === "assistant" && message.status === "completed")) {
-      return;
+    const completed = messages.find(
+      (message) => message.role === "assistant" && message.status === "completed",
+    );
+    if (completed?.runId) {
+      const events = await service.listEvents(owner, conversationId, 0);
+      if (events.some(
+        (event) => event.type === "run.completed" && event.data.runId === completed.runId,
+      )) return;
     }
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
@@ -893,11 +901,11 @@ test("due automations persist their next run and create account-scoped notificat
     kind: "subscription_due_scan",
     intervalHours: 24,
     enabled: true,
-    startAt: "2026-07-28T00:00:00Z",
+    startAt: "2026-07-28T08:00:00+08:00",
   });
   await service.runDueAutomations("2026-07-28T00:01:00Z");
   assert.equal(runner.runs.length, 1);
-  assert.equal(runner.runs[0]?.scheduledFor, "2026-07-28T00:00:00Z");
+  assert.equal(runner.runs[0]?.scheduledFor, "2026-07-28T08:00:00+08:00");
   const latest = (await service.listAutomations(owner))[0];
   assert.equal(latest?.lastStatus, "success");
   assert.ok(Date.parse(latest?.nextRunAt ?? "") > Date.parse("2026-07-29T00:00:00Z"));
@@ -982,7 +990,7 @@ test("automation HTTP writes are idempotent and manual runs preserve the schedul
   }
 });
 
-test("financial summary automation queues a read-only report in the primary conversation", async () => {
+test("financial summary automation completes a read-only report before succeeding", async () => {
   const service = await serviceWith(new FakeEngine());
   const automation = await service.createAutomation(owner, {
     kind: "financial_summary",
@@ -1000,7 +1008,57 @@ test("financial summary automation queues a read-only report in the primary conv
   assert.match(request?.text ?? "", /不要创建或确认任何账务记录/);
   const notice = (await service.listNotifications(owner))[0];
   assert.equal(notice?.action, "agent");
-  assert.equal(notice?.title, "财务总结正在生成");
+  assert.equal(notice?.title, "财务总结已生成");
+  assert.equal((await service.listAutomations(owner))[0]?.lastStatus, "success");
+});
+
+test("startup recovery fails interrupted runs and appends a terminal event", async () => {
+  const service = await serviceWith(new FakeEngine());
+  const primary = (await service.listConversations(owner)).find((item) => item.isPrimary);
+  assert.ok(primary);
+  await service.store.update(owner.userId, (state) => {
+    state.messages.push({
+      id: "msg_interrupted",
+      conversationId: primary.id,
+      role: "assistant",
+      text: "partial",
+      status: "streaming",
+      runId: "run_interrupted",
+      createdAt: "2026-07-28T00:00:00Z",
+    });
+  });
+
+  assert.equal(await service.recoverInterruptedRuns(), 1);
+  const recovered = (await service.listMessages(owner, primary.id)).find(
+    (item) => item.id === "msg_interrupted",
+  );
+  assert.equal(recovered?.status, "failed");
+  assert.equal(recovered?.errorCode, "agent_run_interrupted");
+  assert.ok(recovered?.completedAt);
+  const event = (await service.listEvents(owner, primary.id, 0)).at(-1);
+  assert.equal(event?.type, "run.failed");
+  assert.equal(event?.data.code, "agent_run_interrupted");
+  assert.equal(await service.recoverInterruptedRuns(), 0);
+});
+
+test("financial summary model failures fail the automation and remain retryable", async () => {
+  const engine = new FakeEngine();
+  engine.failure = "agent_model_request_failed";
+  const service = await serviceWith(engine);
+  const automation = await service.createAutomation(owner, {
+    kind: "financial_summary",
+    intervalHours: 24,
+    enabled: false,
+  });
+
+  await assert.rejects(
+    service.runAutomationNow(owner, automation.id),
+    /agent_model_request_failed/,
+  );
+  const latest = (await service.listAutomations(owner))[0];
+  assert.equal(latest?.lastStatus, "failed");
+  assert.equal(latest?.lastErrorCode, "agent_model_request_failed");
+  assert.equal((await service.listNotifications(owner))[0]?.title, "自动任务未完成");
 });
 
 test("workspace file tools reject paths outside the dedicated workspace", async () => {

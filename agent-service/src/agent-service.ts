@@ -227,14 +227,52 @@ export class AgentService {
   }
 
   async runDueAutomations(at = now()): Promise<void> {
+    const dueAt = Date.parse(at);
+    if (!Number.isFinite(dueAt)) throw new Error("invalid_agent_automation_run_time");
     for (const userId of await this.store.listUserIds()) {
       const state = await this.store.read(userId);
       for (const item of state.automations) {
-        if (item.enabled && item.nextRunAt <= at) {
+        if (item.enabled && Date.parse(item.nextRunAt) <= dueAt) {
           await this.#executeAutomation(item, item.nextRunAt, true).catch(() => undefined);
         }
       }
     }
+  }
+
+  async recoverInterruptedRuns(): Promise<number> {
+    let recovered = 0;
+    const timestamp = now();
+    for (const userId of await this.store.listUserIds()) {
+      recovered += await this.store.update(userId, (state) => {
+        let count = 0;
+        for (const message of state.messages) {
+          if (
+            message.role !== "assistant" ||
+            (message.status !== "queued" && message.status !== "streaming")
+          ) continue;
+          message.status = "failed";
+          message.errorCode = "agent_run_interrupted";
+          message.completedAt = timestamp;
+          if (message.runId) {
+            state.events.push({
+              cursor: state.nextEventCursor,
+              conversationId: message.conversationId,
+              type: "run.failed",
+              data: {
+                runId: message.runId,
+                assistantMessageId: message.id,
+                code: "agent_run_interrupted",
+              },
+              createdAt: timestamp,
+            });
+            state.nextEventCursor += 1;
+          }
+          count += 1;
+        }
+        return count;
+      });
+    }
+    return recovered;
   }
 
   async #executeAutomation(
@@ -327,17 +365,54 @@ export class AgentService {
     if (!primary) throw new Error("agent_primary_conversation_not_found");
     const hours = automation.intervalHours;
     const period = hours <= 24 ? "过去一天" : hours <= 168 ? "过去一周" : "过去一个月";
-    await this.sendMessage(
-      principal,
-      primary.id,
-      `请生成${period}的财务总结。读取权威账本数据，概括消费分类与变化、订阅支出、投资仓位和盈亏，并给出简短可执行建议。报告截止时间：${scheduledFor}。不要创建或确认任何账务记录。`,
+    const prompt = `请生成${period}的财务总结。读取权威账本数据，概括消费分类与变化、订阅支出、投资仓位和盈亏，并给出简短可执行建议。报告截止时间：${scheduledFor}。不要创建或确认任何账务记录。`;
+    const state = await this.store.read(automation.userId);
+    const prior = state.messages.findLast(
+      (item) => item.conversationId === primary.id && item.role === "user" && item.text === prompt,
     );
+    const priorAssistant = prior?.runId
+      ? state.messages.find(
+          (item) => item.runId === prior.runId && item.role === "assistant",
+        )
+      : undefined;
+    if (priorAssistant?.status === "completed") {
+      return {
+        title: "财务总结已生成",
+        body: `${period}的报告已写入主会话`,
+        action: "agent",
+        notify: true,
+      };
+    }
+    const runId = priorAssistant && (
+      priorAssistant.status === "queued" || priorAssistant.status === "streaming"
+    )
+      ? priorAssistant.runId
+      : (await this.sendMessage(principal, primary.id, prompt)).runId;
+    if (!runId) throw new Error("agent_summary_run_missing");
+    await this.#waitForRun(automation.userId, runId);
     return {
-      title: "财务总结正在生成",
-      body: `${period}的报告已加入主会话`,
+      title: "财务总结已生成",
+      body: `${period}的报告已写入主会话`,
       action: "agent",
       notify: true,
     };
+  }
+
+  async #waitForRun(userId: string, runId: string): Promise<void> {
+    const deadline = Date.now() + 10 * 60_000;
+    while (Date.now() < deadline) {
+      const state = await this.store.read(userId);
+      const message = state.messages.find(
+        (item) => item.runId === runId && item.role === "assistant",
+      );
+      if (!message) throw new Error("agent_summary_run_missing");
+      if (message.status === "completed") return;
+      if (message.status === "failed") {
+        throw new Error(message.errorCode ?? "agent_summary_run_failed");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error("agent_summary_run_timeout");
   }
 
   async createAttachment(

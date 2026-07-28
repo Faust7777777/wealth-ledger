@@ -41,6 +41,7 @@ const engine = await PiAgentEngine.create(
 );
 const service = new AgentService(store, new EventHub(), engine, finwealth, finwealth);
 const server = createAgentHttpServer(service, internalToken);
+await service.recoverInterruptedRuns();
 
 const automationTimer = setInterval(() => {
   void service.runDueAutomations();
