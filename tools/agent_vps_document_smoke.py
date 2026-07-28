@@ -270,13 +270,13 @@ def main() -> None:
             pdf,
             "application/pdf",
             pdf_marker,
-            "使用隔离 bash 运行 pdftotext 读取所附 PDF，只回复文件中的标记。",
+            "必须调用隔离 bash 工具，并在 command 中使用 pdftotext 读取所附 PDF；禁止用 Python 或 raw read 解析 PDF。只回复文件中的标记。",
         )
         run_document(
             xlsx,
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             xlsx_marker,
-            "使用隔离 bash 中的 python3 zipfile/XML 读取所附 XLSX，只回复第一个单元格的标记。",
+            "必须调用隔离 bash 工具，并在 command 中使用 python3 zipfile/XML 读取所附 XLSX。只回复第一个单元格的标记。",
         )
     print("OK: production Pi model read PDF and XLSX inside the isolated workspace.")
 
