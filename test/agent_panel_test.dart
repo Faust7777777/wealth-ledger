@@ -607,10 +607,9 @@ void main() {
 
       expect(repo.uploads.single.mimeType, 'text/csv');
       expect(find.byIcon(Icons.grid_on_outlined), findsOneWidget);
-      expect(
-        find.textContaining('wechat.csv · ${agentFileSize(csv.length)}'),
-        findsOneWidget,
-      );
+      // 文件名与大小分成两段：大小完整可见，只有文件名会省略。
+      expect(find.text('wechat.csv'), findsOneWidget);
+      expect(find.text(' · ${agentFileSize(csv.length)}'), findsOneWidget);
       // 不把文件正文读出来展示，也不宣称已解析。
       expect(find.textContaining('date,amount'), findsNothing);
       expect(find.textContaining('已解析'), findsNothing);
