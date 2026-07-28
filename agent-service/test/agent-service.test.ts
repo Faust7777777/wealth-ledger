@@ -243,7 +243,7 @@ test("pre-extracts PDF and XLSX text before the model prompt", async () => {
 });
 
 async function serviceWith(
-  engine = new FakeEngine(),
+  engine: AgentEngine = new FakeEngine(),
   quoteWriter?: AgentQuoteWriter,
   automationRunner?: AgentAutomationRunner,
 ): Promise<AgentService> {
@@ -335,6 +335,60 @@ test("queues a run, records compact tool events, and persists the Pi session pat
   );
   const stored = (await service.listConversations(owner))[0];
   assert.equal(stored?.piSessionFile, join("sessions", `${conversation.id}.jsonl`));
+});
+
+test("cancelling a queued run does not abort the active run", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const engine: AgentEngine & { runCalls: number; cancelCalls: number } = {
+    runCalls: 0,
+    cancelCalls: 0,
+    async listModels() {
+      return [{
+        id: "test/text",
+        provider: "test",
+        displayName: "Test Text",
+        supportsImages: false,
+      }];
+    },
+    async run(_conversation, text, _attachments, callbacks) {
+      this.runCalls += 1;
+      await gate;
+      callbacks.onDelta(text);
+      return { text };
+    },
+    async cancel() {
+      this.cancelCalls += 1;
+      return true;
+    },
+  };
+  const service = await serviceWith(engine);
+  const conversation = (await service.listConversations(owner))[0];
+  assert.ok(conversation);
+  const active = await service.sendMessage(owner, conversation.id, "first");
+  const queued = await service.sendMessage(owner, conversation.id, "second");
+
+  assert.equal(await service.cancelRun(owner, queued.runId), true);
+  assert.equal(engine.cancelCalls, 0);
+  release();
+  await waitForCompleted(service, conversation.id);
+
+  assert.equal(engine.runCalls, 1);
+  const messages = await service.listMessages(owner, conversation.id);
+  assert.equal(
+    messages.find((item) => item.runId === active.runId && item.role === "assistant")?.status,
+    "completed",
+  );
+  const cancelled = messages.find(
+    (item) => item.runId === queued.runId && item.role === "assistant",
+  );
+  assert.equal(cancelled?.status, "failed");
+  assert.equal(cancelled?.errorCode, "agent_run_aborted");
+  const events = await service.listEvents(owner, conversation.id, 0);
+  assert.equal(
+    events.some((event) => event.type === "run.started" && event.data.runId === queued.runId),
+    false,
+  );
 });
 
 test("does not expose one principal's conversation to another principal", async () => {

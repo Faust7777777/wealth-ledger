@@ -121,6 +121,7 @@ export class PiAgentEngine implements AgentEngine {
   readonly #models: ModelRuntime;
   readonly #finwealth: FinwealthClient;
   readonly #sessions = new Map<string, CachedSession>();
+  readonly #abortRequested = new Set<string>();
 
   private constructor(
     store: StateStore,
@@ -164,6 +165,9 @@ export class PiAgentEngine implements AgentEngine {
     callbacks: RunCallbacks,
   ): Promise<{ text: string; piSessionFile?: string }> {
     const cached = await this.#session(conversation);
+    if (this.#abortRequested.delete(conversation.id)) {
+      throw new Error("agent_run_aborted");
+    }
     let output = "";
     let currentMessageText = "";
     let terminalError:
@@ -240,10 +244,16 @@ export class PiAgentEngine implements AgentEngine {
         ...filePrompt,
         text,
       ].join("\n\n");
+      if (this.#abortRequested.delete(conversation.id)) {
+        throw new Error("agent_run_aborted");
+      }
       await cached.session.prompt(
         prompt,
         images.length ? { images } : undefined,
       );
+      if (this.#abortRequested.delete(conversation.id)) {
+        throw new Error("agent_run_aborted");
+      }
       if (terminalError) throw new Error(terminalError);
       if (cached.session.sessionFile) {
         cached.sessionFile = cached.session.sessionFile;
@@ -253,13 +263,15 @@ export class PiAgentEngine implements AgentEngine {
         ...(cached.sessionFile ? { piSessionFile: cached.sessionFile } : {}),
       };
     } finally {
+      this.#abortRequested.delete(conversation.id);
       unsubscribe();
     }
   }
 
   async cancel(conversationId: string): Promise<boolean> {
+    this.#abortRequested.add(conversationId);
     const cached = this.#sessions.get(conversationId);
-    if (!cached) return false;
+    if (!cached) return true;
     await cached.session.abort();
     return true;
   }

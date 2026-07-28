@@ -42,6 +42,8 @@ export class AgentService {
   readonly #automationRunner: AgentAutomationRunner | undefined;
   readonly #automationRuns = new Set<string>();
   readonly #runQueues = new Map<string, Promise<void>>();
+  readonly #activeRuns = new Map<string, string>();
+  readonly #cancelledRuns = new Set<string>();
   readonly #idempotencyQueues = new Map<string, Promise<unknown>>();
 
   constructor(
@@ -718,14 +720,12 @@ export class AgentService {
         attachments,
       ),
     );
-    this.#runQueues.set(
-      conversationId,
-      queued.finally(() => {
-        if (this.#runQueues.get(conversationId) === queued) {
-          this.#runQueues.delete(conversationId);
-        }
-      }),
-    );
+    const tracked = queued.finally(() => {
+      if (this.#runQueues.get(conversationId) === tracked) {
+        this.#runQueues.delete(conversationId);
+      }
+    });
+    this.#runQueues.set(conversationId, tracked);
     void queued.catch(() => undefined);
     return {
       runId,
@@ -745,7 +745,37 @@ export class AgentService {
       principal,
       message.conversationId,
     );
-    return this.engine.cancel(message.conversationId);
+    if (message.status === "completed" || message.status === "failed") return false;
+    if (this.#activeRuns.get(message.conversationId) === runId) {
+      return this.engine.cancel(message.conversationId);
+    }
+    if (message.status !== "queued") return false;
+
+    this.#cancelledRuns.add(runId);
+    const cancelledAt = now();
+    const cancelled = await this.store.update(principal.userId, (latest) => {
+      const current = latest.messages.find(
+        (item) => item.runId === runId && item.role === "assistant",
+      );
+      if (!current || current.status !== "queued") return false;
+      current.status = "failed";
+      current.errorCode = "agent_run_aborted";
+      current.completedAt = cancelledAt;
+      return true;
+    });
+    if (!cancelled) {
+      this.#cancelledRuns.delete(runId);
+      if (this.#activeRuns.get(message.conversationId) === runId) {
+        return this.engine.cancel(message.conversationId);
+      }
+      return false;
+    }
+    await this.#appendEvent(principal.userId, message.conversationId, "run.failed", {
+      runId,
+      assistantMessageId: message.id,
+      code: "agent_run_aborted",
+    });
+    return true;
   }
 
   async listEvents(
@@ -795,70 +825,85 @@ export class AgentService {
     text: string,
     attachments: AgentAttachment[],
   ): Promise<void> {
-    await this.#setMessageStatus(principal.userId, assistantMessageId, "streaming");
-    await this.#appendEvent(principal.userId, conversation.id, "run.started", {
-      runId,
-      assistantMessageId,
-    });
-    let eventQueue = Promise.resolve();
-    const enqueue = (type: string, data: Record<string, unknown>): void => {
-      eventQueue = eventQueue.then(() =>
-        this.#appendEvent(principal.userId, conversation.id, type, data).then(
-          () => undefined,
-        ),
-      );
-    };
+    if (this.#cancelledRuns.delete(runId)) return;
+    this.#activeRuns.set(conversation.id, runId);
     try {
-      const result = await this.engine.run(conversation, text, attachments, {
-        onDelta: (delta) => enqueue("message.delta", { assistantMessageId, delta }),
-        onToolStarted: (name) => enqueue("tool.started", { runId, name }),
-        onToolCompleted: (name, isError) =>
-          enqueue("tool.completed", { runId, name, isError }),
+      await this.#setMessageStatus(principal.userId, assistantMessageId, "streaming");
+      await this.#appendEvent(principal.userId, conversation.id, "run.started", {
+        runId,
+        assistantMessageId,
       });
-      await eventQueue;
-      const completedAt = now();
-      await this.store.update(principal.userId, (state) => {
-        const message = state.messages.find(
-          (item) => item.id === assistantMessageId,
+      let eventQueue = Promise.resolve();
+      const enqueue = (type: string, data: Record<string, unknown>): void => {
+        eventQueue = eventQueue.then(() =>
+          this.#appendEvent(principal.userId, conversation.id, type, data).then(
+            () => undefined,
+          ),
         );
-        if (!message) throw new Error("agent_message_not_found");
-        message.text = result.text;
-        message.status = "completed";
-        message.completedAt = completedAt;
-        const storedConversation = state.conversations.find(
-          (item) => item.id === conversation.id,
-        );
-        if (storedConversation) {
-          storedConversation.updatedAt = completedAt;
-          if (result.piSessionFile) {
-            storedConversation.piSessionFile = result.piSessionFile;
+      };
+      try {
+        let result: Awaited<ReturnType<AgentEngine["run"]>>;
+        try {
+          result = await this.engine.run(conversation, text, attachments, {
+            onDelta: (delta) => enqueue("message.delta", { assistantMessageId, delta }),
+            onToolStarted: (name) => enqueue("tool.started", { runId, name }),
+            onToolCompleted: (name, isError) =>
+              enqueue("tool.completed", { runId, name, isError }),
+          });
+        } finally {
+          if (this.#activeRuns.get(conversation.id) === runId) {
+            this.#activeRuns.delete(conversation.id);
           }
         }
-      });
-      await this.#appendEvent(principal.userId, conversation.id, "run.completed", {
-        runId,
-        assistantMessageId,
-      });
-    } catch (error) {
-      await eventQueue;
-      const code =
-        error instanceof Error && /^[a-z0-9_]+$/.test(error.message)
-          ? error.message
-          : "agent_run_failed";
-      await this.store.update(principal.userId, (state) => {
-        const message = state.messages.find(
-          (item) => item.id === assistantMessageId,
-        );
-        if (!message) return;
-        message.status = "failed";
-        message.errorCode = code;
-        message.completedAt = now();
-      });
-      await this.#appendEvent(principal.userId, conversation.id, "run.failed", {
-        runId,
-        assistantMessageId,
-        code,
-      });
+        await eventQueue;
+        const completedAt = now();
+        await this.store.update(principal.userId, (state) => {
+          const message = state.messages.find(
+            (item) => item.id === assistantMessageId,
+          );
+          if (!message) throw new Error("agent_message_not_found");
+          message.text = result.text;
+          message.status = "completed";
+          message.completedAt = completedAt;
+          const storedConversation = state.conversations.find(
+            (item) => item.id === conversation.id,
+          );
+          if (storedConversation) {
+            storedConversation.updatedAt = completedAt;
+            if (result.piSessionFile) {
+              storedConversation.piSessionFile = result.piSessionFile;
+            }
+          }
+        });
+        await this.#appendEvent(principal.userId, conversation.id, "run.completed", {
+          runId,
+          assistantMessageId,
+        });
+      } catch (error) {
+        await eventQueue;
+        const code =
+          error instanceof Error && /^[a-z0-9_]+$/.test(error.message)
+            ? error.message
+            : "agent_run_failed";
+        await this.store.update(principal.userId, (state) => {
+          const message = state.messages.find(
+            (item) => item.id === assistantMessageId,
+          );
+          if (!message) return;
+          message.status = "failed";
+          message.errorCode = code;
+          message.completedAt = now();
+        });
+        await this.#appendEvent(principal.userId, conversation.id, "run.failed", {
+          runId,
+          assistantMessageId,
+          code,
+        });
+      }
+    } finally {
+      if (this.#activeRuns.get(conversation.id) === runId) {
+        this.#activeRuns.delete(conversation.id);
+      }
     }
   }
 
