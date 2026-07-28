@@ -379,6 +379,9 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
   }
 }
 
+/// 会话/模型选择改用真实路由 sheet：菜单项自身消费触摸事件，
+/// 事件不会穿透到下方 composer，返回键也会先关掉这一层。
+/// sheet 只回传选择结果，动作由仍然挂载的 header 执行。
 class _Header extends ConsumerWidget {
   const _Header({
     required this.active,
@@ -388,6 +391,14 @@ class _Header extends ConsumerWidget {
   final AgentConversationVm? active;
   final List<AgentConversationVm> conversations;
   final VoidCallback? onClose;
+
+  Future<void> _mutate(WidgetRef ref, Future<void> Function() action) async {
+    try {
+      await action();
+    } finally {
+      ref.invalidate(agentConversationsProvider);
+    }
+  }
 
   Future<void> _rename(BuildContext context, WidgetRef ref) async {
     final current = active;
@@ -423,21 +434,54 @@ class _Header extends ConsumerWidget {
     );
   }
 
-  Future<void> _mutate(WidgetRef ref, Future<void> Function() action) async {
-    try {
-      await action();
-    } finally {
-      ref.invalidate(agentConversationsProvider);
+  Future<void> _openConversationMenu(
+    BuildContext context,
+    WidgetRef ref,
+  ) async {
+    final visible = [
+      for (final c in conversations)
+        if (c.status == AgentConversationStatus.active) c,
+    ];
+    final choice = await showAgentConversationSheet(
+      context,
+      active: active,
+      conversations: visible,
+    );
+    if (choice == null || !context.mounted) return;
+    switch (choice) {
+      case kAgentMenuNewConversation:
+        await _mutate(ref, () async {
+          final created = await ref
+              .read(agentRepositoryProvider)
+              .createConversation();
+          await ref.read(agentChatProvider.notifier).open(created.id);
+        });
+      case kAgentMenuRenameConversation:
+        if (context.mounted) await _rename(context, ref);
+      case kAgentMenuArchiveConversation:
+        final current = active;
+        if (current == null || current.isPrimary) return;
+        await _mutate(ref, () async {
+          await ref
+              .read(agentRepositoryProvider)
+              .updateConversation(
+                current.id,
+                status: AgentConversationStatus.archived,
+              );
+          final primary = visible.firstWhere(
+            (c) => c.isPrimary,
+            orElse: () => visible.first,
+          );
+          await ref.read(agentChatProvider.notifier).open(primary.id);
+        });
+      default:
+        await ref.read(agentChatProvider.notifier).open(choice);
     }
   }
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final models = ref.watch(agentModelsProvider).asData?.value ?? const [];
-    final visible = [
-      for (final c in conversations)
-        if (c.status == AgentConversationStatus.active) c,
-    ];
     return Padding(
       padding: const EdgeInsets.symmetric(
         horizontal: AppSpacing.base,
@@ -453,73 +497,30 @@ class _Header extends ConsumerWidget {
             ),
           ),
           if (models.isNotEmpty && active != null)
-            PopupMenuButton<String>(
+            IconButton(
+              key: kAgentModelMenuKey,
               tooltip: '模型',
               icon: const Icon(Icons.memory_outlined, size: 20),
-              onSelected: (modelId) => _mutate(
-                ref,
-                () => ref
-                    .read(agentRepositoryProvider)
-                    .updateConversation(active!.id, modelId: modelId),
-              ),
-              itemBuilder: (_) => [
-                for (final m in models)
-                  PopupMenuItem(
-                    value: m.id,
-                    child: Text(
-                      m.displayName,
-                      style: m.id == active!.selectedModelId
-                          ? AppType.bodyStrong
-                          : AppType.body,
-                    ),
-                  ),
-              ],
+              onPressed: () async {
+                final modelId = await showAgentModelSheet(
+                  context,
+                  active: active!,
+                  models: models,
+                );
+                if (modelId == null) return;
+                await _mutate(
+                  ref,
+                  () => ref
+                      .read(agentRepositoryProvider)
+                      .updateConversation(active!.id, modelId: modelId),
+                );
+              },
             ),
-          PopupMenuButton<String>(
+          IconButton(
+            key: kAgentConversationMenuKey,
             tooltip: '会话',
             icon: const Icon(Icons.more_horiz, size: 20),
-            onSelected: (value) async {
-              switch (value) {
-                case 'new':
-                  await _mutate(ref, () async {
-                    final created = await ref
-                        .read(agentRepositoryProvider)
-                        .createConversation();
-                    await ref.read(agentChatProvider.notifier).open(created.id);
-                  });
-                case 'rename':
-                  if (context.mounted) await _rename(context, ref);
-                case 'archive':
-                  final current = active;
-                  if (current == null || current.isPrimary) return;
-                  await _mutate(ref, () async {
-                    await ref
-                        .read(agentRepositoryProvider)
-                        .updateConversation(
-                          current.id,
-                          status: AgentConversationStatus.archived,
-                        );
-                    final primary = visible.firstWhere(
-                      (c) => c.isPrimary,
-                      orElse: () => visible.first,
-                    );
-                    await ref.read(agentChatProvider.notifier).open(primary.id);
-                  });
-                default:
-                  await ref.read(agentChatProvider.notifier).open(value);
-              }
-            },
-            itemBuilder: (_) => [
-              const PopupMenuItem(value: 'new', child: Text('新建会话')),
-              if (active != null)
-                const PopupMenuItem(value: 'rename', child: Text('重命名')),
-              if (active != null && !active!.isPrimary)
-                const PopupMenuItem(value: 'archive', child: Text('归档')),
-              if (visible.length > 1) const PopupMenuDivider(),
-              for (final c in visible)
-                if (c.id != active?.id)
-                  PopupMenuItem(value: c.id, child: Text(c.title)),
-            ],
+            onPressed: () => _openConversationMenu(context, ref),
           ),
           if (onClose != null)
             IconButton(
@@ -533,8 +534,134 @@ class _Header extends ConsumerWidget {
   }
 }
 
-/// 报价候选入口：外层只留一条固定高度的低强调摘要，
-/// 候选卡片放进有高度上限、可滚动的 sheet，避免挤掉聊天区。
+/// 会话菜单与模型菜单入口的稳定 Key（真实触摸测试用）。
+const kAgentConversationMenuKey = ValueKey('agent_conversation_menu');
+const kAgentModelMenuKey = ValueKey('agent_model_menu');
+
+/// 会话菜单的非会话动作；其余回传值就是会话 id。
+const kAgentMenuNewConversation = '__agent_menu_new__';
+const kAgentMenuRenameConversation = '__agent_menu_rename__';
+const kAgentMenuArchiveConversation = '__agent_menu_archive__';
+
+Future<String?> showAgentModelSheet(
+  BuildContext context, {
+  required AgentConversationVm active,
+  required List<AgentModelVm> models,
+}) => showModalBottomSheet<String>(
+  context: context,
+  showDragHandle: true,
+  isScrollControlled: true,
+  builder: (_) => AgentModelSheet(active: active, models: models),
+);
+
+class AgentModelSheet extends StatelessWidget {
+  const AgentModelSheet({
+    super.key,
+    required this.active,
+    required this.models,
+  });
+  final AgentConversationVm active;
+  final List<AgentModelVm> models;
+
+  @override
+  Widget build(BuildContext context) {
+    final maxHeight = (MediaQuery.sizeOf(context).height * 0.6).clamp(
+      160.0,
+      480.0,
+    );
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: maxHeight),
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            for (final m in models)
+              ListTile(
+                key: ValueKey('agent_model_${m.id}'),
+                title: Text(m.displayName, overflow: TextOverflow.ellipsis),
+                trailing: m.id == active.selectedModelId
+                    ? const Icon(Icons.check, size: 18)
+                    : null,
+                onTap: () => Navigator.of(context).pop(m.id),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+Future<String?> showAgentConversationSheet(
+  BuildContext context, {
+  required AgentConversationVm? active,
+  required List<AgentConversationVm> conversations,
+}) => showModalBottomSheet<String>(
+  context: context,
+  showDragHandle: true,
+  isScrollControlled: true,
+  builder: (_) =>
+      AgentConversationSheet(active: active, conversations: conversations),
+);
+
+class AgentConversationSheet extends StatelessWidget {
+  const AgentConversationSheet({
+    super.key,
+    required this.active,
+    required this.conversations,
+  });
+  final AgentConversationVm? active;
+  final List<AgentConversationVm> conversations;
+
+  @override
+  Widget build(BuildContext context) {
+    final current = active;
+    final maxHeight = (MediaQuery.sizeOf(context).height * 0.7).clamp(
+      200.0,
+      560.0,
+    );
+    final others = [
+      for (final c in conversations)
+        if (c.id != current?.id) c,
+    ];
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: maxHeight),
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.add, size: 20),
+              title: const Text('新建会话'),
+              onTap: () => Navigator.of(context).pop(kAgentMenuNewConversation),
+            ),
+            if (current != null)
+              ListTile(
+                leading: const Icon(Icons.edit_outlined, size: 20),
+                title: const Text('重命名'),
+                onTap: () =>
+                    Navigator.of(context).pop(kAgentMenuRenameConversation),
+              ),
+            if (current != null && !current.isPrimary)
+              ListTile(
+                leading: const Icon(Icons.archive_outlined, size: 20),
+                title: const Text('归档'),
+                onTap: () =>
+                    Navigator.of(context).pop(kAgentMenuArchiveConversation),
+              ),
+            if (others.isNotEmpty) const Divider(height: 1),
+            for (final c in others)
+              ListTile(
+                key: ValueKey('agent_conversation_${c.id}'),
+                title: Text(c.title, overflow: TextOverflow.ellipsis),
+                onTap: () => Navigator.of(context).pop(c.id),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _QuoteCandidatesEntry extends ConsumerWidget {
   const _QuoteCandidatesEntry();
 
@@ -1013,11 +1140,15 @@ class _FileChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Chip(
     avatar: Icon(agentAttachmentIcon(mimeType), size: 18),
+    // 大小是定长信息，优先完整可见；只让文件名省略。
     label: ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 180),
-      child: Text(
-        '$fileName · ${agentFileSize(sizeBytes)}',
-        overflow: TextOverflow.ellipsis,
+      constraints: const BoxConstraints(maxWidth: 200),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Flexible(child: Text(fileName, overflow: TextOverflow.ellipsis)),
+          Text(' · ${agentFileSize(sizeBytes)}'),
+        ],
       ),
     ),
     onDeleted: onRemove,
