@@ -57,7 +57,7 @@
 - `tools/agent_vps_web_quote_smoke.py` 验证真实模型经隔离 `bash` 读取公开 USD/CNY 报价并生成恰好一条 `suggested` 候选；权威报价摘要前后相同，临时用户状态已清除。
 - `tools/agent_vps_automation_restart_smoke.py` 用独立端口和 `/tmp` 状态验证：计划在 sidecar 停机期间到期，重启后真实模型完成总结、推进下次时间并生成 `action=agent` 通知；临时状态已清除。
 - 合并 Claude 自动任务 UI 后，Flutter format/analyze 与全量测试、Rust 145 条、Node 24 条、契约检查、两套真实本地 smoke 和 Windows readiness 均通过。
-- 上一版通用服务器客户端从干净的 `3aa9f70` 构建：Windows zip 与 Android debug APK 均通过运行时 endpoint/auth、包完整性和 Android 网络策略检查，产物位于本工作树 `dist/`。它早于后续前端提交，下一次交付应从当前集成线重新打包。
+- 通用服务器客户端已从干净的 `e41b4d1` 重新构建，运行时 endpoint/auth readiness 18 条与包完整性检查通过。Windows zip 为 `dist/finwealth-1.0.0+1-20260728-163344-windows-server-client-x64.zip`（SHA-256 `278b919c3cb41eb814e97dc1501aa8003b2c5096115ef207f1a41c1c79604701`）；Android debug APK 为 `dist/finwealth-1.0.0+1-20260728-163454-android-server-client-debug.apk`（SHA-256 `1f6e12096870cf6adb2795ce07e538d75c7cedd9466e0348a6c51d9363b2a329`）。两者启动时填写 `https://wuwaidut.com`。
 - VPS 源码与 Agent 已部署到 `ea60b12`。完整安装脚本在人工构造的“socket inactive、proxy service active”状态下能自行恢复 `finwealth-docker-proxy@172.19.0.1:8791.socket`，bridge `/v1/health` 返回 200。
 - 共享 Caddyfile 仅在根域 `@finwealth` matcher 中增加 `/v1/agent/*`，原子更新备份为 `/home/opc/sub2api-deploy/Caddyfile.before-finwealth-agent-20260728T082624Z`。工具会验证候选配置、重启单文件 bind mount 的 Caddy 容器并核对实际加载内容；失败会恢复备份。`sub2api.wuwaidut.com`、Cloudflare Access/2FA 与中转站容器配置均未修改。
 - 公网无凭据反馈环：`/v1/health` 为 200，`/v1/agent/status` 为 Rust 401（不再落到中转站 404），`/v1/models` 继续返回中转站既有 401。VPS 上 `finwealth-server`、`finwealth-agent` 和 bridge socket 均正常；Agent 状态最新备份为 `/var/backups/finwealth-agent/20260728-081043Z`，归档和 manifest 校验通过。
