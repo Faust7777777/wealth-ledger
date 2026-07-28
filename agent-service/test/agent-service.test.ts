@@ -7,7 +7,10 @@ import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { AgentService } from "../src/agent-service.js";
 import { EventHub } from "../src/event-hub.js";
-import { FinwealthClient } from "../src/finwealth-client.js";
+import {
+  FinwealthClient,
+  normalizeMovementProposalForLedger,
+} from "../src/finwealth-client.js";
 import { createAgentHttpServer } from "../src/http-server.js";
 import { StateStore } from "../src/state-store.js";
 import type {
@@ -32,6 +35,36 @@ const owner: Principal = {
   ledgerId: "ledger_default",
   deviceId: "dev_test",
 };
+
+test("cash-only movement proposals drop a spurious instrument without rewriting accounting intent", () => {
+  const input = {
+    type: "expense",
+    occurredAt: "2026-07-28T12:30:00+08:00",
+    title: "Test Cafe",
+    entries: [{
+      accountId: "acct_cash",
+      instrumentId: "CNY",
+      amount: "88.20",
+      currency: "CNY",
+      direction: "out",
+      role: "source",
+    }],
+  };
+  assert.deepEqual(normalizeMovementProposalForLedger(input), {
+    ...input,
+    entries: [{
+      accountId: "acct_cash",
+      amount: "88.20",
+      currency: "CNY",
+      direction: "out",
+      role: "source",
+    }],
+  });
+  assert.equal(input.entries[0]?.instrumentId, "CNY");
+
+  const buy = { type: "buy", entries: [{ instrumentId: "inst_btc" }] };
+  assert.equal(normalizeMovementProposalForLedger(buy), buy);
+});
 
 function storedZip(fileNames: string[]): Buffer {
   const locals: Buffer[] = [];

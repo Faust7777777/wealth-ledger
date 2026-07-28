@@ -28,6 +28,30 @@ const QUERY_PATHS = {
 
 type QueryName = keyof typeof QUERY_PATHS;
 
+const CASH_ONLY_MOVEMENT_TYPES = new Set([
+  "expense",
+  "fee",
+  "income",
+  "dividend",
+  "interest",
+]);
+
+export function normalizeMovementProposalForLedger(
+  input: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!CASH_ONLY_MOVEMENT_TYPES.has(String(input.type)) || !Array.isArray(input.entries)) {
+    return input;
+  }
+  return {
+    ...input,
+    entries: input.entries.map((entry) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
+      const { instrumentId: _ignored, ...cashEntry } = entry as Record<string, unknown>;
+      return cashEntry;
+    }),
+  };
+}
+
 export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner {
   readonly #baseUrl: string;
   readonly #internalToken: string;
@@ -272,6 +296,9 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     promptGuidelines: [
       "财务写入只能调用 finwealth_propose_movement；不得调用确认、批准或直接写账接口。",
       "账户、标的或币种不明确时先查询或询问用户，不要虚构 ID。",
+      "expense/fee 必须且只能有一条非负现金分录，direction=out、role=source；income/dividend/interest 同理使用一条 direction=in、role=source 的现金分录。",
+      "occurredAt 必须是带时区的 RFC3339 时间；amount 必须是非负十进制定点字符串，支出方向由 direction=out 表达，不要写负数。",
+      "纯现金分录必须省略 instrumentId；只有 buy/sell 等持仓数量腿才可填写真实的 instrumentId。",
     ],
     parameters: Type.Object({
       type: Type.Union([
@@ -314,7 +341,7 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     executionMode: "sequential",
     async execute(_id, params, signal) {
       const value = await client.proposeMovement(
-        params as Record<string, unknown>,
+        normalizeMovementProposalForLedger(params as Record<string, unknown>),
         signal,
       );
       return { content: [{ type: "text", text: toolText(value) }], details: {} };

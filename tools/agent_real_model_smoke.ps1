@@ -3,7 +3,9 @@ param(
   [int]$AgentPort = 19092,
   [int]$TimeoutSeconds = 240,
   [switch]$SkipFinancialSummary,
-  [switch]$IncludeTextAttachment
+  [switch]$IncludeTextAttachment,
+  [switch]$IncludeVisionAttachment,
+  [switch]$CreateVisionDraft
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,12 +83,74 @@ function Get-AssistantDiagnostic([string]$Root) {
   return "stopReason=$($message.stopReason); contentTypes=$types$errorText"
 }
 
+function Get-ToolErrorCode([string]$Root, [string]$ToolName) {
+  $toolResults = @()
+  Get-ChildItem -LiteralPath $Root -Recurse -Filter "*.jsonl" -ErrorAction SilentlyContinue |
+    ForEach-Object {
+      Get-Content -LiteralPath $_.FullName -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+          $entry = $_ | ConvertFrom-Json
+          if (
+            $entry.message.role -eq "toolResult" -and
+            $entry.message.toolName -eq $ToolName -and
+            $entry.message.isError -eq $true
+          ) {
+            $toolResults += $entry.message
+          }
+        } catch {
+          # Ignore unrelated or partially written JSONL lines.
+        }
+      }
+    }
+  $result = $toolResults | Select-Object -Last 1
+  if (!$result) { return "unknown" }
+  $text = @($result.content | Where-Object { $_.type -eq "text" } | ForEach-Object { $_.text }) -join " "
+  $codeMatch = [regex]::Match($text, '"code"\s*:\s*"([a-z0-9_]+)"')
+  if ($codeMatch.Success) { return $codeMatch.Groups[1].Value }
+  $tokenMatch = [regex]::Match($text, '\b(?:finwealth|invalid|movement|agent)_[a-z0-9_]+\b')
+  return $(if ($tokenMatch.Success) { $tokenMatch.Value } else { "unknown" })
+}
+
+function Get-ToolCallShape([string]$Root, [string]$ToolName, [string]$ExpectedAccountId) {
+  $calls = @()
+  Get-ChildItem -LiteralPath $Root -Recurse -Filter "*.jsonl" -ErrorAction SilentlyContinue |
+    ForEach-Object {
+      Get-Content -LiteralPath $_.FullName -ErrorAction SilentlyContinue | ForEach-Object {
+        try {
+          $entry = $_ | ConvertFrom-Json
+          if ($entry.message.role -eq "assistant") {
+            foreach ($part in @($entry.message.content)) {
+              if ($part.type -eq "toolCall" -and $part.name -eq $ToolName) {
+                $calls += $part.arguments
+              }
+            }
+          }
+        } catch {
+          # Ignore unrelated or partially written JSONL lines.
+        }
+      }
+    }
+  $arguments = $calls | Select-Object -Last 1
+  if (!$arguments) { return "no call arguments" }
+  $entries = @($arguments.entries)
+  $entryShapes = @($entries | ForEach-Object {
+    "amount=$($_.amount),currency=$($_.currency),direction=$($_.direction),role=$($_.role),accountMatches=$($_.accountId -eq $ExpectedAccountId),instrument=$([bool]$_.instrumentId)"
+  }) -join ";"
+  return "type=$($arguments.type),occurredAt=$($arguments.occurredAt),entries=$($entries.Count)[$entryShapes]"
+}
+
 New-Item -ItemType Directory -Path $temp | Out-Null
 $token = [Convert]::ToHexString(
   [Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
 ).ToLowerInvariant()
 
 try {
+  if ($IncludeTextAttachment -and $IncludeVisionAttachment) {
+    throw "Choose at most one real-model attachment smoke mode."
+  }
+  if ($CreateVisionDraft -and !$IncludeVisionAttachment) {
+    throw "CreateVisionDraft requires IncludeVisionAttachment."
+  }
   $apiKey = Require-Environment "LORE_LLM_API_KEY"
   $baseUrl = Require-Environment "LORE_LLM_BASE_URL"
   $modelId = Require-Environment "LORE_LLM_MODEL"
@@ -182,6 +246,28 @@ try {
     throw "Temporary Pi model configuration was not loaded."
   }
 
+  $visionAccountId = $null
+  if ($CreateVisionDraft) {
+    $accountBody = @{
+      displayName = "Vision Smoke Wallet"
+      accountType = "bank"
+      defaultCurrency = "CNY"
+      supportedCurrencies = @("CNY")
+      includeInNetWorth = $true
+      balanceMode = "cash_balance"
+      openingBalances = @(
+        @{ currency = "CNY"; amount = "100.00"; quality = "exact" }
+      )
+    } | ConvertTo-Json -Depth 8 -Compress
+    $account = Invoke-RestMethod `
+      -Method Post `
+      -Uri "$apiBase/v1/accounts" `
+      -Headers @{ "Idempotency-Key" = "real-smoke-vision-account" } `
+      -ContentType "application/json" `
+      -Body $accountBody
+    $visionAccountId = $account.data.id
+  }
+
   $conversation = Invoke-RestMethod `
     -Method Post `
     -Uri "$apiBase/v1/agent/conversations" `
@@ -231,9 +317,74 @@ try {
     $uploadRequest.Dispose()
     $multipart.Dispose()
     $http.Dispose()
+  } elseif ($IncludeVisionAttachment) {
+    Add-Type -AssemblyName System.Drawing
+    $imagePath = Join-Path $temp "vision-smoke.png"
+    $bitmap = [Drawing.Bitmap]::new(1200, 500)
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    $font = [Drawing.Font]::new("Arial", 48, [Drawing.FontStyle]::Bold)
+    try {
+      $graphics.Clear([Drawing.Color]::White)
+      $graphics.DrawString(
+        "FINWEALTH_VISION_8K2",
+        $font,
+        [Drawing.Brushes]::Black,
+        40,
+        60
+      )
+      $graphics.DrawString(
+        "TOTAL CNY 88.20",
+        $font,
+        [Drawing.Brushes]::Black,
+        40,
+        180
+      )
+      $smallFont = [Drawing.Font]::new("Arial", 30, [Drawing.FontStyle]::Regular)
+      try {
+        $graphics.DrawString(
+          "MERCHANT TEST CAFE  2026-07-28 12:30",
+          $smallFont,
+          [Drawing.Brushes]::Black,
+          40,
+          310
+        )
+      } finally {
+        $smallFont.Dispose()
+      }
+      $bitmap.Save($imagePath, [Drawing.Imaging.ImageFormat]::Png)
+    } finally {
+      $font.Dispose()
+      $graphics.Dispose()
+      $bitmap.Dispose()
+    }
+    $http = [Net.Http.HttpClient]::new()
+    $multipart = [Net.Http.MultipartFormDataContent]::new()
+    $fileContent = [Net.Http.ByteArrayContent]::new([IO.File]::ReadAllBytes($imagePath))
+    $fileContent.Headers.ContentType = [Net.Http.Headers.MediaTypeHeaderValue]::new("image/png")
+    $multipart.Add($fileContent, "file", "vision-smoke.png")
+    $uploadRequest = [Net.Http.HttpRequestMessage]::new(
+      [Net.Http.HttpMethod]::Post,
+      "$apiBase/v1/agent/attachments"
+    )
+    $uploadRequest.Headers.Add("Idempotency-Key", "real-smoke-vision")
+    $uploadRequest.Content = $multipart
+    $uploadResponse = $http.Send($uploadRequest)
+    if (!$uploadResponse.IsSuccessStatusCode) {
+      throw "Vision attachment upload failed with $([int]$uploadResponse.StatusCode)."
+    }
+    $upload = $uploadResponse.Content.ReadAsStringAsync().Result | ConvertFrom-Json
+    $attachmentIds = @($upload.data.id)
+    $uploadResponse.Dispose()
+    $uploadRequest.Dispose()
+    $multipart.Dispose()
+    $http.Dispose()
   }
   $prompt = if ($IncludeTextAttachment) {
     "请先用 read 工具读取所附 CSV，再调用 finwealth_query 查询 overview；最后只回复 CSV 的 marker 值和当前净资产。不要创建、提交或修改任何记录。"
+  } elseif ($CreateVisionDraft) {
+    "这是一张需要入账的消费票据。先用 finwealth_query 查询 accounts，找到 Vision Smoke Wallet；识别图片后调用 finwealth_propose_movement 创建一条 CNY 支出待审核记录，金额、时间和商户按图片，图片时间按 Asia/Shanghai。资金从该账户流出。不要确认或批准。最后只说明已提交审核。"
+  } elseif ($IncludeVisionAttachment) {
+    "请查看所附图片，再调用 finwealth_query 查询 overview；最后只回复图片中的 marker、总额和当前净资产。不要创建、提交或修改任何记录。"
   } else {
     "请先调用 finwealth_query 查询 overview，然后只用一句中文说明查询到的当前净资产。不要创建、提交或修改任何记录。"
   }
@@ -268,6 +419,13 @@ try {
   }
   if ($IncludeTextAttachment -and $assistant.text -notmatch [regex]::Escape($attachmentMarker)) {
     throw "The real model response did not contain the CSV marker."
+  }
+  if (
+    $IncludeVisionAttachment -and
+    !$CreateVisionDraft -and
+    ($assistant.text -notmatch "FINWEALTH_VISION_8K2" -or $assistant.text -notmatch "88\.20")
+  ) {
+    throw "The real model response did not contain the image marker and amount."
   }
   $eventDeadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
   do {
@@ -306,6 +464,7 @@ try {
     $events -notmatch "(?m)^event: tool\.started\r?$" -or
     $events -notmatch '"name":"finwealth_query"' -or
     ($IncludeTextAttachment -and $events -notmatch '"name":"read"') -or
+    ($CreateVisionDraft -and $events -notmatch '"name":"finwealth_propose_movement"') -or
     $events -notmatch "(?m)^event: run\.completed\r?$"
   ) {
     $eventNames = [regex]::Matches($events, "(?m)^event: ([a-z.]+)\r?$") |
@@ -313,6 +472,28 @@ try {
       Sort-Object -Unique
     $observed = if ($eventNames.Count) { $eventNames -join ", " } else { "none" }
     throw "SSE event set was incomplete; observed event types: $observed."
+  }
+
+  if ($CreateVisionDraft) {
+    if (
+      $events -notmatch '(?s)event: tool\.completed\r?\ndata: \{[^\r\n]*"name":"finwealth_propose_movement"[^\r\n]*"isError":false'
+    ) {
+      $toolCode = Get-ToolErrorCode $temp "finwealth_propose_movement"
+      $toolShape = Get-ToolCallShape $temp "finwealth_propose_movement" $visionAccountId
+      throw "The vision bill proposal tool did not complete successfully (code=$toolCode; $toolShape)."
+    }
+    $pending = Invoke-RestMethod -Uri "$apiBase/v1/ai/proposals/pending"
+    $pendingCount = @($pending.data).Count
+    if ($pendingCount -ne 1) {
+      throw "Vision bill created $pendingCount pending review proposals instead of one."
+    }
+    $accountAfter = Invoke-RestMethod -Uri "$apiBase/v1/accounts/$visionAccountId"
+    $cnyBalance = $accountAfter.data.cashBalances |
+      Where-Object { $_.currency -eq "CNY" } |
+      Select-Object -First 1
+    if ($cnyBalance.amount -ne "100.00") {
+      throw "Creating a vision draft changed the confirmed account balance."
+    }
   }
 
   if (!$SkipFinancialSummary) {
@@ -363,10 +544,22 @@ try {
   }
 
   if ($SkipFinancialSummary) {
-    $attachmentLabel = if ($IncludeTextAttachment) { ", workspace text attachment" } else { "" }
+    $attachmentLabel = if ($IncludeTextAttachment) {
+      ", workspace text attachment"
+    } elseif ($IncludeVisionAttachment) {
+      if ($CreateVisionDraft) { ", reviewed vision bill draft" } else { ", native vision attachment" }
+    } else {
+      ""
+    }
     Write-Host "OK: real Pi model$attachmentLabel, finance tool, and SSE smoke passed."
   } else {
-    $attachmentLabel = if ($IncludeTextAttachment) { ", workspace text attachment" } else { "" }
+    $attachmentLabel = if ($IncludeTextAttachment) {
+      ", workspace text attachment"
+    } elseif ($IncludeVisionAttachment) {
+      if ($CreateVisionDraft) { ", reviewed vision bill draft" } else { ", native vision attachment" }
+    } else {
+      ""
+    }
     Write-Host "OK: real Pi model$attachmentLabel, finance tool, SSE, and financial summary smoke passed."
   }
 } catch {

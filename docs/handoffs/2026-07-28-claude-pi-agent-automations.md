@@ -4,7 +4,7 @@
 
 ## 基线
 
-后端功能提交为 `142951b`，周期总结补充为 `ebe1be9`。先完成报价多候选紧凑修正，并将 `feat/pi-agent-frontend-followup` rebase 到 `origin/feat/pi-agent-control-center` 最新 HEAD，再接本任务与非图片附件 UI。
+报价多候选紧凑修正与非图片附件 UI 已由 Codex 合入 `origin/feat/pi-agent-control-center`（合并提交 `08ffe67`）。请从该远端分支最新 HEAD 新建或 rebase 前端工作树，再完成本任务；不要回到旧的 `3e34dbc` 基线。后端自动任务提交为 `142951b`，周期总结补充为 `ebe1be9`，真实模型与附件联调修复也已在最新集成线。
 
 ## 后端接口
 

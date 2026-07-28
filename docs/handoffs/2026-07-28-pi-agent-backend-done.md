@@ -45,12 +45,14 @@
 - 变更文件 credential-shaped literal 扫描：无命中；生产秘密未写入仓库。
 - `tools/agent_real_model_smoke.ps1`：使用临时账本、临时 Pi 目录和环境变量引用的模型凭据，真实验证 Rust 代理、LORE OpenAI-compatible 模型、`finwealth_query` 工具、SSE delta/tool/completion 事件及周期财务总结；通过后删除全部临时状态。脚本不输出模型回答、密钥、模型 ID或端点。
 - 同一 smoke 的 `-IncludeTextAttachment` 已真实上传 CSV，经工作区相对路径交给模型；模型调用 `read` 后返回只存在于文件内的随机标记，同时继续调用 `finwealth_query`。这验证的是“原文件进入 Agent 工作区，由模型选工具读取”，不是固定账单解析器。
+- 同一 smoke 的 `-IncludeVisionAttachment -CreateVisionDraft` 已真实生成并上传含商户、时间和 CNY 88.20 的测试票据图。模型原生读取图片、查询临时账户并调用 `finwealth_propose_movement`；最终恰好生成 1 条 pending proposal，账户确认余额保持 100.00，测试全程不调用 approve/confirm。
+- 真实视觉联调发现模型会给纯现金 expense 分录附带多余 `instrumentId`。sidecar 现在只对 expense/fee/income/dividend/interest 这类纯现金提案确定性移除该可选字段；账户、金额、币种、方向、角色和时间继续由账本严格校验，buy/sell 等持仓腿不做此归一化。
 - 真实联调发现并修复 Pi 终态兼容问题：provider 只在最终 `message_end` 给出文本时会补齐缺失 delta；中间自动重试的 `stopReason=error` 不再覆盖后续成功终态；真正最终的模型错误和取消分别落为 `agent_model_request_failed` / `agent_run_aborted`，不再产生“成功但正文为空”的消息。
 
 ## 尚未完成 / 不应误报
 
 - 未在生产 VPS 安装、配置模型或重启现有服务；未读取或修改生产账本。
-- 已用本机现有的 OpenAI-compatible 模型环境变量完成纯文本、CSV 工作区读取、财务查询工具、SSE 与周期财务总结的真实端到端；配置仅存在于 smoke 临时目录。尚未完成真实图片账单和 PDF/XLSX 模型读取，也未把任何模型凭据写入仓库或生产服务器。
+- 已用本机现有的 OpenAI-compatible 模型环境变量完成纯文本、CSV 工作区读取、原生图片票据到待审核记录、财务查询工具、SSE 与周期财务总结的真实端到端；配置仅存在于 smoke 临时目录。尚未完成 PDF/XLSX 模型读取，也未把任何模型凭据写入仓库或生产服务器。
 - PDF、CSV、XLSX、ZIP 与 TXT 已支持原样上传到 Agent 工作区，由 Agent 选择对应读取工具并交给模型理解；未另做固定账单解析器。真实模型端到端仍待生产配置后验证。
 - 网页搜索可在隔离 shell 内完成，并已支持候选报价审核入库；真实模型在目标网站上的可访问性与端到端来源质量仍待生产配置后验证。
 - App 内定时任务与通知已实现；系统级 push、模型周期报告、插件提议/审批/安装尚未实现。
