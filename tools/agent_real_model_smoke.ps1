@@ -2,7 +2,8 @@ param(
   [int]$ServerPort = 19090,
   [int]$AgentPort = 19092,
   [int]$TimeoutSeconds = 240,
-  [switch]$SkipFinancialSummary
+  [switch]$SkipFinancialSummary,
+  [switch]$IncludeTextAttachment
 )
 
 $ErrorActionPreference = "Stop"
@@ -200,9 +201,45 @@ try {
     -ContentType "application/json" `
     -Body $selectModelBody
   $conversationId = $conversation.data.id
+  $attachmentIds = @()
+  $attachmentMarker = "FINWEALTH_SMOKE_7Q9"
+  if ($IncludeTextAttachment) {
+    $csvPath = Join-Path $temp "workspace-smoke.csv"
+    [IO.File]::WriteAllText(
+      $csvPath,
+      "date,merchant,amount,marker`n2026-07-28,Smoke,12.34,$attachmentMarker`n",
+      [Text.UTF8Encoding]::new($false)
+    )
+    $http = [Net.Http.HttpClient]::new()
+    $multipart = [Net.Http.MultipartFormDataContent]::new()
+    $fileContent = [Net.Http.ByteArrayContent]::new([IO.File]::ReadAllBytes($csvPath))
+    $fileContent.Headers.ContentType = [Net.Http.Headers.MediaTypeHeaderValue]::new("text/csv")
+    $multipart.Add($fileContent, "file", "workspace-smoke.csv")
+    $uploadRequest = [Net.Http.HttpRequestMessage]::new(
+      [Net.Http.HttpMethod]::Post,
+      "$apiBase/v1/agent/attachments"
+    )
+    $uploadRequest.Headers.Add("Idempotency-Key", "real-smoke-csv")
+    $uploadRequest.Content = $multipart
+    $uploadResponse = $http.Send($uploadRequest)
+    if (!$uploadResponse.IsSuccessStatusCode) {
+      throw "Text attachment upload failed with $([int]$uploadResponse.StatusCode)."
+    }
+    $upload = $uploadResponse.Content.ReadAsStringAsync().Result | ConvertFrom-Json
+    $attachmentIds = @($upload.data.id)
+    $uploadResponse.Dispose()
+    $uploadRequest.Dispose()
+    $multipart.Dispose()
+    $http.Dispose()
+  }
+  $prompt = if ($IncludeTextAttachment) {
+    "请先用 read 工具读取所附 CSV，再调用 finwealth_query 查询 overview；最后只回复 CSV 的 marker 值和当前净资产。不要创建、提交或修改任何记录。"
+  } else {
+    "请先调用 finwealth_query 查询 overview，然后只用一句中文说明查询到的当前净资产。不要创建、提交或修改任何记录。"
+  }
   $messageBody = @{
-    text = "请先调用 finwealth_query 查询 overview，然后只用一句中文说明查询到的当前净资产。不要创建、提交或修改任何记录。"
-    attachmentIds = @()
+    text = $prompt
+    attachmentIds = $attachmentIds
   } | ConvertTo-Json -Compress
   $accepted = Invoke-RestMethod `
     -Method Post `
@@ -228,6 +265,9 @@ try {
   if ([string]::IsNullOrWhiteSpace($assistant.text)) {
     $diagnostic = Get-AssistantDiagnostic $temp
     throw "The real model completed without assistant text ($diagnostic)."
+  }
+  if ($IncludeTextAttachment -and $assistant.text -notmatch [regex]::Escape($attachmentMarker)) {
+    throw "The real model response did not contain the CSV marker."
   }
   $eventDeadline = [DateTimeOffset]::UtcNow.AddSeconds(10)
   do {
@@ -265,6 +305,7 @@ try {
     $events -notmatch "(?m)^event: message\.delta\r?$" -or
     $events -notmatch "(?m)^event: tool\.started\r?$" -or
     $events -notmatch '"name":"finwealth_query"' -or
+    ($IncludeTextAttachment -and $events -notmatch '"name":"read"') -or
     $events -notmatch "(?m)^event: run\.completed\r?$"
   ) {
     $eventNames = [regex]::Matches($events, "(?m)^event: ([a-z.]+)\r?$") |
@@ -322,9 +363,11 @@ try {
   }
 
   if ($SkipFinancialSummary) {
-    Write-Host "OK: real Pi model, finance tool, and SSE smoke passed."
+    $attachmentLabel = if ($IncludeTextAttachment) { ", workspace text attachment" } else { "" }
+    Write-Host "OK: real Pi model$attachmentLabel, finance tool, and SSE smoke passed."
   } else {
-    Write-Host "OK: real Pi model, finance tool, SSE, and financial summary smoke passed."
+    $attachmentLabel = if ($IncludeTextAttachment) { ", workspace text attachment" } else { "" }
+    Write-Host "OK: real Pi model$attachmentLabel, finance tool, SSE, and financial summary smoke passed."
   }
 } catch {
   $assistantDiagnostic = Get-AssistantDiagnostic $temp
