@@ -1,4 +1,5 @@
 // Wealth Ledger — 设置（主题 / 数据源状态 / 关于）。
+import 'app_update_row.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -95,6 +96,7 @@ class SettingsPage extends ConsumerWidget {
             onTap: () => context.push('/agent/automations'),
           ),
           const Divider(),
+          const AppUpdateRow(),
           const ListTile(
             contentPadding: EdgeInsets.zero,
             title: Text('关于'),

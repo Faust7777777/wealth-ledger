@@ -38,7 +38,10 @@ import 'package:finwealth/features/valuation_status_sheet.dart';
 import 'package:finwealth/features/liability_terms_page.dart';
 import 'package:finwealth/features/loan_section.dart';
 import 'package:finwealth/features/agent_automations_page.dart';
+import 'package:finwealth/data/client_update.dart';
 import 'package:finwealth/features/agent_panel.dart';
+import 'package:finwealth/features/app_update_controller.dart';
+import 'package:finwealth/features/app_update_row.dart';
 import 'package:finwealth/features/ai_import_text_page.dart';
 import 'package:finwealth/features/liabilities_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
@@ -1826,6 +1829,81 @@ void main() {
     });
   }
 
+  // —— 2026-07-28 批：应用更新行 ——
+  final updateManifest = parseClientUpdateManifest({
+    'schemaVersion': 1,
+    'platform': 'android',
+    'channel': 'stable',
+    'versionName': '1.1.0',
+    'versionCode': 3,
+    'releasedAt': '2026-07-28T12:00:00Z',
+    'mandatory': false,
+    'notes': ['加入应用内更新', '修复会话切换'],
+    'asset': {
+      'url': '/v1/client-updates/android/stable/assets/app.apk',
+      'fileName': 'app.apk',
+      'sizeBytes': 167772160,
+      'sha256': 'a' * 64,
+      'contentType': 'application/vnd.android.package-archive',
+    },
+  });
+
+  Widget updateHost(ThemeData theme, {required bool hasUpdate}) =>
+      ProviderScope(
+        overrides: [
+          clientUpdatePlatformProvider.overrideWithValue(
+            const _PreviewUpdatePlatform(),
+          ),
+          // 行的显示门控看的是"有没有更新能力"，预览里给一个不会被调用的实例。
+          clientUpdateServiceProvider.overrideWithValue(
+            ClientUpdateService(
+              apiBaseUrl: 'https://example.invalid',
+              platform: 'android',
+              cacheDirProvider: () async => '',
+            ),
+          ),
+          appUpdateControllerProvider.overrideWith(
+            () => _PreviewUpdateController(hasUpdate ? updateManifest : null),
+          ),
+        ],
+        child: MaterialApp(
+          theme: theme,
+          debugShowCheckedModeBanner: false,
+          home: const Scaffold(
+            body: Padding(padding: EdgeInsets.all(16), child: AppUpdateRow()),
+          ),
+        ),
+      );
+
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('app update up to date - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(400, 260));
+      await tester.pumpWidget(updateHost(theme, hasUpdate: false));
+      await _settleEntrance(tester);
+      await expectLater(
+        find.byType(AppUpdateRow),
+        matchesGoldenFile('goldens/app_update_up_to_date_$name.png'),
+      );
+    });
+
+    testWidgets('app update available - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(400, 300));
+      await tester.pumpWidget(updateHost(theme, hasUpdate: true));
+      await _settleEntrance(tester);
+      await expectLater(
+        find.byType(AppUpdateRow),
+        matchesGoldenFile('goldens/app_update_available_$name.png'),
+      );
+    });
+  }
+
   testWidgets('agent panel unconfigured - dark', skip: !_previewEnabled, (
     tester,
   ) async {
@@ -2205,4 +2283,37 @@ class _PreviewPortfolioRepo implements PortfolioRepository {
     Id accountId,
     HoldingAdjustmentInput input,
   ) => throw UnsupportedError('unused');
+}
+
+/// 预览用更新平台与控制器：不触网、不做文件 I/O。
+class _PreviewUpdatePlatform implements ClientUpdatePlatform {
+  const _PreviewUpdatePlatform();
+  @override
+  Future<InstalledVersionVm> installedVersion() async =>
+      const InstalledVersionVm(versionName: '1.1.0', versionCode: 2);
+  @override
+  Future<String> updateCacheDir() async => '';
+  @override
+  Future<bool> canInstallPackages() async => true;
+  @override
+  Future<void> openInstallPermissionSettings() async {}
+  @override
+  Future<void> openInstaller(String path) async {}
+}
+
+class _PreviewUpdateController extends AppUpdateController {
+  _PreviewUpdateController(this.manifest);
+  final ClientUpdateManifestVm? manifest;
+
+  @override
+  AppUpdateState build() => AppUpdateState(
+    phase: manifest == null
+        ? AppUpdatePhase.upToDate
+        : AppUpdatePhase.available,
+    installed: const InstalledVersionVm(versionName: '1.1.0', versionCode: 2),
+    manifest: manifest,
+  );
+
+  @override
+  Future<void> checkSilently() async {}
 }
