@@ -8,7 +8,7 @@ import 'package:go_router/go_router.dart';
 
 import '../core/types.dart';
 import '../data/api_mock_repositories.dart'
-    show ApiConflictException, ApiValidationException;
+    show ApiConflictException, ApiUnauthorizedException, ApiValidationException;
 import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../theme/app_dimens.dart';
@@ -144,6 +144,49 @@ String agentSourceHost(String url) {
   return host.isEmpty ? url : host;
 }
 
+/// 面板主体的门控状态：只有 ready 才展示会话内容与输入区。
+enum AgentPanelGate { loading, needsLogin, failed, notConfigured, ready }
+
+/// status 与会话列表共同决定门控；401 优先，且绝不与"未配置模型"同时出现。
+AgentPanelGate agentPanelGate(
+  AsyncValue<AgentStatusVm> statusAsync,
+  AsyncValue<List<AgentConversationVm>> conversationsAsync,
+) {
+  for (final async in [statusAsync, conversationsAsync]) {
+    if (async.hasError && async.error is ApiUnauthorizedException) {
+      return AgentPanelGate.needsLogin;
+    }
+  }
+  if (statusAsync.hasError || conversationsAsync.hasError) {
+    return AgentPanelGate.failed;
+  }
+  final status = statusAsync.asData?.value;
+  if (status == null || conversationsAsync.asData == null) {
+    return AgentPanelGate.loading;
+  }
+  return status.configured
+      ? AgentPanelGate.ready
+      : AgentPanelGate.notConfigured;
+}
+
+/// 登录失效：只给一句状态和进入设置登录区的动作。
+class _NeedsLoginBlock extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) => Center(
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text('需要登录', style: AppType.body),
+        const SizedBox(height: AppSpacing.sm),
+        FilledButton(
+          onPressed: () => context.push('/settings'),
+          child: const Text('去登录'),
+        ),
+      ],
+    ),
+  );
+}
+
 class AgentPanel extends ConsumerStatefulWidget {
   const AgentPanel({super.key, this.onClose});
 
@@ -255,7 +298,10 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
     final chat = ref.watch(agentChatProvider);
     conversationsAsync.whenData(_openPrimaryOnce);
 
-    final configured = statusAsync.asData?.value.configured ?? false;
+    // status 只有成功返回才谈"配置"；loading / 401 / 其他错误各走各的分支，
+    // 绝不折叠成"服务器尚未配置模型"。
+    final gate = agentPanelGate(statusAsync, conversationsAsync);
+    final configured = gate == AgentPanelGate.ready;
     final conversations = conversationsAsync.asData?.value ?? const [];
     final active = conversations
         .where((c) => c.id == chat.conversationId)
@@ -275,16 +321,37 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
         const _QuoteCandidatesEntry(),
         const _MemorySuggestions(),
         Expanded(
-          child: chat.loading
-              ? const Center(child: CircularProgressIndicator())
-              : chat.loadFailed
-              ? _RetryBlock(
-                  message: '会话加载失败，请重试。',
-                  onRetry: () => ref.read(agentChatProvider.notifier).reload(),
-                )
-              : _MessageList(chat: chat),
+          child: switch (gate) {
+            AgentPanelGate.loading => const Center(
+              child: CircularProgressIndicator(),
+            ),
+            AgentPanelGate.needsLogin => _NeedsLoginBlock(),
+            AgentPanelGate.failed => _RetryBlock(
+              message: '加载失败，请重试。',
+              onRetry: () {
+                ref.invalidate(agentStatusProvider);
+                ref.invalidate(agentConversationsProvider);
+              },
+            ),
+            AgentPanelGate.notConfigured => const Center(
+              child: Text('服务器尚未配置模型'),
+            ),
+            AgentPanelGate.ready =>
+              chat.loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : chat.loadFailed
+                  ? _RetryBlock(
+                      message: '会话加载失败，请重试。',
+                      onRetry: () =>
+                          ref.read(agentChatProvider.notifier).reload(),
+                    )
+                  : _MessageList(chat: chat),
+          },
         ),
-        if (!chat.streamOnline && !chat.loading && !chat.loadFailed)
+        if (gate == AgentPanelGate.ready &&
+            !chat.streamOnline &&
+            !chat.loading &&
+            !chat.loadFailed)
           _InlineNotice(
             text: '连接已断开',
             actionLabel: '重连',
@@ -1022,11 +1089,6 @@ class _Composer extends StatelessWidget {
                       ),
                 ],
               ),
-            ),
-          if (!configured)
-            Padding(
-              padding: const EdgeInsets.only(bottom: AppSpacing.xs),
-              child: Text('服务器尚未配置模型', style: AppType.caption),
             ),
           if (error != null)
             Padding(
