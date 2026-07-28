@@ -39,8 +39,7 @@
 
 ## 验证结果
 
-- Rust：`cargo test`，145 passed / 0 failed。
-- Node：TypeScript check/build；24 passed / 0 failed。
+- 最新集成线 `69640fd` 全量复跑：Flutter 289 passed / 67 skipped，format 105 files / 0 changed，analyze 0 issues；Rust 145 passed；Node TypeScript check/build 与 24 passed 全绿。
 - Node production audit：0 vulnerabilities。
 - `python tools/contract_check.py`：通过，OpenAPI 93 paths / 168 schemas。
 - `git diff --check`、`cargo fmt --check`：通过。
@@ -61,6 +60,8 @@
 - VPS 源码与 Agent 已部署到 `ea60b12`。完整安装脚本在人工构造的“socket inactive、proxy service active”状态下能自行恢复 `finwealth-docker-proxy@172.19.0.1:8791.socket`，bridge `/v1/health` 返回 200。
 - 共享 Caddyfile 仅在根域 `@finwealth` matcher 中增加 `/v1/agent/*`，原子更新备份为 `/home/opc/sub2api-deploy/Caddyfile.before-finwealth-agent-20260728T082624Z`。工具会验证候选配置、重启单文件 bind mount 的 Caddy 容器并核对实际加载内容；失败会恢复备份。`sub2api.wuwaidut.com`、Cloudflare Access/2FA 与中转站容器配置均未修改。
 - 公网无凭据反馈环：`/v1/health` 为 200，`/v1/agent/status` 为 Rust 401（不再落到中转站 404），`/v1/models` 继续返回中转站既有 401。VPS 上 `finwealth-server`、`finwealth-agent` 和 bridge socket 均正常；Agent 状态最新备份为 `/var/backups/finwealth-agent/20260728-081043Z`，归档和 manifest 校验通过。
+- 使用本机 App 的 DPAPI 加密既有会话完成公网只读验收；过期时沿正式 `/v1/auth/refresh` 旋转并重新加密保存，全程不输出 token 或响应内容。`/v1/agent/status`、`/v1/agent/automations`、`/v1/agent/notifications` 均返回 200。
+- VPS `tools/check_vps_readiness.sh --public-base-url https://wuwaidut.com` 通过，覆盖 loopback bind、required auth、Host allow-list、持久化与公网 health。
 
 ## 尚未完成 / 不应误报
 
