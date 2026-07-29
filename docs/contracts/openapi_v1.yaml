@@ -12,6 +12,7 @@ security:
   - bearerAuth: []
 tags:
   - name: Health
+  - name: Client Updates
   - name: Auth
   - name: Ledger
   - name: Accounts
@@ -40,6 +41,100 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+
+  /client-updates/{platform}/{channel}/latest:
+    get:
+      tags: [Client Updates]
+      security: []
+      summary: Read the latest published client update manifest.
+      parameters:
+        - name: platform
+          in: path
+          required: true
+          schema:
+            enum: [android, windows]
+        - name: channel
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[a-z0-9][a-z0-9-]{0,31}$"
+      responses:
+        "200":
+          description: A no-store update manifest for the requested channel.
+          headers:
+            ETag:
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                const: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientUpdateManifest"
+        "304":
+          description: The manifest matches If-None-Match.
+        "404":
+          description: No release has been published for this platform/channel.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /client-updates/{platform}/{channel}/assets/{fileName}:
+    get:
+      tags: [Client Updates]
+      security: []
+      summary: Stream an immutable client update artifact.
+      parameters:
+        - name: platform
+          in: path
+          required: true
+          schema:
+            enum: [android, windows]
+        - name: channel
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[a-z0-9][a-z0-9-]{0,31}$"
+        - name: fileName
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9._+-]{1,180}$"
+      responses:
+        "200":
+          description: Immutable APK or ZIP bytes with SHA-256 ETag.
+          headers:
+            ETag:
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: integer
+            Cache-Control:
+              schema:
+                const: "public, max-age=31536000, immutable"
+          content:
+            application/vnd.android.package-archive:
+              schema:
+                type: string
+                format: binary
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        "304":
+          description: The artifact matches If-None-Match.
+        "404":
+          description: The artifact is not published.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
 
   /auth/login:
     post:
@@ -2267,6 +2362,73 @@ components:
                   $ref: "#/components/schemas/ISODateTime"
                 version:
                   type: string
+
+    ClientUpdateManifest:
+      type: object
+      additionalProperties: false
+      required:
+        - schemaVersion
+        - platform
+        - channel
+        - versionName
+        - versionCode
+        - releasedAt
+        - sourceCommit
+        - mandatory
+        - minimumVersionCode
+        - notes
+        - asset
+      properties:
+        schemaVersion:
+          const: 1
+        platform:
+          enum: [android, windows]
+        channel:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9-]{0,31}$"
+        versionName:
+          type: string
+        versionCode:
+          type: integer
+          minimum: 1
+        releasedAt:
+          $ref: "#/components/schemas/ISODateTime"
+        sourceCommit:
+          type: string
+          pattern: "^[0-9a-f]{40}$"
+        mandatory:
+          type: boolean
+        minimumVersionCode:
+          type: integer
+          minimum: 1
+        notes:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            maxLength: 240
+        asset:
+          $ref: "#/components/schemas/ClientUpdateAsset"
+
+    ClientUpdateAsset:
+      type: object
+      additionalProperties: false
+      required: [url, fileName, sizeBytes, sha256, contentType]
+      properties:
+        url:
+          type: string
+          pattern: "^/v1/client-updates/"
+        fileName:
+          type: string
+          pattern: "^[A-Za-z0-9._+-]{1,180}$"
+        sizeBytes:
+          type: integer
+          minimum: 1
+        sha256:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        contentType:
+          enum: [application/vnd.android.package-archive, application/zip]
 
     OkEnvelope:
       type: object

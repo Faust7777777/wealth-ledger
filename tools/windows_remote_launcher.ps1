@@ -10,6 +10,7 @@ $InstallDir = $PSScriptRoot
 $ClientExe = Join-Path $InstallDir "finwealth.exe"
 $PackageManifestPath = Join-Path $InstallDir "package-manifest.json"
 $BuildConfigPath = Join-Path $InstallDir "finwealth.build-config.json"
+$UpdaterPath = Join-Path $InstallDir "Finwealth-Updater.ps1"
 
 function Test-HttpsApiBase {
   param([string]$Value)
@@ -45,6 +46,8 @@ function Assert-PackageIntegrity {
     [string]$manifest.launcherPowerShellSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
     $manifest.launcherCmd -cne "Start-Finwealth.cmd" -or
     [string]$manifest.launcherCmdSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
+    $manifest.updater -cne "Finwealth-Updater.ps1" -or
+    [string]$manifest.updaterSha256 -notmatch '^[0-9a-fA-F]{64}$' -or
     $manifest.buildConfig -cne "finwealth.build-config.json" -or
     [string]$manifest.buildConfigSha256 -notmatch '^[0-9a-fA-F]{64}$'
   ) {
@@ -66,6 +69,7 @@ function Assert-PackageIntegrity {
     @($ClientExe, [string]$manifest.clientSha256, "client"),
     @((Join-Path $InstallDir "Start-Finwealth.ps1"), [string]$manifest.launcherPowerShellSha256, "PowerShell launcher"),
     @((Join-Path $InstallDir "Start-Finwealth.cmd"), [string]$manifest.launcherCmdSha256, "CMD launcher"),
+    @($UpdaterPath, [string]$manifest.updaterSha256, "update helper"),
     @($BuildConfigPath, [string]$manifest.buildConfigSha256, "build config")
   )) {
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $check[0]).Hash.ToLowerInvariant()
@@ -82,6 +86,7 @@ foreach ($required in @(
   $BuildConfigPath,
   (Join-Path $InstallDir "Start-Finwealth.ps1"),
   (Join-Path $InstallDir "Start-Finwealth.cmd")
+  $UpdaterPath
 )) {
   if (!(Test-Path -LiteralPath $required -PathType Leaf)) {
     throw "Remote client package input is missing: $required"

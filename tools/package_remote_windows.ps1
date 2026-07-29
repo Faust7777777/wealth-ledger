@@ -58,6 +58,17 @@ if ($CheckReadinessOnly) {
 }
 
 $versionLine = (Select-String -Path (Join-Path $Root "pubspec.yaml") -Pattern "^version:\s*(.+)$").Matches.Groups[1].Value.Trim()
+$versionParts = $versionLine -split '\+', 2
+$versionCode = 0
+if (
+  $versionParts.Count -ne 2 -or
+  [string]::IsNullOrWhiteSpace($versionParts[0]) -or
+  ![int]::TryParse($versionParts[1], [ref]$versionCode) -or
+  $versionCode -lt 1
+) {
+  throw "pubspec version must include a positive Windows update build number."
+}
+$versionName = $versionParts[0]
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $packageName = "finwealth-$versionLine-$stamp-windows-server-client-x64"
 $windowsRelease = Join-Path $Root "build\windows\x64\runner\Release"
@@ -109,13 +120,15 @@ try {
   Copy-Item -Path (Join-Path $windowsRelease "*") -Destination $stage -Recurse
   Copy-Item -LiteralPath (Join-Path $Root "tools\windows_remote_launcher.ps1") -Destination (Join-Path $stage "Start-Finwealth.ps1")
   Copy-Item -LiteralPath (Join-Path $Root "tools\windows_remote_launcher.cmd") -Destination (Join-Path $stage "Start-Finwealth.cmd")
+  Copy-Item -LiteralPath (Join-Path $Root "tools\windows_update_helper.ps1") -Destination (Join-Path $stage "Finwealth-Updater.ps1")
   Copy-Item -LiteralPath (Join-Path $Root "docs\deploy\WINDOWS_SERVER_CLIENT_PACKAGE.md") -Destination (Join-Path $stage "README.md")
 
   $client = Join-Path $stage "finwealth.exe"
   $launcherPs1 = Join-Path $stage "Start-Finwealth.ps1"
   $launcherCmd = Join-Path $stage "Start-Finwealth.cmd"
+  $updater = Join-Path $stage "Finwealth-Updater.ps1"
   $packagedBuildConfig = Join-Path $stage "finwealth.build-config.json"
-  foreach ($required in @($client, $launcherPs1, $launcherCmd, $packagedBuildConfig)) {
+  foreach ($required in @($client, $launcherPs1, $launcherCmd, $updater, $packagedBuildConfig)) {
     if (!(Test-Path -LiteralPath $required -PathType Leaf)) {
       throw "Remote package input is missing: $required"
     }
@@ -136,6 +149,8 @@ try {
     launcherPowerShellSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $launcherPs1).Hash.ToLowerInvariant()
     launcherCmd = "Start-Finwealth.cmd"
     launcherCmdSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $launcherCmd).Hash.ToLowerInvariant()
+    updater = "Finwealth-Updater.ps1"
+    updaterSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $updater).Hash.ToLowerInvariant()
     buildConfig = "finwealth.build-config.json"
     buildConfigSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $packagedBuildConfig).Hash.ToLowerInvariant()
   } | ConvertTo-Json -Compress
@@ -165,6 +180,24 @@ try {
   }
   $zipHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
   "$zipHash  $(Split-Path -Leaf $zipPath)" | Set-Content -LiteralPath "$zipPath.sha256" -Encoding ASCII
+  $provenance = [ordered]@{
+    packageFormat = 4
+    clientVersion = $versionLine
+    versionName = $versionName
+    versionCode = $versionCode
+    createdAt = (Get-Date).ToUniversalTime().ToString("o")
+    sourceCommit = $sourceCommit
+    sourceDirty = $sourceDirty
+    dataSource = "api_remote"
+    endpointMode = $EndpointMode
+    apiBase = $ApiBase
+    platform = "windows"
+    networkPolicyVerified = $true
+    archive = (Split-Path -Leaf $zipPath)
+    archiveSizeBytes = (Get-Item -LiteralPath $zipPath).Length
+    archiveSha256 = $zipHash
+  } | ConvertTo-Json -Compress
+  [System.IO.File]::WriteAllText("$zipPath.manifest.json", $provenance, [System.Text.UTF8Encoding]::new($false))
   Write-Host "Windows server client package: $zipPath"
   Write-Host "Windows server client SHA-256: $zipHash"
 } finally {

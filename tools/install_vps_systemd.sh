@@ -5,6 +5,7 @@ APP_USER="${FINWEALTH_DEPLOY_USER:-finwealth}"
 APP_DIR="${FINWEALTH_DEPLOY_DIR:-/opt/finwealth}"
 DATA_DIR="${FINWEALTH_DATA_DIR:-/var/lib/finwealth}"
 CONFIG_DIR="${FINWEALTH_CONFIG_DIR:-/etc/finwealth}"
+UPDATE_DIR="${FINWEALTH_CLIENT_UPDATE_DIR:-/var/lib/finwealth-updates}"
 ENV_FILE="${FINWEALTH_ENV_FILE:-$CONFIG_DIR/server.env}"
 SERVICE_FILE="${FINWEALTH_SERVICE_FILE:-/etc/systemd/system/finwealth-server.service}"
 
@@ -44,6 +45,7 @@ fi
 install -d -m 0755 "$APP_DIR"
 install -d -m 0755 "$APP_DIR/tools"
 install -d -m 0700 -o "$APP_USER" -g "$APP_USER" "$DATA_DIR"
+install -d -m 0755 -o root -g "$APP_USER" "$UPDATE_DIR"
 install -d -m 0750 "$CONFIG_DIR"
 
 echo "Building release binary..."
@@ -53,10 +55,15 @@ install -m 0755 "$ROOT/tools/configure_vps_auth.sh" "$APP_DIR/tools/"
 install -m 0755 "$ROOT/tools/check_vps_readiness.sh" "$APP_DIR/tools/"
 install -m 0755 "$ROOT/tools/backup_vps_ledger.sh" "$APP_DIR/tools/"
 install -m 0755 "$ROOT/tools/restore_vps_ledger.sh" "$APP_DIR/tools/"
+install -m 0755 "$ROOT/tools/publish_client_update.py" "$APP_DIR/tools/"
+install -m 0755 "$ROOT/tools/patch_vps_caddy_client_update_route.py" "$APP_DIR/tools/"
 
 if [ ! -f "$ENV_FILE" ]; then
   install -m 0600 "$ROOT/deploy/finwealth-server.env.example" "$ENV_FILE"
   echo "Created $ENV_FILE from example."
+fi
+if ! grep -q '^FINWEALTH_CLIENT_UPDATE_DIR=' "$ENV_FILE"; then
+  printf '\nFINWEALTH_CLIENT_UPDATE_DIR=%s\n' "$UPDATE_DIR" >>"$ENV_FILE"
 fi
 chown root:root "$ENV_FILE"
 chmod 0600 "$ENV_FILE"

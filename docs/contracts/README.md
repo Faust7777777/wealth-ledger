@@ -31,19 +31,22 @@
 9. `openapi_v1.yaml`
    `HTTP_API_V1.md` 的机器可读 OpenAPI 3.1 草案，用于后续生成 client/server stub。
 
-10. `BACKEND_INTERFACE_IMPLEMENTATION_PLAN_V1.md`
+10. `CLIENT_UPDATE_V1.md`
+    Android / Windows 自托管更新清单、资源校验、版本单调性与系统安装边界。
+
+11. `BACKEND_INTERFACE_IMPLEMENTATION_PLAN_V1.md`
    接口线下一步执行计划：契约一致性、core ports、后端 stub 边界。
 
-11. `CORE_PORTS_V1.md`
+12. `CORE_PORTS_V1.md`
     本地账本 core 的端口边界：store ports、provider ports、atomic group use case 不变量。
 
-12. `examples/`
+13. `examples/`
     接口载荷示例：空账本、首页空态/降级态、AI diff、DCA proposal、报价 stale。它们不是 debug fixture 种子，不得写入正式账本。
 
-13. `API_MOCK_STUB_PLAN_V1.md`
+14. `API_MOCK_STUB_PLAN_V1.md`
     本地 mock/stub 计划：只读、只返回 examples、不写账、不接真实行情/AI/同步。
 
-14. `FRONTEND_API_INTEGRATION_HANDOFF_V1.md`
+15. `FRONTEND_API_INTEGRATION_HANDOFF_V1.md`
     给 Flutter 前端线的本地联调交接：数据源模式、可接端点、禁止端点、校验命令。
 
 ## 前端数据源边界

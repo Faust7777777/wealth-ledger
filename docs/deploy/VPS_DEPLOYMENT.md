@@ -240,6 +240,19 @@ the existing Cloudflare-only origin rule and forwards the public Host header to
 the Rust allow-list. Validate the combined Caddyfile before an atomic reload;
 do not replace unrelated site blocks.
 
+### Client update delivery
+
+The installer creates root-owned `/var/lib/finwealth-updates`, adds
+`FINWEALTH_CLIENT_UPDATE_DIR` to the server environment when missing, and
+installs the atomic publisher plus the narrow shared-Caddy route patch under
+`/opt/finwealth/tools`. The Rust service streams published files read-only; it
+does not proxy them through the Agent or store them in the ledger.
+
+See `CLIENT_SELF_UPDATE.md` for Android packaging, publication, rollback and
+public verification. Applying the client-update Caddy patch affects only
+`/v1/client-updates/*` on `wuwaidut.com`; it must not alter the sub2api host or
+relay fallback.
+
 Manual backup:
 
 ```bash

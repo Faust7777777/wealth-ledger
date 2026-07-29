@@ -55,11 +55,19 @@ jobs:
 
       - name: Check Python syntax
         shell: pwsh
-        run: python -m py_compile tools/contract_check.py tools/mock_api_server.py tools/server_smoke.py tools/local_ledger_smoke.py server/dev_server.py
+        run: python -m py_compile tools/contract_check.py tools/mock_api_server.py tools/server_smoke.py tools/local_ledger_smoke.py tools/publish_client_update.py tools/client_update_publish_smoke.py tools/patch_vps_caddy_client_update_route.py server/dev_server.py
 
       - name: Check contracts
         shell: pwsh
         run: python tools/contract_check.py
+
+      - name: Run client update publication smoke
+        shell: pwsh
+        run: python tools/client_update_publish_smoke.py
+
+      - name: Run Windows update helper smoke
+        shell: pwsh
+        run: ./tools/windows_update_helper_smoke.ps1
 
       - name: Check Rust formatting
         shell: pwsh
@@ -92,6 +100,10 @@ jobs:
       - name: Run package integrity smoke
         shell: pwsh
         run: ./tools/package_integrity_smoke.ps1
+
+      - name: Run client update local-server smoke
+        shell: pwsh
+        run: ./tools/client_update_local_smoke.ps1
 
       - name: Analyze Flutter
         shell: pwsh
@@ -346,6 +358,7 @@ jobs:
           path: |
             dist/*-windows-server-client-x64.zip
             dist/*-windows-server-client-x64.zip.sha256
+            dist/*-windows-server-client-x64.zip.manifest.json
           if-no-files-found: error
 
   package-android-remote:

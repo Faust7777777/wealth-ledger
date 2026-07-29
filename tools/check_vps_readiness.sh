@@ -10,6 +10,7 @@ SERVICE_NAME="${FINWEALTH_SERVICE_NAME:-finwealth-server.service}"
 BIN="$APP_DIR/finwealth-server"
 LEDGER="$DATA_DIR/ledger.json"
 AUTH_STATE="$DATA_DIR/ledger.auth.json"
+UPDATE_DIR="${FINWEALTH_CLIENT_UPDATE_DIR:-/var/lib/finwealth-updates}"
 PUBLIC_BASE_URL=""
 
 if [ "${1:-}" = "--public-base-url" ]; then
@@ -42,6 +43,10 @@ fi
 [ ! -L "$DATA_DIR" ] || fail "data directory must not be a symbolic link"
 [ "$(stat -c '%a' "$DATA_DIR")" = "700" ] || fail "data directory mode must be 0700"
 [ "$(stat -c '%U:%G' "$DATA_DIR")" = "$APP_USER:$APP_USER" ] || fail "data directory owner is incorrect"
+[ -d "$UPDATE_DIR" ] || fail "client update directory is missing"
+[ ! -L "$UPDATE_DIR" ] || fail "client update directory must not be a symbolic link"
+[ "$(stat -c '%a' "$UPDATE_DIR")" = "755" ] || fail "client update directory mode must be 0755"
+[ "$(stat -c '%U:%G' "$UPDATE_DIR")" = "root:$APP_USER" ] || fail "client update directory owner is incorrect"
 
 systemd-run \
   --wait \
@@ -84,6 +89,12 @@ if [ -n "$PUBLIC_BASE_URL" ]; then
   fi
   curl --fail --silent --show-error --max-time 15 \
     "$PUBLIC_BASE_URL/v1/health" >/dev/null || fail "public HTTPS health check failed"
+  UPDATE_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --max-time 15 \
+    "$PUBLIC_BASE_URL/v1/client-updates/android/stable/latest")"
+  case "$UPDATE_STATUS" in
+    200|404) ;;
+    *) fail "public client update route returned HTTP $UPDATE_STATUS" ;;
+  esac
 fi
 
 echo "Finwealth VPS readiness passed."

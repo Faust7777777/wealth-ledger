@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Atomically add the Finwealth Agent path to an existing shared Caddyfile."""
+"""Atomically add the Finwealth client-update path to the shared Caddyfile."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-ROUTE = "/v1/agent/*"
+ROUTE = "/v1/client-updates/*"
 LIVE_CONFIG = "/etc/caddy/Caddyfile"
-CANDIDATE_CONFIG = "/tmp/finwealth-caddy-candidate"
+CANDIDATE_CONFIG = "/tmp/finwealth-caddy-update-candidate"
 
 
 def run_caddy(container: str, command: str, config: str = LIVE_CONFIG) -> None:
@@ -53,23 +53,20 @@ def validate_candidate(container: str, path: Path) -> None:
         )
 
 
+def route_is_loaded(container: str) -> bool:
+    return subprocess.run(
+        ["docker", "exec", container, "grep", "-Fq", ROUTE, LIVE_CONFIG],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
 def restart_container(container: str) -> None:
     subprocess.run(
         ["docker", "restart", container],
         check=True,
         stdout=subprocess.DEVNULL,
-    )
-
-
-def route_is_loaded(container: str) -> bool:
-    return (
-        subprocess.run(
-            ["docker", "exec", container, "grep", "-Fq", ROUTE, LIVE_CONFIG],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
     )
 
 
@@ -118,25 +115,21 @@ def main() -> None:
         raise RuntimeError("Finwealth matcher block is incomplete")
     block = original[start:end]
     if "/v1/health" not in block or "path /v1/accounts" not in block:
-        raise RuntimeError("Finwealth matcher is missing its expected anchor paths")
+        raise RuntimeError("Finwealth matcher is missing expected anchor paths")
     if ROUTE in block:
         if not route_is_loaded(args.container):
             validate_candidate(args.container, path)
             restart_container(args.container)
         if not route_is_loaded(args.container):
-            raise RuntimeError("Caddy container did not mount the Agent route")
+            raise RuntimeError("Caddy container did not load the client update route")
         run_caddy(args.container, "validate")
-        print("OK: shared Caddyfile already routes the Finwealth Agent API.")
+        print("OK: shared Caddyfile already routes Finwealth client updates.")
         return
 
-    updated_block = block.replace(
-        "path /v1/accounts",
-        f"path /v1/accounts {ROUTE}",
-        1,
-    )
+    updated_block = block.replace("path /v1/accounts", f"path /v1/accounts {ROUTE}", 1)
     updated = original[:start] + updated_block + original[end:]
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup = path.with_name(f"{path.name}.before-finwealth-agent-{timestamp}")
+    backup = path.with_name(f"{path.name}.before-finwealth-client-update-{timestamp}")
     shutil.copy2(path, backup)
     mode = stat.S_IMODE(metadata.st_mode)
     try:
@@ -144,7 +137,7 @@ def main() -> None:
         validate_candidate(args.container, path)
         restart_container(args.container)
         if not route_is_loaded(args.container):
-            raise RuntimeError("Caddy container did not mount the Agent route")
+            raise RuntimeError("Caddy container did not load the client update route")
         run_caddy(args.container, "validate")
     except Exception:
         write_atomic(
