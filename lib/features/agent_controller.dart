@@ -207,6 +207,10 @@ class AgentChatController extends Notifier<AgentChatState> {
         if (agentToolMayCreateQuoteCandidate(event.toolName)) {
           ref.invalidate(agentQuoteCandidatesProvider);
         }
+        // 持仓快照等工具会直接写出待审核组：同样提前刷新入口计数。
+        if (agentToolMayCreatePendingReview(event.toolName)) {
+          ref.invalidate(aiPendingProvider);
+        }
       case AgentEventType.runCompleted:
         _setStatus(event.assistantMessageId, AgentMessageStatus.completed);
         if (event.assistantMessageId != null) {
@@ -234,6 +238,7 @@ class AgentChatController extends Notifier<AgentChatState> {
         );
         // 失败的一轮也可能已经写下候选（例如报价工具成功、后续步骤失败）。
         ref.invalidate(agentQuoteCandidatesProvider);
+        ref.invalidate(aiPendingProvider);
       case AgentEventType.unknown:
         break;
     }

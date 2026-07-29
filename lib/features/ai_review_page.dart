@@ -11,6 +11,7 @@ import '../shared/widgets.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
+import 'holding_snapshot_card.dart';
 
 class AiReviewPage extends ConsumerWidget {
   const AiReviewPage({super.key});
@@ -135,7 +136,11 @@ class _GroupBlock extends ConsumerWidget {
               Expanded(child: Text(g.title, style: AppType.bodyStrong)),
             ],
           ),
-          if (g.proposedMovement != null) ...[
+          // 持仓快照：多条候选合成一张卡，只有整组采用/忽略。
+          if (isHoldingSnapshotGroup(g)) ...[
+            const SizedBox(height: AppSpacing.xs),
+            HoldingSnapshotCard(group: g),
+          ] else if (g.proposedMovement != null) ...[
             const SizedBox(height: AppSpacing.xs),
             _MovementSummary(m: g.proposedMovement!),
           ] else if (g.needsCompletion) ...[

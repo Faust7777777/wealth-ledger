@@ -8,10 +8,11 @@ import '../core/format.dart';
 import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../shared/widgets.dart';
-import '../theme/app_colors.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
+import 'account_holdings_section.dart';
 import 'account_visuals.dart';
+import 'holding_snapshot_dialog.dart';
 import 'holding_adjustment_dialog.dart';
 import 'loan_section.dart';
 
@@ -60,9 +61,7 @@ class AccountDetailPage extends ConsumerWidget {
             }
             final holdings = holdingsAsync.asData?.value ?? const <HoldingVm>[];
             // 账户是资产容器：现金/稳定币与持仓分组展示，原始数量为主。
-            final holdingsCapable =
-                !a.isLiability &&
-                (a.balanceMode == 'holdings' || a.balanceMode == 'mixed');
+            final holdingsCapable = accountIsMultiAsset(a);
             return ListView(
               padding: const EdgeInsets.all(AppSpacing.base),
               children: [
@@ -97,36 +96,34 @@ class AccountDetailPage extends ConsumerWidget {
                     ),
                 ],
                 if (a.isLiability) LoanSection(account: a),
-                if (holdingsCapable || holdings.isNotEmpty) ...[
-                  SectionHeader(
-                    title: '持仓',
-                    trailing: holdingsCapable
-                        ? TextButton.icon(
-                            onPressed:
-                                ref.writeCapabilities.canPersistPendingProposal
-                                ? () => showHoldingAdjustmentDialog(
-                                    context,
-                                    account: a,
-                                  )
-                                : null,
-                            icon: const Icon(Icons.add, size: 18),
-                            label: const Text('添加资产'),
+                if (holdingsCapable || holdings.isNotEmpty)
+                  AccountHoldingsSection(
+                    account: a,
+                    holdings: holdings,
+                    onUpdateHoldings:
+                        holdingsCapable &&
+                            holdings.isNotEmpty &&
+                            ref.writeCapabilities.canPersistPendingProposal
+                        ? () => showHoldingSnapshotDialog(
+                            context,
+                            account: a,
+                            holdings: holdings,
+                          )
+                        : null,
+                    onAddAsset:
+                        holdingsCapable &&
+                            ref.writeCapabilities.canPersistPendingProposal
+                        ? () => showHoldingAdjustmentDialog(context, account: a)
+                        : null,
+                    onTapHolding:
+                        ref.writeCapabilities.canPersistPendingProposal
+                        ? (h) => showHoldingAdjustmentDialog(
+                            context,
+                            account: a,
+                            existing: h,
                           )
                         : null,
                   ),
-                  if (holdings.isEmpty)
-                    Padding(
-                      padding: const EdgeInsets.symmetric(
-                        vertical: AppSpacing.sm,
-                      ),
-                      child: Text(
-                        '暂无持仓',
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                    )
-                  else
-                    for (final h in holdings) _HoldingTile(h: h, account: a),
-                ],
               ],
             );
           },
@@ -215,57 +212,6 @@ class _Header extends StatelessWidget {
         if (a.isLiability && v != null)
           Text(liabilityAmountLabel(v.amount), style: AppType.caption),
       ],
-    );
-  }
-}
-
-class _HoldingTile extends ConsumerWidget {
-  const _HoldingTile({required this.h, required this.account});
-  final HoldingVm h;
-  final AccountVm account;
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final dark = Theme.of(context).brightness == Brightness.dark;
-    final mv = h.marketValue;
-    final cost = h.costBasisTotal == null
-        ? ''
-        : '成本 ${formatMoney(h.costBasisTotal!)}';
-    String pnl = '';
-    Color? color;
-    final p = h.unrealizedPnl;
-    if (p != null) {
-      final down = p.amount.startsWith('-');
-      final abs = p.amount.replaceFirst(RegExp(r'^[+-]'), '');
-      pnl = '浮 ${down ? '−' : '+'}¥${formatDecimalThousands(abs)}';
-      color = down
-          ? (dark ? AppColors.negative : AppColorsLight.negative)
-          : (dark ? AppColors.positive : AppColorsLight.positive);
-    }
-    final sub = pnl.isEmpty ? cost : (cost.isEmpty ? pnl : '$cost   $pnl');
-    return ListTile(
-      contentPadding: EdgeInsets.zero,
-      leading: LeadingAvatar.mono(h.symbol),
-      title: Text('${h.displayName} · ${h.symbol}', style: AppType.bodyStrong),
-      subtitle: sub.isEmpty
-          ? null
-          : Text(sub, style: AppType.caption.copyWith(color: color)),
-      // 原始数量为主信息；缺报价只弱化折算金额，绝不显示成 0。
-      trailing: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          Text(formatDecimalThousands(h.quantity), style: AppType.moneyRow),
-          Text(mv == null ? '暂无估值' : formatValued(mv), style: AppType.caption),
-        ],
-      ),
-      onTap: ref.writeCapabilities.canPersistPendingProposal
-          ? () => showHoldingAdjustmentDialog(
-              context,
-              account: account,
-              existing: h,
-            )
-          : null,
     );
   }
 }

@@ -126,6 +126,7 @@ class CreateAccountInput {
     this.includeInNetWorth = true,
     this.institutionName,
     this.openingBalance,
+    this.supportedCurrencies = const [],
   });
   final String displayName;
   final AccountType accountType;
@@ -137,6 +138,10 @@ class CreateAccountInput {
   /// 期初余额（仅创建时使用；负债欠款已在 UI 层转为账本负数）。
   /// null → openingBalances: []。编辑（PATCH）不发送、不覆盖既有余额。
   final Money? openingBalance;
+
+  /// 账户可持有的币种。默认折算币种与支持币种分开维护；
+  /// 留空时服务端按默认币种处理。
+  final List<CurrencyCode> supportedCurrencies;
 }
 
 /// 用户维护的分类词表。不是封闭目录；AI 可读取并填充，用户确认后才入账。

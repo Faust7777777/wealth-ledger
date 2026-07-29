@@ -1106,6 +1106,14 @@ class LocalServerAccountRepository implements AccountRepository {
     for (final a in _list(await _c.getData('/v1/accounts/anomalies')))
       _anomaly(_m(a)),
   ];
+
+  /// 支持币种：默认币种必须在内且排第一；未显式维护时退化成单一默认币种。
+  static List<String> _supportedCurrencies(CreateAccountInput input) => [
+    input.defaultCurrency,
+    for (final c in input.supportedCurrencies)
+      if (c != input.defaultCurrency) c,
+  ];
+
   @override
   Future<AccountVm> createAccount(CreateAccountInput input) async {
     final opening = input.openingBalance;
@@ -1115,7 +1123,7 @@ class LocalServerAccountRepository implements AccountRepository {
         'displayName': input.displayName,
         'accountType': _acctTypeWire(input.accountType),
         'defaultCurrency': input.defaultCurrency,
-        'supportedCurrencies': [input.defaultCurrency],
+        'supportedCurrencies': _supportedCurrencies(input),
         'includeInNetWorth': input.includeInNetWorth,
         'balanceMode': input.balanceMode,
         if (input.institutionName != null)
@@ -1141,7 +1149,7 @@ class LocalServerAccountRepository implements AccountRepository {
         'displayName': input.displayName,
         'accountType': _acctTypeWire(input.accountType),
         'defaultCurrency': input.defaultCurrency,
-        'supportedCurrencies': [input.defaultCurrency],
+        'supportedCurrencies': _supportedCurrencies(input),
         'includeInNetWorth': input.includeInNetWorth,
         'balanceMode': input.balanceMode,
         if (input.institutionName != null)

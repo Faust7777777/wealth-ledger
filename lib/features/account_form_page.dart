@@ -10,11 +10,19 @@ import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
+import '../theme/app_typography.dart';
 import 'account_form_validation.dart';
 import 'account_type_picker.dart';
 import 'account_visuals.dart';
 
 const List<String> _currencies = ['CNY', 'USD', 'HKD', 'USDT', 'BTC', 'ETH'];
+
+/// 交易所/钱包等多资产账户才需要维护多币种；其余账户保持单一默认币种。
+bool accountSupportsMultipleCurrencies(AccountType type) =>
+    type == AccountType.exchange ||
+    type == AccountType.wallet ||
+    type == AccountType.brokerage ||
+    type == AccountType.platformWallet;
 
 /// 账户类型字段的稳定 Key（widget 测试打开选择器用）。
 const kAccountTypeFieldKey = ValueKey('account_type_field');
@@ -38,6 +46,8 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
   final _openingAmount = TextEditingController();
   late AccountType _type = widget.initialType ?? AccountType.bank;
   String _currency = 'CNY';
+  // 支持币种与默认折算币种分开：默认币种始终隐含被支持。
+  final Set<String> _supported = <String>{};
   bool _includeInNetWorth = true;
   bool _busy = false;
 
@@ -61,6 +71,7 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
       _institution.text = e.institutionName ?? '';
       _type = e.accountType;
       _currency = e.defaultCurrency;
+      _supported.addAll(e.supportedCurrencies.where((c) => c != _currency));
       _includeInNetWorth = e.includeInNetWorth;
     }
   }
@@ -107,6 +118,7 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
           ? null
           : _institution.text.trim(),
       openingBalance: _openingBalance,
+      supportedCurrencies: _supported.toList(),
     );
     try {
       if (_isEdit) {
@@ -189,6 +201,31 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
               ],
               onChanged: (v) => setState(() => _currency = v ?? _currency),
             ),
+            if (accountSupportsMultipleCurrencies(_type)) ...[
+              const SizedBox(height: AppSpacing.base),
+              Text('支持币种', style: AppType.caption),
+              Wrap(
+                spacing: AppSpacing.xs,
+                children: [
+                  for (final c in currencyItems)
+                    FilterChip(
+                      key: ValueKey('account_supported_$c'),
+                      label: Text(c),
+                      // 默认折算币种恒被支持，不允许取消。
+                      selected: c == _currency || _supported.contains(c),
+                      onSelected: c == _currency
+                          ? null
+                          : (on) => setState(() {
+                              if (on) {
+                                _supported.add(c);
+                              } else {
+                                _supported.remove(c);
+                              }
+                            }),
+                    ),
+                ],
+              ),
+            ],
             if (!_isEdit) ...[
               const SizedBox(height: AppSpacing.base),
               TextField(
