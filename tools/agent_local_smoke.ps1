@@ -135,6 +135,43 @@ try {
     throw "Attachment download bytes differ from the upload."
   }
   $contentResponse.Dispose()
+
+  # WeChat JPEGs can contain a short private trailer after the FF D9 end marker.
+  # Exercise the complete Rust proxy -> sidecar archive -> byte-for-byte readback path.
+  [byte[]]$wechatJpeg = @(
+    0xFF,0xD8,0xFF,0xE0,0x00,0x04,0x4A,0x46,0xFF,0xD9,
+    0x17,0x4D,0xA1,0x01,0x00,0x00,0x00,0x00,0x42,0xCD,0xF2,0xE4,
+    0x03,0xC5,0xBF,0x2F,0x8D,0x87,0x5C,0x01,0xEB,0xFC,0x4B,0x5E
+  )
+  $jpegMultipart = [Net.Http.MultipartFormDataContent]::new()
+  $jpegContent = [Net.Http.ByteArrayContent]::new($wechatJpeg)
+  $jpegContent.Headers.ContentType = [Net.Http.Headers.MediaTypeHeaderValue]::new("image/jpeg")
+  $jpegMultipart.Add($jpegContent, "file", "wechat.jpg")
+  $jpegRequest = [Net.Http.HttpRequestMessage]::new(
+    [Net.Http.HttpMethod]::Post,
+    "http://127.0.0.1:$ServerPort/v1/agent/attachments"
+  )
+  $jpegRequest.Headers.Add("Idempotency-Key", "smoke-upload-wechat-jpeg")
+  $jpegRequest.Content = $jpegMultipart
+  $jpegUploadResponse = $http.Send($jpegRequest)
+  if (!$jpegUploadResponse.IsSuccessStatusCode) {
+    throw "WeChat JPEG upload failed with $([int]$jpegUploadResponse.StatusCode)."
+  }
+  $jpegUpload = $jpegUploadResponse.Content.ReadAsStringAsync().Result | ConvertFrom-Json
+  $jpegAttachmentId = $jpegUpload.data.id
+  $jpegRequest.Dispose()
+  $jpegMultipart.Dispose()
+  if (!$jpegAttachmentId) { throw "WeChat JPEG upload did not return an ID." }
+  $jpegDownload = $http.GetAsync(
+    "http://127.0.0.1:$ServerPort/v1/agent/attachments/$jpegAttachmentId/content"
+  ).Result
+  if (!$jpegDownload.IsSuccessStatusCode -or
+      $jpegDownload.Content.Headers.ContentType.MediaType -ne "image/jpeg" -or
+      [Convert]::ToBase64String($jpegDownload.Content.ReadAsByteArrayAsync().Result) -ne
+        [Convert]::ToBase64String($wechatJpeg)) {
+    throw "WeChat JPEG archive/readback did not preserve the original image."
+  }
+  $jpegDownload.Dispose()
   $http.Dispose()
 
   $messageBody = @{

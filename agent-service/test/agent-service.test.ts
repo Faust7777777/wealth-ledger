@@ -33,6 +33,7 @@ import {
   suggestQuoteCandidate,
 } from "../src/quote-candidate-tools.js";
 import { prepareFileAttachmentPrompt } from "../src/pi-engine.js";
+import { attachmentMatchesMime } from "../src/attachment-formats.js";
 
 const roots: string[] = [];
 const owner: Principal = {
@@ -40,6 +41,26 @@ const owner: Principal = {
   ledgerId: "ledger_default",
   deviceId: "dev_test",
 };
+
+test("accepts a JPEG with a small post-EOI metadata trailer", () => {
+  // WeChat commonly appends private metadata after the JPEG EOI marker.
+  // Decoders accept it; the attachment gate must not call it a MIME mismatch.
+  const jpeg = Buffer.from([
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x04, 0x4a, 0x46,
+    0xff, 0xd9,
+    0x17, 0x4d, 0xa1, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x42, 0xcd, 0xf2, 0xe4, 0x03, 0xc5, 0xbf, 0x2f,
+    0x8d, 0x87, 0x5c, 0x01, 0xeb, 0xfc, 0x4b, 0x5e,
+  ]);
+  assert.equal(attachmentMatchesMime("image/jpeg", jpeg), true);
+  assert.equal(
+    attachmentMatchesMime(
+      "image/jpeg",
+      Buffer.concat([jpeg.subarray(0, 10), Buffer.alloc(4 * 1024 + 1)]),
+    ),
+    false,
+  );
+});
 
 test("cash-only movement proposals drop a spurious instrument without rewriting accounting intent", () => {
   const input = {

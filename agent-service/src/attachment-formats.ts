@@ -82,8 +82,13 @@ export function attachmentMatchesMime(mimeType: string, bytes: Buffer): boolean 
       bytes.subarray(12, 16).toString("ascii") === "IHDR";
   }
   if (mimeType === "image/jpeg") {
-    return bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8 &&
-      bytes.at(-2) === 0xff && bytes.at(-1) === 0xd9;
+    if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return false;
+    const eoi = bytes.lastIndexOf(Buffer.from([0xff, 0xd9]));
+    // JPEG decoders permit trailing application metadata. WeChat currently
+    // appends a short private trailer after EOI, so requiring EOI at EOF rejects
+    // a real JPEG. Keep the allowance bounded to avoid accepting arbitrary
+    // concatenated payloads.
+    return eoi >= 2 && bytes.length - (eoi + 2) <= 4 * 1024;
   }
   if (mimeType === "image/webp") {
     return bytes.length >= 12 && bytes.subarray(0, 4).toString("ascii") === "RIFF" &&
