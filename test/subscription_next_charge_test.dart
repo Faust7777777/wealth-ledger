@@ -280,12 +280,16 @@ void main() {
       final repo = _CapturingSubRepo();
       await _pumpForm(tester, repo);
       await _fillRequired(tester);
-      // 下次扣费日（第 2 个日期字段）改到当月 28 日。
-      await _pickDay(tester, 1, '28');
+      // 下次扣费日（第 2 个日期字段）改到当月最后一天：写死某一天会在
+      // 那天之后失效，日期选择器不允许回选已过去的日子。
+      final now = DateTime.now();
+      final lastDay = DateTime(now.year, now.month + 1, 0).day;
+      final target = now.day < lastDay ? lastDay : now.day;
+      await _pickDay(tester, 1, '$target');
       await tester.tap(find.widgetWithText(FilledButton, '创建订阅'));
       await tester.pumpAndSettle();
-      final now = DateTime.now();
-      final expected = '${now.year}-${now.month.toString().padLeft(2, '0')}-28';
+      String two(int n) => n.toString().padLeft(2, '0');
+      final expected = '${now.year}-${two(now.month)}-${two(target)}';
       expect(repo.created, isNotNull);
       expect(repo.created!.nextChargeDate, expected);
       expect(repo.created!.startDate, _today());
