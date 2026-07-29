@@ -18,6 +18,7 @@ import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/view_models.dart';
 import 'package:finwealth/features/accounts_page.dart';
 import 'package:finwealth/features/ai_review_page.dart';
+import 'package:finwealth/features/holding_snapshot_card.dart';
 import 'package:finwealth/features/account_form_page.dart';
 import 'package:finwealth/features/account_type_picker.dart';
 import 'package:finwealth/features/dca_execution_dialog.dart';
@@ -994,7 +995,46 @@ void main() {
       quality: ValueQuality.incomplete,
     ),
   );
+  const okxInstruments = [
+    InstrumentVm(
+      id: 'inst_btc',
+      type: InstrumentType.crypto,
+      symbol: 'BTC',
+      displayName: 'Bitcoin',
+      quoteCurrency: 'USDT',
+    ),
+    InstrumentVm(
+      id: 'inst_eth',
+      type: InstrumentType.crypto,
+      symbol: 'ETH',
+      displayName: 'Ethereum',
+      quoteCurrency: 'USDT',
+    ),
+    InstrumentVm(
+      id: 'inst_usdt',
+      type: InstrumentType.crypto,
+      symbol: 'USDT',
+      displayName: 'Tether',
+      quoteCurrency: 'USDT',
+    ),
+  ];
+
   const okxHoldings = [
+    HoldingVm(
+      id: 'h_usdt',
+      accountId: 'a_okx',
+      instrumentId: 'inst_usdt',
+      symbol: 'USDT',
+      displayName: 'Tether',
+      quantity: '1250',
+      quoteStatus: QuoteStatus.fresh,
+      marketValue: ValuedMoney(
+        amount: '9000.00',
+        currency: 'USDT',
+        asOf: '2026-07-29T09:00:00+08:00',
+        quality: ValueQuality.exact,
+      ),
+    ),
     HoldingVm(
       id: 'h_btc',
       accountId: 'a_okx',
@@ -1030,7 +1070,7 @@ void main() {
       portfolioRepositoryProvider.overrideWithValue(
         const _PreviewCryptoPortfolioRepo(okxHoldings),
       ),
-      instrumentsProvider.overrideWith((ref) async => const <InstrumentVm>[]),
+      instrumentsProvider.overrideWith((ref) async => okxInstruments),
     ],
     child: MaterialApp.router(
       theme: theme,
@@ -1068,6 +1108,123 @@ void main() {
       matchesGoldenFile('goldens/account_multi_asset_light.png'),
     );
   });
+
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets(
+      'multi-asset account detail narrow - $name',
+      skip: !_previewEnabled,
+      (tester) async {
+        await sized(tester, const Size(360, 640));
+        await tester.pumpWidget(accountDetailHost(theme));
+        await _settleEntrance(tester);
+        await expectLater(
+          find.byType(AccountDetailPage),
+          matchesGoldenFile('goldens/account_multi_asset_narrow_$name.png'),
+        );
+      },
+    );
+  }
+
+  // —— 2026-07-29 批：持仓快照审核卡 ——
+  Map<String, dynamic> snapshotMovement(
+    String id,
+    String instrumentId,
+    String previous,
+    String target,
+  ) => {
+    'id': id,
+    'atomicGroupId': 'ag_snapshot_1',
+    'type': 'adjustment',
+    'status': 'pending_review',
+    'title': '调整持仓',
+    'occurredAt': '2026-07-29T10:00:00Z',
+    'entries': const [],
+    'holdingAdjustment': {
+      'accountId': 'a_okx',
+      'instrumentId': instrumentId,
+      'previousQuantity': previous,
+      'targetQuantity': target,
+    },
+    'tags': const ['holding_adjustment', 'holding_snapshot'],
+  };
+
+  final snapshotProposal = parseAiProposalData({
+    'id': 'ap_snapshot',
+    'status': 'pending',
+    'summary': 'OKX 持仓快照',
+    'source': {
+      'kind': 'manual',
+      'evidenceRefs': [
+        {'label': 'OKX 导出'},
+      ],
+    },
+    'atomicGroups': [
+      {
+        'id': 'ag_snapshot_1',
+        'title': '更新 OKX 持仓',
+        'operation': 'modify',
+        'status': 'pending',
+        'proposedMovements': [
+          snapshotMovement('mv_btc', 'inst_btc', '0.25', '0.4'),
+          snapshotMovement('mv_eth', 'inst_eth', '3.2', '5.0'),
+        ],
+        'skippedPositions': [
+          {
+            'instrumentId': 'inst_usdt',
+            'quantity': '1250',
+            'reason': 'unchanged',
+          },
+        ],
+      },
+    ],
+  });
+
+  Widget snapshotReviewHost(ThemeData theme) => ProviderScope(
+    overrides: [
+      capabilitiesProvider.overrideWith((ref) async => tradeCaps),
+      accountsProvider.overrideWith((ref) async => const [okxAccount]),
+      instrumentsProvider.overrideWith((ref) async => okxInstruments),
+      aiProposalRepositoryProvider.overrideWithValue(
+        _PreviewAiRepo([snapshotProposal]),
+      ),
+    ],
+    child: MaterialApp.router(
+      theme: theme,
+      routerConfig: GoRouter(
+        routes: [
+          GoRoute(path: '/', builder: (_, _) => const AiReviewPage()),
+          GoRoute(path: '/ai-edit/:id', builder: (_, _) => const Placeholder()),
+        ],
+      ),
+    ),
+  );
+
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('holding snapshot review - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(360, 640));
+      await tester.pumpWidget(snapshotReviewHost(theme));
+      await _settleEntrance(tester);
+      await expectLater(
+        find.byType(AiReviewPage),
+        matchesGoldenFile('goldens/holding_snapshot_review_$name.png'),
+      );
+
+      await tester.tap(find.byKey(kHoldingSnapshotExpandKey));
+      await tester.pumpAndSettle();
+      await expectLater(
+        find.byType(AiReviewPage),
+        matchesGoldenFile('goldens/holding_snapshot_review_expanded_$name.png'),
+      );
+    });
+  }
 
   Widget valuationHost(ThemeData theme) => ProviderScope(
     overrides: [

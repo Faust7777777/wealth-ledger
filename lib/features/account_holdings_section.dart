@@ -35,14 +35,29 @@ class AccountHoldingsTotal {
     required this.currency,
     required this.amount,
     required this.pricedCount,
-    required this.missingCount,
+    required this.missingQuoteCount,
+    required this.otherCurrencyCount,
   });
   final CurrencyCode currency;
   final DecimalString amount;
   final int pricedCount;
 
-  /// 未计入合计的持仓项数（界面据此给低强调入口）。
-  final int missingCount;
+  /// 缺报价因而无法折算的项数。
+  final int missingQuoteCount;
+
+  /// 有价值但币种与账户折算币种不一致、因此没有并入合计的项数。
+  final int otherCurrencyCount;
+
+  /// 未计入合计的项数合计（界面据此给低强调入口）。
+  int get missingCount => missingQuoteCount + otherCurrencyCount;
+
+  /// 入口文案：全部是缺报价才说"待补报价"，否则只说未计入合计。
+  String? get excludedLabel {
+    if (missingCount == 0) return null;
+    return otherCurrencyCount == 0
+        ? '$missingQuoteCount 项待补报价'
+        : '$missingCount 项未计入合计';
+  }
 }
 
 AccountHoldingsTotal accountHoldingsTotal(
@@ -53,16 +68,21 @@ AccountHoldingsTotal accountHoldingsTotal(
   var total = BigInt.zero;
   var scale = 0;
   var priced = 0;
-  var missing = 0;
+  var missingQuote = 0;
+  var otherCurrency = 0;
   for (final h in holdings) {
     final value = h.marketValue;
-    if (holdingLacksValue(h) || value == null || value.currency != currency) {
-      missing += 1;
+    if (holdingLacksValue(h) || value == null) {
+      missingQuote += 1;
+      continue;
+    }
+    if (value.currency != currency) {
+      otherCurrency += 1;
       continue;
     }
     final (units, valueScale) = _decimalParts(value.amount);
     if (units == null) {
-      missing += 1;
+      missingQuote += 1;
       continue;
     }
     if (valueScale > scale) {
@@ -76,7 +96,8 @@ AccountHoldingsTotal accountHoldingsTotal(
     currency: currency,
     amount: _decimalString(total, scale),
     pricedCount: priced,
-    missingCount: missing,
+    missingQuoteCount: missingQuote,
+    otherCurrencyCount: otherCurrency,
   );
 }
 
@@ -175,13 +196,13 @@ class AccountHoldingsSection extends ConsumerWidget {
               ),
             ],
           ),
-          if (total.missingCount > 0)
+          if (total.excludedLabel case final label?)
             Align(
               alignment: Alignment.centerLeft,
               child: TextButton(
                 key: kAccountMissingQuotesKey,
                 onPressed: () => showValuationStatusDialog(context),
-                child: Text('${total.missingCount} 项待补报价'),
+                child: Text(label),
               ),
             ),
         ],
