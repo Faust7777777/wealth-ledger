@@ -17,3 +17,11 @@ Android Agent 面板选择微信保存的 `.jpg` 后显示“文件内容与扩�
 - 用户提供的真实 `759287` 字节微信 JPEG 已通过同一校验函数。
 
 图片上传成功后由 Pi 直接接收归档图片的 base64 与 MIME，不依赖手机原始文件路径。
+
+## 验证与部署
+
+- Node 30 条通过；TypeScript check/build 通过。
+- Agent local smoke 已覆盖微信式 JPEG 的完整上传与原字节回读。
+- 已部署 `0e75df4` 的 Agent sidecar；带内部认证的 status 为 200，Rust/Agent unit 均 active，线上构建包含新 validator。
+- 部署前 Agent 状态备份：`/var/backups/finwealth-agent/20260729-151630Z`。
+- 未修改 Rust、Flutter、Caddy、Cloudflare、sub2api 或生产账本。
