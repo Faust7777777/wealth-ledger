@@ -316,7 +316,7 @@ export class PiAgentEngine implements AgentEngine {
         ...createWorkspaceTools(cwd),
         ...createFinwealthTools(this.#finwealth),
         ...createMemoryTools(this.#store, conversation),
-        ...createQuoteCandidateTools(this.#store, conversation),
+        ...createQuoteCandidateTools(this.#store, conversation, this.#finwealth),
       ],
     });
     const cached: CachedSession = {

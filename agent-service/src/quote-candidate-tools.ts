@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { FinwealthClient } from "./finwealth-client.js";
+import { quoteCandidateInputsFromLookup } from "./finwealth-client.js";
 import { StateStore } from "./state-store.js";
 import type { AgentConversation, AgentQuoteCandidate } from "./types.js";
 
@@ -31,7 +33,7 @@ function validSourceUrl(value: string): boolean {
 
 export async function suggestQuoteCandidate(
   store: StateStore,
-  conversation: AgentConversation,
+  owner: Pick<AgentConversation, "userId" | "ledgerId">,
   input: Record<string, unknown>,
 ): Promise<AgentQuoteCandidate> {
   const kind = input.kind;
@@ -48,8 +50,8 @@ export async function suggestQuoteCandidate(
   const timestamp = new Date().toISOString();
   const shared = {
     id: `aqc_${randomUUID()}`,
-    userId: conversation.userId,
-    ledgerId: conversation.ledgerId,
+    userId: owner.userId,
+    ledgerId: owner.ledgerId,
     asOf,
     source,
     sourceUrl,
@@ -84,7 +86,7 @@ export async function suggestQuoteCandidate(
     }
     candidate = { ...shared, kind, baseCurrency, quoteCurrency, rate };
   }
-  return store.update(conversation.userId, (state) => {
+  return store.update(owner.userId, (state) => {
     const existing = state.quoteCandidates.find((item) =>
       item.ledgerId === candidate.ledgerId &&
       item.status === "suggested" &&
@@ -104,11 +106,109 @@ export async function suggestQuoteCandidate(
   });
 }
 
+function candidateTargetKey(input: Record<string, unknown>): string {
+  if (input.kind === "instrument") {
+    return `instrument:${String(input.instrumentId ?? "").trim()}`;
+  }
+  return `fx:${String(input.baseCurrency ?? "").trim().toUpperCase()}/${
+    String(input.quoteCurrency ?? "").trim().toUpperCase()
+  }`;
+}
+
+function lookupRequest(input: Record<string, unknown>): Record<string, unknown> {
+  if (input.kind === "instrument") {
+    return { instruments: [String(input.instrumentId ?? "").trim()] };
+  }
+  return {
+    currencyPairs: [{
+      baseCurrency: String(input.baseCurrency ?? "").trim().toUpperCase(),
+      quoteCurrency: String(input.quoteCurrency ?? "").trim().toUpperCase(),
+    }],
+  };
+}
+
 export function createQuoteCandidateTools(
   store: StateStore,
   conversation: AgentConversation,
+  client: Pick<FinwealthClient, "lookupStructuredQuotes">,
 ): ToolDefinition[] {
-  return [defineTool({
+  const fallbackEligible = new Set<string>();
+  const targetParameters = Type.Union([
+    Type.Object({
+      kind: Type.Literal("instrument"),
+      instrumentId: Type.String({ minLength: 1, maxLength: 128 }),
+    }),
+    Type.Object({
+      kind: Type.Literal("fx"),
+      baseCurrency: Type.String({ minLength: 2, maxLength: 12 }),
+      quoteCurrency: Type.String({ minLength: 2, maxLength: 12 }),
+    }),
+  ]);
+  const lookup = defineTool({
+    name: "finwealth_lookup_quote_candidate",
+    label: "查询结构化报价",
+    description:
+      "从 Finwealth 配置的确定性行情源查询一个标的或汇率，并保存为待审核候选。它不会改变估值；只有明确查不到后才能改用网页来源。",
+    promptSnippet: "优先从结构化来源查询报价或汇率并生成待审核候选。",
+    promptGuidelines: [
+      "任何报价请求都先调用本工具；不要先搜索网页。",
+      "成功只表示生成待审核候选，不表示报价已经写入或估值已经更新。",
+      "工具明确返回 fallbackAllowed=true 后，才可搜索网页并调用 finwealth_suggest_quote。",
+    ],
+    parameters: targetParameters,
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      const input = params as Record<string, unknown>;
+      const key = candidateTargetKey(input);
+      try {
+        const response = await client.lookupStructuredQuotes(
+          lookupRequest(input),
+          signal,
+        );
+        const inputs = quoteCandidateInputsFromLookup(response);
+        const candidates = [];
+        for (const candidateInput of inputs) {
+          candidates.push(
+            await suggestQuoteCandidate(store, conversation, candidateInput),
+          );
+        }
+        if (candidates.length === 0) fallbackEligible.add(key);
+        else fallbackEligible.delete(key);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              ok: true,
+              data: {
+                createdCount: candidates.length,
+                candidateIds: candidates.map((candidate) => candidate.id),
+                approvalRequired: candidates.length > 0,
+                fallbackAllowed: candidates.length === 0,
+              },
+            }),
+          }],
+          details: {},
+        };
+      } catch {
+        fallbackEligible.add(key);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              ok: true,
+              data: {
+                createdCount: 0,
+                approvalRequired: false,
+                fallbackAllowed: true,
+              },
+            }),
+          }],
+          details: {},
+        };
+      }
+    },
+  });
+  const suggest = defineTool({
     name: "finwealth_suggest_quote",
     label: "建议报价",
     description:
@@ -116,7 +216,7 @@ export function createQuoteCandidateTools(
     promptSnippet: "把有明确来源和时间的网页报价整理成待审核候选。",
     promptGuidelines: [
       "先用 finwealth_query 获取真实 instrumentId、计价单位和缺失报价，不要虚构内部 ID。",
-      "网页结果只能调用 finwealth_suggest_quote，不能直接调用结构化报价刷新或声称已经更新估值。",
+      "同一目标必须先调用 finwealth_lookup_quote_candidate；仅当它明确允许 fallback 后才能提交网页候选。",
       "每个候选只包含一个报价或一个汇率；来源 URL 必须是实际读取的 http/https 页面。",
     ],
     parameters: Type.Union([
@@ -141,10 +241,14 @@ export function createQuoteCandidateTools(
     ]),
     executionMode: "sequential",
     async execute(_id, params) {
+      const input = params as Record<string, unknown>;
+      if (!fallbackEligible.has(candidateTargetKey(input))) {
+        throw new Error("structured_quote_lookup_required");
+      }
       const candidate = await suggestQuoteCandidate(
         store,
         conversation,
-        params as Record<string, unknown>,
+        input,
       );
       return {
         content: [{
@@ -161,5 +265,6 @@ export function createQuoteCandidateTools(
         details: {},
       };
     },
-  })];
+  });
+  return [lookup, suggest];
 }

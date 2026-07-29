@@ -1406,6 +1406,7 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/quotes/summary", get(quote_summary))
         .route("/v1/quotes", get(quotes))
         .route("/v1/fx-rates", get(fx_rates))
+        .route("/v1/quotes/lookup", post(lookup_quotes))
         .route("/v1/quotes/refresh", post(refresh_quotes))
         .route("/v1/instruments", get(instruments).post(create_instrument))
         .route(
@@ -3940,6 +3941,88 @@ async fn refresh_quotes(
     }
 
     example_json(QUOTE_STALE).into_response()
+}
+
+/// Fetch provider data without changing the ledger. Agent callers use this
+/// before any web fallback and turn successful items into review candidates.
+async fn lookup_quotes(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+    Json(input): Json<Value>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let Some(object) = input.as_object() else {
+            return bad_request(
+                "invalid_quote_lookup_input",
+                "Quote lookup input must be a JSON object.",
+                json!({}),
+            );
+        };
+        if object
+            .keys()
+            .any(|key| key != "instruments" && key != "currencyPairs")
+        {
+            return bad_request(
+                "invalid_quote_lookup_input",
+                "Quote lookup accepts only instruments and currencyPairs.",
+                json!({"allowedFields": ["instruments", "currencyPairs"]}),
+            );
+        }
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        let now = current_timestamp();
+        let result = match enrich_quote_refresh_with_yahoo(path, input, &now).await {
+            Ok(enriched) => quote_lookup_result(enriched, &now),
+            Err(provider_result) => provider_result,
+        };
+        return envelope(result).into_response();
+    }
+
+    envelope(json!({
+        "status": "success",
+        "quotes": [],
+        "fxRates": [],
+        "errors": [],
+        "completedAt": current_timestamp()
+    }))
+    .into_response()
+}
+
+fn quote_lookup_result(mut enriched: Value, now: &str) -> Value {
+    let quotes = enriched
+        .get_mut("quotes")
+        .and_then(Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let fx_rates = enriched
+        .get_mut("fxRates")
+        .and_then(Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let errors = enriched
+        .get_mut("_providerErrors")
+        .and_then(Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let found_any = !quotes.is_empty() || !fx_rates.is_empty();
+    let status = if found_any && errors.is_empty() {
+        "success"
+    } else if found_any {
+        "partial_success"
+    } else if errors.is_empty() {
+        "success"
+    } else {
+        "offline"
+    };
+    json!({
+        "status": status,
+        "quotes": quotes,
+        "fxRates": fx_rates,
+        "errors": errors,
+        "completedAt": now
+    })
 }
 
 async fn enrich_quote_refresh_with_yahoo(
@@ -12326,6 +12409,61 @@ mod tests {
             .is_err(),
             "unknown symbols must not receive a fabricated price"
         );
+
+        let lookup = quote_lookup_result(
+            json!({
+                "quotes": [quote],
+                "fxRates": [fiat_rate],
+                "_providerErrors": []
+            }),
+            now,
+        );
+        assert_eq!(lookup["status"], "success");
+        assert_eq!(lookup["quotes"].as_array().map(Vec::len), Some(1));
+        assert_eq!(lookup["fxRates"][0]["rate"], "6.7775");
+    }
+
+    #[tokio::test]
+    async fn structured_quote_lookup_rejects_manual_values_and_never_changes_the_ledger() {
+        let path = unique_test_ledger_path("structured_quote_lookup_read_only");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+        let (valid_status, valid_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/lookup",
+            json!({"instruments": [], "currencyPairs": []}),
+        )
+        .await;
+        assert_eq!(valid_status, StatusCode::OK);
+        assert_eq!(valid_body["data"]["quotes"], json!([]));
+        assert_eq!(valid_body["data"]["fxRates"], json!([]));
+
+        let manual_value = json!({
+            "quotes": [{
+                "instrumentId": "inst_lookup_only",
+                "price": "123.45",
+                "currency": "USD",
+                "asOf": "2026-07-29T00:00:00Z",
+                "source": "structured_test",
+                "sourceUrl": "https://example.test/quote"
+            }]
+        });
+        let (lookup_status, lookup_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/lookup",
+            manual_value,
+        )
+        .await;
+        assert_eq!(lookup_status, StatusCode::BAD_REQUEST);
+        assert_eq!(lookup_body["error"]["code"], "invalid_quote_lookup_input");
+
+        let (quotes_status, quotes_body) =
+            request_json_from(router, Method::GET, "/v1/quotes").await;
+        assert_eq!(quotes_status, StatusCode::OK);
+        assert_eq!(quotes_body["data"], json!([]));
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

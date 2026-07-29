@@ -1205,6 +1205,24 @@ paths:
               schema:
                 $ref: "#/components/schemas/FXRateListResponse"
 
+  /quotes/lookup:
+    post:
+      tags: [Quotes]
+      summary: Look up structured quotes and FX rates without changing the ledger.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QuoteLookupRequest"
+      responses:
+        "200":
+          description: Read-only provider lookup result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QuoteRefreshResultResponse"
+
   /quotes/refresh:
     post:
       tags: [Quotes]
@@ -4285,6 +4303,24 @@ components:
           type: integer
         errorCount:
           type: integer
+    QuoteLookupRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        instruments:
+          type: array
+          items:
+            $ref: "#/components/schemas/ID"
+        currencyPairs:
+          type: array
+          items:
+            type: object
+            required: [baseCurrency, quoteCurrency]
+            properties:
+              baseCurrency:
+                $ref: "#/components/schemas/CurrencyCode"
+              quoteCurrency:
+                $ref: "#/components/schemas/CurrencyCode"
     QuoteRefreshRequest:
       type: object
       required: [mode, requestedAt]
@@ -4338,7 +4374,7 @@ components:
             required: [targetType, message, retryable]
             properties:
               targetType:
-                enum: [instrument, fx_pair]
+                enum: [request, instrument, fx_pair]
               targetId:
                 $ref: "#/components/schemas/ID"
               message:

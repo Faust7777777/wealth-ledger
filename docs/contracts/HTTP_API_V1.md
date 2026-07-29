@@ -346,12 +346,16 @@ POST /v1/ai/atomic-groups/{atomicGroupId}/edit
 GET  /v1/quotes/summary
 GET  /v1/quotes
 GET  /v1/fx-rates
+POST /v1/quotes/lookup
 POST /v1/quotes/refresh
 GET  /v1/instruments/{instrumentId}/historical-prices?from=YYYY-MM-DD&to=YYYY-MM-DD
 ```
 
 规则：
 
+- `lookup` 只调用显式配置的结构化 provider 并返回结果，不写账本、不改变估值，也不要求 `Idempotency-Key`。
+- Agent 对报价或汇率请求必须先走 `lookup`；成功结果和后续网页兜底结果都只保存为待审核候选，用户采用后才可调用 `refresh` 写入。
+- 只有 `lookup` 对同一目标明确无结果或失败后，Agent 才可使用网页来源；不得跳过确定性来源。
 - refresh mode 支持 `manual` / `startup` / `scheduled`。
 - 断网时客户端可使用缓存并标记 `offline_cached`。
 - 历史价格 MVP 固定近一年上限。

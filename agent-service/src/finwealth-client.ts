@@ -90,12 +90,15 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
     );
   }
 
-  async refreshStructuredQuotes(signal?: AbortSignal): Promise<unknown> {
+  async lookupStructuredQuotes(
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
     return this.#request(
       "POST",
-      "/v1/quotes/refresh",
-      {},
-      `agent-quotes-${randomUUID()}`,
+      "/v1/quotes/lookup",
+      input,
+      undefined,
       signal,
     );
   }
@@ -149,21 +152,16 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
   ): Promise<AgentAutomationResult> {
     const key = `agent-auto-${automation.id}-${scheduledFor}`;
     if (automation.kind === "quote_refresh") {
-      const response = await this.#request(
-        "POST",
-        "/v1/quotes/refresh",
-        { mode: "scheduled", requestedAt: scheduledFor },
-        key,
-      );
+      const response = await this.lookupStructuredQuotes({});
       const data = responseData(response);
-      const quotes = Array.isArray(data?.quotes) ? data.quotes.length : 0;
-      const fxRates = Array.isArray(data?.fxRates) ? data.fxRates.length : 0;
+      const quoteCandidateInputs = quoteCandidateInputsFromLookup(response);
       const errors = Array.isArray(data?.errors) ? data.errors.length : 0;
       return {
-        title: errors ? "报价刷新有未完成项" : "报价已刷新",
-        body: `更新 ${quotes} 条报价、${fxRates} 条汇率${errors ? `，${errors} 项失败` : ""}`,
+        title: quoteCandidateInputs.length ? "报价建议等待审核" : "报价检查完成",
+        body: `新增 ${quoteCandidateInputs.length} 条报价建议${errors ? `，${errors} 项未找到` : ""}`,
         action: "quotes",
-        notify: errors > 0,
+        notify: quoteCandidateInputs.length > 0 || errors > 0,
+        quoteCandidateInputs,
       };
     }
     if (automation.kind === "subscription_due_scan") {
@@ -242,6 +240,43 @@ function responseData(value: unknown): Record<string, unknown> | undefined {
   return data && typeof data === "object" && !Array.isArray(data)
     ? data as Record<string, unknown>
     : undefined;
+}
+
+/// Convert the read-only structured lookup response into the same candidate
+/// input shape used by web fallback. Validation still happens when persisted.
+export function quoteCandidateInputsFromLookup(
+  value: unknown,
+): Record<string, unknown>[] {
+  const data = responseData(value);
+  if (!data) return [];
+  const candidates: Record<string, unknown>[] = [];
+  for (const item of Array.isArray(data.quotes) ? data.quotes : []) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const quote = item as Record<string, unknown>;
+    candidates.push({
+      kind: "instrument",
+      instrumentId: quote.instrumentId,
+      price: quote.price,
+      currency: quote.currency,
+      asOf: quote.asOf,
+      source: quote.source,
+      sourceUrl: quote.sourceUrl,
+    });
+  }
+  for (const item of Array.isArray(data.fxRates) ? data.fxRates : []) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const rate = item as Record<string, unknown>;
+    candidates.push({
+      kind: "fx",
+      baseCurrency: rate.baseCurrency,
+      quoteCurrency: rate.quoteCurrency,
+      rate: rate.rate,
+      asOf: rate.asOf,
+      source: rate.source,
+      sourceUrl: rate.sourceUrl,
+    });
+  }
+  return candidates;
 }
 
 function numberField(value: Record<string, unknown> | undefined, field: string): number {
@@ -348,19 +383,5 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     },
   });
 
-  const refreshQuotes = defineTool({
-    name: "finwealth_refresh_quotes",
-    label: "刷新结构化报价",
-    description:
-      "调用 Finwealth 已配置且获准的结构化报价源刷新市场报价和汇率。网页搜索结果不能调用此工具写入。",
-    promptSnippet: "从服务器已配置的结构化来源刷新报价和汇率。",
-    parameters: Type.Object({}),
-    executionMode: "sequential",
-    async execute(_id, _params, signal) {
-      const value = await client.refreshStructuredQuotes(signal);
-      return { content: [{ type: "text", text: toolText(value) }], details: {} };
-    },
-  });
-
-  return [query, proposeMovement, refreshQuotes];
+  return [query, proposeMovement];
 }

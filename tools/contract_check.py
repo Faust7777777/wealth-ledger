@@ -97,6 +97,9 @@ FORBIDDEN_ENDPOINTS = {
 
 HTTP_METHODS = {"GET", "POST", "PATCH", "PUT", "DELETE"}
 LEDGER_WRITE_METHODS = {"post", "patch", "put", "delete"}
+READ_ONLY_POST_OPERATIONS = {
+    ("post", "/quotes/lookup"),
+}
 
 
 def fail(message: str) -> None:
@@ -2212,6 +2215,21 @@ def main() -> None:
         fail("Idempotency-Key must document minLength 1")
     if idempotency_schema.get("maxLength") != 128:
         fail("Idempotency-Key must document maxLength 128")
+    for method, path in READ_ONLY_POST_OPERATIONS:
+        operation = doc["paths"].get(path, {}).get(method)
+        if not isinstance(operation, dict):
+            fail(f"Read-only POST allow-list references a missing operation: {method.upper()} {path}")
+        read_only_text = " ".join(
+            str(operation.get(field, "")) for field in ("summary", "description")
+        ).lower()
+        if not any(
+            marker in read_only_text
+            for marker in ("read-only", "without changing the ledger")
+        ):
+            fail(
+                "Read-only POST operations must explicitly document non-write semantics: "
+                f"{method.upper()} {path}"
+            )
     missing_idempotency: list[str] = []
     for path, path_item in doc["paths"].items():
         if path.startswith("/auth/") or not isinstance(path_item, dict):
@@ -2219,6 +2237,8 @@ def main() -> None:
         for method in LEDGER_WRITE_METHODS:
             operation = path_item.get(method)
             if not isinstance(operation, dict):
+                continue
+            if (method, path) in READ_ONLY_POST_OPERATIONS:
                 continue
             parameters = operation.get("parameters", [])
             if not any(

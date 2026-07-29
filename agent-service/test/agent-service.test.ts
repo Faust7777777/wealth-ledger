@@ -10,6 +10,7 @@ import { EventHub } from "../src/event-hub.js";
 import {
   FinwealthClient,
   normalizeMovementProposalForLedger,
+  quoteCandidateInputsFromLookup,
 } from "../src/finwealth-client.js";
 import { createAgentHttpServer } from "../src/http-server.js";
 import { StateStore } from "../src/state-store.js";
@@ -27,7 +28,10 @@ import type {
 } from "../src/types.js";
 import { createWorkspaceTools } from "../src/workspace-tools.js";
 import { createMemoryTools } from "../src/memory-tools.js";
-import { suggestQuoteCandidate } from "../src/quote-candidate-tools.js";
+import {
+  createQuoteCandidateTools,
+  suggestQuoteCandidate,
+} from "../src/quote-candidate-tools.js";
 import { prepareFileAttachmentPrompt } from "../src/pi-engine.js";
 
 const roots: string[] = [];
@@ -514,7 +518,9 @@ test("Finwealth client reads data and submits a draft only to review", async () 
       "sidecar-secret",
     );
     await client.query("accounts");
-    await client.refreshStructuredQuotes();
+    await client.lookupStructuredQuotes({
+      currencyPairs: [{ baseCurrency: "USD", quoteCurrency: "CNY" }],
+    });
     await client.proposeMovement({
       type: "expense",
       occurredAt: "2026-07-28T00:00:00Z",
@@ -531,7 +537,7 @@ test("Finwealth client reads data and submits a draft only to review", async () 
     requests.map((item) => `${item.method} ${item.path}`),
     [
       "GET /v1/accounts",
-      "POST /v1/quotes/refresh",
+      "POST /v1/quotes/lookup",
       "POST /v1/movements/drafts",
       "POST /v1/movements/mov_agent_draft/submit-review",
     ],
@@ -610,8 +616,26 @@ test("Finwealth client maps scheduled quotes, subscription scans and DCA checks"
         ? { key: request.headers["idempotency-key"] }
         : {}),
     });
-    const data = request.url === "/v1/quotes/refresh"
-      ? { quotes: [{}], fxRates: [{}], errors: [] }
+    const data = request.url === "/v1/quotes/lookup"
+      ? {
+        quotes: [{
+          instrumentId: "inst_btc",
+          price: "118234.25",
+          currency: "USDT",
+          asOf: "2026-07-28T10:00:00Z",
+          source: "coingecko",
+          sourceUrl: "https://www.coingecko.com/",
+        }],
+        fxRates: [{
+          baseCurrency: "USD",
+          quoteCurrency: "CNY",
+          rate: "7.21",
+          asOf: "2026-07-28T00:00:00Z",
+          source: "frankfurter_ecb",
+          sourceUrl: "https://frankfurter.app/",
+        }],
+        errors: [],
+      }
       : request.url === "/v1/subscriptions/charge-proposals/due-scan"
       ? { createdCount: 2, blockedCount: 1, remainingEligibleCount: 0 }
       : [{ id: "reminder_due" }];
@@ -649,7 +673,8 @@ test("Finwealth client maps scheduled quotes, subscription scans and DCA checks"
       { ...base, kind: "dca_due_check" },
       "2026-07-28T00:00:00Z",
     );
-    assert.equal(quote.notify, false);
+    assert.equal(quote.notify, true);
+    assert.equal(quote.quoteCandidateInputs?.length, 2);
     assert.equal(subscription.action, "review");
     assert.equal(subscription.notify, true);
     assert.equal(dca.action, "dca");
@@ -659,13 +684,144 @@ test("Finwealth client maps scheduled quotes, subscription scans and DCA checks"
     );
   }
   assert.deepEqual(requests.map((item) => item.path), [
-    "/v1/quotes/refresh",
+    "/v1/quotes/lookup",
     "/v1/subscriptions/charge-proposals/due-scan",
     "/v1/dca/reminders/due",
   ]);
-  assert.equal(requests[0]?.key, "agent-auto-auto_test-2026-07-28T00:00:00Z");
+  assert.equal(requests[0]?.key, undefined);
   assert.equal(requests[1]?.key, "agent-auto-auto_test-2026-07-28T00:00:00Z");
   assert.equal(requests[2]?.key, undefined);
+});
+
+test("structured quote lookup maps provider data into review candidate inputs", () => {
+  const inputs = quoteCandidateInputsFromLookup({
+    ok: true,
+    data: {
+      quotes: [{
+        instrumentId: "inst_eth",
+        price: "3820.15",
+        currency: "USDT",
+        asOf: "2026-07-29T04:00:00Z",
+        source: "coingecko",
+        sourceUrl: "https://www.coingecko.com/",
+      }],
+      fxRates: [{
+        baseCurrency: "USD",
+        quoteCurrency: "CNY",
+        rate: "7.1882",
+        asOf: "2026-07-29T00:00:00Z",
+        source: "frankfurter_ecb",
+        sourceUrl: "https://frankfurter.app/",
+      }],
+    },
+  });
+  assert.deepEqual(inputs.map((item) => item.kind), ["instrument", "fx"]);
+  assert.equal(inputs[1]?.rate, "7.1882");
+});
+
+test("quote tools require deterministic lookup before web fallback", async () => {
+  const service = await serviceWith(new FakeEngine());
+  const conversation = (await service.listConversations(owner))[0];
+  assert.ok(conversation);
+  let lookupReturnsRate = true;
+  const tools = createQuoteCandidateTools(service.store, conversation, {
+    async lookupStructuredQuotes() {
+      return lookupReturnsRate
+        ? {
+          ok: true,
+          data: {
+            fxRates: [{
+              baseCurrency: "USD",
+              quoteCurrency: "CNY",
+              rate: "7.1882",
+              asOf: "2026-07-29T00:00:00Z",
+              source: "frankfurter_ecb",
+              sourceUrl: "https://frankfurter.app/",
+            }],
+            quotes: [],
+            errors: [],
+          },
+        }
+        : { ok: true, data: { fxRates: [], quotes: [], errors: [{}] } };
+    },
+  });
+  const lookup = tools.find((tool) => tool.name === "finwealth_lookup_quote_candidate");
+  const suggest = tools.find((tool) => tool.name === "finwealth_suggest_quote");
+  assert.ok(lookup && suggest);
+  const webInput = {
+    kind: "fx" as const,
+    baseCurrency: "USD",
+    quoteCurrency: "CNY",
+    rate: "7.2",
+    asOf: "2026-07-29T05:00:00Z",
+    source: "Example FX",
+    sourceUrl: "https://example.test/usd-cny",
+  };
+  await assert.rejects(
+    suggest.execute("web-before-lookup", webInput, undefined, undefined, {} as never),
+    /structured_quote_lookup_required/,
+  );
+  await lookup.execute(
+    "structured-success",
+    { kind: "fx", baseCurrency: "USD", quoteCurrency: "CNY" },
+    undefined,
+    undefined,
+    {} as never,
+  );
+  assert.equal((await service.listQuoteCandidates(owner)).length, 1);
+  await assert.rejects(
+    suggest.execute("web-after-success", webInput, undefined, undefined, {} as never),
+    /structured_quote_lookup_required/,
+  );
+
+  lookupReturnsRate = false;
+  await lookup.execute(
+    "structured-miss",
+    { kind: "fx", baseCurrency: "EUR", quoteCurrency: "CNY" },
+    undefined,
+    undefined,
+    {} as never,
+  );
+  await suggest.execute(
+    "web-after-miss",
+    { ...webInput, baseCurrency: "EUR", rate: "8.2" },
+    undefined,
+    undefined,
+    {} as never,
+  );
+  assert.equal((await service.listQuoteCandidates(owner)).length, 2);
+});
+
+test("scheduled quote checks persist suggestions without applying quotes", async () => {
+  const writer = new FakeQuoteWriter();
+  const runner = new FakeAutomationRunner();
+  runner.result = {
+    title: "报价建议等待审核",
+    body: "新增 1 条报价建议",
+    action: "quotes",
+    notify: true,
+    quoteCandidateInputs: [{
+      kind: "fx",
+      baseCurrency: "USD",
+      quoteCurrency: "CNY",
+      rate: "7.1882",
+      asOf: "2026-07-29T00:00:00Z",
+      source: "frankfurter_ecb",
+      sourceUrl: "https://frankfurter.app/",
+    }],
+  };
+  const service = await serviceWith(new FakeEngine(), writer, runner);
+  const automation = await service.createAutomation(owner, {
+    kind: "quote_refresh",
+    intervalHours: 24,
+    enabled: true,
+    startAt: "2026-07-29T00:00:00Z",
+  });
+  await service.runAutomationNow(owner, automation.id);
+  const candidates = await service.listQuoteCandidates(owner);
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]?.status, "suggested");
+  assert.equal(writer.applied.length, 0);
 });
 
 test("archives an image and passes only owned attachment IDs to the model", async () => {

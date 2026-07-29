@@ -206,6 +206,7 @@ void main() {
     expect(agentToolLabel('finwealth_query'), '正在读取数据…');
     expect(agentToolLabel('finwealth_propose_movement'), '正在整理记录…');
     expect(agentToolLabel('finwealth_refresh_quotes'), '正在刷新估值…');
+    expect(agentToolLabel('finwealth_lookup_quote_candidate'), '正在查询报价…');
     expect(agentToolLabel('finwealth_suggest_memory'), '正在整理偏好…');
     for (final unknown in ['bash', 'read', 'write', null]) {
       expect(agentToolLabel(unknown), '正在处理…');

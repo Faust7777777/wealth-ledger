@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { EventHub } from "./event-hub.js";
 import { StateStore } from "./state-store.js";
 import { ATTACHMENT_EXTENSIONS, attachmentMatchesMime } from "./attachment-formats.js";
+import { suggestQuoteCandidate } from "./quote-candidate-tools.js";
 import type {
   AgentConversation,
   AgentEngine,
@@ -17,6 +18,7 @@ import type {
   AgentAutomation,
   AgentAutomationKind,
   AgentAutomationRunner,
+  AgentAutomationResult,
   AgentNotification,
 } from "./types.js";
 
@@ -285,11 +287,14 @@ export class AgentService {
     if (this.#automationRuns.has(automation.id)) throw new Error("agent_automation_busy");
     this.#automationRuns.add(automation.id);
     try {
-      const result = automation.kind === "financial_summary"
+      const result: AgentAutomationResult = automation.kind === "financial_summary"
         ? await this.#startFinancialSummary(automation, scheduledFor)
         : this.#automationRunner
         ? await this.#automationRunner.runAutomation(automation, scheduledFor)
         : (() => { throw new Error("agent_automation_unavailable"); })();
+      for (const input of result.quoteCandidateInputs ?? []) {
+        await suggestQuoteCandidate(this.store, automation, input);
+      }
       await this.store.update(automation.userId, (state) => {
         const current = state.automations.find((item) => item.id === automation.id);
         if (!current) return;

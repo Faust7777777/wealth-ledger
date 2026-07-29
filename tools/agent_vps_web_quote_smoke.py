@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that the production Pi model can research a web FX quote safely."""
+"""Verify that production Pi prefers structured USD/CNY lookup and review."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 AGENT_BASE = "http://127.0.0.1:8792/v1/agent"
-SOURCE_URL = "https://api.frankfurter.app/latest?from=USD&to=CNY"
+SOURCE_URL = "https://frankfurter.app/"
 TIMEOUT_SECONDS = 600
 NONCE = secrets.token_hex(8)
 USER_ID = f"usr_web_quote_smoke_{NONCE}"
@@ -114,19 +114,16 @@ def main() -> None:
     )
     assert isinstance(conversation, dict)
     models = request("GET", "/models")
-    model = next(item for item in models if item.get("provider") == "lore")
+    model = next(item for item in models if item.get("provider") == "xai")
     request(
         "PATCH",
         f"/conversations/{conversation['id']}",
         body={"modelId": model["id"]},
     )
     prompt = (
-        "调用隔离 bash，用 curl -fsSL 读取 "
-        f"{SOURCE_URL}。取其中 USD/CNY 的 rate 和 date，然后调用 "
-        "finwealth_suggest_quote 创建 kind=fx、baseCurrency=USD、"
-        "quoteCurrency=CNY 的待审核候选；rate 使用网页原值，asOf 使用网页日期"
-        "的 UTC 零点，source=Frankfurter，sourceUrl 使用实际读取的完整 URL。"
-        "最后只回复完成。"
+        "查询 USD/CNY 最新汇率。必须先调用 finwealth_lookup_quote_candidate，"
+        "kind=fx、baseCurrency=USD、quoteCurrency=CNY。结构化查询成功后不要调用"
+        " bash、不要搜索网页、不要采用候选，最后只回复完成。"
     )
     accepted = request(
         "POST",
@@ -157,11 +154,13 @@ def main() -> None:
         raise TimeoutError("web quote Agent run timed out")
 
     tools = completed_tools(conversation["id"], accepted["runId"])
-    if "bash:False" not in tools or "finwealth_suggest_quote:False" not in tools:
-        raise RuntimeError(f"web quote tools did not complete successfully: {tools}")
+    if "finwealth_lookup_quote_candidate:False" not in tools:
+        raise RuntimeError(f"structured quote tool did not complete successfully: {tools}")
+    if any(item.startswith("bash:") or item.startswith("finwealth_suggest_quote:") for item in tools):
+        raise RuntimeError(f"structured USD/CNY lookup incorrectly used web fallback: {tools}")
     candidates = request("GET", "/quote-candidates")
     if not isinstance(candidates, list) or len(candidates) != 1:
-        raise RuntimeError("web quote smoke did not create exactly one candidate")
+        raise RuntimeError("structured quote smoke did not create exactly one candidate")
     candidate = candidates[0]
     if (
         candidate.get("kind") != "fx"
@@ -171,10 +170,10 @@ def main() -> None:
         or candidate.get("sourceUrl") != SOURCE_URL
         or float(candidate.get("rate", "0")) <= 0
     ):
-        raise RuntimeError("web quote candidate fields are invalid")
+        raise RuntimeError("structured quote candidate fields are invalid")
     if authoritative_quote_summary() != before:
-        raise RuntimeError("suggesting a web quote changed authoritative valuation")
-    print("OK: production Pi model created one reviewed web FX quote candidate.")
+        raise RuntimeError("suggesting a structured quote changed authoritative valuation")
+    print("OK: production Pi created one reviewed structured USD/CNY candidate.")
 
 
 if __name__ == "__main__":

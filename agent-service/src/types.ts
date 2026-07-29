@@ -137,6 +137,8 @@ export interface AgentAutomationResult {
   body: string;
   action?: AgentNotification["action"];
   notify: boolean;
+  /// Provider results that must become review candidates, never direct writes.
+  quoteCandidateInputs?: Record<string, unknown>[];
 }
 
 export interface AgentAutomationRunner {
