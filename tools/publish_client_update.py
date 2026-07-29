@@ -104,22 +104,70 @@ def validate_android_provenance(artifact: Path, value: dict) -> tuple[str, int, 
     return version_name.strip(), version_code, source_commit, actual_hash
 
 
+def validate_windows_provenance(artifact: Path, value: dict) -> tuple[str, int, str, str]:
+    required = {
+        "packageFormat": 4,
+        "sourceDirty": False,
+        "dataSource": "api_remote",
+        "platform": "windows",
+        "networkPolicyVerified": True,
+    }
+    for key, expected in required.items():
+        if value.get(key) != expected:
+            fail(f"provenance field {key} must be {expected!r}")
+    version_name = value.get("versionName")
+    version_code = value.get("versionCode")
+    source_commit = value.get("sourceCommit")
+    expected_hash = value.get("archiveSha256")
+    expected_size = value.get("archiveSizeBytes")
+    if not isinstance(version_name, str) or not version_name.strip():
+        fail("provenance versionName is missing")
+    if not isinstance(version_code, int) or isinstance(version_code, bool) or version_code < 1:
+        fail("provenance versionCode must be a positive integer")
+    if not isinstance(source_commit, str) or not COMMIT_RE.fullmatch(source_commit):
+        fail("provenance sourceCommit must be 40 lowercase hex characters")
+    if not isinstance(expected_hash, str) or not SHA256_RE.fullmatch(expected_hash):
+        fail("provenance archiveSha256 is invalid")
+    if value.get("archive") != artifact.name:
+        fail("artifact file name does not match provenance")
+    if expected_size != artifact.stat().st_size:
+        fail("artifact size does not match provenance")
+    actual_hash = sha256_file(artifact)
+    if actual_hash != expected_hash:
+        fail("artifact SHA-256 does not match provenance")
+    return version_name.strip(), version_code, source_commit, actual_hash
+
+
 def publish(args: argparse.Namespace) -> Path:
     artifact = args.artifact.resolve(strict=True)
     provenance_path = args.provenance.resolve(strict=True)
-    if not artifact.is_file() or artifact.suffix.lower() != ".apk":
-        fail("the Android artifact must be a regular .apk file")
+    if not artifact.is_file():
+        fail("the client artifact must be a regular file")
     if not CHANNEL_RE.fullmatch(args.channel):
         fail("channel must match ^[a-z0-9][a-z0-9-]{0,31}$")
     provenance = load_json(provenance_path)
-    version_name, version_code, source_commit, sha256 = validate_android_provenance(
-        artifact, provenance
-    )
+    platform = provenance.get("platform")
+    if platform == "android":
+        if artifact.suffix.lower() != ".apk":
+            fail("the Android artifact must be a regular .apk file")
+        version_name, version_code, source_commit, sha256 = validate_android_provenance(
+            artifact, provenance
+        )
+        content_type = "application/vnd.android.package-archive"
+    elif platform == "windows":
+        if artifact.suffix.lower() != ".zip":
+            fail("the Windows artifact must be a regular .zip file")
+        version_name, version_code, source_commit, sha256 = validate_windows_provenance(
+            artifact, provenance
+        )
+        content_type = "application/zip"
+    else:
+        fail("provenance platform must be android or windows")
     if args.minimum_version_code < 1 or args.minimum_version_code > version_code:
         fail("minimum-version-code must be between 1 and the published versionCode")
     notes = normalized_notes(args)
 
-    channel_dir = args.update_dir.resolve() / "android" / args.channel
+    channel_dir = args.update_dir.resolve() / platform / args.channel
     release_dir = channel_dir / "releases"
     latest_path = channel_dir / "latest.json"
     if latest_path.exists():
@@ -134,7 +182,7 @@ def publish(args: argparse.Namespace) -> Path:
 
     release_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(args.update_dir.resolve(), 0o755)
-    os.chmod((args.update_dir.resolve() / "android"), 0o755)
+    os.chmod((args.update_dir.resolve() / platform), 0o755)
     os.chmod(channel_dir, 0o755)
     os.chmod(release_dir, 0o755)
     destination = release_dir / artifact.name
@@ -160,7 +208,7 @@ def publish(args: argparse.Namespace) -> Path:
     atomic_write(sidecar, f"{sha256}  {artifact.name}\n".encode("ascii"))
     manifest = {
         "schemaVersion": 1,
-        "platform": "android",
+        "platform": platform,
         "channel": args.channel,
         "versionName": version_name,
         "versionCode": version_code,
@@ -170,11 +218,11 @@ def publish(args: argparse.Namespace) -> Path:
         "minimumVersionCode": args.minimum_version_code,
         "notes": notes,
         "asset": {
-            "url": f"/v1/client-updates/android/{args.channel}/assets/{artifact.name}",
+            "url": f"/v1/client-updates/{platform}/{args.channel}/assets/{artifact.name}",
             "fileName": artifact.name,
             "sizeBytes": artifact.stat().st_size,
             "sha256": sha256,
-            "contentType": "application/vnd.android.package-archive",
+            "contentType": content_type,
         },
     }
     encoded = (json.dumps(manifest, ensure_ascii=False, separators=(",", ":")) + "\n").encode(

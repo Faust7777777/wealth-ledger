@@ -37,6 +37,27 @@ def provenance(artifact: Path, version_code: int) -> dict:
     }
 
 
+def windows_provenance(artifact: Path, version_code: int) -> dict:
+    content = artifact.read_bytes()
+    return {
+        "packageFormat": 4,
+        "clientVersion": f"1.2.0+{version_code}",
+        "versionName": "1.2.0",
+        "versionCode": version_code,
+        "createdAt": "2026-07-29T12:00:00Z",
+        "sourceCommit": "0123456789abcdef0123456789abcdef01234567",
+        "sourceDirty": False,
+        "dataSource": "api_remote",
+        "endpointMode": "runtime",
+        "apiBase": "",
+        "platform": "windows",
+        "networkPolicyVerified": True,
+        "archive": artifact.name,
+        "archiveSizeBytes": len(content),
+        "archiveSha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
 def run(*args: str, expect_ok: bool) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         [sys.executable, str(PUBLISHER), *args],
@@ -102,6 +123,29 @@ def main() -> None:
             expect_ok=False,
         )
         assert "file name" in rejected.stderr
+
+        windows = temp / "finwealth-1.2.0+4-windows-x64.zip"
+        windows.write_bytes(b"windows-zip-v4")
+        windows_manifest = temp / "windows.manifest.json"
+        windows_manifest.write_text(
+            json.dumps(windows_provenance(windows, 4)), encoding="utf-8"
+        )
+        run(
+            str(windows),
+            str(windows_manifest),
+            "--update-dir",
+            str(updates),
+            "--minimum-version-code",
+            "3",
+            expect_ok=True,
+        )
+        windows_latest = json.loads(
+            (updates / "windows/stable/latest.json").read_text(encoding="utf-8")
+        )
+        assert windows_latest["platform"] == "windows"
+        assert windows_latest["versionCode"] == 4
+        assert windows_latest["asset"]["contentType"] == "application/zip"
+        assert windows_latest["asset"]["url"].endswith(windows.name)
 
     print("Client update publish smoke passed.")
 

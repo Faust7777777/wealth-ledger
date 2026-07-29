@@ -26,3 +26,23 @@ tokens before the new endpoint becomes active.
 This remote package must not be confused with the paired Windows self-use
 package. The paired package includes a loopback Rust server; this package talks
 to a separately deployed VPS server.
+
+## Online updates
+
+The first package containing the Windows updater must be extracted manually.
+After that, Settings can check and download a newer Windows stable ZIP from the
+same HTTPS origin. The client streams the ZIP into
+`%LOCALAPPDATA%\Finwealth\updates`, verifies its exact size and SHA-256, then
+starts `Finwealth-Updater.ps1` from that controlled cache and exits.
+
+The helper independently verifies the archive hash, rejects absolute and
+traversing ZIP entries, runs the packaged integrity check, waits for the old App
+to exit, and replaces the install directory. A failed replacement restores the
+old directory. The preceding package is retained beside the install directory
+as `.finwealth-previous` until the next successful update, providing one local
+rollback copy without accumulating every historical release.
+
+Tokens and the saved server origin remain under `%APPDATA%\Finwealth`; neither
+the replacement nor rollback touches them. Keep the extracted package in a
+normal user-writable directory rather than `Program Files`, because the updater
+does not request administrator privileges.

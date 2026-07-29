@@ -67,6 +67,8 @@ LOCAL_RESTORE = ROOT / "tools" / "restore_local_ledger.ps1"
 LOCAL_BACKUP_RESTORE_SMOKE = ROOT / "tools" / "local_backup_restore_smoke.ps1"
 PACKAGE_SCRIPT = ROOT / "tools" / "package_release.ps1"
 PACKAGE_INTEGRITY_SMOKE = ROOT / "tools" / "package_integrity_smoke.ps1"
+WINDOWS_UPDATE_HELPER = ROOT / "tools" / "windows_update_helper.ps1"
+WINDOWS_UPDATE_HELPER_SMOKE = ROOT / "tools" / "windows_update_helper_smoke.ps1"
 WINDOWS_LAUNCHER = ROOT / "tools" / "windows_self_use_launcher.ps1"
 WINDOWS_LAUNCHER_CMD = ROOT / "tools" / "windows_self_use_launcher.cmd"
 WINDOWS_PACKAGE_DOC = ROOT / "docs" / "deploy" / "WINDOWS_SELF_USE_PACKAGE.md"
@@ -1852,6 +1854,8 @@ def check_release_packaging() -> None:
     for required in (
         PACKAGE_SCRIPT,
         PACKAGE_INTEGRITY_SMOKE,
+        WINDOWS_UPDATE_HELPER,
+        WINDOWS_UPDATE_HELPER_SMOKE,
         FRONTEND_LOCAL_SERVER_SMOKE,
         PYTHON_REQUIREMENTS,
         WINDOWS_LAUNCHER,
@@ -2013,6 +2017,16 @@ def check_release_packaging() -> None:
     if missing:
         fail("Package integrity smoke missing regression coverage: " + ", ".join(missing))
 
+    windows_update_smoke_text = WINDOWS_UPDATE_HELPER_SMOKE.read_text(encoding="utf-8")
+    for snippet in (
+        "ExpectedSha256",
+        "SkipParentWait",
+        "unsafe.zip",
+        "Windows update helper smoke passed",
+    ):
+        if snippet not in windows_update_smoke_text:
+            fail(f"Windows update helper smoke lacks required coverage: {snippet}")
+
     workflow_text = PACKAGE_WORKFLOW.read_text(encoding="utf-8")
     required_workflow_snippets = [
         "finwealth-windows-self-use-x64",
@@ -2027,6 +2041,7 @@ def check_release_packaging() -> None:
         "python tools/production_topology_smoke.py",
         "local_backup_restore_smoke.ps1",
         "package_integrity_smoke.ps1",
+        "windows_update_helper_smoke.ps1",
         "frontend_local_server_smoke.ps1",
         "flutter analyze",
         "flutter test",
@@ -2034,6 +2049,7 @@ def check_release_packaging() -> None:
         "Verify source remained clean",
         "needs: [verify-windows-source, verify-linux-server]",
         "*-windows-self-use-x64.zip.sha256",
+        "*-windows-server-client-x64.zip.manifest.json",
         "include_android_readonly_preview",
         "AndroidReadOnlyPreview",
         "android-readonly-preview-debug",

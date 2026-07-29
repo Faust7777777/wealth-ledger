@@ -1,6 +1,7 @@
 // Wealth Ledger — 应用更新状态机。
 // 检查/下载/校验全程与账本隔离：失败只反映在这一行 UI 上。
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -18,6 +19,11 @@ abstract interface class ClientUpdatePlatform {
   Future<bool> canInstallPackages();
   Future<void> openInstallPermissionSettings();
   Future<void> openInstaller(String path);
+}
+
+/// Windows helper needs the already-reviewed archive digest as a second gate.
+abstract interface class VerifiedClientUpdatePlatform {
+  Future<void> openVerifiedInstaller(String path, String sha256);
 }
 
 class AndroidClientUpdatePlatform implements ClientUpdatePlatform {
@@ -50,6 +56,119 @@ class AndroidClientUpdatePlatform implements ClientUpdatePlatform {
   @override
   Future<void> openInstaller(String path) =>
       _channel.invokeMethod<void>('openInstaller', {'path': path});
+}
+
+typedef WindowsProcessStarter =
+    Future<Process> Function(
+      String executable,
+      List<String> arguments,
+      String? workingDirectory,
+      ProcessStartMode mode,
+    );
+
+InstalledVersionVm parsePackagedClientVersion(String rawJson) {
+  final value = jsonDecode(rawJson) as Map<String, dynamic>;
+  final raw = '${value['clientVersion'] ?? ''}'.trim();
+  final match = RegExp(r'^(.+)\+([1-9][0-9]*)$').firstMatch(raw);
+  if (match == null) throw const FormatException('invalid client version');
+  return InstalledVersionVm(
+    versionName: match.group(1)!,
+    versionCode: int.parse(match.group(2)!),
+  );
+}
+
+class WindowsClientUpdatePlatform
+    implements ClientUpdatePlatform, VerifiedClientUpdatePlatform {
+  WindowsClientUpdatePlatform({
+    String? resolvedExecutable,
+    Map<String, String>? environment,
+    WindowsProcessStarter? processStarter,
+    void Function(int)? exitApplication,
+  }) : _resolvedExecutable = resolvedExecutable ?? Platform.resolvedExecutable,
+       _environment = environment ?? Platform.environment,
+       _processStarter =
+           processStarter ??
+           ((executable, arguments, workingDirectory, mode) => Process.start(
+             executable,
+             arguments,
+             workingDirectory: workingDirectory,
+             mode: mode,
+           )),
+       _exitApplication = exitApplication ?? exit;
+
+  final String _resolvedExecutable;
+  final Map<String, String> _environment;
+  final WindowsProcessStarter _processStarter;
+  final void Function(int) _exitApplication;
+
+  Directory get _installDir => File(_resolvedExecutable).parent;
+
+  @override
+  Future<InstalledVersionVm> installedVersion() async {
+    final config = File('${_installDir.path}\\finwealth.build-config.json');
+    return parsePackagedClientVersion(await config.readAsString());
+  }
+
+  @override
+  Future<String> updateCacheDir() async {
+    final localAppData = _environment['LOCALAPPDATA'];
+    if (localAppData == null || localAppData.trim().isEmpty) {
+      throw StateError('LOCALAPPDATA is unavailable');
+    }
+    final dir = Directory('$localAppData\\Finwealth\\updates');
+    await dir.create(recursive: true);
+    return dir.path;
+  }
+
+  @override
+  Future<bool> canInstallPackages() async => true;
+
+  @override
+  Future<void> openInstallPermissionSettings() async {}
+
+  @override
+  Future<void> openInstaller(String path) =>
+      throw UnsupportedError('Windows updates require a verified digest');
+
+  @override
+  Future<void> openVerifiedInstaller(String path, String sha256) async {
+    final cache = Directory(await updateCacheDir()).absolute;
+    final archive = File(path).absolute;
+    if (!await archive.exists() ||
+        archive.parent.path.toLowerCase() != cache.path.toLowerCase() ||
+        !archive.path.toLowerCase().endsWith('.zip')) {
+      throw StateError('archive is outside the update cache');
+    }
+    if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(sha256)) {
+      throw StateError('invalid archive digest');
+    }
+    final source = File('${_installDir.path}\\Finwealth-Updater.ps1');
+    if (!await source.exists()) throw StateError('update helper is missing');
+    final helper = File('${cache.path}\\Finwealth-Updater.ps1');
+    await source.copy(helper.path);
+    await _processStarter(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        helper.path,
+        '-Archive',
+        archive.path,
+        '-InstallDir',
+        _installDir.path,
+        '-ParentPid',
+        '$pid',
+        '-ExpectedSha256',
+        sha256,
+      ],
+      cache.path,
+      ProcessStartMode.detached,
+    );
+    _exitApplication(0);
+  }
 }
 
 enum AppUpdatePhase {
@@ -297,7 +416,16 @@ class AppUpdateController extends Notifier<AppUpdateState> {
         await platform.openInstallPermissionSettings();
         return;
       }
-      await platform.openInstaller(path);
+      if (platform is VerifiedClientUpdatePlatform) {
+        final digest = state.manifest?.asset.sha256;
+        if (digest == null) throw StateError('update digest is missing');
+        await (platform as VerifiedClientUpdatePlatform).openVerifiedInstaller(
+          path,
+          digest,
+        );
+      } else {
+        await platform.openInstaller(path);
+      }
       state = state.copyWith(phase: AppUpdatePhase.readyToInstall);
     } catch (_) {
       state = state.copyWith(
@@ -330,13 +458,17 @@ final appUpdateControllerProvider =
       AppUpdateController.new,
     );
 
-/// 只有 Android 提供更新能力；其他平台返回 null，设置页不显示这一行。
+/// Android 和 Windows 提供更新能力；其他平台不显示这一行。
 final clientUpdatePlatformProvider = Provider<ClientUpdatePlatform?>((ref) {
-  if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return null;
-  return const AndroidClientUpdatePlatform();
+  if (kIsWeb) return null;
+  return switch (defaultTargetPlatform) {
+    TargetPlatform.android => const AndroidClientUpdatePlatform(),
+    TargetPlatform.windows => WindowsClientUpdatePlatform(),
+    _ => null,
+  };
 });
 
-/// 更新服务只在 Android + 远端 HTTPS 模式下存在：
+/// 更新服务只在 Android/Windows + 远端 HTTPS 模式下存在：
 /// local_server/DEMO 不向 loopback HTTP 检查更新，也不绕过生产门禁。
 final clientUpdateServiceProvider = Provider<ClientUpdateService?>((ref) {
   final platform = ref.watch(clientUpdatePlatformProvider);
@@ -351,7 +483,7 @@ final clientUpdateServiceProvider = Provider<ClientUpdateService?>((ref) {
   }
   return ClientUpdateService(
     apiBaseUrl: env.apiBaseUrl,
-    platform: 'android',
+    platform: platform is WindowsClientUpdatePlatform ? 'windows' : 'android',
     cacheDirProvider: platform.updateCacheDir,
   );
 });

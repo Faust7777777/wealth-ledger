@@ -1,6 +1,6 @@
 # Client Update V1
 
-状态：后端已实现，Flutter 客户端待接入。
+状态：后端、Android 客户端与 Windows 客户端已实现。
 
 ## 目标
 
@@ -55,6 +55,8 @@ GET /v1/client-updates/{platform}/{channel}/assets/{fileName}
 4. 下载失败不影响账本使用；不清 token、不改服务器地址。
 5. `mandatory=false` 时允许稍后；`mandatory=true` 也保留退出 App 的能力，不制造不可退出的假死界面。
 6. 不把 APK、下载 URL、文件路径或安装状态写入 Agent 记忆。
+7. Windows ZIP 校验通过后，由独立 helper 等待 App 退出、验证压缩包路径、阻止目录穿越、验证包内 manifest，再替换程序目录；替换失败必须恢复上一版。
+8. Windows 的 token 与服务器地址保存在 `%APPDATA%\\Finwealth`，不得随程序目录替换或回滚。
 
 ## 发布不变量
 

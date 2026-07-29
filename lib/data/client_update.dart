@@ -1,4 +1,4 @@
-// Wealth Ledger — 应用内更新（Android P0）。
+// Wealth Ledger — Android / Windows 应用内更新。
 // 更新接口公开可读：这里不复用 DevApiClient，不带 bearer、不参与 401 刷新，
 // 因此更新失败绝不会影响账本登录态。
 import 'dart:async';
@@ -95,7 +95,8 @@ Uri resolveUpdateAssetUrl(String apiBaseUrl, String assetUrl) {
 }
 
 final RegExp _sha256Hex = RegExp(r'^[a-f0-9]{64}$');
-final RegExp _androidAssetName = RegExp(r'^[A-Za-z0-9][A-Za-z0-9._-]*\.apk$');
+final RegExp _androidAssetName = RegExp(r'^[A-Za-z0-9][A-Za-z0-9._+-]*\.apk$');
+final RegExp _windowsAssetName = RegExp(r'^[A-Za-z0-9][A-Za-z0-9._+-]*\.zip$');
 
 ClientUpdateManifestVm parseClientUpdateManifest(Map<String, dynamic> j) {
   final asset = (j['asset'] as Map).cast<String, dynamic>();
@@ -112,6 +113,9 @@ ClientUpdateManifestVm parseClientUpdateManifest(Map<String, dynamic> j) {
     throw ClientUpdateRejected('更新信息不完整');
   }
   if (j['platform'] == 'android' && !_androidAssetName.hasMatch(fileName)) {
+    throw ClientUpdateRejected('更新信息不完整');
+  }
+  if (j['platform'] == 'windows' && !_windowsAssetName.hasMatch(fileName)) {
     throw ClientUpdateRejected('更新信息不完整');
   }
   return ClientUpdateManifestVm(
