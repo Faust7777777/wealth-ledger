@@ -407,6 +407,13 @@ class FixturePortfolioRepository implements PortfolioRepository {
     Id accountId,
     HoldingAdjustmentInput input,
   ) async => throw UnsupportedError('DEMO 演示只读，不支持持仓校准；请用 local_server');
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingSnapshot(
+    Id accountId, {
+    required List<HoldingSnapshotPositionInput> positions,
+    IsoDateTime? asOf,
+    String? note,
+  }) async => throw UnsupportedError('DEMO 演示只读，不支持持仓快照；请用 local_server');
 }
 
 class FixtureMovementRepository implements MovementRepository {

@@ -387,6 +387,8 @@ class MovementVm {
     this.counterpartyId,
     this.saleResult,
     this.costBasisFx,
+    this.tags = const [],
+    this.holdingAdjustment,
   });
   final Id id;
   final Id atomicGroupId;
@@ -407,6 +409,50 @@ class MovementVm {
 
   /// 跨币种买入固化的成本换算依据（只读；旧记录可缺失）。
   final ExecutionFxBasisVm? costBasisFx;
+
+  /// 服务端标签（如 holding_adjustment / holding_snapshot）。
+  final List<String> tags;
+
+  /// 持仓调整候选的 previous → target（只有调整类记录才有）。
+  final HoldingAdjustmentVm? holdingAdjustment;
+}
+
+/// 一笔持仓调整候选：确认前不改变任何持仓。
+class HoldingAdjustmentVm {
+  const HoldingAdjustmentVm({
+    required this.accountId,
+    required this.instrumentId,
+    required this.previousQuantity,
+    required this.targetQuantity,
+  });
+  final Id accountId;
+  final Id instrumentId;
+  final DecimalString previousQuantity;
+  final DecimalString targetQuantity;
+}
+
+/// 快照里数量没变化、因此没有生成 movement 的标的。
+class HoldingSnapshotSkippedVm {
+  const HoldingSnapshotSkippedVm({
+    required this.instrumentId,
+    required this.quantity,
+    required this.reason,
+  });
+  final Id instrumentId;
+  final DecimalString quantity;
+
+  /// 目前只有 unchanged。
+  final String reason;
+}
+
+/// 提交多资产持仓快照的一项。数量为非负十进制字符串，不经 double。
+class HoldingSnapshotPositionInput {
+  const HoldingSnapshotPositionInput({
+    required this.instrumentId,
+    required this.targetQuantity,
+  });
+  final Id instrumentId;
+  final DecimalString targetQuantity;
 }
 
 /// 已实现盈亏状态（wire: calculated / calculated_with_fx /
@@ -855,6 +901,8 @@ class AiAtomicGroupVm {
     this.warnings = const [],
     this.proposedMovement,
     this.isValid = true,
+    this.proposedMovements = const [],
+    this.skippedPositions = const [],
   });
   final Id id;
   final String title;
@@ -865,6 +913,12 @@ class AiAtomicGroupVm {
 
   /// 结构化候选记录（proposedMovements[0]）；待补全候选为 null。
   final MovementVm? proposedMovement;
+
+  /// 组内全部候选记录：持仓快照会有多条（每个变化的标的一条）。
+  final List<MovementVm> proposedMovements;
+
+  /// 数量未变化因而被跳过的标的（只有持仓快照会返回）。
+  final List<HoldingSnapshotSkippedVm> skippedPositions;
 
   /// 服务端 validation.isValid（缺失按 true 兼容旧候选）。
   final bool isValid;

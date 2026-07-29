@@ -2497,6 +2497,14 @@ class _PreviewCryptoPortfolioRepo implements PortfolioRepository {
     Id accountId,
     HoldingAdjustmentInput input,
   ) => throw UnsupportedError('preview');
+
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingSnapshot(
+    Id accountId, {
+    required List<HoldingSnapshotPositionInput> positions,
+    IsoDateTime? asOf,
+    String? note,
+  }) => throw UnsupportedError('unused');
 }
 
 /// 预览用只读 movement 仓库。
@@ -2562,6 +2570,14 @@ class _PreviewPortfolioRepo implements PortfolioRepository {
     Id accountId,
     HoldingAdjustmentInput input,
   ) => throw UnsupportedError('unused');
+
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingSnapshot(
+    Id accountId, {
+    required List<HoldingSnapshotPositionInput> positions,
+    IsoDateTime? asOf,
+    String? note,
+  }) => throw UnsupportedError('unused');
 }
 
 /// 预览用更新平台与控制器：不触网、不做文件 I/O。

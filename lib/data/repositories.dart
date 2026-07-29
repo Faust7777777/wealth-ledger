@@ -53,6 +53,16 @@ abstract interface class PortfolioRepository {
     Id accountId,
     HoldingAdjustmentInput input,
   );
+
+  /// 多资产持仓快照：一次提交同一账户下多个标的的目标数量，
+  /// 服务端生成一个审核组（每个发生变化的标的一条候选记录）。
+  /// 确认前不改变持仓与估值；全部数量未变化时返回 409。仅 local_server。
+  Future<AiAtomicGroupVm> proposeHoldingSnapshot(
+    Id accountId, {
+    required List<HoldingSnapshotPositionInput> positions,
+    IsoDateTime? asOf,
+    String? note,
+  });
 }
 
 abstract interface class MovementRepository {

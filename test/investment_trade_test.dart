@@ -201,6 +201,14 @@ class _FakePortfolioRepo implements PortfolioRepository {
     Id accountId,
     HoldingAdjustmentInput input,
   ) => throw UnsupportedError('unused');
+
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingSnapshot(
+    Id accountId, {
+    required List<HoldingSnapshotPositionInput> positions,
+    IsoDateTime? asOf,
+    String? note,
+  }) => throw UnsupportedError('unused');
 }
 
 Widget _formHost(MovementRepository movementRepo) => ProviderScope(

@@ -812,6 +812,19 @@ MovementVm _movement(Map<String, dynamic> j) {
     counterpartyId: j['counterpartyId'] as String?,
     saleResult: _saleResult(j['saleResult']),
     costBasisFx: _fxBasis(j['costBasisFx']),
+    tags: [for (final t in _list(j['tags'])) '$t'],
+    holdingAdjustment: _holdingAdjustment(j['holdingAdjustment']),
+  );
+}
+
+HoldingAdjustmentVm? _holdingAdjustment(Object? raw) {
+  if (raw is! Map) return null;
+  final j = _m(raw);
+  return HoldingAdjustmentVm(
+    accountId: '${j['accountId']}',
+    instrumentId: '${j['instrumentId']}',
+    previousQuantity: '${j['previousQuantity']}',
+    targetQuantity: '${j['targetQuantity']}',
   );
 }
 
@@ -901,6 +914,16 @@ AiAtomicGroupVm _group(Map<String, dynamic> j) {
     ],
     proposedMovement: proposed.isEmpty ? null : _movement(_m(proposed.first)),
     isValid: _bool(validation['isValid'], fallback: true),
+    proposedMovements: [for (final m in proposed) _movement(_m(m))],
+    skippedPositions: [
+      for (final sp in _list(j['skippedPositions']))
+        if (sp is Map)
+          HoldingSnapshotSkippedVm(
+            instrumentId: '${_m(sp)['instrumentId']}',
+            quantity: '${_m(sp)['quantity']}',
+            reason: '${_m(sp)['reason']}',
+          ),
+    ],
   );
 }
 
@@ -1267,6 +1290,31 @@ class LocalServerPortfolioRepository implements PortfolioRepository {
           'targetQuantity': input.targetQuantity,
           if (input.asOf != null) 'asOf': input.asOf,
           if (input.note != null && input.note!.isNotEmpty) 'note': input.note,
+        },
+      ),
+    ),
+  );
+
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingSnapshot(
+    Id accountId, {
+    required List<HoldingSnapshotPositionInput> positions,
+    IsoDateTime? asOf,
+    String? note,
+  }) async => _group(
+    _m(
+      await _c.postData(
+        '/v1/accounts/$accountId/holding-snapshot-proposals',
+        body: {
+          'positions': [
+            for (final p in positions)
+              {
+                'instrumentId': p.instrumentId,
+                'targetQuantity': p.targetQuantity,
+              },
+          ],
+          'asOf': ?asOf,
+          if (note != null && note.isNotEmpty) 'note': note,
         },
       ),
     ),

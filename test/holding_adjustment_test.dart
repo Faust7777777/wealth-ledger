@@ -175,6 +175,14 @@ class _FakePortfolioRepo implements PortfolioRepository {
     Id accountId,
     HoldingAdjustmentInput input,
   ) => inner.proposeHoldingAdjustment(accountId, input);
+
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingSnapshot(
+    Id accountId, {
+    required List<HoldingSnapshotPositionInput> positions,
+    IsoDateTime? asOf,
+    String? note,
+  }) => throw UnsupportedError('unused');
 }
 
 class _FakeAccountRepo implements AccountRepository {
