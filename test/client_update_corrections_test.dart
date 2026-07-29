@@ -315,6 +315,12 @@ void main() {
     });
 
     test('Android 资源必须是安全的 .apk 文件名', () {
+      expect(
+        parseClientUpdateManifest(
+          _manifestJson(fileName: 'finwealth-1.1.0+3-android.apk'),
+        ).asset.fileName,
+        'finwealth-1.1.0+3-android.apk',
+      );
       for (final bad in [
         '../evil.apk',
         'evil.apk/../x',

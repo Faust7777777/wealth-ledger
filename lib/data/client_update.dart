@@ -95,7 +95,7 @@ Uri resolveUpdateAssetUrl(String apiBaseUrl, String assetUrl) {
 }
 
 final RegExp _sha256Hex = RegExp(r'^[a-f0-9]{64}$');
-final RegExp _androidAssetName = RegExp(r'^[A-Za-z0-9][A-Za-z0-9._-]*\.apk$');
+final RegExp _androidAssetName = RegExp(r'^[A-Za-z0-9][A-Za-z0-9._+-]*\.apk$');
 
 ClientUpdateManifestVm parseClientUpdateManifest(Map<String, dynamic> j) {
   final asset = (j['asset'] as Map).cast<String, dynamic>();
