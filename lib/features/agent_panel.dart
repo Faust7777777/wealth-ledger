@@ -13,6 +13,7 @@ import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
+import 'agent_chat_view.dart';
 import 'agent_controller.dart';
 import 'agent_providers_page.dart';
 import 'agent_notifications.dart'
@@ -347,7 +348,11 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
                       onRetry: () =>
                           ref.read(agentChatProvider.notifier).reload(),
                     )
-                  : _MessageList(chat: chat),
+                  : AgentTranscript(
+                      chat: chat,
+                      attachmentBuilder: (_, id) =>
+                          AgentAttachmentPreview(attachmentId: id),
+                    ),
           },
         ),
         if (gate == AgentPanelGate.ready &&
@@ -975,88 +980,6 @@ class _MemorySuggestions extends ConsumerWidget {
             ),
           ),
       ],
-    );
-  }
-}
-
-class _MessageList extends ConsumerWidget {
-  const _MessageList({required this.chat});
-  final AgentChatState chat;
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final hasPending =
-        (ref.watch(aiPendingProvider).asData?.value ?? const []).isNotEmpty;
-    return ListView(
-      padding: const EdgeInsets.all(AppSpacing.base),
-      children: [
-        if (chat.messages.isEmpty)
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: AppSpacing.lg),
-            child: Text('还没有对话', style: AppType.caption),
-          ),
-        for (final m in chat.messages)
-          if (m.role != AgentMessageRole.system) _MessageBubble(message: m),
-        if (chat.activity != null)
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
-            child: Text(chat.activity!, style: AppType.caption),
-          ),
-        if (hasPending)
-          Align(
-            alignment: Alignment.centerLeft,
-            child: TextButton(
-              onPressed: () => context.push('/ai-review'),
-              child: const Text('前往审核'),
-            ),
-          ),
-      ],
-    );
-  }
-}
-
-class _MessageBubble extends StatelessWidget {
-  const _MessageBubble({required this.message});
-  final AgentMessageVm message;
-
-  @override
-  Widget build(BuildContext context) {
-    final mine = message.role == AgentMessageRole.user;
-    final scheme = Theme.of(context).colorScheme;
-    return Align(
-      alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
-        padding: const EdgeInsets.all(AppSpacing.sm),
-        constraints: const BoxConstraints(maxWidth: 520),
-        decoration: BoxDecoration(
-          color: mine
-              ? scheme.secondaryContainer
-              : scheme.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(AppRadius.sm),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (message.attachmentIds.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(bottom: AppSpacing.xs),
-                child: Wrap(
-                  spacing: AppSpacing.xs,
-                  runSpacing: AppSpacing.xs,
-                  children: [
-                    for (final id in message.attachmentIds)
-                      AgentAttachmentPreview(attachmentId: id),
-                  ],
-                ),
-              ),
-            if (message.text.isNotEmpty)
-              Text(message.text, style: AppType.body)
-            else if (message.status == AgentMessageStatus.queued)
-              Text('排队中…', style: AppType.caption),
-          ],
-        ),
-      ),
     );
   }
 }

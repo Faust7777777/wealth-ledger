@@ -95,6 +95,9 @@ Future<void> _settleEntrance(WidgetTester tester) async {
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 500));
   await tester.pump(const Duration(milliseconds: 500));
+  // 对话列表首帧后还会排一次滚动到底（延时 + 有限动画），多推进两拍收尾。
+  await tester.pump(const Duration(milliseconds: 500));
+  await tester.pump(const Duration(milliseconds: 500));
 }
 
 // 仅当 PREVIEW_GOLDENS=1 时运行，避免机器相关的 golden 进入常规测试门禁。
@@ -1423,6 +1426,7 @@ void main() {
     AgentAttachmentVm? attachmentMeta,
     List<AgentNotificationVm> notifications = const [],
     Object? statusFailure,
+    double? railWidth,
   }) => ProviderScope(
     overrides: [
       if (picker != null)
@@ -1458,7 +1462,18 @@ void main() {
     child: MaterialApp(
       theme: theme,
       debugShowCheckedModeBanner: false,
-      home: const Scaffold(body: AgentPanel()),
+      home: Scaffold(
+        body: railWidth == null
+            ? const AgentPanel()
+            // Windows 右栏：面板固定宽度，左边留主内容区。
+            : Row(
+                children: [
+                  const Expanded(child: SizedBox.expand()),
+                  const VerticalDivider(width: 1),
+                  SizedBox(width: railWidth, child: const AgentPanel()),
+                ],
+              ),
+      ),
     ),
   );
 
@@ -1525,6 +1540,109 @@ void main() {
       await expectLater(
         find.byType(AgentPanel),
         matchesGoldenFile('goldens/agent_panel_streaming_$name.png'),
+      );
+    });
+  }
+
+  // —— 2026-07-29 批：对话渲染改造 ——
+  const markdownAnswer =
+      '这个月的现金流我按三块看：\n\n'
+      '- 固定支出仍是房贷与订阅，占比最大\n'
+      '- 浮动支出集中在餐饮\n'
+      '- 结余已经转入货币基金\n\n'
+      '需要我把 `餐饮` 这一类单独拉出来吗？\n\n'
+      '```text\n固定 12,400\n浮动  3,180\n结余  4,220\n```';
+
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('agent chat markdown - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(360, 720));
+      await tester.pumpWidget(
+        agentHost(
+          theme,
+          messages: [
+            agentMessage('m1', AgentMessageRole.user, '这个月的钱都花哪了'),
+            agentMessage('m2', AgentMessageRole.assistant, markdownAnswer),
+          ],
+        ),
+      );
+      await _settleEntrance(tester);
+      await expectLater(
+        find.byType(AgentPanel),
+        matchesGoldenFile('goldens/agent_chat_markdown_$name.png'),
+      );
+    });
+
+    testWidgets(
+      'agent chat activity attachment - $name',
+      skip: !_previewEnabled,
+      (tester) async {
+        await sized(tester, const Size(360, 720));
+        await tester.pumpWidget(
+          agentHost(
+            theme,
+            messages: [
+              agentMessage(
+                'm1',
+                AgentMessageRole.user,
+                '这份对账单帮我看下',
+                attachmentIds: ['att_1'],
+              ),
+            ],
+            attachmentMeta: const AgentAttachmentVm(
+              id: 'att_1',
+              fileName: '2026-06-statement.pdf',
+              mimeType: 'application/pdf',
+              sizeBytes: 184320,
+              sha256: 'b',
+              createdAt: '2026-07-29T00:00:00Z',
+            ),
+            events: const [
+              AgentEventVm(
+                cursor: 1,
+                type: AgentEventType.toolStarted,
+                runId: 'run_1',
+                toolName: 'finwealth_lookup_fx_candidate',
+              ),
+            ],
+          ),
+        );
+        await _settleEntrance(tester);
+        await expectLater(
+          find.byType(AgentPanel),
+          matchesGoldenFile('goldens/agent_chat_activity_$name.png'),
+        );
+      },
+    );
+
+    testWidgets('agent chat wide panel - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(1280, 720));
+      await tester.pumpWidget(
+        agentHost(
+          theme,
+          railWidth: 360,
+          messages: [
+            agentMessage('m1', AgentMessageRole.user, '把上半年的结余讲清楚'),
+            agentMessage(
+              'm2',
+              AgentMessageRole.assistant,
+              '$markdownAnswer\n\n补充一句：上半年结余的节奏比去年稳，'
+                  '主要是浮动支出没有再出现单月冲高，'
+                  '所以即使收入没有变化，结余曲线也是逐月抬升的。',
+            ),
+          ],
+        ),
+      );
+      await _settleEntrance(tester);
+      await expectLater(
+        find.byType(AgentPanel),
+        matchesGoldenFile('goldens/agent_chat_wide_panel_$name.png'),
       );
     });
   }
