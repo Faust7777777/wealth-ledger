@@ -14,3 +14,13 @@
 - 没有重做 Account/Holding/Instrument 模型。
 - 没有自动创建标的、自动采用报价或自动确认持仓。
 - 没有修改 Flutter 前端和生产账本数据。
+
+## 验证与部署
+
+- Rust 全量 150 条通过；Node 全量 29 条通过；TypeScript check/build、OpenAPI 契约门禁和 `git diff --check` 通过。
+- 已部署提交 `6a4c7e2` 的 Rust 服务与 Agent sidecar；loopback、公网 health 及两个 systemd unit 正常。
+- 生产只做了不存在账户的无写入路由探针，返回 404；已核实 Agent 构建包含 `finwealth_propose_holding_snapshot`。
+- 部署前账本备份：`/var/backups/finwealth/20260729-112016Z`。
+- 部署前 Agent 状态备份：`/var/backups/finwealth-agent/20260729-112016Z`。
+- 代码回滚副本：`/opt/finwealth/rollback-20260729-112016Z`。
+- 未修改 Caddy、Cloudflare、sub2api、中转站配置或生产账本内容。
