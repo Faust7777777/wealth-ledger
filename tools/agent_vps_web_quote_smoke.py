@@ -19,6 +19,28 @@ NONCE = secrets.token_hex(8)
 USER_ID = f"usr_web_quote_smoke_{NONCE}"
 
 
+def selected_model(models: object) -> dict[str, object]:
+    if not isinstance(models, list):
+        raise RuntimeError("Agent model list is invalid")
+    model_id = (
+        os.environ.get("FINWEALTH_AGENT_SMOKE_MODEL_ID", "").strip()
+        or os.environ.get("FINWEALTH_AGENT_DEFAULT_MODEL_ID", "").strip()
+    )
+    if not model_id:
+        raise RuntimeError("an explicit Agent smoke model ID is required")
+    model = next(
+        (
+            item
+            for item in models
+            if isinstance(item, dict) and item.get("id") == model_id
+        ),
+        None,
+    )
+    if model is None:
+        raise RuntimeError("explicit Agent smoke model is unavailable")
+    return model
+
+
 def token() -> str:
     value = os.environ.get("FINWEALTH_AGENT_INTERNAL_TOKEN", "").strip()
     if not value:
@@ -114,7 +136,7 @@ def main() -> None:
     )
     assert isinstance(conversation, dict)
     models = request("GET", "/models")
-    model = next(item for item in models if item.get("provider") == "lore")
+    model = selected_model(models)
     request(
         "PATCH",
         f"/conversations/{conversation['id']}",

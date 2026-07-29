@@ -36,3 +36,20 @@ Branch: `feat/agent-provider-oauth`
 
 OAuth cannot be completed unattended because the account owner must approve the
 device code in their browser.
+
+## Production acceptance
+
+- Sidecar `91f2543` was atomically deployed; `dist.before-91f2543` remains as a
+  code-only rollback point.
+- The account owner completed xAI device authorization and the server reports
+  xAI connected.
+- Production was migrated to the explicit `xai/grok-4.5` default. Active model
+  configuration, environment keys and stored credential provider IDs were
+  checked structurally: Lore is absent and no credential value was printed.
+- After the migration and service restart, real Grok 4.5 smokes passed for a
+  synthetic PNG, PDF, XLSX, the Finwealth FX tool and a suggested USD/CNY quote.
+  The authoritative quote summary stayed unchanged and isolated smoke state was
+  removed.
+- VPS smoke scripts now require an explicit model ID from
+  `FINWEALTH_AGENT_SMOKE_MODEL_ID` or `FINWEALTH_AGENT_DEFAULT_MODEL_ID`; they
+  no longer locate a Lore provider or choose another model.

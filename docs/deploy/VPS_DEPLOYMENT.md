@@ -60,6 +60,10 @@ set -a; . /etc/finwealth/agent.env; set +a
 python3 tools/agent_vps_document_smoke.py
 ```
 
+Production model smokes require an explicit
+`FINWEALTH_AGENT_SMOKE_MODEL_ID`, or use the configured
+`FINWEALTH_AGENT_DEFAULT_MODEL_ID`. They never choose another available model.
+
 For the xAI subscription path, the sidecar uses Pi's OAuth device-code flow.
 Run `sudo python3 tools/prepare_vps_xai_oauth.py` once to remove the legacy Lore
 provider and set the explicit model to `xai/grok-4.5`. The authenticated app

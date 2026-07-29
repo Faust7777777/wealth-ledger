@@ -1,22 +1,49 @@
 #!/usr/bin/env python3
-"""Real-model PDF/XLSX workspace smoke for an installed Linux sidecar."""
+"""Real-model image/PDF/XLSX smoke for an installed Linux sidecar."""
 
 from __future__ import annotations
 
 import json
 import os
 import secrets
+import shutil
+import struct
 import subprocess
 import tempfile
 import time
 import urllib.error
 import urllib.request
 import zipfile
+import zlib
 from pathlib import Path
 
 
 BASE = "http://127.0.0.1:8792/v1/agent"
 TIMEOUT_SECONDS = 600
+NONCE = secrets.token_hex(8)
+USER_ID = f"usr_document_smoke_{NONCE}"
+
+
+def selected_model(models: object) -> dict[str, object]:
+    if not isinstance(models, list):
+        raise RuntimeError("Agent model list is invalid")
+    model_id = (
+        os.environ.get("FINWEALTH_AGENT_SMOKE_MODEL_ID", "").strip()
+        or os.environ.get("FINWEALTH_AGENT_DEFAULT_MODEL_ID", "").strip()
+    )
+    if not model_id:
+        raise RuntimeError("an explicit Agent smoke model ID is required")
+    model = next(
+        (
+            item
+            for item in models
+            if isinstance(item, dict) and item.get("id") == model_id
+        ),
+        None,
+    )
+    if model is None:
+        raise RuntimeError("explicit Agent smoke model is unavailable")
+    return model
 
 
 def headers(*, idempotency_key: str | None = None) -> dict[str, str]:
@@ -25,7 +52,7 @@ def headers(*, idempotency_key: str | None = None) -> dict[str, str]:
         raise RuntimeError("FINWEALTH_AGENT_INTERNAL_TOKEN is required")
     result = {
         "x-finwealth-internal-token": token,
-        "x-finwealth-user-id": "usr_owner",
+        "x-finwealth-user-id": USER_ID,
         "x-finwealth-ledger-id": "ledger_default",
         "x-finwealth-device-id": "vps_document_smoke",
     }
@@ -121,6 +148,26 @@ def write_xlsx(path: Path, marker: str) -> None:
             archive.writestr(name, content)
 
 
+def solid_png(red: int, green: int, blue: int, size: int = 128) -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    row = b"\x00" + bytes((red, green, blue)) * size
+    pixels = row * size
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(pixels, 9))
+        + chunk(b"IEND", b"")
+    )
+
+
 def upload(path: Path, mime_type: str, key: str) -> str:
     boundary = f"----finwealth-{secrets.token_hex(16)}"
     content = path.read_bytes()
@@ -172,7 +219,7 @@ def run_event_summary(conversation_id: str, run_id: str) -> list[str]:
 
 def session_tool_diagnostic(marker: str) -> str:
     state_dir = Path(os.environ.get("FINWEALTH_AGENT_STATE_DIR", "/var/lib/finwealth-agent"))
-    sessions = sorted((state_dir / "users" / "usr_owner" / "sessions").glob("*.jsonl"))
+    sessions = sorted((state_dir / "users" / USER_ID / "sessions").glob("*.jsonl"))
     if not sessions:
         return "session=false"
     command_uses_pdftotext = False
@@ -196,6 +243,18 @@ def session_tool_diagnostic(marker: str) -> str:
     )
 
 
+def cleanup() -> None:
+    state_dir = Path(
+        os.environ.get("FINWEALTH_AGENT_STATE_DIR", "/var/lib/finwealth-agent")
+    ).resolve()
+    users = (state_dir / "users").resolve()
+    target = (users / USER_ID).resolve()
+    if target.parent != users or not target.name.startswith("usr_document_smoke_"):
+        raise RuntimeError("refusing unsafe document smoke cleanup")
+    if target.exists():
+        shutil.rmtree(target)
+
+
 def run_document(
     file_path: Path,
     mime_type: str,
@@ -212,7 +271,7 @@ def run_document(
     )
     assert isinstance(conversation, dict)
     models = request("GET", "/models")
-    model = next(item for item in models if item.get("provider") == "lore")
+    model = selected_model(models)
     conversation = request(
         "PATCH",
         f"/conversations/{conversation['id']}",
@@ -255,6 +314,57 @@ def run_document(
     raise TimeoutError("document Agent run timed out")
 
 
+def run_image(file_path: Path, expected_terms: tuple[str, ...]) -> None:
+    nonce = secrets.token_hex(8)
+    conversation = request(
+        "POST",
+        "/conversations",
+        body={"title": f"Image smoke {nonce}"},
+        idempotency_key=f"vps-image-conversation-{nonce}",
+    )
+    assert isinstance(conversation, dict)
+    model = selected_model(request("GET", "/models"))
+    request(
+        "PATCH",
+        f"/conversations/{conversation['id']}",
+        body={"modelId": model["id"]},
+        idempotency_key=f"vps-image-model-{nonce}",
+    )
+    attachment_id = upload(file_path, "image/png", f"vps-image-upload-{nonce}")
+    accepted = request(
+        "POST",
+        f"/conversations/{conversation['id']}/messages",
+        body={
+            "text": "查看所附纯色图片，只回复它的主色名称。",
+            "attachmentIds": [attachment_id],
+        },
+        idempotency_key=f"vps-image-message-{nonce}",
+    )
+    deadline = time.monotonic() + TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        messages = request("GET", f"/conversations/{conversation['id']}/messages")
+        assistant = next(
+            (
+                item
+                for item in messages
+                if item.get("role") == "assistant"
+                and item.get("runId") == accepted["runId"]
+            ),
+            None,
+        )
+        if assistant and assistant.get("status") == "failed":
+            raise RuntimeError(
+                f"image Agent run failed: {assistant.get('errorCode', 'unknown')}"
+            )
+        if assistant and assistant.get("status") == "completed":
+            text = str(assistant.get("text", "")).lower()
+            if not any(term in text for term in expected_terms):
+                raise RuntimeError("model did not identify the synthetic image color")
+            return
+        time.sleep(0.25)
+    raise TimeoutError("image Agent run timed out")
+
+
 def main() -> None:
     ready_deadline = time.monotonic() + 30
     while True:
@@ -283,6 +393,9 @@ def main() -> None:
         xlsx_marker = "FINWEALTH_XLSX_4M8"
         xlsx = root / "smoke.xlsx"
         write_xlsx(xlsx, xlsx_marker)
+        image = root / "solid-red.png"
+        image.write_bytes(solid_png(255, 0, 0))
+        run_image(image, ("红", "red"))
         run_document(
             pdf,
             "application/pdf",
@@ -297,8 +410,13 @@ def main() -> None:
             "读取所附 XLSX，只回复第一个单元格的标记。",
             "finwealth_read_xlsx_text",
         )
-    print("OK: production Pi model read PDF and XLSX inside the isolated workspace.")
+    print(
+        "OK: production Pi model read a PNG, PDF and XLSX inside the isolated workspace."
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        cleanup()
