@@ -352,8 +352,12 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     name: "finwealth_refresh_quotes",
     label: "刷新结构化报价",
     description:
-      "调用 Finwealth 已配置且获准的结构化报价源刷新市场报价和汇率。网页搜索结果不能调用此工具写入。",
+      "调用 Finwealth 已配置且获准的结构化报价源刷新市场报价和汇率。它不用于探测配置；法币汇率查询应优先调用 finwealth_lookup_fx_candidate。网页搜索结果不能调用此工具写入。",
     promptSnippet: "从服务器已配置的结构化来源刷新报价和汇率。",
+    promptGuidelines: [
+      "只有已知服务器配置了结构化报价源时才调用；不要把 HTTP 成功误当成已更新报价。",
+      "用户要求查询法币汇率时直接使用 finwealth_lookup_fx_candidate，不要先调用此工具。",
+    ],
     parameters: Type.Object({}),
     executionMode: "sequential",
     async execute(_id, _params, signal) {

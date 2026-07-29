@@ -22,6 +22,7 @@ import {
 } from "./workspace-tools.js";
 import { createMemoryTools } from "./memory-tools.js";
 import { createQuoteCandidateTools } from "./quote-candidate-tools.js";
+import { createPublicFxTools } from "./public-fx-tools.js";
 import { isImageAttachment } from "./attachment-formats.js";
 
 interface CachedSession {
@@ -316,6 +317,7 @@ export class PiAgentEngine implements AgentEngine {
         ...createWorkspaceTools(cwd),
         ...createFinwealthTools(this.#finwealth),
         ...createMemoryTools(this.#store, conversation),
+        ...createPublicFxTools(this.#store, conversation),
         ...createQuoteCandidateTools(this.#store, conversation),
       ],
     });

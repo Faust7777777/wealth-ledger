@@ -19,6 +19,7 @@ import type {
   AgentAutomationRunner,
   AgentNotification,
 } from "./types.js";
+import { normalizeAssistantText } from "./message-text.js";
 
 function now(): string {
   return new Date().toISOString();
@@ -639,7 +640,13 @@ export class AgentService {
   ): Promise<AgentMessage[]> {
     const state = await this.store.read(principal.userId);
     this.#ownedConversation(state.conversations, principal, conversationId);
-    return state.messages.filter((item) => item.conversationId === conversationId);
+    return state.messages
+      .filter((item) => item.conversationId === conversationId)
+      .map((item) =>
+        item.role === "assistant"
+          ? { ...item, text: normalizeAssistantText(item.text) }
+          : { ...item }
+      );
   }
 
   async sendMessage(
@@ -862,7 +869,7 @@ export class AgentService {
             (item) => item.id === assistantMessageId,
           );
           if (!message) throw new Error("agent_message_not_found");
-          message.text = result.text;
+          message.text = normalizeAssistantText(result.text);
           message.status = "completed";
           message.completedAt = completedAt;
           const storedConversation = state.conversations.find(

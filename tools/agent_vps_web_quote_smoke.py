@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that the production Pi model can research a web FX quote safely."""
+"""Verify that the production Pi model can create a public FX candidate safely."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 AGENT_BASE = "http://127.0.0.1:8792/v1/agent"
-SOURCE_URL = "https://api.frankfurter.app/latest?from=USD&to=CNY"
+SOURCE_URL = "https://open.er-api.com/v6/latest/USD"
 TIMEOUT_SECONDS = 600
 NONCE = secrets.token_hex(8)
 USER_ID = f"usr_web_quote_smoke_{NONCE}"
@@ -121,12 +121,9 @@ def main() -> None:
         body={"modelId": model["id"]},
     )
     prompt = (
-        "调用隔离 bash，用 curl -fsSL 读取 "
-        f"{SOURCE_URL}。取其中 USD/CNY 的 rate 和 date，然后调用 "
-        "finwealth_suggest_quote 创建 kind=fx、baseCurrency=USD、"
-        "quoteCurrency=CNY 的待审核候选；rate 使用网页原值，asOf 使用网页日期"
-        "的 UTC 零点，source=Frankfurter，sourceUrl 使用实际读取的完整 URL。"
-        "最后只回复完成。"
+        "查询最新 USD/CNY 汇率并创建待审核候选。必须调用 "
+        "finwealth_lookup_fx_candidate，baseCurrency=USD、quoteCurrency=CNY；"
+        "不要调用 bash 或 finwealth_refresh_quotes。最后只回复完成。"
     )
     accepted = request(
         "POST",
@@ -157,8 +154,8 @@ def main() -> None:
         raise TimeoutError("web quote Agent run timed out")
 
     tools = completed_tools(conversation["id"], accepted["runId"])
-    if "bash:False" not in tools or "finwealth_suggest_quote:False" not in tools:
-        raise RuntimeError(f"web quote tools did not complete successfully: {tools}")
+    if tools != ["finwealth_lookup_fx_candidate:False"]:
+        raise RuntimeError(f"public FX tool did not complete exactly once: {tools}")
     candidates = request("GET", "/quote-candidates")
     if not isinstance(candidates, list) or len(candidates) != 1:
         raise RuntimeError("web quote smoke did not create exactly one candidate")

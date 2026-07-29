@@ -337,6 +337,51 @@ test("queues a run, records compact tool events, and persists the Pi session pat
   assert.equal(stored?.piSessionFile, join("sessions", `${conversation.id}.jsonl`));
 });
 
+test("normalizes escaped assistant layout before persistence and when reading history", async () => {
+  const escaped = String.raw`当前情况：\n- 刷新失败\n- 网页失败\n\n请重试。`;
+  const engine: AgentEngine = {
+    async listModels() {
+      return [{
+        id: "test/text",
+        provider: "test",
+        displayName: "Test Text",
+        supportsImages: false,
+      }];
+    },
+    async run(_conversation, _text, _attachments, callbacks) {
+      callbacks.onDelta(escaped);
+      return { text: escaped };
+    },
+    async cancel() { return true; },
+  };
+  const service = await serviceWith(engine);
+  const conversation = (await service.listConversations(owner))[0];
+  assert.ok(conversation);
+  await service.sendMessage(owner, conversation.id, "查询汇率");
+  await waitForCompleted(service, conversation.id);
+  const completed = (await service.listMessages(owner, conversation.id))
+    .find((item) => item.role === "assistant");
+  assert.equal(completed?.text, "当前情况：\n- 刷新失败\n- 网页失败\n\n请重试。");
+  const persisted = (await service.store.read(owner.userId)).messages
+    .find((item) => item.role === "assistant");
+  assert.equal(persisted?.text, completed?.text);
+
+  await service.store.update(owner.userId, (state) => {
+    state.messages.push({
+      id: "msg_historical_escaped",
+      conversationId: conversation.id,
+      role: "assistant",
+      text: escaped,
+      status: "completed",
+      createdAt: "2026-07-29T00:00:00Z",
+      completedAt: "2026-07-29T00:00:01Z",
+    });
+  });
+  const historical = (await service.listMessages(owner, conversation.id))
+    .find((item) => item.id === "msg_historical_escaped");
+  assert.equal(historical?.text, "当前情况：\n- 刷新失败\n- 网页失败\n\n请重试。");
+});
+
 test("cancelling a queued run does not abort the active run", async () => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
