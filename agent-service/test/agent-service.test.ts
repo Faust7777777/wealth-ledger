@@ -108,6 +108,7 @@ class FakeEngine implements AgentEngine {
   cancelled: string[] = [];
   lastAttachmentCount = 0;
   failure?: string;
+  deleted: string[] = [];
 
   constructor(models: AgentModelInfo[] = [
     {
@@ -145,6 +146,10 @@ class FakeEngine implements AgentEngine {
   async cancel(conversationId: string): Promise<boolean> {
     this.cancelled.push(conversationId);
     return true;
+  }
+
+  async deleteConversation(conversation: AgentConversation): Promise<void> {
+    this.deleted.push(conversation.id);
   }
 }
 
@@ -300,6 +305,52 @@ test("creates one persistent owner-scoped primary conversation", async () => {
   assert.equal((await reloaded.listConversations(owner))[0]?.id, first[0]?.id);
 });
 
+test("deletes only archived non-primary conversations and their history", async () => {
+  const engine = new FakeEngine();
+  const service = await serviceWith(engine);
+  const primary = (await service.listConversations(owner))[0];
+  assert.ok(primary);
+  const old = await service.createConversation(owner, "旧对话");
+  const bytes = Buffer.from("old attachment", "utf8");
+  const attachment = await service.createAttachment(owner, {
+    fileName: "old.txt",
+    mimeType: "text/plain",
+    bytes,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  });
+  const storedAttachment = (await service.store.read(owner.userId)).attachments
+    .find((item) => item.id === attachment.id);
+  assert.ok(storedAttachment);
+  await service.sendMessage(owner, old.id, "旧内容", [attachment.id]);
+  await waitForCompleted(service, old.id);
+
+  await assert.rejects(
+    service.deleteConversation(owner, primary.id),
+    /primary_conversation_cannot_be_deleted/,
+  );
+  await assert.rejects(
+    service.deleteConversation(owner, old.id),
+    /conversation_must_be_archived_before_delete/,
+  );
+  await service.updateConversation(owner, old.id, { status: "archived" });
+  const result = await service.deleteConversation(owner, old.id);
+
+  assert.equal(result.conversationId, old.id);
+  assert.equal(result.deletedMessageCount, 2);
+  assert.equal(result.deletedAttachmentCount, 1);
+  assert.deepEqual(engine.deleted, [old.id]);
+  assert.equal(
+    (await service.listConversations(owner)).some((item) => item.id === old.id),
+    false,
+  );
+  await assert.rejects(
+    service.listMessages(owner, old.id),
+    /conversation_not_found/,
+  );
+  await assert.rejects(readFile(storedAttachment.originalPath), /ENOENT/);
+  await assert.rejects(readFile(storedAttachment.workingPath), /ENOENT/);
+});
+
 test("queues a run, records compact tool events, and persists the Pi session path", async () => {
   const service = await serviceWith();
   const conversation = (await service.listConversations(owner))[0];
@@ -443,6 +494,40 @@ test("HTTP surface requires the Rust gateway token and principal headers", async
     };
     assert.equal(body.data.configured, true);
     assert.equal(body.data.userId, owner.userId);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+test("HTTP permanently deletes an archived conversation idempotently", async () => {
+  const service = await serviceWith();
+  const conversation = await service.createConversation(owner, "待删除");
+  await service.updateConversation(owner, conversation.id, { status: "archived" });
+  const server = createAgentHttpServer(service, "internal-test-token");
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const url = `http://127.0.0.1:${address.port}/v1/agent/conversations/${conversation.id}`;
+  const headers = {
+    "x-finwealth-internal-token": "internal-test-token",
+    "x-finwealth-user-id": owner.userId,
+    "x-finwealth-ledger-id": owner.ledgerId,
+    "x-finwealth-device-id": owner.deviceId,
+    "idempotency-key": "delete-old-conversation",
+  };
+  try {
+    const deleted = await fetch(url, { method: "DELETE", headers });
+    assert.equal(deleted.status, 200);
+    assert.equal(
+      ((await deleted.json()) as { data: { conversationId: string } }).data
+        .conversationId,
+      conversation.id,
+    );
+    const replay = await fetch(url, { method: "DELETE", headers });
+    assert.equal(replay.status, 200);
+    assert.equal(replay.headers.get("idempotency-replayed"), "true");
   } finally {
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),

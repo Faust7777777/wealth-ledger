@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { isAbsolute, dirname, join, relative } from "node:path";
 import { EventHub } from "./event-hub.js";
 import { StateStore } from "./state-store.js";
 import { ATTACHMENT_EXTENSIONS, attachmentMatchesMime } from "./attachment-formats.js";
@@ -34,6 +34,13 @@ function validTimestamp(value: string): boolean {
 function cleanTitle(value: string): string {
   const compact = value.replace(/\s+/g, " ").trim();
   return compact.length > 32 ? `${compact.slice(0, 32)}…` : compact;
+}
+
+function assertOwnedFile(root: string, path: string): void {
+  const child = relative(root, path);
+  if (!child || child.startsWith("..") || isAbsolute(child)) {
+    throw new Error("invalid_agent_attachment_path");
+  }
 }
 
 export class AgentService {
@@ -636,6 +643,94 @@ export class AgentService {
       conversation.updatedAt = now();
       return { ...conversation };
     });
+  }
+
+  async deleteConversation(
+    principal: Principal,
+    conversationId: string,
+  ): Promise<{
+    conversationId: string;
+    deletedMessageCount: number;
+    deletedAttachmentCount: number;
+  }> {
+    if (this.#activeRuns.has(conversationId)) throw new Error("agent_conversation_busy");
+    const deleted = await this.store.update(principal.userId, async (state) => {
+      const conversation = this.#ownedConversation(
+        state.conversations,
+        principal,
+        conversationId,
+      );
+      if (conversation.isPrimary) {
+        throw new Error("primary_conversation_cannot_be_deleted");
+      }
+      if (conversation.status !== "archived") {
+        throw new Error("conversation_must_be_archived_before_delete");
+      }
+      if (
+        state.messages.some(
+          (item) =>
+            item.conversationId === conversationId &&
+            (item.status === "queued" || item.status === "streaming"),
+        )
+      ) {
+        throw new Error("agent_conversation_busy");
+      }
+      await this.engine.deleteConversation?.({ ...conversation });
+      const removedMessages = state.messages.filter(
+        (item) => item.conversationId === conversationId,
+      );
+      const removedAttachmentIds = new Set(
+        removedMessages.flatMap((item) => item.attachmentIds ?? []),
+      );
+      const retainedMessages = state.messages.filter(
+        (item) => item.conversationId !== conversationId,
+      );
+      const retainedAttachmentIds = new Set(
+        retainedMessages.flatMap((item) => item.attachmentIds ?? []),
+      );
+      const orphanAttachments = state.attachments.filter(
+        (item) =>
+          item.userId === principal.userId &&
+          item.ledgerId === principal.ledgerId &&
+          removedAttachmentIds.has(item.id) &&
+          !retainedAttachmentIds.has(item.id),
+      );
+      const orphanIds = new Set(orphanAttachments.map((item) => item.id));
+      const userRoot = this.store.userRoot(principal.userId);
+      for (const attachment of orphanAttachments) {
+        assertOwnedFile(userRoot, attachment.originalPath);
+        assertOwnedFile(userRoot, attachment.workingPath);
+      }
+      state.conversations = state.conversations.filter(
+        (item) => item.id !== conversationId,
+      );
+      state.messages = retainedMessages;
+      state.events = state.events.filter(
+        (item) => item.conversationId !== conversationId,
+      );
+      state.attachments = state.attachments.filter(
+        (item) => !orphanIds.has(item.id),
+      );
+      state.idempotency = state.idempotency.filter(
+        (item) =>
+          !item.operation.includes(`/v1/agent/conversations/${conversationId}`),
+      );
+      return { removedMessages, orphanAttachments };
+    });
+    // State deletion is authoritative. A filesystem cleanup failure may leave
+    // an unreachable orphan file, but must not turn an already-committed
+    // deletion into a non-replayable error.
+    await Promise.allSettled(
+      deleted.orphanAttachments.flatMap((item) => [
+        rm(item.originalPath, { force: true }),
+        rm(item.workingPath, { force: true }),
+      ]),
+    );
+    return {
+      conversationId,
+      deletedMessageCount: deleted.removedMessages.length,
+      deletedAttachmentCount: deleted.orphanAttachments.length,
+    };
   }
 
   async listMessages(

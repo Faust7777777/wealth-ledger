@@ -2096,6 +2096,23 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AgentConversationResponse"
+    delete:
+      tags: [Agent]
+      summary: Permanently delete an archived non-primary conversation and its history.
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Conversation history deleted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkEnvelope"
 
   /agent/conversations/{conversationId}/messages:
     get:

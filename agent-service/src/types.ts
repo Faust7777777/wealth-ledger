@@ -181,4 +181,5 @@ export interface AgentEngine {
     callbacks: RunCallbacks,
   ): Promise<{ text: string; piSessionFile?: string }>;
   cancel(conversationId: string): Promise<boolean>;
+  deleteConversation?(conversation: AgentConversation): Promise<void>;
 }

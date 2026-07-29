@@ -91,6 +91,9 @@ function errorStatus(code: string): number {
   if (
     code === "conversation_archived" ||
     code === "primary_conversation_cannot_be_archived" ||
+    code === "primary_conversation_cannot_be_deleted" ||
+    code === "conversation_must_be_archived_before_delete" ||
+    code === "agent_conversation_busy" ||
     code === "agent_memory_already_reviewed" ||
     code === "agent_quote_candidate_already_reviewed" ||
     code === "agent_automation_already_exists" ||
@@ -332,6 +335,19 @@ export function createAgentHttpServer(
           `PATCH /v1/agent/conversations/${conversationId}`,
           patch,
           () => service.updateConversation(principal, conversationId, patch),
+        );
+        markReplay(response, result.replayed);
+        ok(response, result.value);
+        return;
+      }
+      if (match?.[1] && request.method === "DELETE") {
+        const conversationId = match[1];
+        const result = await service.idempotent(
+          principal,
+          idempotencyKey(request),
+          `DELETE /v1/agent/conversations/${conversationId}`,
+          {},
+          () => service.deleteConversation(principal, conversationId),
         );
         markReplay(response, result.replayed);
         ok(response, result.value);

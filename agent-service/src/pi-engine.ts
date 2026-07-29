@@ -1,5 +1,5 @@
-import { mkdir, readFile } from "node:fs/promises";
-import { relative } from "node:path";
+import { mkdir, readFile, rm } from "node:fs/promises";
+import { isAbsolute, relative, resolve } from "node:path";
 import {
   ModelRuntime,
   SessionManager,
@@ -274,6 +274,26 @@ export class PiAgentEngine implements AgentEngine {
     if (!cached) return true;
     await cached.session.abort();
     return true;
+  }
+
+  async deleteConversation(conversation: AgentConversation): Promise<void> {
+    const cached = this.#sessions.get(conversation.id);
+    if (cached) {
+      cached.session.dispose();
+      this.#sessions.delete(conversation.id);
+    }
+    this.#abortRequested.delete(conversation.id);
+    const sessionFile = conversation.piSessionFile ?? cached?.sessionFile;
+    if (!sessionFile) return;
+    const sessionDir = this.#store.sessionDir(conversation.userId);
+    const absoluteSessionFile = isAbsolute(sessionFile)
+      ? sessionFile
+      : resolve(this.#store.userRoot(conversation.userId), sessionFile);
+    const child = relative(sessionDir, absoluteSessionFile);
+    if (!child || child.startsWith("..") || isAbsolute(child)) {
+      throw new Error("invalid_agent_session_path");
+    }
+    await rm(absoluteSessionFile, { force: true });
   }
 
   async #session(conversation: AgentConversation): Promise<CachedSession> {
