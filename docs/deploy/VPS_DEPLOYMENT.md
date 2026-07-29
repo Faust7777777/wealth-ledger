@@ -60,6 +60,15 @@ set -a; . /etc/finwealth/agent.env; set +a
 python3 tools/agent_vps_document_smoke.py
 ```
 
+For the xAI subscription path, the sidecar uses Pi's OAuth device-code flow.
+Run `sudo python3 tools/prepare_vps_xai_oauth.py` once to remove the legacy Lore
+provider and set the explicit model to `xai/grok-4.5`. The authenticated app
+then starts `/v1/agent/providers/xai/oauth/start`, shows the returned HTTPS URL
+and user code, and polls the attempt until connected. OAuth tokens stay in
+`/var/lib/finwealth-agent/pi/auth.json` with mode `0600`; they are never returned
+through the API. The runtime does not select the first available model and does
+not fall back to another provider when Grok is unavailable.
+
 It generates synthetic PDF/XLSX files, uploads them through the authenticated
 sidecar surface, and requires the model to recover file-only markers using
 `pdftotext` and Python/ZIP inside bubblewrap. It does not print model responses

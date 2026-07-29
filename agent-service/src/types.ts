@@ -164,6 +164,30 @@ export interface AgentModelInfo {
   supportsImages: boolean;
 }
 
+export interface AgentProviderInfo {
+  id: string;
+  displayName: string;
+  authMethods: Array<"oauth" | "api_key">;
+  connectionStatus: "connected" | "disconnected" | "connecting";
+}
+
+export interface AgentProviderOAuthAttempt {
+  attemptId: string;
+  providerId: string;
+  status: "pending" | "connected" | "failed" | "cancelled";
+  verificationUri?: string;
+  userCode?: string;
+  expiresAt?: string;
+  errorCode?: string;
+}
+
+export interface AgentProviderManager {
+  listProviders(): Promise<AgentProviderInfo[]>;
+  startOAuth(providerId: string): Promise<AgentProviderOAuthAttempt>;
+  getOAuthAttempt(attemptId: string): AgentProviderOAuthAttempt;
+  disconnect(providerId: string): Promise<void>;
+}
+
 export interface RunCallbacks {
   onDelta(delta: string): void;
   onToolStarted(name: string): void;

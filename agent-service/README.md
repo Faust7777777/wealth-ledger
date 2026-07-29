@@ -11,6 +11,13 @@ Required environment:
 - `FINWEALTH_AGENT_ADDR`: loopback address, default `127.0.0.1:8792`;
 - `FINWEALTH_AGENT_STATE_DIR`: conversations, sessions, attachments and workspaces;
 - `PI_CODING_AGENT_DIR`: Pi `auth.json` and `models.json` directory.
+- `FINWEALTH_AGENT_DEFAULT_MODEL_ID`: explicit provider/model used only when a
+  conversation has no selection. There is no first-available or cross-provider
+  fallback.
+
+Provider management is intentionally provider-neutral at the HTTP boundary.
+The current registry exposes only xAI OAuth; additional OAuth or API-key
+providers can be added without changing conversation model identifiers.
 
 The token is removed from `process.env` before any Pi session is created.
 Finance writes expose only draft plus submit-for-review; there is no confirm or

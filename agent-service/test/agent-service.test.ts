@@ -23,6 +23,7 @@ import type {
   AgentAutomation,
   AgentAutomationResult,
   AgentAutomationRunner,
+  AgentProviderManager,
   RunCallbacks,
 } from "../src/types.js";
 import { createWorkspaceTools } from "../src/workspace-tools.js";
@@ -246,6 +247,7 @@ async function serviceWith(
   engine: AgentEngine = new FakeEngine(),
   quoteWriter?: AgentQuoteWriter,
   automationRunner?: AgentAutomationRunner,
+  providerManager?: AgentProviderManager,
 ): Promise<AgentService> {
   const root = await mkdtemp(join(tmpdir(), "finwealth-agent-test-"));
   roots.push(root);
@@ -255,6 +257,7 @@ async function serviceWith(
     engine,
     quoteWriter,
     automationRunner,
+    providerManager,
   );
 }
 
@@ -484,6 +487,106 @@ test("HTTP surface requires the Rust gateway token and principal headers", async
     };
     assert.equal(body.data.configured, true);
     assert.equal(body.data.userId, owner.userId);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+test("provider HTTP surface exposes device authorization without credentials", async () => {
+  let disconnected = false;
+  const providerManager: AgentProviderManager = {
+    async listProviders() {
+      return [{
+        id: "xai",
+        displayName: "Grok",
+        authMethods: ["oauth"],
+        connectionStatus: disconnected ? "disconnected" : "connecting",
+      }];
+    },
+    async startOAuth() {
+      return {
+        attemptId: "oauth_test",
+        providerId: "xai",
+        status: "pending",
+        verificationUri: "https://auth.x.ai/device",
+        userCode: "ABCD-EFGH",
+        expiresAt: "2026-07-29T12:00:00Z",
+      };
+    },
+    getOAuthAttempt() {
+      return {
+        attemptId: "oauth_test",
+        providerId: "xai",
+        status: "connected",
+      };
+    },
+    async disconnect() {
+      disconnected = true;
+    },
+  };
+  const service = await serviceWith(
+    new FakeEngine(),
+    undefined,
+    undefined,
+    providerManager,
+  );
+  const server = createAgentHttpServer(service, "internal-test-token");
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const base = `http://127.0.0.1:${address.port}`;
+  const headers = {
+    "x-finwealth-internal-token": "internal-test-token",
+    "x-finwealth-user-id": owner.userId,
+    "x-finwealth-ledger-id": owner.ledgerId,
+    "x-finwealth-device-id": owner.deviceId,
+  };
+  try {
+    const providers = await fetch(`${base}/v1/agent/providers`, { headers });
+    assert.equal(providers.status, 200);
+
+    const missingKey = await fetch(
+      `${base}/v1/agent/providers/xai/oauth/start`,
+      { method: "POST", headers },
+    );
+    assert.equal(missingKey.status, 400);
+
+    const started = await fetch(
+      `${base}/v1/agent/providers/xai/oauth/start`,
+      {
+        method: "POST",
+        headers: { ...headers, "idempotency-key": "oauth-start-test" },
+      },
+    );
+    assert.equal(started.status, 202);
+    const startBody = await started.json() as {
+      data: Record<string, unknown>;
+    };
+    assert.equal(startBody.data.userCode, "ABCD-EFGH");
+    assert.equal("accessToken" in startBody.data, false);
+    assert.equal("refreshToken" in startBody.data, false);
+
+    const polled = await fetch(
+      `${base}/v1/agent/provider-oauth/oauth_test`,
+      { headers },
+    );
+    assert.equal(polled.status, 200);
+    assert.equal(
+      ((await polled.json()) as { data: { status: string } }).data.status,
+      "connected",
+    );
+
+    const removed = await fetch(
+      `${base}/v1/agent/providers/xai/disconnect`,
+      {
+        method: "POST",
+        headers: { ...headers, "idempotency-key": "oauth-disconnect-test" },
+      },
+    );
+    assert.equal(removed.status, 200);
+    assert.equal(disconnected, true);
   } finally {
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),

@@ -7,7 +7,6 @@ import argparse
 import base64
 import json
 import os
-import pwd
 import secrets
 import tempfile
 from pathlib import Path
@@ -73,7 +72,20 @@ def updated_environment(path: Path, replacements: dict[str, str]) -> str:
     return "\n".join(retained) + "\n"
 
 
+def environment_without(path: Path, removed: set[str]) -> list[str]:
+    if not path.exists():
+        return []
+    retained: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key = line.split("=", 1)[0].strip() if "=" in line else ""
+        if key not in removed:
+            retained.append(line)
+    return retained
+
+
 def main() -> None:
+    import pwd
+
     parser = argparse.ArgumentParser()
     parser.add_argument("secrets_file", type=Path)
     parser.add_argument("--server-env", type=Path, default=Path("/etc/finwealth/server.env"))

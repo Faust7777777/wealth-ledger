@@ -24,6 +24,7 @@ import { createMemoryTools } from "./memory-tools.js";
 import { createQuoteCandidateTools } from "./quote-candidate-tools.js";
 import { createPublicFxTools } from "./public-fx-tools.js";
 import { isImageAttachment } from "./attachment-formats.js";
+import { ProviderConnections } from "./provider-connections.js";
 
 interface CachedSession {
   session: AgentSession;
@@ -35,6 +36,20 @@ type PdfTextExtractor = (workspace: string, path: string) => Promise<string>;
 type XlsxTextExtractor = (workspace: string, path: string) => Promise<string>;
 const XLSX_MIME_TYPE =
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+export function selectAgentModel<T extends { provider: string; id: string }>(
+  available: readonly T[],
+  conversationModelId?: string,
+  defaultModelId?: string,
+): T {
+  const requestedModelId = conversationModelId ?? defaultModelId;
+  if (!requestedModelId) throw new Error("agent_model_selection_required");
+  const selected = available.find(
+    (model) => `${model.provider}/${model.id}` === requestedModelId,
+  );
+  if (!selected) throw new Error("agent_model_unavailable");
+  return selected;
+}
 
 export async function prepareFileAttachmentPrompt(
   workspace: string,
@@ -123,30 +138,36 @@ export class PiAgentEngine implements AgentEngine {
   readonly #finwealth: FinwealthClient;
   readonly #sessions = new Map<string, CachedSession>();
   readonly #abortRequested = new Set<string>();
+  readonly providers: ProviderConnections;
+  readonly #defaultModelId: string | undefined;
 
   private constructor(
     store: StateStore,
     agentDir: string,
     models: ModelRuntime,
     finwealth: FinwealthClient,
+    defaultModelId?: string,
   ) {
     this.#store = store;
     this.#agentDir = agentDir;
     this.#models = models;
     this.#finwealth = finwealth;
+    this.providers = new ProviderConnections(models);
+    this.#defaultModelId = defaultModelId;
   }
 
   static async create(
     store: StateStore,
     agentDir: string,
     finwealth: FinwealthClient,
+    defaultModelId?: string,
   ): Promise<PiAgentEngine> {
     await mkdir(agentDir, { recursive: true, mode: 0o700 });
     const models = await ModelRuntime.create({
       authPath: `${agentDir}/auth.json`,
       modelsPath: `${agentDir}/models.json`,
     });
-    return new PiAgentEngine(store, agentDir, models, finwealth);
+    return new PiAgentEngine(store, agentDir, models, finwealth, defaultModelId);
   }
 
   async listModels(): Promise<AgentModelInfo[]> {
@@ -292,13 +313,11 @@ export class PiAgentEngine implements AgentEngine {
     }
 
     const available = await this.#models.getAvailable();
-    const selected = conversation.selectedModelId
-      ? available.find(
-          (model) =>
-            `${model.provider}/${model.id}` === conversation.selectedModelId,
-        )
-      : available[0];
-    if (!selected) throw new Error("agent_model_unavailable");
+    const selected = selectAgentModel(
+      available,
+      conversation.selectedModelId,
+      this.#defaultModelId,
+    );
 
     const cwd = this.#store.workspace(conversation.userId);
     const sessionDir = this.#store.sessionDir(conversation.userId);

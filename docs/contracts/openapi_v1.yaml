@@ -1583,6 +1583,86 @@ paths:
               schema:
                 $ref: "#/components/schemas/AgentModelListResponse"
 
+  /agent/providers:
+    get:
+      tags: [Agent]
+      summary: List configurable Agent providers and their connection state.
+      responses:
+        "200":
+          description: Provider credentials and OAuth tokens are never returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentProviderListResponse"
+
+  /agent/providers/{providerId}/oauth/start:
+    post:
+      tags: [Agent]
+      summary: Start an OAuth device-code connection for one Agent provider.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+        - name: providerId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "202":
+          description: Device authorization is waiting for the user in a browser.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentProviderOAuthResponse"
+        "409":
+          description: Another OAuth attempt for the same provider is active.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/provider-oauth/{attemptId}:
+    get:
+      tags: [Agent]
+      summary: Poll one in-memory provider OAuth attempt.
+      parameters:
+        - name: attemptId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Current attempt state. Tokens are never returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentProviderOAuthResponse"
+        "404":
+          description: Attempt is unknown, including after a sidecar restart.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/providers/{providerId}/disconnect:
+    post:
+      tags: [Agent]
+      summary: Cancel an active login and remove the provider credential.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+        - name: providerId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Provider is disconnected.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentProviderDisconnectResponse"
+
   /agent/attachments:
     post:
       tags: [Agent]
@@ -4775,6 +4855,40 @@ components:
           type: string
         supportsImages:
           type: boolean
+    AgentProvider:
+      type: object
+      required: [id, displayName, authMethods, connectionStatus]
+      properties:
+        id:
+          type: string
+        displayName:
+          type: string
+        authMethods:
+          type: array
+          items:
+            enum: [oauth, api_key]
+        connectionStatus:
+          enum: [connected, disconnected, connecting]
+    AgentProviderOAuthAttempt:
+      type: object
+      required: [attemptId, providerId, status]
+      properties:
+        attemptId:
+          type: string
+        providerId:
+          type: string
+        status:
+          enum: [pending, connected, failed, cancelled]
+        verificationUri:
+          type: string
+          format: uri
+          description: HTTPS page opened by the user to authorize the device code.
+        userCode:
+          type: string
+        expiresAt:
+          $ref: "#/components/schemas/ISODateTime"
+        errorCode:
+          type: string
     AgentConversation:
       type: object
       required:
@@ -5036,6 +5150,36 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AgentModel"
+    AgentProviderListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentProvider"
+    AgentProviderOAuthResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AgentProviderOAuthAttempt"
+    AgentProviderDisconnectResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: object
+          required: [disconnected]
+          properties:
+            disconnected:
+              const: true
     AgentAttachmentResponse:
       type: object
       required: [ok, data]

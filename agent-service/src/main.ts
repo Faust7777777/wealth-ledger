@@ -38,8 +38,16 @@ const engine = await PiAgentEngine.create(
   store,
   agentDir,
   finwealth,
+  process.env.FINWEALTH_AGENT_DEFAULT_MODEL_ID?.trim() || undefined,
 );
-const service = new AgentService(store, new EventHub(), engine, finwealth, finwealth);
+const service = new AgentService(
+  store,
+  new EventHub(),
+  engine,
+  finwealth,
+  finwealth,
+  engine.providers,
+);
 const server = createAgentHttpServer(service, internalToken);
 await service.recoverInterruptedRuns();
 

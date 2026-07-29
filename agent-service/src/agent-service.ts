@@ -18,6 +18,9 @@ import type {
   AgentAutomationKind,
   AgentAutomationRunner,
   AgentNotification,
+  AgentProviderManager,
+  AgentProviderOAuthAttempt,
+  AgentProviderInfo,
 } from "./types.js";
 import { normalizeAssistantText } from "./message-text.js";
 
@@ -41,6 +44,7 @@ export class AgentService {
   readonly engine: AgentEngine;
   readonly #quoteWriter: AgentQuoteWriter | undefined;
   readonly #automationRunner: AgentAutomationRunner | undefined;
+  readonly #providerManager: AgentProviderManager | undefined;
   readonly #automationRuns = new Set<string>();
   readonly #runQueues = new Map<string, Promise<void>>();
   readonly #activeRuns = new Map<string, string>();
@@ -53,12 +57,14 @@ export class AgentService {
     engine: AgentEngine,
     quoteWriter?: AgentQuoteWriter,
     automationRunner?: AgentAutomationRunner,
+    providerManager?: AgentProviderManager,
   ) {
     this.store = store;
     this.events = events;
     this.engine = engine;
     this.#quoteWriter = quoteWriter;
     this.#automationRunner = automationRunner;
+    this.#providerManager = providerManager;
   }
 
   async status(principal: Principal): Promise<Record<string, unknown>> {
@@ -135,6 +141,27 @@ export class AgentService {
 
   async listModels(): Promise<unknown[]> {
     return this.engine.listModels();
+  }
+
+  async listProviders(): Promise<AgentProviderInfo[]> {
+    if (!this.#providerManager) throw new Error("agent_provider_management_unavailable");
+    return this.#providerManager.listProviders();
+  }
+
+  async startProviderOAuth(providerId: string): Promise<AgentProviderOAuthAttempt> {
+    if (!this.#providerManager) throw new Error("agent_provider_management_unavailable");
+    return this.#providerManager.startOAuth(providerId);
+  }
+
+  getProviderOAuthAttempt(attemptId: string): AgentProviderOAuthAttempt {
+    if (!this.#providerManager) throw new Error("agent_provider_management_unavailable");
+    return this.#providerManager.getOAuthAttempt(attemptId);
+  }
+
+  async disconnectProvider(providerId: string): Promise<{ disconnected: true }> {
+    if (!this.#providerManager) throw new Error("agent_provider_management_unavailable");
+    await this.#providerManager.disconnect(providerId);
+    return { disconnected: true };
   }
 
   async listAutomations(principal: Principal): Promise<AgentAutomation[]> {

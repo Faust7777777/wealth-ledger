@@ -87,7 +87,11 @@ function writeEvent(response: ServerResponse, event: AgentEvent): void {
 function errorStatus(code: string): number {
   if (code.endsWith("_not_found")) return 404;
   if (code === "agent_model_not_allowed") return 403;
-  if (code === "agent_model_unavailable") return 503;
+  if (
+    code === "agent_model_unavailable" ||
+    code === "agent_provider_management_unavailable"
+  ) return 503;
+  if (code === "agent_provider_oauth_failed") return 502;
   if (
     code === "conversation_archived" ||
     code === "primary_conversation_cannot_be_archived" ||
@@ -95,7 +99,10 @@ function errorStatus(code: string): number {
     code === "agent_quote_candidate_already_reviewed" ||
     code === "agent_automation_already_exists" ||
     code === "agent_automation_busy" ||
-    code === "idempotency_key_reused"
+    code === "idempotency_key_reused" ||
+    code === "agent_provider_oauth_busy" ||
+    code === "agent_provider_oauth_cancelled" ||
+    code === "agent_model_selection_required"
   ) {
     return 409;
   }
@@ -206,6 +213,27 @@ export function createAgentHttpServer(
         ok(response, await service.listModels());
         return;
       }
+      if (request.method === "GET" && path === "/v1/agent/providers") {
+        ok(response, await service.listProviders());
+        return;
+      }
+      let match = path.match(/^\/v1\/agent\/providers\/([^/]+)\/oauth\/start$/);
+      if (match?.[1] && request.method === "POST") {
+        idempotencyKey(request);
+        ok(response, await service.startProviderOAuth(match[1]), 202);
+        return;
+      }
+      match = path.match(/^\/v1\/agent\/provider-oauth\/([^/]+)$/);
+      if (match?.[1] && request.method === "GET") {
+        ok(response, service.getProviderOAuthAttempt(match[1]));
+        return;
+      }
+      match = path.match(/^\/v1\/agent\/providers\/([^/]+)\/disconnect$/);
+      if (match?.[1] && request.method === "POST") {
+        idempotencyKey(request);
+        ok(response, await service.disconnectProvider(match[1]));
+        return;
+      }
       if (request.method === "GET" && path === "/v1/agent/memories") {
         ok(response, await service.listMemories(principal));
         return;
@@ -273,7 +301,7 @@ export function createAgentHttpServer(
         ok(response, result.value, 201);
         return;
       }
-      let match = path.match(/^\/v1\/agent\/attachments\/([^/]+)\/content$/);
+      match = path.match(/^\/v1\/agent\/attachments\/([^/]+)\/content$/);
       if (match?.[1] && request.method === "GET") {
         const content = await service.getAttachmentContent(principal, match[1]);
         response.writeHead(200, {
