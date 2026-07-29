@@ -77,6 +77,39 @@ try {
   }
   if (!$ready) { throw "Agent proxy did not become ready." }
 
+  # 会话删除必须真实穿过 Rust gateway，并保持 archive -> delete 边界。
+  $conversationKey = "agent-smoke-create-$([Guid]::NewGuid().ToString('N'))"
+  $createdEnvelope = Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://127.0.0.1:$ServerPort/v1/agent/conversations" `
+    -Headers @{ "Idempotency-Key" = $conversationKey } `
+    -ContentType "application/json" `
+    -Body '{"title":"Delete smoke"}' `
+    -TimeoutSec 10
+  $conversationId = $createdEnvelope.data.id
+  if (!$conversationId) { throw "Agent delete smoke did not create a conversation." }
+  Invoke-RestMethod `
+    -Method Patch `
+    -Uri "http://127.0.0.1:$ServerPort/v1/agent/conversations/$conversationId" `
+    -Headers @{ "Idempotency-Key" = "agent-smoke-archive-$conversationId" } `
+    -ContentType "application/json" `
+    -Body '{"status":"archived"}' `
+    -TimeoutSec 10 | Out-Null
+  $deletedEnvelope = Invoke-RestMethod `
+    -Method Delete `
+    -Uri "http://127.0.0.1:$ServerPort/v1/agent/conversations/$conversationId" `
+    -Headers @{ "Idempotency-Key" = "agent-smoke-delete-$conversationId" } `
+    -TimeoutSec 10
+  if ($deletedEnvelope.data.conversationId -ne $conversationId) {
+    throw "Agent delete smoke returned the wrong conversation."
+  }
+  $remaining = Invoke-RestMethod `
+    -Uri "http://127.0.0.1:$ServerPort/v1/agent/conversations" `
+    -TimeoutSec 10
+  if ($remaining.data.id -contains $conversationId) {
+    throw "Deleted Agent conversation remained in the list."
+  }
+
   $flutterExitCode = 1
   Push-Location $root
   try {
@@ -89,7 +122,7 @@ try {
     Pop-Location
   }
   if ($flutterExitCode -ne 0) { throw "Flutter agent integration test failed." }
-  Write-Host "OK: Flutter agent integration smoke passed (proxy + conversations + attachments + fail-closed)"
+  Write-Host "OK: Flutter agent integration smoke passed (proxy + conversation delete + attachments + fail-closed)"
 } catch {
   Write-Host "FAILED: $($_.Exception.Message)"
   foreach ($logName in @("server.err", "agent.err", "server.out", "agent.out")) {

@@ -15,4 +15,5 @@
 - TypeScript build/check：通过。
 - Node：29 passed / 0 failed，覆盖主会话拒绝、活跃会话拒绝、消息与附件清理、HTTP DELETE 及幂等重放。
 - OpenAPI/contract check：通过。
+- `tools/frontend_agent_smoke.ps1`：真实 Rust gateway + Node sidecar 完成新建、归档、永久删除并确认列表中消失。
 - 前端任务见 `2026-07-29-claude-agent-conversations-and-quotes.md`。
