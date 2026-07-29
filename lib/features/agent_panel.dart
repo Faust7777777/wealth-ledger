@@ -14,6 +14,7 @@ import '../data/view_models.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
 import 'agent_controller.dart';
+import 'agent_providers_page.dart';
 import 'agent_notifications.dart'
     show
         AgentNotificationsEntry,
@@ -359,6 +360,15 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
           ),
         if (chat.runError != null)
           _InlineNotice(text: chat.runError!, actionLabel: null),
+        // 选中的模型不在可用列表里：只提示重新连接，绝不替用户换一个模型。
+        if (gate == AgentPanelGate.ready &&
+            agentSelectedModelMissing(
+              active?.selectedModelId,
+              ref.watch(agentModelsProvider).asData?.value ?? const [],
+            ))
+          AgentModelUnavailableNotice(
+            onReconnect: () => context.push('/agent/providers'),
+          ),
         const Divider(height: 1),
         _Composer(
           draft: _draft,

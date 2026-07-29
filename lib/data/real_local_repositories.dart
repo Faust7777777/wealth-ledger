@@ -193,6 +193,18 @@ class RealLocalAgentRepository implements AgentRepository {
   @override
   Future<List<AgentModelVm>> listModels() async => const [];
   @override
+  Future<List<AgentProviderVm>> listProviders() async => const [];
+  @override
+  Future<AgentProviderOAuthAttemptVm> startProviderOAuth(
+    String providerId,
+  ) async => _unsupported();
+  @override
+  Future<AgentProviderOAuthAttemptVm> getProviderOAuthAttempt(
+    Id attemptId,
+  ) async => _unsupported();
+  @override
+  Future<void> disconnectProvider(String providerId) async => _unsupported();
+  @override
   Future<List<AgentMemoryVm>> listMemories() async => const [];
   @override
   Future<List<AgentConversationVm>> listConversations() async => const [];

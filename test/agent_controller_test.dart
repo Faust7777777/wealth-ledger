@@ -168,6 +168,18 @@ class _FakeAgentRepo implements AgentRepository {
     AgentConversationStatus? status,
     String? modelId,
   }) => throw UnsupportedError('unused');
+
+  @override
+  Future<List<AgentProviderVm>> listProviders() async => const [];
+  @override
+  Future<AgentProviderOAuthAttemptVm> startProviderOAuth(String providerId) =>
+      throw UnsupportedError('unused');
+  @override
+  Future<AgentProviderOAuthAttemptVm> getProviderOAuthAttempt(Id attemptId) =>
+      throw UnsupportedError('unused');
+  @override
+  Future<void> disconnectProvider(String providerId) =>
+      throw UnsupportedError('unused');
 }
 
 ProviderContainer _container(_FakeAgentRepo repo) {

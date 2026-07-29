@@ -11,6 +11,7 @@ import '../features/account_form_page.dart';
 import '../features/accounts_page.dart';
 import '../features/agent_automations_page.dart';
 import '../features/agent_page.dart';
+import '../features/agent_providers_page.dart';
 import '../features/ai_edit_page.dart';
 import '../features/ai_import_csv_page.dart';
 import '../features/ai_import_image_page.dart';
@@ -72,6 +73,10 @@ final appRouter = GoRouter(
       ],
     ),
     GoRoute(path: '/agent', builder: (c, s) => const AgentPage()),
+    GoRoute(
+      path: '/agent/providers',
+      builder: (c, s) => const AgentProvidersPage(),
+    ),
     GoRoute(
       path: '/agent/automations',
       builder: (c, s) => const AgentAutomationsPage(),

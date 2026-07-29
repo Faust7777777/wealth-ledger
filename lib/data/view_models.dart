@@ -1307,6 +1307,48 @@ class AgentStatusVm {
   final Id? primaryConversationId;
 }
 
+/// 模型连接方式。目前只有设备码授权一种，接口保持中立以便以后扩展。
+enum AgentProviderAuthMethod { oauth, apiKey, unknown }
+
+enum AgentProviderConnectionStatus { connected, disconnected, connecting }
+
+/// 一个可连接的模型来源。响应里不含任何令牌、密钥或服务器路径。
+class AgentProviderVm {
+  const AgentProviderVm({
+    required this.id,
+    required this.displayName,
+    required this.authMethods,
+    required this.connectionStatus,
+  });
+  final String id;
+  final String displayName;
+  final List<AgentProviderAuthMethod> authMethods;
+  final AgentProviderConnectionStatus connectionStatus;
+}
+
+enum AgentProviderOAuthStatus { pending, connected, failed, cancelled }
+
+/// 一次授权尝试的可见状态。verificationUri / userCode 是给用户看的，
+/// 令牌永远不会出现在这里。
+class AgentProviderOAuthAttemptVm {
+  const AgentProviderOAuthAttemptVm({
+    required this.attemptId,
+    required this.providerId,
+    required this.status,
+    this.verificationUri,
+    this.userCode,
+    this.expiresAt,
+    this.errorCode,
+  });
+  final Id attemptId;
+  final String providerId;
+  final AgentProviderOAuthStatus status;
+  final String? verificationUri;
+  final String? userCode;
+  final IsoDateTime? expiresAt;
+  final String? errorCode;
+}
+
 /// 服务端允许的模型；不含任何凭据或 provider 配置路径。
 class AgentModelVm {
   const AgentModelVm({

@@ -1736,6 +1736,46 @@ AgentStatusVm _agentStatus(Map<String, dynamic> j) => AgentStatusVm(
   primaryConversationId: j['primaryConversationId'] as String?,
 );
 
+AgentProviderAuthMethod _agentAuthMethod(Object? v) => switch ('$v') {
+  'oauth' => AgentProviderAuthMethod.oauth,
+  'api_key' => AgentProviderAuthMethod.apiKey,
+  _ => AgentProviderAuthMethod.unknown,
+};
+
+AgentProviderVm _agentProvider(Map<String, dynamic> j) => AgentProviderVm(
+  id: '${j['id']}',
+  displayName: '${j['displayName']}',
+  authMethods: [for (final m in _list(j['authMethods'])) _agentAuthMethod(m)],
+  connectionStatus: switch (j['connectionStatus']) {
+    'connected' => AgentProviderConnectionStatus.connected,
+    'connecting' => AgentProviderConnectionStatus.connecting,
+    _ => AgentProviderConnectionStatus.disconnected,
+  },
+);
+
+AgentProviderOAuthAttemptVm _agentOAuthAttempt(Map<String, dynamic> j) =>
+    AgentProviderOAuthAttemptVm(
+      attemptId: '${j['attemptId']}',
+      providerId: '${j['providerId']}',
+      status: switch (j['status']) {
+        'connected' => AgentProviderOAuthStatus.connected,
+        'failed' => AgentProviderOAuthStatus.failed,
+        'cancelled' => AgentProviderOAuthStatus.cancelled,
+        _ => AgentProviderOAuthStatus.pending,
+      },
+      verificationUri: j['verificationUri'] as String?,
+      userCode: j['userCode'] as String?,
+      expiresAt: j['expiresAt'] as String?,
+      errorCode: j['errorCode'] as String?,
+    );
+
+/// 供测试直接校验 wire → VM 映射。
+AgentProviderVm parseAgentProviderData(Map<String, dynamic> j) =>
+    _agentProvider(j);
+AgentProviderOAuthAttemptVm parseAgentOAuthAttemptData(
+  Map<String, dynamic> j,
+) => _agentOAuthAttempt(j);
+
 AgentModelVm _agentModel(Map<String, dynamic> j) => AgentModelVm(
   id: '${j['id']}',
   provider: '${j['provider']}',
@@ -1935,6 +1975,31 @@ class LocalServerAgentRepository implements AgentRepository {
     for (final m in _list(await _c.getData('/v1/agent/models')))
       _agentModel(_m(m)),
   ];
+
+  @override
+  Future<List<AgentProviderVm>> listProviders() async => [
+    for (final p in _list(await _c.getData('/v1/agent/providers')))
+      _agentProvider(_m(p)),
+  ];
+
+  @override
+  Future<AgentProviderOAuthAttemptVm> startProviderOAuth(
+    String providerId,
+  ) async => _agentOAuthAttempt(
+    _m(await _c.postData('/v1/agent/providers/$providerId/oauth/start')),
+  );
+
+  @override
+  Future<AgentProviderOAuthAttemptVm> getProviderOAuthAttempt(
+    Id attemptId,
+  ) async => _agentOAuthAttempt(
+    _m(await _c.getData('/v1/agent/provider-oauth/$attemptId')),
+  );
+
+  @override
+  Future<void> disconnectProvider(String providerId) async {
+    await _c.postData('/v1/agent/providers/$providerId/disconnect');
+  }
 
   @override
   Future<AgentAttachmentVm> uploadAttachment({

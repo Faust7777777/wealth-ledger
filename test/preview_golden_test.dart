@@ -2024,6 +2024,18 @@ class _PreviewAgentRepo implements AgentRepository {
       throw UnsupportedError('preview');
   @override
   Future<void> cancelRun(Id runId) => throw UnsupportedError('preview');
+
+  @override
+  Future<List<AgentProviderVm>> listProviders() async => const [];
+  @override
+  Future<AgentProviderOAuthAttemptVm> startProviderOAuth(String providerId) =>
+      throw UnsupportedError('unused');
+  @override
+  Future<AgentProviderOAuthAttemptVm> getProviderOAuthAttempt(Id attemptId) =>
+      throw UnsupportedError('unused');
+  @override
+  Future<void> disconnectProvider(String providerId) =>
+      throw UnsupportedError('unused');
 }
 
 /// 预览用 AI 提案仓库。

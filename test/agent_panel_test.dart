@@ -244,6 +244,18 @@ class _FakeAgentRepo implements AgentRepository {
       throw UnsupportedError('unused');
   @override
   Future<void> cancelRun(Id runId) => throw UnsupportedError('unused');
+
+  @override
+  Future<List<AgentProviderVm>> listProviders() async => const [];
+  @override
+  Future<AgentProviderOAuthAttemptVm> startProviderOAuth(String providerId) =>
+      throw UnsupportedError('unused');
+  @override
+  Future<AgentProviderOAuthAttemptVm> getProviderOAuthAttempt(Id attemptId) =>
+      throw UnsupportedError('unused');
+  @override
+  Future<void> disconnectProvider(String providerId) =>
+      throw UnsupportedError('unused');
 }
 
 /// Riverpod 未导出 Override 类型，覆盖列表只能就地写在 ProviderScope 里。

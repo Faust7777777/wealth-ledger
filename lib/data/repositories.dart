@@ -125,6 +125,12 @@ abstract interface class AgentRepository {
   Future<AgentStatusVm> getStatus();
   Future<List<AgentModelVm>> listModels();
 
+  /// 模型连接：provider 列表由服务端给出，前端不内置任何厂商清单。
+  Future<List<AgentProviderVm>> listProviders();
+  Future<AgentProviderOAuthAttemptVm> startProviderOAuth(String providerId);
+  Future<AgentProviderOAuthAttemptVm> getProviderOAuthAttempt(Id attemptId);
+  Future<void> disconnectProvider(String providerId);
+
   Future<AgentAttachmentVm> uploadAttachment({
     required String fileName,
     required String mimeType,

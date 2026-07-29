@@ -346,6 +346,13 @@ final agentStatusProvider = FutureProvider<AgentStatusVm>(
 final agentModelsProvider = FutureProvider<List<AgentModelVm>>(
   (ref) => ref.watch(agentRepositoryProvider).listModels(),
 );
+
+/// 模型连接列表。失败要能看见错误并重试，因此关掉自动重试
+/// （Riverpod 3 默认会一直重试并把 provider 留在 loading）。
+final agentProvidersProvider = FutureProvider<List<AgentProviderVm>>(
+  (ref) => ref.watch(agentRepositoryProvider).listProviders(),
+  retry: (_, _) => null,
+);
 final agentConversationsProvider = FutureProvider<List<AgentConversationVm>>(
   (ref) => ref.watch(agentRepositoryProvider).listConversations(),
 );

@@ -220,6 +220,18 @@ class _FakeAgentRepo implements AgentRepository {
   }) => throw UnsupportedError('unused');
   @override
   Future<void> cancelRun(Id runId) => throw UnsupportedError('unused');
+
+  @override
+  Future<List<AgentProviderVm>> listProviders() async => const [];
+  @override
+  Future<AgentProviderOAuthAttemptVm> startProviderOAuth(String providerId) =>
+      throw UnsupportedError('unused');
+  @override
+  Future<AgentProviderOAuthAttemptVm> getProviderOAuthAttempt(Id attemptId) =>
+      throw UnsupportedError('unused');
+  @override
+  Future<void> disconnectProvider(String providerId) =>
+      throw UnsupportedError('unused');
 }
 
 Widget _host(_FakeAgentRepo repo, {required Widget child}) => ProviderScope(
