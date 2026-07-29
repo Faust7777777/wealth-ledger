@@ -1388,6 +1388,20 @@ void main() {
     updatedAt: '2026-07-28T00:00:00Z',
   );
 
+  AgentConversationVm agentMessageConversation(
+    String id,
+    String title,
+    String updatedAt, {
+    AgentConversationStatus status = AgentConversationStatus.active,
+  }) => AgentConversationVm(
+    id: id,
+    title: title,
+    isPrimary: false,
+    status: status,
+    createdAt: '2026-07-01T00:00:00Z',
+    updatedAt: updatedAt,
+  );
+
   AgentMessageVm agentMessage(
     String id,
     AgentMessageRole role,
@@ -1420,6 +1434,7 @@ void main() {
 
   Widget agentHost(
     ThemeData theme, {
+    List<AgentConversationVm>? conversations,
     bool configured = true,
     List<AgentMessageVm> messages = const [],
     List<AgentMemoryVm> memories = const [],
@@ -1454,7 +1469,7 @@ void main() {
           messages: messages,
           memories: memories,
           frames: events,
-          conversations: const [agentConversation],
+          conversations: conversations ?? const [agentConversation],
           candidates: candidates,
           attachmentMeta: attachmentMeta,
           notifications: notifications,
@@ -1544,6 +1559,55 @@ void main() {
         find.byType(AgentPanel),
         matchesGoldenFile('goldens/agent_panel_streaming_$name.png'),
       );
+    });
+  }
+
+  // —— 2026-07-29 批：会话管理 ——
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    testWidgets('agent conversation sheet - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(400, 720));
+      await tester.pumpWidget(
+        agentHost(
+          theme,
+          conversations: [
+            agentConversation,
+            agentMessageConversation('conv_2', '本月现金流', '2026-07-29T10:00:00Z'),
+            agentMessageConversation(
+              'conv_3',
+              '去年的报销',
+              '2026-06-01T10:00:00Z',
+              status: AgentConversationStatus.archived,
+            ),
+            agentMessageConversation(
+              'conv_4',
+              '装修预算',
+              '2026-05-01T10:00:00Z',
+              status: AgentConversationStatus.archived,
+            ),
+          ],
+        ),
+      );
+      await _settleEntrance(tester);
+      await tester.tap(find.byKey(kAgentConversationMenuKey));
+      await tester.pumpAndSettle();
+      await expectLater(
+        find.byType(AgentConversationSheet),
+        matchesGoldenFile('goldens/agent_conversation_sheet_$name.png'),
+      );
+
+      await tester.tap(find.byKey(kAgentArchivedEntryKey));
+      await tester.pumpAndSettle();
+      await expectLater(
+        find.byType(AgentConversationSheet),
+        matchesGoldenFile('goldens/agent_conversation_archived_$name.png'),
+      );
+      await tester.binding.handlePopRoute();
+      await tester.pumpAndSettle();
     });
   }
 
