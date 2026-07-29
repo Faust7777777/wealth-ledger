@@ -2807,6 +2807,10 @@ components:
           $ref: "#/components/schemas/Money"
         marketValue:
           $ref: "#/components/schemas/ValuedMoney"
+        accountMarketValue:
+          allOf:
+            - $ref: "#/components/schemas/ValuedMoney"
+          description: Holding value converted into the owning account's defaultCurrency. Portfolio marketValue remains in the ledger base currency.
         dayChange:
           $ref: "#/components/schemas/Money"
         unrealizedPnl:

@@ -117,6 +117,7 @@ QuoteRefreshError {
 - Rust local server 支持两个显式 provider：`FINWEALTH_QUOTE_PROVIDER=public` 使用 CoinGecko 获取 BTC/ETH/USDT 最新价、Frankfurter/ECB 获取传统法币汇率；`yahoo` 保留股票、传统行情和历史价格能力。`public` 当前只认 BTC、ETH、USDT，不支持的 symbol 必须逐项报错，不得伪造价格。Yahoo 只对 `Instrument.symbol` 存在，或 `instrumentId` 本身可安全解释为 ticker 的标的自动刷新；内部 ID（如 `inst_*`）缺少 symbol 时必须返回错误并继续使用缓存。
 - FX provider 可按 `currencyPairs` 或账本中的非本位币现金自动推导 Yahoo pair（如 `USD/CNY` → `USDCNY=X`）。
 - 自动刷新还必须检查正数量持仓的 `Instrument.quoteCurrency`，不能只检查现金余额。持仓以 USDT 等加密货币报价、账本本位币不是 USD 时，provider 可拆成可验证的桥接路径，例如 `USDT/USD`（`USDT-USD`）+ `USD/CNY`（`USDCNY=X`）。
+- 内置 public provider 对 BTC、ETH、USDT 自计价资产支持单位报价 `1`，并用 CoinGecko 生成 BTC/ETH/USDT 与 USD、CNY 或彼此之间的 FX；这用于兼容交易所账户中按原始币种保存的旧标的。任意其他币种仍逐项失败，不做猜测。
 - 估值换算优先使用直接汇率；没有直接汇率时，可在已有 FX rate 图中使用最多三跳的无环路径。路径状态取各段最差质量，同跳数存在多条路径时优先质量更好的路径。`incomplete`、`unpriceable`、`error` 段不得参与数值换算。
 - `fxRates` 需要保留同一货币对的历史时间点；相同稳定 ID（同 pair + asOf）可幂等覆盖，
   不同 `asOf` 不得互相覆盖。投资成交按成交时间选择历史 rate，而非读取最新缓存裸值。

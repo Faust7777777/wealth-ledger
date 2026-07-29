@@ -195,6 +195,7 @@ GET /v1/portfolio/allocation
 
 - overview 返回 `APPLICATION_INTERFACES_V1.PortfolioOverview`。
 - holdings 来自同一底层数据，投资页与账户详情只是两种投影。
+- `Holding.marketValue` 始终按账本本位币折算，供组合/净资产聚合；`accountMarketValue` 按所属账户 `defaultCurrency` 折算，供账户内持仓合计。两者缺少报价或 FX 路径时分别缺失，不得由客户端混用币种求和。
 - 主要持仓按市值占比排序，不按收益率排序。
 - 持仓调整输入目标 quantity，不由客户端计算最终余额。服务端在同一账本锁内读取旧 quantity、生成 pending adjustment，并在确认时做 optimistic check；确认前持仓不变。
 - 持仓快照一次接收同一账户的 1–100 个标的，所有变化项进入同一个 atomic group。重复标的、负数、未知标的、不受支持的计价币种或既有 pending adjustment 会使整次请求失败；数量未变化的项目只在 `skippedPositions` 报告。快照组元数据随 pending movement 持久化，刷新待审核列表后仍保留标题、目标账户和未变化项。整组确认或拒绝，不逐项落账。

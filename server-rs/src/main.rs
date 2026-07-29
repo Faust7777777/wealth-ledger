@@ -4447,7 +4447,9 @@ fn public_latest_quote(
 
 fn public_coin_price(data: &Value, coin_id: &str, quote_currency: &str) -> Result<f64, String> {
     let direct_currency = quote_currency.to_ascii_lowercase();
-    let price = if matches!(direct_currency.as_str(), "usd" | "cny") {
+    let price = if public_coin_id_for_symbol(quote_currency) == Some(coin_id) {
+        Some(1.0)
+    } else if matches!(direct_currency.as_str(), "usd" | "cny") {
         data.get(coin_id)
             .and_then(|coin| coin.get(&direct_currency))
             .and_then(Value::as_f64)
@@ -4482,7 +4484,8 @@ fn public_coin_as_of(data: &Value, coin_id: &str) -> Option<String> {
 fn public_fx_uses_coingecko(target: &Value) -> bool {
     let base = target.get("baseCurrency").and_then(Value::as_str);
     let quote = target.get("quoteCurrency").and_then(Value::as_str);
-    matches!(base, Some("USDT")) || matches!(quote, Some("USDT"))
+    base.and_then(public_coin_id_for_symbol).is_some()
+        || quote.and_then(public_coin_id_for_symbol).is_some()
 }
 
 fn public_fx_target_id(target: &Value) -> Option<String> {
@@ -4507,17 +4510,23 @@ fn public_crypto_fx_rate(
         .and_then(Value::as_str)
         .ok_or_else(|| "FX target has no quoteCurrency".to_string())?;
     let data = coingecko.ok_or_else(|| "CoinGecko data is unavailable".to_string())?;
-    let (currency, inverted) = if base == "USDT" {
-        (quote, false)
-    } else if quote == "USDT" {
-        (base, true)
-    } else {
-        return Err(format!("unsupported crypto FX pair: {base}/{quote}"));
+    let base_coin = public_coin_id_for_symbol(base);
+    let quote_coin = public_coin_id_for_symbol(quote);
+    let (rate, as_of_coin) = match (base_coin, quote_coin) {
+        (Some(base_coin), Some(quote_coin)) => {
+            let base_usd = public_coin_price(data, base_coin, "USD")?;
+            let quote_usd = public_coin_price(data, quote_coin, "USD")?;
+            (base_usd / quote_usd, base_coin)
+        }
+        (Some(base_coin), None) => (public_coin_price(data, base_coin, quote)?, base_coin),
+        (None, Some(quote_coin)) => {
+            let quote_in_base = public_coin_price(data, quote_coin, base)?;
+            (1.0 / quote_in_base, quote_coin)
+        }
+        (None, None) => return Err(format!("unsupported crypto FX pair: {base}/{quote}")),
     };
-    let direct = public_coin_price(data, "tether", currency)?;
-    let rate = if inverted { 1.0 / direct } else { direct };
     let rate = provider_decimal_string(rate)?;
-    let as_of = public_coin_as_of(data, "tether").unwrap_or_else(|| now.to_string());
+    let as_of = public_coin_as_of(data, as_of_coin).unwrap_or_else(|| now.to_string());
     let expires_at = (OffsetDateTime::now_utc() + Duration::minutes(5))
         .format(&Rfc3339)
         .expect("RFC3339 formatting should succeed");
@@ -12699,6 +12708,29 @@ mod tests {
         )
         .expect("USDT/USD should map");
         assert_eq!(stablecoin_rate["rate"], "0.999");
+
+        let self_quote = public_latest_quote(
+            &json!({
+                "instrumentId": "inst_legacy_btc",
+                "symbol": "BTC",
+                "quoteCurrency": "BTC"
+            }),
+            Some(&prices),
+            now,
+        )
+        .expect("a self-quoted crypto holding should have a unit quote");
+        assert_eq!(self_quote["price"], "1");
+
+        let btc_cny = public_crypto_fx_rate(
+            &json!({"baseCurrency": "BTC", "quoteCurrency": "CNY"}),
+            Some(&prices),
+            now,
+        )
+        .expect("BTC/CNY should map through CoinGecko");
+        assert_eq!(btc_cny["rate"], "433000");
+        assert!(public_fx_uses_coingecko(
+            &json!({"baseCurrency": "BTC", "quoteCurrency": "CNY"})
+        ));
 
         let fiat_rate = public_fiat_fx_rate_from_response(
             "USD",

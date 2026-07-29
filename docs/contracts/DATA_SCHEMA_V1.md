@@ -144,6 +144,7 @@ Holding {
   quantity: DecimalString;
   costBasisTotal?: Money;
   marketValue?: ValuedMoney;
+  accountMarketValue?: ValuedMoney; // 按所属账户 defaultCurrency 折算；账户详情合计使用
   dayChange?: Money;
   unrealizedPnl?: Money;
   unrealizedPnlRate?: DecimalString;

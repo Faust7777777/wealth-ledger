@@ -876,6 +876,11 @@ pub fn quote_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value
             .and_then(|instrument| instrument.get("symbol").and_then(Value::as_str))
             .filter(|symbol| !symbol.trim().is_empty())
             .map(str::to_string)
+            .or_else(|| {
+                instrument
+                    .and_then(|instrument| instrument.get("displayName").and_then(Value::as_str))
+                    .and_then(infer_public_crypto_symbol)
+            })
             .or_else(|| infer_yahoo_symbol_from_id(&instrument_id));
         let quote_currency = instrument
             .and_then(|instrument| instrument.get("quoteCurrency").and_then(Value::as_str))
@@ -10264,6 +10269,22 @@ fn project_holding_for_api(document: &Value, holding: &Value) -> Value {
             object.remove("unrealizedPnlRate");
         }
     }
+    if let Some(account_currency) = holding
+        .get("accountId")
+        .and_then(Value::as_str)
+        .and_then(|account_id| {
+            document["accounts"]
+                .as_array()
+                .expect("validated local ledger accounts should be an array")
+                .iter()
+                .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+        })
+        .and_then(|account| account.get("defaultCurrency").and_then(Value::as_str))
+        && let Some((account_market_value, _)) =
+            quoted_holding_market_value_in_currency(document, holding, account_currency)
+    {
+        projected["accountMarketValue"] = account_market_value;
+    }
     if projected.get("unrealizedPnl").is_none()
         && let (Some(market_value), Some(cost_basis)) = (
             projected
@@ -10435,6 +10456,18 @@ fn upsert_fx_rate(document: &mut Value, rate: Value) -> Result<(), String> {
 }
 
 fn quoted_holding_market_value(document: &Value, holding: &Value) -> Option<(Value, &'static str)> {
+    let base_currency = document
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_BASE_CURRENCY);
+    quoted_holding_market_value_in_currency(document, holding, base_currency)
+}
+
+fn quoted_holding_market_value_in_currency(
+    document: &Value,
+    holding: &Value,
+    target_currency: &str,
+) -> Option<(Value, &'static str)> {
     let now = current_timestamp_for_projection();
     let instrument_id = holding.get("instrumentId").and_then(Value::as_str)?;
     let quantity = parse_decimal(holding.get("quantity")?.as_str()?).ok()?;
@@ -10442,23 +10475,19 @@ fn quoted_holding_market_value(document: &Value, holding: &Value) -> Option<(Val
     let price = parse_decimal(quote.get("price")?.as_str()?).ok()?;
     let quote_currency = quote.get("currency")?.as_str()?;
     let quote_status = effective_quote_status(quote, &now);
-    let base_currency = document
-        .get("baseCurrency")
-        .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_BASE_CURRENCY);
     let quote_value = multiply_decimal(quantity, price);
     let as_of = quote
         .get("asOf")
         .and_then(Value::as_str)
         .unwrap_or(now.as_str());
 
-    let (base_value, fx_status) =
-        convert_amount(document, quote_value, quote_currency, base_currency, &now)?;
+    let (target_value, fx_status) =
+        convert_amount(document, quote_value, quote_currency, target_currency, &now)?;
     let status = combine_quote_status(quote_status, fx_status);
     Some((
         json!({
-            "amount": money_amount(base_value),
-            "currency": base_currency,
+            "amount": money_amount(target_value),
+            "currency": target_currency,
             "asOf": as_of,
             "quality": quality_from_quote_status(status)
         }),
@@ -10820,6 +10849,15 @@ fn infer_yahoo_symbol_from_id(instrument_id: &str) -> Option<String> {
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '='))
         .then(|| value.to_ascii_uppercase())
+}
+
+/// Legacy/self-entered crypto instruments sometimes only have a concise
+/// displayName (for example `BTC`) and no provider symbol.  Infer only the
+/// small deterministic set supported by the built-in public provider; never
+/// turn an arbitrary display name into an outbound ticker.
+fn infer_public_crypto_symbol(display_name: &str) -> Option<String> {
+    let symbol = display_name.trim().to_ascii_uppercase();
+    matches!(symbol.as_str(), "BTC" | "ETH" | "USDT").then_some(symbol)
 }
 
 fn clean_identifier(value: &str) -> String {
@@ -18275,6 +18313,20 @@ mod tests {
             "quoteStatus": "unpriceable",
             "asOf": now
         }]);
+        document["quotes"] = json!([{
+            "id": "quote_btc_usdt_fx",
+            "instrumentId": "inst_btc_usdt_fx",
+            "price": "100",
+            "currency": "USDT",
+            "asOf": now,
+            "source": "test",
+            "status": "fresh"
+        }]);
+        let projected = project_holdings_for_api(&document);
+        assert_eq!(projected[0]["marketValue"]["amount"], "360.00");
+        assert_eq!(projected[0]["marketValue"]["currency"], "CNY");
+        assert_eq!(projected[0]["accountMarketValue"]["amount"], "50.00");
+        assert_eq!(projected[0]["accountMarketValue"]["currency"], "USDT");
         let path = unique_temp_path("holding_fx_targets");
         load_or_initialize(&path).expect("ledger should initialize");
         write_document(&path, &document).expect("ledger should persist");
@@ -18299,6 +18351,49 @@ mod tests {
             .clone()
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn quote_refresh_target_recovers_supported_crypto_symbol_from_display_name() {
+        let now = "2026-07-29T00:00:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["accounts"] = json!([account_from_create_input(
+            &json!({
+                "displayName": "Exchange",
+                "accountType": "exchange",
+                "defaultCurrency": "BTC",
+                "supportedCurrencies": ["BTC"],
+                "includeInNetWorth": true,
+                "balanceMode": "holdings",
+                "openingBalances": []
+            }),
+            "acct_exchange",
+            now,
+        )
+        .expect("holding account")]);
+        document["instruments"] = json!([{
+            "id": "inst_legacy_btc",
+            "type": "crypto",
+            "displayName": "btc",
+            "quoteCurrency": "BTC"
+        }]);
+        document["holdings"] = json!([{
+            "id": "holding_legacy_btc",
+            "accountId": "acct_exchange",
+            "instrumentId": "inst_legacy_btc",
+            "quantity": "0.1",
+            "quoteStatus": "unpriceable",
+            "asOf": now
+        }]);
+        let path = unique_temp_path("legacy_crypto_symbol_target");
+        load_or_initialize(&path).expect("ledger should initialize");
+        write_document(&path, &document).expect("ledger should persist");
+
+        let targets =
+            quote_refresh_targets(&path, &json!({"mode": "manual"})).expect("targets should load");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0]["symbol"], "BTC");
+        assert_eq!(targets[0]["quoteCurrency"], "BTC");
     }
 
     #[test]
