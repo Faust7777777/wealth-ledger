@@ -1,0 +1,1321 @@
+// Wealth Ledger — Agent 面板（Windows 右栏 / Android 全屏共用同一份实现）。
+// 只经 /v1/agent/**；账务产出落到既有 AI 待审核列表，这里只提供低强调入口。
+import 'package:file_selector/file_selector.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
+
+import '../core/types.dart';
+import '../data/api_mock_repositories.dart'
+    show ApiConflictException, ApiUnauthorizedException, ApiValidationException;
+import '../data/providers.dart';
+import '../data/view_models.dart';
+import '../theme/app_dimens.dart';
+import '../theme/app_typography.dart';
+import 'agent_controller.dart';
+import 'agent_providers_page.dart';
+import 'agent_notifications.dart'
+    show
+        AgentNotificationsEntry,
+        agentOpenQuoteSuggestionsProvider,
+        formatLocalDateTime;
+
+/// 图片白名单（作为模型视觉输入）；HEIC 不在范围内。
+const Map<String, String> kAgentImageMimeTypes = {
+  'png': 'image/png',
+  'jpg': 'image/jpeg',
+  'jpeg': 'image/jpeg',
+  'webp': 'image/webp',
+};
+
+/// 文档白名单（进 Agent 工作区，由 Agent 自行选择工具读取）。
+const Map<String, String> kAgentDocumentMimeTypes = {
+  'txt': 'text/plain',
+  'csv': 'text/csv',
+  'pdf': 'application/pdf',
+  'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'zip': 'application/zip',
+};
+
+String? agentImageMimeType(String fileName) =>
+    kAgentImageMimeTypes[_extensionOf(fileName)];
+
+/// 按真实扩展名给出准确 MIME；不在白名单内返回 null。
+String? agentAttachmentMimeType(String fileName) {
+  final ext = _extensionOf(fileName);
+  return kAgentImageMimeTypes[ext] ?? kAgentDocumentMimeTypes[ext];
+}
+
+String _extensionOf(String fileName) {
+  final dot = fileName.lastIndexOf('.');
+  return dot < 0 ? '' : fileName.substring(dot + 1).toLowerCase();
+}
+
+bool agentMimeIsImage(String mimeType) =>
+    kAgentImageMimeTypes.containsValue(mimeType);
+
+/// 文档类型的小图标（不显示 MIME 本身）。
+IconData agentAttachmentIcon(String mimeType) => switch (mimeType) {
+  'application/pdf' => Icons.picture_as_pdf_outlined,
+  'text/csv' => Icons.grid_on_outlined,
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' =>
+    Icons.table_chart_outlined,
+  'application/zip' => Icons.folder_zip_outlined,
+  'text/plain' => Icons.description_outlined,
+  _ => Icons.insert_drive_file_outlined,
+};
+
+/// 人类可读的文件大小。
+String agentFileSize(int bytes) {
+  if (bytes < 1024) return '$bytes B';
+  if (bytes < 1024 * 1024) return '${(bytes / 1024).round()} KB';
+  return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+}
+
+/// 用户选中的一个待上传文件。
+typedef AgentPickedFile = ({String fileName, Uint8List bytes});
+
+/// 选文件入口的可注入接缝：默认弹系统选择器；测试与预览覆盖它，
+/// 因此不需要在测试里驱动真实文件对话框。
+typedef AgentFilePicker = Future<AgentPickedFile?> Function();
+
+Future<AgentPickedFile?> _pickFileFromSystem() async {
+  final extensions = [
+    ...kAgentImageMimeTypes.keys,
+    ...kAgentDocumentMimeTypes.keys,
+  ];
+  final typeGroup = XTypeGroup(
+    label: 'attachments',
+    extensions: extensions,
+    mimeTypes: [
+      ...kAgentImageMimeTypes.values.toSet(),
+      ...kAgentDocumentMimeTypes.values,
+    ],
+  );
+  final file = await openFile(acceptedTypeGroups: [typeGroup]);
+  if (file == null) return null;
+  return (fileName: file.name, bytes: await file.readAsBytes());
+}
+
+final agentAttachmentPickerProvider = Provider<AgentFilePicker>(
+  (ref) => _pickFileFromSystem,
+);
+
+/// 附件失败的用户可见短提示。UTF-8 不合法与格式不符在服务端同码，
+/// 用本地选中的文件类型区分成两句话。
+String agentAttachmentErrorMessage(String? code, {String? fileName}) {
+  final ext = fileName == null ? '' : _extensionOf(fileName);
+  final isText = ext == 'txt' || ext == 'csv';
+  return switch (code) {
+    'invalid_attachment_size' => '文件超过 15 MiB，请压缩后再试。',
+    'unsupported_attachment_type' => '只支持图片、TXT、CSV、PDF、XLSX 与 ZIP。',
+    'attachment_mime_mismatch' when isText => '文本内容不是有效的 UTF-8，请另存后再试。',
+    'attachment_mime_mismatch' => '文件内容与扩展名不一致，请重新选择。',
+    _ => '文件未通过校验，请重新选择。',
+  };
+}
+
+/// 候选主体：标的用可读名称（不显示内部 ID），汇率用币对。
+String agentQuoteSubject(
+  AgentQuoteCandidateVm candidate,
+  List<InstrumentVm> instruments,
+) {
+  if (candidate.kind == AgentQuoteCandidateKind.fx) {
+    return '${candidate.baseCurrency} / ${candidate.quoteCurrency}';
+  }
+  for (final i in instruments) {
+    if (i.id != candidate.instrumentId) continue;
+    final symbol = i.symbol ?? '';
+    return symbol.isEmpty ? i.displayName : '${i.displayName} · $symbol';
+  }
+  return '标的';
+}
+
+/// 数值 + 计价单位。
+String agentQuoteValue(AgentQuoteCandidateVm candidate) =>
+    candidate.kind == AgentQuoteCandidateKind.fx
+    ? '${candidate.rate} ${candidate.quoteCurrency}'
+    : '${candidate.price} ${candidate.currency}';
+
+/// 来源域名（只显示 host）。
+String agentSourceHost(String url) {
+  final uri = Uri.tryParse(url);
+  final host = uri?.host ?? '';
+  return host.isEmpty ? url : host;
+}
+
+/// 面板主体的门控状态：只有 ready 才展示会话内容与输入区。
+enum AgentPanelGate { loading, needsLogin, failed, notConfigured, ready }
+
+/// status 与会话列表共同决定门控；401 优先，且绝不与"未配置模型"同时出现。
+AgentPanelGate agentPanelGate(
+  AsyncValue<AgentStatusVm> statusAsync,
+  AsyncValue<List<AgentConversationVm>> conversationsAsync,
+) {
+  for (final async in [statusAsync, conversationsAsync]) {
+    if (async.hasError && async.error is ApiUnauthorizedException) {
+      return AgentPanelGate.needsLogin;
+    }
+  }
+  if (statusAsync.hasError || conversationsAsync.hasError) {
+    return AgentPanelGate.failed;
+  }
+  final status = statusAsync.asData?.value;
+  if (status == null || conversationsAsync.asData == null) {
+    return AgentPanelGate.loading;
+  }
+  return status.configured
+      ? AgentPanelGate.ready
+      : AgentPanelGate.notConfigured;
+}
+
+/// 登录失效：只给一句状态和进入设置登录区的动作。
+class _NeedsLoginBlock extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) => Center(
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text('需要登录', style: AppType.body),
+        const SizedBox(height: AppSpacing.sm),
+        FilledButton(
+          onPressed: () => context.push('/settings'),
+          child: const Text('去登录'),
+        ),
+      ],
+    ),
+  );
+}
+
+class AgentPanel extends ConsumerStatefulWidget {
+  const AgentPanel({super.key, this.onClose});
+
+  /// 桌面右栏的关闭动作；移动端全屏页由返回键处理，传 null。
+  final VoidCallback? onClose;
+
+  @override
+  ConsumerState<AgentPanel> createState() => _AgentPanelState();
+}
+
+class _AgentPanelState extends ConsumerState<AgentPanel> {
+  final _draft = TextEditingController();
+  final _pending = <({AgentAttachmentVm meta, Uint8List bytes})>[];
+  bool _uploading = false;
+  String? _composerError;
+  bool _opened = false;
+
+  @override
+  void dispose() {
+    _draft.dispose();
+    super.dispose();
+  }
+
+  /// 首次可用时进入主会话；会话列表变化不重复打开。
+  void _openPrimaryOnce(List<AgentConversationVm> conversations) {
+    if (_opened || conversations.isEmpty) return;
+    _opened = true;
+    final primary = conversations.firstWhere(
+      (c) => c.isPrimary,
+      orElse: () => conversations.first,
+    );
+    Future.microtask(
+      () => ref.read(agentChatProvider.notifier).open(primary.id),
+    );
+  }
+
+  Future<void> _pickAttachment() async {
+    if (_uploading) return;
+    setState(() {
+      _uploading = true;
+      _composerError = null;
+    });
+    String? pickedName;
+    try {
+      final picked = await ref.read(agentAttachmentPickerProvider)();
+      if (picked == null) return;
+      pickedName = picked.fileName;
+      final mime = agentAttachmentMimeType(picked.fileName);
+      if (mime == null) {
+        setState(() => _composerError = '只支持图片、TXT、CSV、PDF、XLSX 与 ZIP。');
+        return;
+      }
+      final meta = await ref
+          .read(agentRepositoryProvider)
+          .uploadAttachment(
+            fileName: picked.fileName,
+            mimeType: mime,
+            bytes: picked.bytes,
+          );
+      if (!mounted) return;
+      setState(() => _pending.add((meta: meta, bytes: picked.bytes)));
+    } on ApiValidationException catch (e) {
+      // 400/413 保留用户仍可重新选择。
+      if (mounted) {
+        setState(
+          () => _composerError = agentAttachmentErrorMessage(
+            e.code,
+            fileName: pickedName,
+          ),
+        );
+      }
+    } catch (_) {
+      if (mounted) setState(() => _composerError = '文件上传失败，请重试。');
+    } finally {
+      if (mounted) setState(() => _uploading = false);
+    }
+  }
+
+  Future<void> _send() async {
+    final chat = ref.read(agentChatProvider);
+    if (chat.sending) return; // 同一次点击只产生一个请求
+    final text = _draft.text;
+    if (text.trim().isEmpty) return;
+    final attachmentIds = [for (final a in _pending) a.meta.id];
+    final failure = await ref
+        .read(agentChatProvider.notifier)
+        .send(text: text, attachmentIds: attachmentIds);
+    if (!mounted) return;
+    if (failure != null) {
+      // 草稿与附件引用保留，可直接重试。
+      setState(() => _composerError = failure);
+      return;
+    }
+    setState(() {
+      _draft.clear();
+      _pending.clear();
+      _composerError = null;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // 通知里的「去看报价」请求：在面板层打开报价建议 sheet。
+    ref.listen(agentOpenQuoteSuggestionsProvider, (_, _) {
+      if (mounted) showAgentQuoteCandidateSheet(context);
+    });
+    final statusAsync = ref.watch(agentStatusProvider);
+    final conversationsAsync = ref.watch(agentConversationsProvider);
+    final modelsAsync = ref.watch(agentModelsProvider);
+    final chat = ref.watch(agentChatProvider);
+    conversationsAsync.whenData(_openPrimaryOnce);
+
+    // status 只有成功返回才谈"配置"；loading / 401 / 其他错误各走各的分支，
+    // 绝不折叠成"服务器尚未配置模型"。
+    final gate = agentPanelGate(statusAsync, conversationsAsync);
+    final configured = gate == AgentPanelGate.ready;
+    final conversations = conversationsAsync.asData?.value ?? const [];
+    final active = conversations
+        .where((c) => c.id == chat.conversationId)
+        .cast<AgentConversationVm?>()
+        .firstWhere((c) => true, orElse: () => null);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        _Header(
+          active: active,
+          conversations: conversations,
+          onClose: widget.onClose,
+        ),
+        const Divider(height: 1),
+        const AgentNotificationsEntry(),
+        const _QuoteCandidatesEntry(),
+        const _MemorySuggestions(),
+        Expanded(
+          child: switch (gate) {
+            AgentPanelGate.loading => const Center(
+              child: CircularProgressIndicator(),
+            ),
+            AgentPanelGate.needsLogin => _NeedsLoginBlock(),
+            AgentPanelGate.failed => _RetryBlock(
+              message: '加载失败，请重试。',
+              onRetry: () {
+                ref.invalidate(agentStatusProvider);
+                ref.invalidate(agentConversationsProvider);
+              },
+            ),
+            AgentPanelGate.notConfigured => const Center(
+              child: Text('服务器尚未配置模型'),
+            ),
+            AgentPanelGate.ready =>
+              chat.loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : chat.loadFailed
+                  ? _RetryBlock(
+                      message: '会话加载失败，请重试。',
+                      onRetry: () =>
+                          ref.read(agentChatProvider.notifier).reload(),
+                    )
+                  : _MessageList(chat: chat),
+          },
+        ),
+        if (gate == AgentPanelGate.ready &&
+            !chat.streamOnline &&
+            !chat.loading &&
+            !chat.loadFailed)
+          _InlineNotice(
+            text: '连接已断开',
+            actionLabel: '重连',
+            onAction: () => ref.read(agentChatProvider.notifier).reconnect(),
+          ),
+        if (chat.runError != null)
+          _InlineNotice(text: chat.runError!, actionLabel: null),
+        // 只有模型列表成功返回后才能判定缺失；加载和请求失败不是“模型不可用”。
+        if (gate == AgentPanelGate.ready &&
+            agentSelectedModelUnavailable(active?.selectedModelId, modelsAsync))
+          AgentModelUnavailableNotice(
+            onReconnect: () => context.push('/agent/providers'),
+          ),
+        const Divider(height: 1),
+        _Composer(
+          draft: _draft,
+          pending: _pending,
+          configured: configured,
+          uploading: _uploading,
+          busy: chat.busy,
+          sending: chat.sending,
+          error: _composerError,
+          onPick: _pickAttachment,
+          onRemove: (id) =>
+              setState(() => _pending.removeWhere((a) => a.meta.id == id)),
+          onSend: _send,
+          onStop: () => ref.read(agentChatProvider.notifier).cancel(),
+        ),
+      ],
+    );
+  }
+}
+
+/// 会话/模型选择改用真实路由 sheet：菜单项自身消费触摸事件，
+/// 事件不会穿透到下方 composer，返回键也会先关掉这一层。
+/// sheet 只回传选择结果，动作由仍然挂载的 header 执行。
+class _Header extends ConsumerWidget {
+  const _Header({
+    required this.active,
+    required this.conversations,
+    required this.onClose,
+  });
+  final AgentConversationVm? active;
+  final List<AgentConversationVm> conversations;
+  final VoidCallback? onClose;
+
+  Future<void> _mutate(WidgetRef ref, Future<void> Function() action) async {
+    try {
+      await action();
+    } finally {
+      ref.invalidate(agentConversationsProvider);
+    }
+  }
+
+  Future<void> _rename(BuildContext context, WidgetRef ref) async {
+    final current = active;
+    if (current == null) return;
+    final controller = TextEditingController(text: current.title);
+    final title = await showDialog<String>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('重命名会话'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(border: OutlineInputBorder()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(c),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(c, controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    if (title == null || title.isEmpty) return;
+    await _mutate(
+      ref,
+      () => ref
+          .read(agentRepositoryProvider)
+          .updateConversation(current.id, title: title),
+    );
+  }
+
+  Future<void> _openConversationMenu(
+    BuildContext context,
+    WidgetRef ref,
+  ) async {
+    final visible = [
+      for (final c in conversations)
+        if (c.status == AgentConversationStatus.active) c,
+    ];
+    final choice = await showAgentConversationSheet(
+      context,
+      active: active,
+      conversations: visible,
+    );
+    if (choice == null || !context.mounted) return;
+    switch (choice) {
+      case kAgentMenuNewConversation:
+        await _mutate(ref, () async {
+          final created = await ref
+              .read(agentRepositoryProvider)
+              .createConversation();
+          await ref.read(agentChatProvider.notifier).open(created.id);
+        });
+      case kAgentMenuRenameConversation:
+        if (context.mounted) await _rename(context, ref);
+      case kAgentMenuArchiveConversation:
+        final current = active;
+        if (current == null || current.isPrimary) return;
+        await _mutate(ref, () async {
+          await ref
+              .read(agentRepositoryProvider)
+              .updateConversation(
+                current.id,
+                status: AgentConversationStatus.archived,
+              );
+          final primary = visible.firstWhere(
+            (c) => c.isPrimary,
+            orElse: () => visible.first,
+          );
+          await ref.read(agentChatProvider.notifier).open(primary.id);
+        });
+      default:
+        await ref.read(agentChatProvider.notifier).open(choice);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final models = ref.watch(agentModelsProvider).asData?.value ?? const [];
+    return Padding(
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppSpacing.base,
+        vertical: AppSpacing.sm,
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              active?.title ?? '助手',
+              style: AppType.bodyStrong,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if (models.isNotEmpty && active != null)
+            IconButton(
+              key: kAgentModelMenuKey,
+              tooltip: '模型',
+              icon: const Icon(Icons.memory_outlined, size: 20),
+              onPressed: () async {
+                final modelId = await showAgentModelSheet(
+                  context,
+                  active: active!,
+                  models: models,
+                );
+                if (modelId == null) return;
+                await _mutate(
+                  ref,
+                  () => ref
+                      .read(agentRepositoryProvider)
+                      .updateConversation(active!.id, modelId: modelId),
+                );
+              },
+            ),
+          IconButton(
+            key: kAgentConversationMenuKey,
+            tooltip: '会话',
+            icon: const Icon(Icons.more_horiz, size: 20),
+            onPressed: () => _openConversationMenu(context, ref),
+          ),
+          if (onClose != null)
+            IconButton(
+              onPressed: onClose,
+              icon: const Icon(Icons.close, size: 20),
+              tooltip: '关闭',
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 会话菜单与模型菜单入口的稳定 Key（真实触摸测试用）。
+const kAgentConversationMenuKey = ValueKey('agent_conversation_menu');
+const kAgentModelMenuKey = ValueKey('agent_model_menu');
+
+/// 会话菜单的非会话动作；其余回传值就是会话 id。
+const kAgentMenuNewConversation = '__agent_menu_new__';
+const kAgentMenuRenameConversation = '__agent_menu_rename__';
+const kAgentMenuArchiveConversation = '__agent_menu_archive__';
+
+Future<String?> showAgentModelSheet(
+  BuildContext context, {
+  required AgentConversationVm active,
+  required List<AgentModelVm> models,
+}) => showModalBottomSheet<String>(
+  context: context,
+  showDragHandle: true,
+  isScrollControlled: true,
+  builder: (_) => AgentModelSheet(active: active, models: models),
+);
+
+class AgentModelSheet extends StatelessWidget {
+  const AgentModelSheet({
+    super.key,
+    required this.active,
+    required this.models,
+  });
+  final AgentConversationVm active;
+  final List<AgentModelVm> models;
+
+  @override
+  Widget build(BuildContext context) {
+    final maxHeight = (MediaQuery.sizeOf(context).height * 0.6).clamp(
+      160.0,
+      480.0,
+    );
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: maxHeight),
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            for (final m in models)
+              ListTile(
+                key: ValueKey('agent_model_${m.id}'),
+                title: Text(m.displayName, overflow: TextOverflow.ellipsis),
+                trailing: m.id == active.selectedModelId
+                    ? const Icon(Icons.check, size: 18)
+                    : null,
+                onTap: () => Navigator.of(context).pop(m.id),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+Future<String?> showAgentConversationSheet(
+  BuildContext context, {
+  required AgentConversationVm? active,
+  required List<AgentConversationVm> conversations,
+}) => showModalBottomSheet<String>(
+  context: context,
+  showDragHandle: true,
+  isScrollControlled: true,
+  builder: (_) =>
+      AgentConversationSheet(active: active, conversations: conversations),
+);
+
+class AgentConversationSheet extends StatelessWidget {
+  const AgentConversationSheet({
+    super.key,
+    required this.active,
+    required this.conversations,
+  });
+  final AgentConversationVm? active;
+  final List<AgentConversationVm> conversations;
+
+  @override
+  Widget build(BuildContext context) {
+    final current = active;
+    final maxHeight = (MediaQuery.sizeOf(context).height * 0.7).clamp(
+      200.0,
+      560.0,
+    );
+    final others = [
+      for (final c in conversations)
+        if (c.id != current?.id) c,
+    ];
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: maxHeight),
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.add, size: 20),
+              title: const Text('新建会话'),
+              onTap: () => Navigator.of(context).pop(kAgentMenuNewConversation),
+            ),
+            if (current != null)
+              ListTile(
+                leading: const Icon(Icons.edit_outlined, size: 20),
+                title: const Text('重命名'),
+                onTap: () =>
+                    Navigator.of(context).pop(kAgentMenuRenameConversation),
+              ),
+            if (current != null && !current.isPrimary)
+              ListTile(
+                leading: const Icon(Icons.archive_outlined, size: 20),
+                title: const Text('归档'),
+                onTap: () =>
+                    Navigator.of(context).pop(kAgentMenuArchiveConversation),
+              ),
+            if (others.isNotEmpty) const Divider(height: 1),
+            for (final c in others)
+              ListTile(
+                key: ValueKey('agent_conversation_${c.id}'),
+                title: Text(c.title, overflow: TextOverflow.ellipsis),
+                onTap: () => Navigator.of(context).pop(c.id),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _QuoteCandidatesEntry extends ConsumerWidget {
+  const _QuoteCandidatesEntry();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final suggested = ref.watch(agentSuggestedQuoteCandidatesProvider);
+    if (suggested.isEmpty) return const SizedBox.shrink();
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: TextButton.icon(
+        onPressed: () => showAgentQuoteCandidateSheet(context),
+        icon: const Icon(Icons.link_outlined, size: 18),
+        label: Text('报价建议 ${suggested.length}'),
+      ),
+    );
+  }
+}
+
+/// 只保留 suggested；applied / rejected 不进入界面。
+final agentSuggestedQuoteCandidatesProvider =
+    Provider<List<AgentQuoteCandidateVm>>((ref) {
+      final all =
+          ref.watch(agentQuoteCandidatesProvider).asData?.value ?? const [];
+      return [
+        for (final c in all)
+          if (c.status == AgentQuoteCandidateStatus.suggested) c,
+      ];
+    });
+
+Future<void> showAgentQuoteCandidateSheet(BuildContext context) =>
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (_) => const AgentQuoteCandidateSheet(),
+    );
+
+class AgentQuoteCandidateSheet extends ConsumerStatefulWidget {
+  const AgentQuoteCandidateSheet({super.key});
+
+  @override
+  ConsumerState<AgentQuoteCandidateSheet> createState() =>
+      _AgentQuoteCandidateSheetState();
+}
+
+class _AgentQuoteCandidateSheetState
+    extends ConsumerState<AgentQuoteCandidateSheet> {
+  final _busy = <Id>{};
+  final _errors = <Id, String>{};
+
+  Future<void> _review(
+    AgentQuoteCandidateVm candidate,
+    AgentQuoteCandidateStatus decision,
+  ) async {
+    // 重复点击只产生一次请求。
+    if (!_busy.add(candidate.id)) return;
+    setState(() => _errors.remove(candidate.id));
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await ref
+          .read(agentRepositoryProvider)
+          .reviewQuoteCandidate(candidate.id, decision: decision);
+      ref.invalidate(agentQuoteCandidatesProvider);
+      if (decision == AgentQuoteCandidateStatus.applied) {
+        // 采用是唯一会改变估值的动作：刷新所有报价派生视图。
+        ref.invalidate(holdingsProvider);
+        ref.invalidate(accountsProvider);
+        ref.invalidate(overviewProvider);
+        ref.invalidate(allocationProvider);
+        messenger.showSnackBar(const SnackBar(content: Text('已采用这条报价')));
+      }
+    } on ApiConflictException {
+      // 409：状态已变，重新拉列表。
+      ref.invalidate(agentQuoteCandidatesProvider);
+      if (mounted) {
+        setState(() => _errors[candidate.id] = '这条建议已被处理，已重新加载');
+      }
+    } on ApiValidationException catch (e) {
+      if (mounted) setState(() => _errors[candidate.id] = e.userMessage);
+    } catch (_) {
+      // 失败保留候选，可再试一次。
+      if (mounted) setState(() => _errors[candidate.id] = '操作失败，请重试');
+    } finally {
+      _busy.remove(candidate.id);
+      if (mounted) setState(() {});
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final suggested = ref.watch(agentSuggestedQuoteCandidatesProvider);
+    // 处理完最后一条就收起，不留空 sheet。
+    if (suggested.isEmpty) {
+      final navigator = Navigator.of(context);
+      Future.microtask(() {
+        if (mounted) navigator.maybePop();
+      });
+    }
+    final instruments =
+        ref.watch(instrumentsProvider).asData?.value ?? const <InstrumentVm>[];
+    final maxHeight = (MediaQuery.sizeOf(context).height * 0.7).clamp(
+      200.0,
+      560.0,
+    );
+
+    return SafeArea(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(maxHeight: maxHeight),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: AppSpacing.base,
+                vertical: AppSpacing.xs,
+              ),
+              child: Text('报价建议', style: AppType.bodyStrong),
+            ),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                padding: const EdgeInsets.only(bottom: AppSpacing.base),
+                itemCount: suggested.length,
+                itemBuilder: (context, index) => _QuoteCandidateCard(
+                  candidate: suggested[index],
+                  instruments: instruments,
+                  busy: _busy.contains(suggested[index].id),
+                  error: _errors[suggested[index].id],
+                  onReview: _review,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _QuoteCandidateCard extends StatelessWidget {
+  const _QuoteCandidateCard({
+    required this.candidate,
+    required this.instruments,
+    required this.busy,
+    required this.error,
+    required this.onReview,
+  });
+
+  final AgentQuoteCandidateVm candidate;
+  final List<InstrumentVm> instruments;
+  final bool busy;
+  final String? error;
+  final void Function(AgentQuoteCandidateVm, AgentQuoteCandidateStatus)
+  onReview;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: const EdgeInsets.fromLTRB(
+        AppSpacing.base,
+        AppSpacing.xs,
+        AppSpacing.base,
+        0,
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.sm),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    agentQuoteSubject(candidate, instruments),
+                    style: AppType.bodyStrong,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                Text(agentQuoteValue(candidate), style: AppType.moneyRow),
+              ],
+            ),
+            Text(
+              '${formatLocalDateTime(candidate.asOf)} · ${candidate.source}',
+              style: AppType.caption,
+            ),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton(
+                onPressed: () async {
+                  await Clipboard.setData(
+                    ClipboardData(text: candidate.sourceUrl),
+                  );
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(
+                      context,
+                    ).showSnackBar(const SnackBar(content: Text('已复制来源链接')));
+                  }
+                },
+                style: TextButton.styleFrom(
+                  padding: EdgeInsets.zero,
+                  textStyle: AppType.caption,
+                ),
+                child: Text(agentSourceHost(candidate.sourceUrl)),
+              ),
+            ),
+            if (error != null)
+              Text(
+                error!,
+                style: AppType.caption.copyWith(
+                  color: Theme.of(context).colorScheme.error,
+                ),
+              ),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton(
+                  onPressed: busy
+                      ? null
+                      : () => onReview(
+                          candidate,
+                          AgentQuoteCandidateStatus.rejected,
+                        ),
+                  child: const Text('忽略'),
+                ),
+                const SizedBox(width: AppSpacing.xs),
+                FilledButton(
+                  onPressed: busy
+                      ? null
+                      : () => onReview(
+                          candidate,
+                          AgentQuoteCandidateStatus.applied,
+                        ),
+                  child: const Text('采用'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MemorySuggestions extends ConsumerWidget {
+  const _MemorySuggestions();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final memories = ref.watch(agentMemoriesProvider).asData?.value ?? const [];
+    final suggested = [
+      for (final m in memories)
+        if (m.status == AgentMemoryStatus.suggested) m,
+    ];
+    if (suggested.isEmpty) return const SizedBox.shrink();
+    Future<void> review(AgentMemoryVm m, AgentMemoryStatus decision) async {
+      try {
+        await ref
+            .read(agentRepositoryProvider)
+            .reviewMemory(m.id, decision: decision);
+      } finally {
+        ref.invalidate(agentMemoriesProvider);
+      }
+    }
+
+    return Column(
+      children: [
+        for (final m in suggested)
+          Card(
+            margin: const EdgeInsets.fromLTRB(
+              AppSpacing.base,
+              AppSpacing.sm,
+              AppSpacing.base,
+              0,
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(AppSpacing.sm),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('记忆建议', style: AppType.caption),
+                  const SizedBox(height: AppSpacing.xxs),
+                  Text(m.content, style: AppType.body),
+                  if (m.reason.isNotEmpty)
+                    Text(m.reason, style: AppType.caption),
+                  const SizedBox(height: AppSpacing.xs),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      TextButton(
+                        onPressed: () => review(m, AgentMemoryStatus.rejected),
+                        child: const Text('拒绝'),
+                      ),
+                      const SizedBox(width: AppSpacing.xs),
+                      FilledButton(
+                        onPressed: () => review(m, AgentMemoryStatus.active),
+                        child: const Text('批准'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _MessageList extends ConsumerWidget {
+  const _MessageList({required this.chat});
+  final AgentChatState chat;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final hasPending =
+        (ref.watch(aiPendingProvider).asData?.value ?? const []).isNotEmpty;
+    return ListView(
+      padding: const EdgeInsets.all(AppSpacing.base),
+      children: [
+        if (chat.messages.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: AppSpacing.lg),
+            child: Text('还没有对话', style: AppType.caption),
+          ),
+        for (final m in chat.messages)
+          if (m.role != AgentMessageRole.system) _MessageBubble(message: m),
+        if (chat.activity != null)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
+            child: Text(chat.activity!, style: AppType.caption),
+          ),
+        if (hasPending)
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton(
+              onPressed: () => context.push('/ai-review'),
+              child: const Text('前往审核'),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _MessageBubble extends StatelessWidget {
+  const _MessageBubble({required this.message});
+  final AgentMessageVm message;
+
+  @override
+  Widget build(BuildContext context) {
+    final mine = message.role == AgentMessageRole.user;
+    final scheme = Theme.of(context).colorScheme;
+    return Align(
+      alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
+        padding: const EdgeInsets.all(AppSpacing.sm),
+        constraints: const BoxConstraints(maxWidth: 520),
+        decoration: BoxDecoration(
+          color: mine
+              ? scheme.secondaryContainer
+              : scheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (message.attachmentIds.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: AppSpacing.xs),
+                child: Wrap(
+                  spacing: AppSpacing.xs,
+                  runSpacing: AppSpacing.xs,
+                  children: [
+                    for (final id in message.attachmentIds)
+                      AgentAttachmentPreview(attachmentId: id),
+                  ],
+                ),
+              ),
+            if (message.text.isNotEmpty)
+              Text(message.text, style: AppType.body)
+            else if (message.status == AgentMessageStatus.queued)
+              Text('排队中…', style: AppType.caption),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 历史附件：先读安全元数据，图片才走 Image.memory，
+/// 其他文件只显示紧凑文件 chip，避免把 PDF/ZIP 字节交给图片解码器。
+class AgentAttachmentPreview extends ConsumerWidget {
+  const AgentAttachmentPreview({super.key, required this.attachmentId});
+  final String attachmentId;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final metaAsync = ref.watch(agentAttachmentMetaProvider(attachmentId));
+    return metaAsync.when(
+      loading: () => const SizedBox(
+        width: 72,
+        height: 72,
+        child: Center(
+          child: SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      ),
+      error: (_, _) => IconButton(
+        tooltip: '重试',
+        onPressed: () =>
+            ref.invalidate(agentAttachmentMetaProvider(attachmentId)),
+        icon: const Icon(Icons.refresh, size: 18),
+      ),
+      data: (meta) => agentMimeIsImage(meta.mimeType)
+          ? _ImageAttachment(attachmentId: attachmentId)
+          : _FileChip(
+              fileName: meta.fileName,
+              mimeType: meta.mimeType,
+              sizeBytes: meta.sizeBytes,
+            ),
+    );
+  }
+}
+
+class _ImageAttachment extends ConsumerWidget {
+  const _ImageAttachment({required this.attachmentId});
+  final String attachmentId;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final async = ref.watch(agentAttachmentBytesProvider(attachmentId));
+    return SizedBox(
+      width: 72,
+      height: 72,
+      child: async.when(
+        loading: () => const Center(
+          child: SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+        error: (_, _) => IconButton(
+          tooltip: '重试',
+          onPressed: () =>
+              ref.invalidate(agentAttachmentBytesProvider(attachmentId)),
+          icon: const Icon(Icons.refresh, size: 18),
+        ),
+        data: (bytes) => ClipRRect(
+          borderRadius: BorderRadius.circular(AppRadius.sm),
+          child: Image.memory(bytes, fit: BoxFit.cover),
+        ),
+      ),
+    );
+  }
+}
+
+/// 紧凑文件 chip：类型图标 + 文件名 + 大小。不读取也不展示文件正文。
+class _FileChip extends StatelessWidget {
+  const _FileChip({
+    required this.fileName,
+    required this.mimeType,
+    required this.sizeBytes,
+    this.onRemove,
+  });
+  final String fileName;
+  final String mimeType;
+  final int sizeBytes;
+  final VoidCallback? onRemove;
+
+  @override
+  Widget build(BuildContext context) => Chip(
+    avatar: Icon(agentAttachmentIcon(mimeType), size: 18),
+    // 大小是定长信息，优先完整可见；只让文件名省略。
+    label: ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 200),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Flexible(child: Text(fileName, overflow: TextOverflow.ellipsis)),
+          Text(' · ${agentFileSize(sizeBytes)}'),
+        ],
+      ),
+    ),
+    onDeleted: onRemove,
+  );
+}
+
+class _Composer extends StatelessWidget {
+  const _Composer({
+    required this.draft,
+    required this.pending,
+    required this.configured,
+    required this.uploading,
+    required this.busy,
+    required this.sending,
+    required this.error,
+    required this.onPick,
+    required this.onRemove,
+    required this.onSend,
+    required this.onStop,
+  });
+
+  final TextEditingController draft;
+  final List<({AgentAttachmentVm meta, Uint8List bytes})> pending;
+  final bool configured;
+  final bool uploading;
+  final bool busy;
+  final bool sending;
+  final String? error;
+  final VoidCallback onPick;
+  final ValueChanged<String> onRemove;
+  final VoidCallback onSend;
+  final VoidCallback onStop;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(AppSpacing.base),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (pending.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+              child: Wrap(
+                spacing: AppSpacing.sm,
+                runSpacing: AppSpacing.xs,
+                children: [
+                  for (final a in pending)
+                    if (agentMimeIsImage(a.meta.mimeType))
+                      Chip(
+                        avatar: ClipRRect(
+                          borderRadius: BorderRadius.circular(4),
+                          child: Image.memory(
+                            a.bytes,
+                            width: 24,
+                            height: 24,
+                            fit: BoxFit.cover,
+                          ),
+                        ),
+                        label: Text(a.meta.fileName),
+                        onDeleted: () => onRemove(a.meta.id),
+                      )
+                    else
+                      _FileChip(
+                        fileName: a.meta.fileName,
+                        mimeType: a.meta.mimeType,
+                        sizeBytes: a.meta.sizeBytes,
+                        onRemove: () => onRemove(a.meta.id),
+                      ),
+                ],
+              ),
+            ),
+          if (error != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: AppSpacing.xs),
+              child: Text(
+                error!,
+                style: AppType.caption.copyWith(
+                  color: Theme.of(context).colorScheme.error,
+                ),
+              ),
+            ),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              IconButton(
+                onPressed: configured && !uploading ? onPick : null,
+                icon: const Icon(Icons.attach_file),
+                tooltip: '添加文件',
+              ),
+              Expanded(
+                child: TextField(
+                  controller: draft,
+                  enabled: configured,
+                  minLines: 1,
+                  maxLines: 4,
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    hintText: '说点什么',
+                    isDense: true,
+                  ),
+                ),
+              ),
+              const SizedBox(width: AppSpacing.xs),
+              if (busy)
+                IconButton(
+                  onPressed: onStop,
+                  icon: const Icon(Icons.stop_circle_outlined),
+                  tooltip: '停止',
+                ),
+              FilledButton(
+                onPressed: configured && !sending ? onSend : null,
+                child: const Text('发送'),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _InlineNotice extends StatelessWidget {
+  const _InlineNotice({
+    required this.text,
+    required this.actionLabel,
+    this.onAction,
+  });
+  final String text;
+  final String? actionLabel;
+  final VoidCallback? onAction;
+
+  @override
+  Widget build(BuildContext context) => Padding(
+    padding: const EdgeInsets.symmetric(horizontal: AppSpacing.base),
+    child: Row(
+      children: [
+        Expanded(child: Text(text, style: AppType.caption)),
+        if (actionLabel != null)
+          TextButton(onPressed: onAction, child: Text(actionLabel!)),
+      ],
+    ),
+  );
+}
+
+class _RetryBlock extends StatelessWidget {
+  const _RetryBlock({required this.message, required this.onRetry});
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) => Center(
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(message, style: AppType.caption),
+        const SizedBox(height: AppSpacing.sm),
+        OutlinedButton(onPressed: onRetry, child: const Text('重试')),
+      ],
+    ),
+  );
+}

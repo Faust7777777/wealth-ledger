@@ -16,39 +16,43 @@
 4. `QUOTE_RATE_CONTRACT_V1.md`  
    行情/汇率刷新、过期、估值质量、历史价格口径。
 
-5. `SYNC_API_DRAFT.md`  
-   未来 VPS 同步、登录、设备、冲突处理草案。
+5. `SERVER_MODE_ALGORITHMS_V1.md`
+   当前 VPS 在线模式的事实源、金额、atomic group、订阅、估值、认证与持久化算法。
 
-6. `APPLICATION_INTERFACES_V1.md`  
+6. `SYNC_API_DRAFT.md`
+   离线多账本同步、设备、冲突处理草案；不阻塞在线客户端共享服务端账本。
+
+7. `APPLICATION_INTERFACES_V1.md`
    应用层服务接口：账户、组合、流水、定投、AI、行情、快照、同步。
 
-7. `HTTP_API_V1.md`  
-   未来 VPS HTTP API 草案；当前前端第一阶段不发真实请求。
+8. `HTTP_API_V1.md`
+   VPS/local_server HTTP API；Rust `--ledger-path` 模式已实现主要读写路径。
 
-8. `openapi_v1.yaml`  
+9. `openapi_v1.yaml`
    `HTTP_API_V1.md` 的机器可读 OpenAPI 3.1 草案，用于后续生成 client/server stub。
 
-9. `BACKEND_INTERFACE_IMPLEMENTATION_PLAN_V1.md`  
+10. `BACKEND_INTERFACE_IMPLEMENTATION_PLAN_V1.md`
    接口线下一步执行计划：契约一致性、core ports、后端 stub 边界。
 
-10. `CORE_PORTS_V1.md`  
+11. `CORE_PORTS_V1.md`
     本地账本 core 的端口边界：store ports、provider ports、atomic group use case 不变量。
 
-11. `examples/`  
+12. `examples/`
     接口载荷示例：空账本、首页空态/降级态、AI diff、DCA proposal、报价 stale。它们不是 debug fixture 种子，不得写入正式账本。
 
-12. `API_MOCK_STUB_PLAN_V1.md`  
+13. `API_MOCK_STUB_PLAN_V1.md`
     本地 mock/stub 计划：只读、只返回 examples、不写账、不接真实行情/AI/同步。
 
-13. `FRONTEND_API_INTEGRATION_HANDOFF_V1.md`  
+14. `FRONTEND_API_INTEGRATION_HANDOFF_V1.md`
     给 Flutter 前端线的本地联调交接：数据源模式、可接端点、禁止端点、校验命令。
 
-## 对 Claude 前端的约束
+## 前端数据源边界
 
 - 当前 Flutter 前端以 `DATA_SCHEMA_V1.md` 和 `AI_PROPOSAL_SCHEMA_V1.md` 的命名为准。
 - 如项目中存在旧 `API_CONTRACT_V1.md`，只作为 legacy reference，不驱动 UI / Repository 命名。
-- 第一阶段前端只做 Repository interface、`real_local` 空实现、`debug_fixture` 隔离实现、空数据 UI、DEMO 标记。
-- 不实现 SQLite / 加密 / Rust core / 同步 / 真实行情 / 真实 AI。
+- `api_remote` 与 `local_server` 使用同一组 HTTP repository；前者连接 HTTPS VPS 且不显示 DEV 标记。
+- `real_local` 仍是空实现边界，`debug_fixture` 只用于隔离演示。
+- 不在 Flutter 内复制 Rust 账本算法；所有远端写入以服务端验证和 atomic group 为准。
 
 ## 契约检查
 

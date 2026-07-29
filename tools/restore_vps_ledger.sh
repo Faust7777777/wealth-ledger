@@ -195,6 +195,7 @@ EOF
 fi
 
 SERVICE_WAS_ACTIVE="false"
+ACTIVE_PROXY_SOCKETS=()
 LEDGER_TMP=""
 AUTH_TMP=""
 ROLLBACK_DIR=""
@@ -203,6 +204,28 @@ COMMIT_SUCCEEDED="false"
 LEDGER_EXISTED="false"
 AUTH_EXISTED="false"
 ROLLBACK_PERFORMED="false"
+
+stop_proxy_companions() {
+  mapfile -t ACTIVE_PROXY_SOCKETS < <(
+    systemctl list-units \
+      --type=socket \
+      --state=active \
+      --plain \
+      --no-legend \
+      'finwealth-docker-proxy@*.socket' 2>/dev/null | awk '{print $1}'
+  )
+  local socket service
+  for socket in "${ACTIVE_PROXY_SOCKETS[@]}"; do
+    service="${socket%.socket}.service"
+    systemctl stop "$socket" "$service"
+  done
+}
+
+start_proxy_sockets() {
+  if [ "${#ACTIVE_PROXY_SOCKETS[@]}" -gt 0 ]; then
+    systemctl start "${ACTIVE_PROXY_SOCKETS[@]}"
+  fi
+}
 
 rollback_current_state() {
   if [ "$COMMIT_STARTED" != "true" ] || [ "$ROLLBACK_PERFORMED" = "true" ]; then
@@ -251,6 +274,12 @@ cleanup() {
       status=1
     fi
   fi
+  if [ "$status" -eq 0 ]; then
+    if ! start_proxy_sockets; then
+      echo "failed to restore Finwealth Docker bridge proxy sockets after restore" >&2
+      status=1
+    fi
+  fi
   [ -z "$LEDGER_TMP" ] || rm -f -- "$LEDGER_TMP"
   [ -z "$AUTH_TMP" ] || rm -f -- "$AUTH_TMP"
   [ -z "$ROLLBACK_DIR" ] || rm -rf -- "$ROLLBACK_DIR"
@@ -267,6 +296,7 @@ if [ "$STOP_SERVICE" = "true" ] && [ -n "$SERVICE_NAME" ]; then
   fi
   if systemctl is-active --quiet "$SERVICE_NAME"; then
     SERVICE_WAS_ACTIVE="true"
+    stop_proxy_companions
     systemctl stop "$SERVICE_NAME"
   fi
 fi

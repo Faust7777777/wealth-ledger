@@ -37,7 +37,7 @@ jobs:
         run: python tools/contract_check.py
 
       - name: Check shell scripts
-        run: bash -n tools/install_vps_systemd.sh tools/backup_vps_ledger.sh tools/restore_vps_ledger.sh tools/vps_backup_restore_smoke.sh
+        run: bash -n tools/install_vps_systemd.sh tools/check_vps_readiness.sh tools/backup_vps_ledger.sh tools/restore_vps_ledger.sh tools/vps_backup_restore_smoke.sh
 
       - name: Run VPS backup and restore smoke
         run: bash tools/vps_backup_restore_smoke.sh
@@ -57,6 +57,9 @@ jobs:
       - name: Run local ledger smoke
         run: python tools/local_ledger_smoke.py
 
+      - name: Run production TLS/auth/persistence topology smoke
+        run: python tools/production_topology_smoke.py
+
   flutter-windows:
     name: Flutter Windows
     runs-on: windows-latest
@@ -75,6 +78,7 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: 3.44.4
           cache: true
 
       - name: Get Flutter dependencies
@@ -119,9 +123,17 @@ jobs:
         shell: pwsh
         run: ./tools/package_release.ps1 -WindowsOnly -CheckReadinessOnly
 
+      - name: Check Windows server client readiness
+        shell: pwsh
+        run: ./tools/package_remote_windows.ps1 -CheckReadinessOnly
+
       - name: Build paired Windows self-use package
         shell: pwsh
         run: ./tools/package_release.ps1 -WindowsOnly -OutputDir tmp/package-ci
+
+      - name: Build Windows server client package
+        shell: pwsh
+        run: ./tools/package_remote_windows.ps1 -OutputDir tmp/package-remote-ci
 
   flutter-android:
     name: Flutter Android
@@ -139,10 +151,11 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: 3.44.4
           cache: true
 
       - name: Get Flutter dependencies
         run: flutter pub get
 
       - name: Build Android debug APK
-        run: flutter build apk --debug
+        run: flutter build apk --debug --dart-define=DATA_SOURCE=api_remote --dart-define=API_BASE=

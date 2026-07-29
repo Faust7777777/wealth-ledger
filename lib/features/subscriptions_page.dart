@@ -1,5 +1,6 @@
-// Wealth Ledger — 订阅列表（近期扣费区 + 全部订阅）。
-// 只读浏览人人可见；创建/编辑等写入口由 canManageSubscriptions 门控。
+// Wealth Ledger — 订阅列表（近期扣费区 + 全部订阅 + 到期扫描入口）。
+// 只读浏览人人可见；创建/扫描等写入口由 canManageSubscriptions 门控。
+// 到期扫描是用户显式触发的命令（无后台 timer），只生成待确认候选，不自动确认或扣款。
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -23,6 +24,7 @@ class SubscriptionsPage extends ConsumerWidget {
       appBar: AppBar(
         title: const Text('订阅管理'),
         actions: [
+          const _DueScanAction(),
           IconButton(
             tooltip: canManage ? '新建订阅' : kReadOnlyHint,
             icon: const Icon(Icons.add),
@@ -72,6 +74,172 @@ class SubscriptionsPage extends ConsumerWidget {
           },
         ),
       ),
+    );
+  }
+}
+
+/// 「扫描到期扣费」AppBar 动作：用户显式触发，busy 期间禁点防重复。
+class _DueScanAction extends ConsumerStatefulWidget {
+  const _DueScanAction();
+
+  @override
+  ConsumerState<_DueScanAction> createState() => _DueScanActionState();
+}
+
+class _DueScanActionState extends ConsumerState<_DueScanAction> {
+  bool _busy = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final canManage = ref.writeCapabilities.canManageSubscriptions;
+    return IconButton(
+      tooltip: canManage ? '扫描到期扣费' : kReadOnlyHint,
+      icon: _busy
+          ? const SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : const Icon(Icons.manage_search),
+      onPressed: _busy || !canManage ? null : _scan,
+    );
+  }
+
+  Future<void> _scan() async {
+    setState(() => _busy = true);
+    final messenger = ScaffoldMessenger.of(context);
+    // 失效前取列表快照，供结果里把 subscriptionId 映射为名称。
+    final names = {
+      for (final s
+          in ref.read(subscriptionsProvider).asData?.value ??
+              const <SubscriptionVm>[])
+        s.id: s.displayName,
+    };
+    try {
+      var again = true;
+      while (again && mounted) {
+        final SubscriptionDueScanResultVm result;
+        try {
+          result = await ref
+              .read(subscriptionRepositoryProvider)
+              .scanDueChargeProposals(throughDate: todayIsoDate());
+          ref.refreshAfterDueScan();
+        } finally {
+          // spinner 只覆盖请求阶段；结果对话框打开期间不显示进行中。
+          if (mounted) setState(() => _busy = false);
+        }
+        if (!mounted) return;
+        // 返回 true 表示用户选了「再次扫描」（hasMore 时提供）。
+        again =
+            (await showDialog<bool>(
+              context: context,
+              builder: (_) =>
+                  DueScanResultDialog(result: result, subscriptionNames: names),
+            )) ??
+            false;
+        if (again && mounted) setState(() => _busy = true);
+      }
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+}
+
+/// 到期扫描结果：只报告候选生成情况（待确认语义），绝不出现「已扣款/已入账」。
+/// pop(true) 表示用户要求再次扫描。公开以便 golden 预览直接渲染。
+class DueScanResultDialog extends StatelessWidget {
+  const DueScanResultDialog({
+    super.key,
+    required this.result,
+    this.subscriptionNames = const {},
+  });
+
+  final SubscriptionDueScanResultVm result;
+
+  /// subscriptionId → displayName（来自扫描前的列表快照；缺失时回退显示 id）。
+  final Map<String, String> subscriptionNames;
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context);
+    final r = result;
+    final blocked = [
+      for (final s in r.skipped)
+        if (s.reason != SubscriptionDueScanSkipReason.alreadyPending) s,
+    ];
+    return AlertDialog(
+      title: const Text('到期扫描结果'),
+      content: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 420),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (r.createdCount > 0) ...[
+                Text(
+                  '已生成 ${r.createdCount} 个待确认扣费',
+                  style: t.textTheme.titleSmall,
+                ),
+              ] else
+                Text(
+                  r.skipped.isEmpty && !r.hasMore
+                      ? '截至 ${r.throughDate} 没有需要生成的到期扣费。'
+                      : '本次没有新增待确认扣费。',
+                  style: t.textTheme.bodyMedium,
+                ),
+              if (r.alreadyPendingCount > 0) ...[
+                const SizedBox(height: AppSpacing.sm),
+                Text(
+                  '已在待确认队列 ${r.alreadyPendingCount} 个。',
+                  style: t.textTheme.bodySmall,
+                ),
+              ],
+              if (blocked.isNotEmpty) ...[
+                const SizedBox(height: AppSpacing.sm),
+                Text('受阻 ${r.blockedCount} 个', style: t.textTheme.titleSmall),
+                for (final s in blocked)
+                  Padding(
+                    padding: const EdgeInsets.only(top: AppSpacing.xs),
+                    child: Text(
+                      '${subscriptionNames[s.subscriptionId] ?? s.subscriptionId}'
+                      ' · 计划 ${s.scheduledChargeDate}\n'
+                      '${dueScanSkipReasonLabel(s.reason)}',
+                      style: t.textTheme.bodySmall,
+                    ),
+                  ),
+              ],
+              if (r.hasMore) ...[
+                const SizedBox(height: AppSpacing.sm),
+                Text(
+                  '还有 ${r.remainingEligibleCount} 个到期订阅本次未生成（单次上限），可再次扫描。',
+                  style: t.textTheme.bodySmall,
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, false),
+          child: const Text('关闭'),
+        ),
+        if (r.hasMore)
+          OutlinedButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('再次扫描'),
+          ),
+        if (r.createdCount > 0)
+          FilledButton(
+            onPressed: () {
+              final router = GoRouter.of(context);
+              Navigator.pop(context, false);
+              router.push('/ai-review');
+            },
+            child: const Text('前往审核'),
+          ),
+      ],
     );
   }
 }

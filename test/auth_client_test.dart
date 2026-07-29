@@ -259,9 +259,9 @@ void main() {
       client.getData('/v1/accounts'),
       throwsA(isA<ApiUnauthorizedException>()),
     );
-    // refresh 失败不得破坏本地会话（留给用户手动重新登录）。
-    final stored = await store.read();
-    expect(stored?.refreshToken, 'refresh_revoked');
+    // refresh 也明确 401：会话确定失效，必须清除本地 token
+    // （网络失败/5xx 仍保留，见 agent_expired_session_test）。
+    expect(await store.read(), isNull);
   });
 
   test(

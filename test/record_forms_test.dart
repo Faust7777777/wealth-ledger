@@ -143,7 +143,7 @@ void main() {
     expect(find.text('默认账户'), findsOneWidget);
     expect(find.textContaining('钱包'), findsWidgets);
     expect(find.text('CSV 内容'), findsOneWidget);
-    expect(find.widgetWithText(FilledButton, '生成候选'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, '导入'), findsOneWidget);
   });
 
   testWidgets('AiImportImagePage renders base64 form', (t) async {
@@ -152,7 +152,7 @@ void main() {
     expect(find.widgetWithText(OutlinedButton, '选择图片'), findsOneWidget);
     expect(find.text('图片文件名'), findsOneWidget);
     expect(find.text('图片 Base64 / data URL（可选兜底）'), findsOneWidget);
-    expect(find.widgetWithText(FilledButton, '生成候选'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, '导入'), findsOneWidget);
   });
 
   testWidgets('DcaPlanFormPage renders with funding account', (t) async {
@@ -253,6 +253,6 @@ void main() {
     expect(find.text('当前金额'), findsOneWidget);
     expect(find.text('更正后金额'), findsOneWidget);
     expect(find.text('更正原因'), findsOneWidget);
-    expect(find.widgetWithText(FilledButton, '生成更正候选'), findsOneWidget);
+    expect(find.widgetWithText(FilledButton, '提交更正'), findsOneWidget);
   });
 }

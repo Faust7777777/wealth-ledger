@@ -27,7 +27,7 @@ Future<void> showRecordSheet(BuildContext context, LedgerCapabilitiesVm caps) {
                 style: Theme.of(sheetCtx).textTheme.titleMedium,
               ),
               subtitle: Text(
-                canRecord || canPropose ? '选择记录方式（候选 → 确认）' : kReadOnlyHint,
+                canRecord || canPropose ? '选择记录方式' : kReadOnlyHint,
               ),
             ),
             _RecordTile(
@@ -44,6 +44,14 @@ Future<void> showRecordSheet(BuildContext context, LedgerCapabilitiesVm caps) {
               icon: Icons.swap_horiz,
               label: '转账',
               route: '/record/transfer',
+              enabled: canRecord,
+            ),
+            _RecordTile(
+              sheetCtx: sheetCtx,
+              pageCtx: context,
+              icon: Icons.candlestick_chart_outlined,
+              label: '投资成交',
+              route: '/investment/trade/new',
               enabled: canRecord,
             ),
             _RecordTile(

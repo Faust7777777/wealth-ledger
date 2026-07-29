@@ -79,6 +79,7 @@ SubscriptionUseCases {
   updateSubscription(subscriptionId: ID, patch: UpdateSubscriptionPatch): Subscription;
   cancelSubscription(subscriptionId: ID): Subscription;
   createChargeProposal(subscriptionId: ID): AiAtomicGroup;
+  scanDueChargeProposals(input: SubscriptionDueScanInput): SubscriptionDueScanResult;
 }
 ```
 
@@ -86,6 +87,7 @@ SubscriptionUseCases {
 
 - 创建、编辑、暂停或取消计划只改变订阅资源，不直接写 confirmed movement。
 - `createChargeProposal` 只创建待确认候选，并记录该订阅当前计费日期的 pending 引用。
+- `scanDueChargeProposals` 按 `(nextChargeDate,id)` 稳定扫描到期计划；limit 只限制创建数量，逐项付款阻塞以结构化 skip 返回。
 - 候选确认与拒绝复用 atomic-group 事务边界，不另建绕过复核的扣款路径。
 
 ## 3. Store ports
@@ -137,9 +139,10 @@ SubscriptionStorePort {
 
 - subscription 保存未来周期计划与 pending/last charge 引用，不等同于 confirmed movement。
 - 同一订阅、同一计费日期最多有一个待确认扣费候选。
-- 创建候选时，proposal 写入与订阅 pending 引用必须处于同一事务边界。
+- 创建候选时，pending movement/entries 写入与订阅 pending 引用必须处于同一事务边界；无需在 proposal store 再保存副本。
+- pending 指针必须引用状态为 `pending_review`、subscription ID 和计费日期均匹配的 movement；反向孤儿引用必须拒绝。
 - 确认扣费时，movement 写入、pending 清除、last charge 更新和 `nextChargeDate` 推进必须处于同一事务边界。
-- 拒绝候选只清除 pending 引用，不推进计费日期。
+- 拒绝候选把 movement 标记为 `cancelled` 并清除 pending 引用，不推进计费日期；历史候选保留用于追溯。
 
 ### ProposalStorePort
 
@@ -156,6 +159,7 @@ ProposalStorePort {
 
 - proposal store 与 confirmed ledger 分离。
 - approve 前必须重新 validation。
+- `listPending` / `getProposal` 可以把 standalone pending movement group 动态投影为只读 proposal；该投影不经 `saveProposal` 持久化，避免同一 movement 双份真相。
 
 ### QuoteStorePort
 
@@ -173,6 +177,8 @@ QuoteStorePort {
 
 - `unpriceable` 不写成 0。
 - 缓存报价必须保留 `asOf` 与 `status`。
+- Quote 必须引用现有 Instrument，币种匹配 `quoteCurrency`，且同一标的最多一条当前报价。
+- Quote 与分类/对手方等写入必须在持久化前通过完整 document 校验；失败时不得留下部分写入或幂等记录。
 
 ### SnapshotStorePort
 
@@ -304,6 +310,16 @@ confirmAtomicGroup(groupId: ID): ConfirmResult
 4. 事务写入 confirmed movements/entities。
 5. 若为订阅扣费候选，清除 pending 引用、记录本次扣费并推进下次计费日期。
 6. 更新 proposal group 状态。
+
+投资买卖确认时：
+
+- 买入 principal、fee、tax 的现金流出合计计入持仓成本基础。
+- 卖出现金净流入等于 gross proceeds 减 fee/tax，成本基础按出售数量比例减少。
+- fee/tax 必须与 principal 使用同一现金账户和币种；未提供 FX 明细时不得跨币种归集。
+- 卖出确认必须把毛回款、费用合计、净回款、平均成本释放额及已实现盈亏计算状态固化到
+  confirmed movement；不允许前端提交或覆盖派生结果。
+- 成交换算只能选择 `FXRate.asOf <= Movement.occurredAt` 的最近一条，反向货币对使用倒数；
+  实际 rate、来源 ID、来源时间和是否倒数必须随 movement 固化。
 7. 标记快照过期。
 8. 追加 sync outbox。
 
@@ -327,16 +343,21 @@ createCorrection(input: CreateCorrectionInput): AiAtomicGroup
 - 对 confirmed movement 的修改默认产生 correction proposal。
 - correction proposal 必须包含 old → new diff。
 - 用户确认后写入新 Movement，不覆盖原 Movement。
+- 投资更正必须是完整 replacement，并且只能更正该持仓最后一笔 confirmed buy/sell；确认时
+  精确撤销原现金、数量和成本基础后再应用 replacement，不能把数量差额当金额 adjustment。
 
 ### Mark DCA executed
 
 ```ts
-markDcaExecutedAsProposal(reminderId: ID): AiAtomicGroup
+markDcaExecutedAsProposal(reminderId: ID, input: DcaExecutionInput): AiAtomicGroup
 ```
 
 规则：
 
 - 只生成 proposal。
+- `input.quantity` 形成持仓腿，`input.totalCost` 形成现金腿；计划金额不能代替成交数量。
+- 资金账户必须支持成本币种；持仓账户必须支持持仓并支持标的报价币种。
+- 同一 reminder 只能有一个 pending proposal；同一幂等请求可安全重放。
 - 不下单。
 - 不转账。
 - 不连接券商交易接口。
@@ -356,6 +377,22 @@ createSubscriptionChargeProposal(subscriptionId: ID): AiAtomicGroup
 - 已存在 pending 扣费候选时返回冲突，不重复创建。
 - 确认前不影响余额、流水、净值或快照；确认后才推进计划日期。
 - 不调用支付平台，不执行自动续费或真实代扣。
+
+### Scan due subscription charge proposals
+
+```ts
+scanDueChargeProposals(input: SubscriptionDueScanInput): SubscriptionDueScanResult
+```
+
+规则：
+
+- `throughDate` 是必填本地 ISO 日历日；limit 默认 100，范围 1–200，未知字段必须拒绝。
+- 只扫描 `trial|active` 且 `nextChargeDate <= throughDate` 的计划，按 `(nextChargeDate,id)` 稳定排序。
+- 已 pending、付款账户不可用、付款币种不受支持分别返回 `already_pending`、`payment_account_unavailable`、`payment_currency_unsupported`；单项 skip 不终止批次。
+- 账户或支持币种在计划创建后发生漂移时，不自动换汇或修改计划；单条和批量生成都必须重新校验付款能力。
+- limit 只约束新建候选数；`remainingEligibleCount` 只统计因 limit 未创建的可创建项目，`hasMore` 与其是否大于零一致。
+- 扫描与所有候选写入必须共用一次事务和一次幂等结果提交；任一非预期不变量错误整批回滚。
+- 只创建待复核 movement，不确认、不扣款、不推进日期，也不启动后台 timer。
 
 ## 7. Data source mode
 

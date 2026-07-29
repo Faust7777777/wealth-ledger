@@ -46,6 +46,36 @@ String formatValued(ValuedMoney v) {
   }
 }
 
+/// 十进制字符串的符号（-1 / 0 / 1），纯字符串判断（"-0.00" 视为 0），不经 double。
+int decimalSign(DecimalString raw) {
+  var s = raw.trim();
+  final neg = s.startsWith('-');
+  if (neg || s.startsWith('+')) s = s.substring(1);
+  final hasNonZeroDigit = s.replaceAll(RegExp(r'[0.]'), '').isNotEmpty;
+  if (!hasNonZeroDigit) return 0;
+  return neg ? -1 : 1;
+}
+
+/// 十进制字符串取绝对值（仅去符号位，不动数字本身）。
+DecimalString absDecimal(DecimalString raw) {
+  final s = raw.trim();
+  if (s.startsWith('-') || s.startsWith('+')) return s.substring(1);
+  return s;
+}
+
+/// 精确十进制相加(a + b)：对 b 取反后走 [subtractDecimal]，同样不经 double。
+DecimalString addDecimal(DecimalString a, DecimalString b) {
+  var t = b.trim();
+  if (t.startsWith('+')) t = t.substring(1);
+  return t.startsWith('-')
+      ? subtractDecimal(a, t.substring(1))
+      : subtractDecimal(a, '-$t');
+}
+
+/// 精确十进制比较：a<b → -1，a==b → 0，a>b → 1（纯字符串，不经 double）。
+int compareDecimal(DecimalString a, DecimalString b) =>
+    decimalSign(subtractDecimal(a, b));
+
 /// 精确十进制相减(a - b)，走 BigInt 缩放整数，绝不经过 double。保留两者中较多的小数位。
 DecimalString subtractDecimal(DecimalString a, DecimalString b) {
   (BigInt, int) parse(String s) {

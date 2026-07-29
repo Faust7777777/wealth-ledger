@@ -116,7 +116,7 @@ class _DcaPlanFormPageState extends ConsumerState<DcaPlanFormPage> {
       ref.invalidate(dueRemindersProvider);
       ref.invalidate(overviewProvider);
       messenger.showSnackBar(
-        SnackBar(content: Text(_editing ? '定投计划已更新。' : '定投计划已创建；只提醒和记录，不下单。')),
+        SnackBar(content: Text(_editing ? '定投计划已更新。' : '定投计划已创建。')),
       );
       if (mounted) router.pop();
     } catch (e) {
@@ -289,7 +289,6 @@ class _DcaPlanFormPageState extends ConsumerState<DcaPlanFormPage> {
                   maxLines: 3,
                   decoration: const InputDecoration(
                     labelText: '备注（可选）',
-                    hintText: '只提醒与记录，不下单。',
                     border: OutlineInputBorder(),
                   ),
                 ),

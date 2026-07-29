@@ -25,6 +25,10 @@ class _FakeMovementRepo implements MovementRepository {
   @override
   Future<void> createCorrectionProposal(CreateCorrectionInput input) async {}
   @override
+  Future<ConfirmResultVm> createInvestmentTrade(
+    InvestmentTradeInput input,
+  ) async => result;
+  @override
   Future<List<MovementVm>> listRecentMovements({int limit = 20}) async =>
       const [];
   @override
@@ -106,6 +110,6 @@ void main() {
     await tester.pumpAndSettle();
     await _submit(tester);
     expect(find.text('已入账'), findsNothing);
-    expect(find.text('已提交候选，尚未入账'), findsOneWidget);
+    expect(find.text('已加入待确认，尚未入账'), findsOneWidget);
   });
 }

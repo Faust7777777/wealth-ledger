@@ -31,6 +31,7 @@ enum MovementType {
   adjustment,
   loanDisbursement,
   loanRepayment,
+  loanInterest,
   correction,
 }
 
@@ -96,6 +97,7 @@ class AccountVm {
     this.includeInNetWorth = true,
     this.institutionName,
     this.cashBalances = const {},
+    this.supportedCurrencies = const [],
   });
   final Id id;
   final String displayName;
@@ -109,6 +111,9 @@ class AccountVm {
   final bool includeInNetWorth;
   final String? institutionName;
   final Map<CurrencyCode, DecimalString> cashBalances; // 各币种现金余额（local_server）
+
+  /// 账户可持有的现金币种（服务端 supportedCurrencies；缺失时按默认币种）。
+  final List<CurrencyCode> supportedCurrencies;
 }
 
 /// 创建账户输入（对齐 APPLICATION_INTERFACES_V1.CreateAccountInput）。
@@ -120,6 +125,7 @@ class CreateAccountInput {
     required this.balanceMode,
     this.includeInNetWorth = true,
     this.institutionName,
+    this.openingBalance,
   });
   final String displayName;
   final AccountType accountType;
@@ -127,6 +133,10 @@ class CreateAccountInput {
   final String balanceMode; // cash_balance | holdings | liability | mixed
   final bool includeInNetWorth;
   final String? institutionName;
+
+  /// 期初余额（仅创建时使用；负债欠款已在 UI 层转为账本负数）。
+  /// null → openingBalances: []。编辑（PATCH）不发送、不覆盖既有余额。
+  final Money? openingBalance;
 }
 
 /// 用户维护的分类词表。不是封闭目录；AI 可读取并填充，用户确认后才入账。
@@ -325,6 +335,7 @@ class HoldingVm {
     required this.displayName,
     required this.quantity,
     required this.quoteStatus,
+    this.instrumentId = '',
     this.costBasisTotal,
     this.marketValue,
     this.dayChange,
@@ -333,6 +344,9 @@ class HoldingVm {
   });
   final Id id;
   final Id accountId;
+
+  /// 持仓对应的标的 ID（卖出腿必须回填；缺失时为空串）。
+  final Id instrumentId;
   final String symbol;
   final String displayName;
   final DecimalString quantity;
@@ -371,6 +385,8 @@ class MovementVm {
     this.entries = const [],
     this.categoryId,
     this.counterpartyId,
+    this.saleResult,
+    this.costBasisFx,
   });
   final Id id;
   final Id atomicGroupId;
@@ -385,6 +401,301 @@ class MovementVm {
   final List<MovementEntryVm> entries;
   final Id? categoryId;
   final Id? counterpartyId;
+
+  /// 卖出确认后服务端固化的成交结果（只读；旧记录可缺失）。
+  final InvestmentSaleResultVm? saleResult;
+
+  /// 跨币种买入固化的成本换算依据（只读；旧记录可缺失）。
+  final ExecutionFxBasisVm? costBasisFx;
+}
+
+/// 已实现盈亏状态（wire: calculated / calculated_with_fx /
+/// cost_basis_unavailable / currency_mismatch）。
+enum RealizedPnlStatus {
+  calculated,
+  calculatedWithFx,
+  costBasisUnavailable,
+  currencyMismatch,
+}
+
+/// 成交时实际使用的汇率依据（服务端固化，不可变；前端只展示不重算）。
+class ExecutionFxBasisVm {
+  const ExecutionFxBasisVm({
+    required this.baseCurrency,
+    required this.quoteCurrency,
+    required this.rate,
+    required this.asOf,
+    required this.sourceRateId,
+    required this.source,
+    this.sourceUrl,
+    required this.inverted,
+  });
+  final CurrencyCode baseCurrency;
+  final CurrencyCode quoteCurrency;
+  final DecimalString rate;
+  final IsoDateTime asOf;
+  final Id sourceRateId; // 内部 ID，仅供调试/测试；UI 不展示
+  final String source;
+  final String? sourceUrl;
+  final bool inverted;
+}
+
+/// 卖出成交结果（服务端按平均成本法固化；前端禁止重算或用浮点推导）。
+class InvestmentSaleResultVm {
+  const InvestmentSaleResultVm({
+    required this.costBasisMethod,
+    required this.grossProceeds,
+    required this.feeAndTaxTotal,
+    required this.netProceeds,
+    this.costBasisReleased,
+    this.realizedPnl,
+    this.netProceedsInCostBasisCurrency,
+    this.fxBasis,
+    required this.realizedPnlStatus,
+  });
+  final String costBasisMethod; // average_cost
+  final Money grossProceeds;
+  final Money feeAndTaxTotal;
+  final Money netProceeds;
+  final Money? costBasisReleased;
+  final Money? realizedPnl;
+  final Money? netProceedsInCostBasisCurrency;
+  final ExecutionFxBasisVm? fxBasis;
+  final RealizedPnlStatus realizedPnlStatus;
+}
+
+/// 投资标的（服务端 Instrument 投影；买入只能从中选择，不手填 wire ID）。
+class InstrumentVm {
+  const InstrumentVm({
+    required this.id,
+    required this.type,
+    this.symbol,
+    required this.displayName,
+    required this.quoteCurrency,
+    this.market,
+  });
+  final Id id;
+  final InstrumentType type;
+  final String? symbol;
+  final String displayName;
+  final CurrencyCode quoteCurrency;
+  final String? market;
+}
+
+/// 新建标的输入（POST /v1/instruments；仅登记标的，不连券商、不同步行情）。
+class CreateInstrumentInput {
+  const CreateInstrumentInput({
+    required this.type,
+    required this.displayName,
+    required this.quoteCurrency,
+    this.symbol,
+  });
+  final InstrumentType type;
+  final String displayName;
+  final CurrencyCode quoteCurrency;
+  final String? symbol;
+}
+
+/// 持仓导入/数量校准输入（POST /v1/accounts/{id}/holding-adjustment-proposals）。
+/// 只生成待确认调整，target 为期望的当前数量（可为 0 = 清零）。
+class HoldingAdjustmentInput {
+  const HoldingAdjustmentInput({
+    required this.instrumentId,
+    required this.targetQuantity,
+    this.asOf,
+    this.note,
+  });
+  final Id instrumentId;
+  final DecimalString targetQuantity; // 非负，≤8 位小数
+  final IsoDateTime? asOf;
+  final String? note;
+}
+
+// ———————————— 贷款条款 / 负债头寸 / 还款计划 ————————————
+// 对齐 openapi LiabilityTerms* / LiabilityPosition / LoanRepaymentSchedule。
+// 计算结果（应计利息、下一期拆分、逐期计划）一律来自服务端，前端不得自行计算。
+
+enum LiabilityType { studentLoan, mortgage, consumerLoan, creditCard, other }
+
+enum LiabilityRateType { fixed, floating }
+
+/// 贷款条款输入（PATCH /v1/accounts/{id}/liability-terms；整表替换）。
+/// 年利率为 wire 十进制小数（3.65% → '0.0365'），转换在 UI 层完成。
+class LiabilityTermsInput {
+  const LiabilityTermsInput({
+    required this.liabilityType,
+    required this.annualRate,
+    required this.rateType,
+    required this.dayCountBasis,
+    required this.interestStartDate,
+    required this.maturityDate,
+    required this.repaymentStartDate,
+    required this.nextDueDate,
+    this.repaymentFrequency = 'monthly',
+    required this.scheduledPayment,
+    required this.paymentAccountId,
+  });
+  final LiabilityType liabilityType;
+  final DecimalString annualRate;
+  final LiabilityRateType rateType;
+  final int dayCountBasis; // 360 | 365
+  final IsoDate interestStartDate;
+  final IsoDate maturityDate;
+  final IsoDate repaymentStartDate;
+  final IsoDate nextDueDate;
+  final String repaymentFrequency; // monthly
+  final Money scheduledPayment;
+  final Id paymentAccountId;
+}
+
+/// 服务端贷款条款（含应计指针与待确认利息指针）。
+class LiabilityTermsVm {
+  const LiabilityTermsVm({
+    required this.liabilityType,
+    required this.annualRate,
+    required this.rateType,
+    required this.dayCountBasis,
+    required this.interestStartDate,
+    required this.maturityDate,
+    required this.repaymentStartDate,
+    required this.nextDueDate,
+    required this.scheduledPayment,
+    required this.paymentAccountId,
+    required this.lastInterestAccruedThrough,
+    this.pendingLoanInterestMovementId,
+    this.pendingLoanInterestThroughDate,
+    this.lastLoanInterestMovementId,
+  });
+  final LiabilityType liabilityType;
+  final DecimalString annualRate;
+  final LiabilityRateType rateType;
+  final int dayCountBasis;
+  final IsoDate interestStartDate;
+  final IsoDate maturityDate;
+  final IsoDate repaymentStartDate;
+  final IsoDate nextDueDate;
+  final Money scheduledPayment;
+  final Id paymentAccountId;
+  final IsoDate lastInterestAccruedThrough;
+  final Id? pendingLoanInterestMovementId;
+  final IsoDate? pendingLoanInterestThroughDate;
+  final Id? lastLoanInterestMovementId;
+
+  /// 已有待确认利息：禁重复提交、禁改条款，引导去审核。
+  bool get hasPendingInterest => pendingLoanInterestMovementId != null;
+}
+
+/// 下一期合同计划金额的预计拆分（服务端计算）。
+class LiabilityNextPaymentVm {
+  const LiabilityNextPaymentVm({
+    required this.dueDate,
+    required this.scheduledAmount,
+    required this.projectedInterest,
+    required this.projectedPrincipal,
+  });
+  final IsoDate dueDate;
+  final Money scheduledAmount;
+  final Money projectedInterest;
+  final Money projectedPrincipal;
+}
+
+/// 负债头寸（GET /v1/liability-positions；计算结果的权威来源）。
+class LiabilityPositionVm {
+  const LiabilityPositionVm({
+    required this.accountId,
+    required this.accountName,
+    required this.currency,
+    required this.terms,
+    required this.outstandingPrincipal,
+    required this.accruedThrough,
+    required this.accrualDays,
+    required this.accruedInterest,
+    required this.nextPayment,
+    required this.status,
+  });
+  final Id accountId;
+  final String accountName;
+  final CurrencyCode currency;
+  final LiabilityTermsVm terms;
+  final Money outstandingPrincipal;
+  final IsoDate accruedThrough;
+  final int accrualDays;
+  final Money accruedInterest;
+  final LiabilityNextPaymentVm nextPayment;
+  final String status; // active | matured | paid_off
+}
+
+/// 还款计划单期（kind=balloon 展示为「到期还款」）。
+class LoanRepaymentScheduleItemVm {
+  const LoanRepaymentScheduleItemVm({
+    required this.sequence,
+    required this.dueDate,
+    required this.openingBalance,
+    required this.interest,
+    required this.principal,
+    required this.payment,
+    required this.closingBalance,
+    required this.kind,
+  });
+  final int sequence;
+  final IsoDate dueDate;
+  final Money openingBalance;
+  final Money interest;
+  final Money principal;
+  final Money payment;
+  final Money closingBalance;
+  final String kind; // scheduled | balloon
+}
+
+/// 有界还款计划投影（GET /v1/accounts/{id}/repayment-schedule）。
+class LoanRepaymentScheduleVm {
+  const LoanRepaymentScheduleVm({
+    required this.accountId,
+    required this.currency,
+    required this.maturityDate,
+    required this.items,
+    required this.hasMore,
+  });
+  final Id accountId;
+  final CurrencyCode currency;
+  final IsoDate maturityDate;
+  final List<LoanRepaymentScheduleItemVm> items;
+  final bool hasMore;
+}
+
+enum TradeSide { buy, sell }
+
+/// 手动投资成交输入。买入 principal=成交价款，卖出 principal=毛回款；
+/// 现金实际变动与成本增减由服务端按 principal±fee±tax 计算，前端不推导。
+class InvestmentTradeInput {
+  const InvestmentTradeInput({
+    required this.side,
+    required this.cashAccountId,
+    required this.holdingAccountId,
+    required this.instrumentId,
+    required this.quantity,
+    required this.principalAmount,
+    required this.cashCurrency,
+    required this.holdingCurrency,
+    this.feeAmount,
+    this.taxAmount,
+    this.occurredAt,
+    required this.title,
+    this.note,
+  });
+  final TradeSide side;
+  final Id cashAccountId;
+  final Id holdingAccountId;
+  final Id instrumentId;
+  final DecimalString quantity;
+  final DecimalString principalAmount;
+  final CurrencyCode cashCurrency;
+  final CurrencyCode holdingCurrency; // 标的报价币种（由所选标的派生）
+  final DecimalString? feeAmount; // 空或 0 → 不发送费用腿
+  final DecimalString? taxAmount; // 空或 0 → 不发送税费腿
+  final IsoDateTime? occurredAt; // null → 仓库用当前时间
+  final String title;
+  final String? note;
 }
 
 /// 分录（双分录账本的一条腿）：方向 in/out、角色、所属账户。
@@ -444,6 +755,33 @@ class CreateDcaPlanInput {
   final DcaFrequency frequency;
   final IsoDate nextDueDate;
   final String? note;
+}
+
+/// 真实成交输入（openapi DcaExecutionInput）。
+/// 计划金额只是提醒/默认值，绝不复用为成交数量；本命令只生成候选，不下单。
+class DcaExecutionInput {
+  const DcaExecutionInput({
+    required this.holdingAccountId,
+    required this.quantity,
+    required this.totalCost,
+    required this.quoteCurrency,
+    this.executedAt,
+  });
+
+  /// 持仓账户（balanceMode=holdings|mixed 的未归档账户）。
+  final Id holdingAccountId;
+
+  /// 实际买到的数量（>0，≤8 位小数的十进制字符串）。
+  final DecimalString quantity;
+
+  /// 实际总成本（>0；资金账户币种）。
+  final Money totalCost;
+
+  /// 标的/持仓分录的报价币种（默认持仓账户 defaultCurrency，可改）。
+  final CurrencyCode quoteCurrency;
+
+  /// 成交时间（可空；省略由服务端取当前时间；提供须带时区）。
+  final IsoDateTime? executedAt;
 }
 
 class UpdateDcaPlanPatch {
@@ -515,6 +853,8 @@ class AiAtomicGroupVm {
     required this.status,
     this.diffs = const [],
     this.warnings = const [],
+    this.proposedMovement,
+    this.isValid = true,
   });
   final Id id;
   final String title;
@@ -522,6 +862,15 @@ class AiAtomicGroupVm {
   final AiGroupStatus status;
   final List<AiFieldDiffVm> diffs;
   final List<String> warnings;
+
+  /// 结构化候选记录（proposedMovements[0]）；待补全候选为 null。
+  final MovementVm? proposedMovement;
+
+  /// 服务端 validation.isValid（缺失按 true 兼容旧候选）。
+  final bool isValid;
+
+  /// 待补全：无结构化记录或校验未过，只能编辑/拒绝，不能直接确认。
+  bool get needsCompletion => proposedMovement == null || !isValid;
 }
 
 class AiProposalVm {
@@ -531,12 +880,16 @@ class AiProposalVm {
     required this.sourceLabel,
     required this.groups,
     this.summary,
+    this.modelName,
   });
   final Id id;
   final AiProposalStatus status;
   final String sourceLabel; // 证据来源摘要（可见）
   final List<AiAtomicGroupVm> groups;
   final String? summary;
+
+  /// source.modelName：仅供诊断，不在候选主卡片展示。
+  final String? modelName;
 }
 
 class AccountAnomalyVm {
@@ -552,6 +905,22 @@ class AccountAnomalyVm {
   final AnomalyKind kind;
   final AnomalySeverity severity;
   final String detail;
+}
+
+/// 汇率读模型（GET /v1/fx-rates；只读，用于估值状态说明，不做前端换算）。
+class FxRateVm {
+  const FxRateVm({
+    required this.baseCurrency,
+    required this.quoteCurrency,
+    required this.rate,
+    required this.asOf,
+    required this.status,
+  });
+  final CurrencyCode baseCurrency;
+  final CurrencyCode quoteCurrency;
+  final DecimalString rate;
+  final IsoDateTime asOf;
+  final QuoteStatus status;
 }
 
 class QuoteStatusSummaryVm {
@@ -786,6 +1155,7 @@ class CreateSubscriptionInput {
     required this.paymentAccountId,
     required this.billingCycle,
     required this.startDate,
+    this.nextChargeDate,
     this.duration,
     this.endDate,
     this.autoRenew = true,
@@ -800,6 +1170,10 @@ class CreateSubscriptionInput {
   final Id paymentAccountId;
   final SubscriptionBillingCycleVm billingCycle;
   final IsoDate startDate;
+
+  /// 下次扣费日（与开始日期是两个概念）。null → 服务端按开始日期排期。
+  /// 本月已续费的场景由用户直接填下个月日期。
+  final IsoDate? nextChargeDate;
   final SubscriptionDurationVm? duration;
   final IsoDate? endDate;
   final bool autoRenew;
@@ -817,6 +1191,7 @@ class UpdateSubscriptionInput {
     required this.paymentAccountId,
     required this.billingCycle,
     required this.startDate,
+    required this.nextChargeDate,
     required this.duration,
     required this.endDate,
     required this.autoRenew,
@@ -832,10 +1207,401 @@ class UpdateSubscriptionInput {
   final Id paymentAccountId;
   final SubscriptionBillingCycleVm billingCycle;
   final IsoDate startDate;
+
+  /// 下次扣费日；编辑时以服务端返回值初始化，null（如已取消）则不发送。
+  final IsoDate? nextChargeDate;
   final SubscriptionDurationVm? duration; // 与 endDate 互斥
   final IsoDate? endDate;
   final bool autoRenew;
   final int reminderDaysBefore;
   final SubscriptionStatus status;
   final String? note;
+}
+
+// —— 订阅到期扫描（HTTP_API_V1 §7A due-scan）——
+// 显式调用命令：只批量生成 pending_review 候选，不自动确认、不扣款、不推进日期。
+
+enum SubscriptionDueScanSkipReason {
+  alreadyPending,
+  paymentAccountUnavailable,
+  paymentCurrencyUnsupported,
+}
+
+/// 被跳过的到期项：already_pending 去审核即可，payment_* 需先修订阅/账户。
+class SubscriptionDueScanSkipVm {
+  const SubscriptionDueScanSkipVm({
+    required this.subscriptionId,
+    required this.scheduledChargeDate,
+    required this.reason,
+  });
+  final Id subscriptionId;
+  final IsoDate scheduledChargeDate;
+  final SubscriptionDueScanSkipReason reason;
+}
+
+/// 扫描新建的候选：atomic group 附所属订阅与计费期（AI_PROPOSAL_SCHEMA §3）。
+class SubscriptionDueScanCreatedVm {
+  const SubscriptionDueScanCreatedVm({
+    required this.group,
+    required this.subscriptionId,
+    required this.scheduledChargeDate,
+  });
+  final AiAtomicGroupVm group;
+  final Id subscriptionId;
+  final IsoDate scheduledChargeDate;
+}
+
+/// 一次 due-scan 的结果。limit 只限新建数量：
+/// remainingEligibleCount 统计仅因 limit 未创建的项，hasMore 等价于其 > 0。
+class SubscriptionDueScanResultVm {
+  const SubscriptionDueScanResultVm({
+    required this.throughDate,
+    required this.createdCount,
+    required this.alreadyPendingCount,
+    required this.blockedCount,
+    required this.remainingEligibleCount,
+    required this.hasMore,
+    this.created = const [],
+    this.skipped = const [],
+  });
+  final IsoDate throughDate;
+  final int createdCount;
+  final int alreadyPendingCount;
+  final int blockedCount;
+  final int remainingEligibleCount;
+  final bool hasMore;
+  final List<SubscriptionDueScanCreatedVm> created;
+  final List<SubscriptionDueScanSkipVm> skipped;
+}
+
+// ———— Pi Agent 控制中枢（/v1/agent/**）————
+
+enum AgentConversationStatus { active, archived }
+
+enum AgentMessageRole { user, assistant, system }
+
+enum AgentMessageStatus { queued, streaming, completed, failed }
+
+enum AgentMemoryStatus { suggested, active, rejected }
+
+enum AgentEventType {
+  runQueued,
+  runStarted,
+  messageDelta,
+  toolStarted,
+  toolCompleted,
+  runCompleted,
+  runFailed,
+  unknown,
+}
+
+/// Agent 运行时状态。configured=false 表示服务端没有可用模型。
+class AgentStatusVm {
+  const AgentStatusVm({
+    required this.configured,
+    required this.modelCount,
+    this.primaryConversationId,
+  });
+  final bool configured;
+  final int modelCount;
+  final Id? primaryConversationId;
+}
+
+/// 模型连接方式。目前只有设备码授权一种，接口保持中立以便以后扩展。
+enum AgentProviderAuthMethod { oauth, apiKey, unknown }
+
+enum AgentProviderConnectionStatus { connected, disconnected, connecting }
+
+/// 一个可连接的模型来源。响应里不含任何令牌、密钥或服务器路径。
+class AgentProviderVm {
+  const AgentProviderVm({
+    required this.id,
+    required this.displayName,
+    required this.authMethods,
+    required this.connectionStatus,
+  });
+  final String id;
+  final String displayName;
+  final List<AgentProviderAuthMethod> authMethods;
+  final AgentProviderConnectionStatus connectionStatus;
+}
+
+enum AgentProviderOAuthStatus { pending, connected, failed, cancelled }
+
+/// 一次授权尝试的可见状态。verificationUri / userCode 是给用户看的，
+/// 令牌永远不会出现在这里。
+class AgentProviderOAuthAttemptVm {
+  const AgentProviderOAuthAttemptVm({
+    required this.attemptId,
+    required this.providerId,
+    required this.status,
+    this.verificationUri,
+    this.userCode,
+    this.expiresAt,
+    this.errorCode,
+  });
+  final Id attemptId;
+  final String providerId;
+  final AgentProviderOAuthStatus status;
+  final String? verificationUri;
+  final String? userCode;
+  final IsoDateTime? expiresAt;
+  final String? errorCode;
+}
+
+/// 服务端允许的模型；不含任何凭据或 provider 配置路径。
+class AgentModelVm {
+  const AgentModelVm({
+    required this.id,
+    required this.provider,
+    required this.displayName,
+    required this.supportsImages,
+  });
+  final String id;
+  final String provider;
+  final String displayName;
+  final bool supportsImages;
+}
+
+class AgentConversationVm {
+  const AgentConversationVm({
+    required this.id,
+    required this.title,
+    required this.isPrimary,
+    required this.status,
+    required this.createdAt,
+    required this.updatedAt,
+    this.selectedModelId,
+  });
+  final Id id;
+  final String title;
+  final bool isPrimary;
+  final AgentConversationStatus status;
+  final IsoDateTime createdAt;
+  final IsoDateTime updatedAt;
+  final String? selectedModelId;
+}
+
+class AgentMessageVm {
+  const AgentMessageVm({
+    required this.id,
+    required this.conversationId,
+    required this.role,
+    required this.text,
+    required this.status,
+    required this.createdAt,
+    this.runId,
+    this.completedAt,
+    this.errorCode,
+    this.attachmentIds = const [],
+  });
+  final Id id;
+  final Id conversationId;
+  final AgentMessageRole role;
+  final String text;
+  final AgentMessageStatus status;
+  final IsoDateTime createdAt;
+  final Id? runId;
+  final IsoDateTime? completedAt;
+  final String? errorCode;
+  final List<Id> attachmentIds;
+
+  AgentMessageVm copyWith({
+    String? text,
+    AgentMessageStatus? status,
+    Id? runId,
+    String? errorCode,
+  }) => AgentMessageVm(
+    id: id,
+    conversationId: conversationId,
+    role: role,
+    text: text ?? this.text,
+    status: status ?? this.status,
+    createdAt: createdAt,
+    runId: runId ?? this.runId,
+    completedAt: completedAt,
+    errorCode: errorCode ?? this.errorCode,
+    attachmentIds: attachmentIds,
+  );
+}
+
+/// 附件安全元数据；不含服务端存储路径。
+class AgentAttachmentVm {
+  const AgentAttachmentVm({
+    required this.id,
+    required this.fileName,
+    required this.mimeType,
+    required this.sizeBytes,
+    required this.sha256,
+    required this.createdAt,
+  });
+  final Id id;
+  final String fileName;
+  final String mimeType;
+  final int sizeBytes;
+  final String sha256;
+  final IsoDateTime createdAt;
+}
+
+class AgentMemoryVm {
+  const AgentMemoryVm({
+    required this.id,
+    required this.content,
+    required this.reason,
+    required this.status,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+  final Id id;
+  final String content;
+  final String reason;
+  final AgentMemoryStatus status;
+  final IsoDateTime createdAt;
+  final IsoDateTime updatedAt;
+}
+
+/// POST 消息后的受理结果（202）：本地据此立刻建立 queued 占位。
+class AgentRunAcceptedVm {
+  const AgentRunAcceptedVm({
+    required this.runId,
+    required this.userMessageId,
+    required this.assistantMessageId,
+  });
+  final Id runId;
+  final Id userMessageId;
+  final Id assistantMessageId;
+}
+
+/// 规范化 SSE 事件。cursor 用于断线续接；不含 tool payload 与隐藏推理。
+class AgentEventVm {
+  const AgentEventVm({
+    required this.cursor,
+    required this.type,
+    this.runId,
+    this.userMessageId,
+    this.assistantMessageId,
+    this.delta,
+    this.toolName,
+    this.isError,
+    this.code,
+  });
+  final int cursor;
+  final AgentEventType type;
+  final Id? runId;
+  final Id? userMessageId;
+  final Id? assistantMessageId;
+  final String? delta;
+  final String? toolName;
+  final bool? isError;
+  final String? code;
+}
+
+enum AgentQuoteCandidateKind { instrument, fx }
+
+enum AgentQuoteCandidateStatus { suggested, applied, rejected }
+
+/// Agent 从网页整理出的单条报价/汇率候选。
+/// suggested 不改变任何估值；只有用户「采用」才会写入权威报价缓存。
+class AgentQuoteCandidateVm {
+  const AgentQuoteCandidateVm({
+    required this.id,
+    required this.kind,
+    required this.asOf,
+    required this.source,
+    required this.sourceUrl,
+    required this.status,
+    required this.createdAt,
+    required this.updatedAt,
+    this.instrumentId,
+    this.price,
+    this.currency,
+    this.baseCurrency,
+    this.quoteCurrency,
+    this.rate,
+    this.appliedAt,
+  });
+  final Id id;
+  final AgentQuoteCandidateKind kind;
+  final IsoDateTime asOf;
+  final String source;
+  final String sourceUrl;
+  final AgentQuoteCandidateStatus status;
+  final IsoDateTime createdAt;
+  final IsoDateTime updatedAt;
+
+  /// kind=instrument 时给出标的与报价。
+  final Id? instrumentId;
+  final DecimalString? price;
+  final CurrencyCode? currency;
+
+  /// kind=fx 时给出币对与汇率。
+  final CurrencyCode? baseCurrency;
+  final CurrencyCode? quoteCurrency;
+  final DecimalString? rate;
+  final IsoDateTime? appliedAt;
+}
+
+// ———— Agent 自动任务与通知 ————
+
+enum AgentAutomationKind {
+  quoteRefresh,
+  subscriptionDueScan,
+  dcaDueCheck,
+  financialSummary,
+}
+
+enum AgentAutomationRunStatus { success, failed }
+
+enum AgentNotificationAction { review, quotes, dca, agent }
+
+/// 一条自动任务计划。执行与调度都在服务端；前端只读状态并改开关/频率。
+class AgentAutomationVm {
+  const AgentAutomationVm({
+    required this.id,
+    required this.kind,
+    required this.intervalHours,
+    required this.enabled,
+    required this.nextRunAt,
+    required this.createdAt,
+    required this.updatedAt,
+    this.lastRunAt,
+    this.lastStatus,
+    this.lastErrorCode,
+  });
+  final Id id;
+  final AgentAutomationKind kind;
+  final int intervalHours;
+  final bool enabled;
+  final IsoDateTime nextRunAt;
+  final IsoDateTime createdAt;
+  final IsoDateTime updatedAt;
+  final IsoDateTime? lastRunAt;
+  final AgentAutomationRunStatus? lastStatus;
+
+  /// 只作诊断，不进用户可见文案。
+  final String? lastErrorCode;
+
+  bool get lastRunFailed => lastStatus == AgentAutomationRunStatus.failed;
+}
+
+/// App 内通知（自动任务产出）。newest-first 由服务端保证。
+class AgentNotificationVm {
+  const AgentNotificationVm({
+    required this.id,
+    required this.kind,
+    required this.title,
+    required this.body,
+    required this.createdAt,
+    this.action,
+    this.readAt,
+  });
+  final Id id;
+  final AgentAutomationKind kind;
+  final String title;
+  final String body;
+  final IsoDateTime createdAt;
+  final AgentNotificationAction? action;
+  final IsoDateTime? readAt;
+
+  bool get isUnread => readAt == null;
 }

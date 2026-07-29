@@ -2,6 +2,8 @@
 // 命名对齐 DATA_SCHEMA_V1 §14；方法对齐 APPLICATION_INTERFACES_V1 的读路径。
 // 第一阶段只暴露读方法 + 空/隔离实现；写路径（confirmAtomicGroup / approve /
 // markExecutedAsProposal 等）在后续批次补，并仍走"候选→确认"。
+import 'dart:typed_data';
+
 import 'view_models.dart';
 import '../core/types.dart';
 
@@ -44,6 +46,13 @@ abstract interface class PortfolioRepository {
   Future<List<HoldingVm>> listHoldings();
   Future<List<HoldingVm>> listHoldingsByAccount(Id accountId);
   Future<AssetAllocationVm> getAssetAllocation();
+
+  /// 持仓导入/数量校准：只生成待确认调整（进 AI 审核），确认前不动持仓。
+  /// 同一持仓已有待确认调整时服务端返回 409。仅 local_server。
+  Future<AiAtomicGroupVm> proposeHoldingAdjustment(
+    Id accountId,
+    HoldingAdjustmentInput input,
+  );
 }
 
 abstract interface class MovementRepository {
@@ -63,6 +72,16 @@ abstract interface class MovementRepository {
 
   /// 已确认记录更正：只生成 correction 候选；确认前不改原记录、不影响余额。
   Future<void> createCorrectionProposal(CreateCorrectionInput input);
+
+  /// 手动投资成交（买入/卖出多腿：现金腿 + 持仓腿 + 可选费用/税费腿）。
+  /// 走草稿 → 复核 → 确认流水线；仅 local_server。是否已入账以 ledgerWrite 为准。
+  Future<ConfirmResultVm> createInvestmentTrade(InvestmentTradeInput input);
+}
+
+/// 投资标的：买入只能从服务端已有标的中选择（可紧凑新建），不手填 wire ID。
+abstract interface class InstrumentRepository {
+  Future<List<InstrumentVm>> listInstruments();
+  Future<InstrumentVm> createInstrument(CreateInstrumentInput input);
 }
 
 abstract interface class DcaRepository {
@@ -72,14 +91,118 @@ abstract interface class DcaRepository {
   Future<DcaPlanVm> updatePlan(Id planId, UpdateDcaPlanPatch patch);
 
   /// 「记录已执行」：只生成待确认候选记录；不下单、不转账、不连券商。
-  Future<void> markExecutedAsProposal(Id reminderId);
+  /// 「记录已执行」：提交真实成交（数量/总成本/持仓账户），只生成待确认候选。
+  /// 同一 reminder 已有 pending 时服务端返回 409。
+  Future<void> markExecutedAsProposal(Id reminderId, DcaExecutionInput input);
   Future<void> skipReminder(Id reminderId);
   Future<void> snoozeReminder(Id reminderId, {required IsoDate until});
+}
+
+/// 贷款：条款维护 + 应计利息候选 + 还款计划投影。
+/// 应计/拆分/计划一律来自服务端；「记录利息」只生成待确认候选（进 AI 审核）。
+abstract interface class LoanRepository {
+  Future<List<LiabilityPositionVm>> listLiabilityPositions({
+    IsoDate? throughDate,
+  });
+  Future<LoanRepaymentScheduleVm> getRepaymentSchedule(
+    Id accountId, {
+    int limit = 24,
+  });
+  Future<AccountVm> updateLiabilityTerms(
+    Id accountId,
+    LiabilityTermsInput input,
+  );
+  Future<AiAtomicGroupVm> proposeLoanInterest(
+    Id accountId, {
+    required IsoDate throughDate,
+    String? note,
+  });
+}
+
+/// Pi Agent 控制中枢。只经现有 Rust 公网 origin 的 `/v1/agent/**`；
+/// Agent 不直接写账本，账务变更一律落到既有 AI 待审核列表。
+abstract interface class AgentRepository {
+  Future<AgentStatusVm> getStatus();
+  Future<List<AgentModelVm>> listModels();
+
+  /// 模型连接：provider 列表由服务端给出，前端不内置任何厂商清单。
+  Future<List<AgentProviderVm>> listProviders();
+  Future<AgentProviderOAuthAttemptVm> startProviderOAuth(String providerId);
+  Future<AgentProviderOAuthAttemptVm> getProviderOAuthAttempt(Id attemptId);
+  Future<void> disconnectProvider(String providerId);
+
+  Future<AgentAttachmentVm> uploadAttachment({
+    required String fileName,
+    required String mimeType,
+    required Uint8List bytes,
+  });
+  Future<AgentAttachmentVm> getAttachment(Id attachmentId);
+  Future<Uint8List> getAttachmentContent(Id attachmentId);
+
+  Future<List<AgentMemoryVm>> listMemories();
+  Future<AgentMemoryVm> reviewMemory(
+    Id memoryId, {
+    required AgentMemoryStatus decision,
+  });
+
+  Future<List<AgentConversationVm>> listConversations();
+  Future<AgentConversationVm> createConversation({String? title});
+  Future<AgentConversationVm> updateConversation(
+    Id conversationId, {
+    String? title,
+    AgentConversationStatus? status,
+    String? modelId,
+  });
+
+  Future<List<AgentMessageVm>> listMessages(Id conversationId);
+  Future<AgentRunAcceptedVm> sendMessage(
+    Id conversationId, {
+    required String text,
+    List<Id> attachmentIds,
+  });
+
+  /// 自动任务：调度与执行都在服务端；前端只读状态、改开关/频率、手动触发。
+  Future<List<AgentAutomationVm>> listAutomations();
+  Future<AgentAutomationVm> createAutomation({
+    required AgentAutomationKind kind,
+    required int intervalHours,
+    bool enabled = true,
+    IsoDateTime? startAt,
+  });
+  Future<AgentAutomationVm> updateAutomation(
+    Id automationId, {
+    int? intervalHours,
+    bool? enabled,
+    IsoDateTime? nextRunAt,
+  });
+
+  /// 立即运行一次；不改变下次计划时间。
+  Future<AgentAutomationVm> runAutomation(Id automationId);
+
+  /// App 内通知（newest-first 由服务端保证）。
+  Future<List<AgentNotificationVm>> listNotifications();
+  Future<AgentNotificationVm> markNotificationRead(Id notificationId);
+
+  /// 网页报价候选：suggested 不改变估值；只有「采用」才写入权威报价。
+  Future<List<AgentQuoteCandidateVm>> listQuoteCandidates();
+  Future<AgentQuoteCandidateVm> reviewQuoteCandidate(
+    Id candidateId, {
+    required AgentQuoteCandidateStatus decision,
+  });
+
+  /// SSE：`after` 为已应用的最大 cursor，重连时只补发之后的事件。
+  Stream<AgentEventVm> events(Id conversationId, {int? after});
+
+  Future<void> cancelRun(Id runId);
 }
 
 abstract interface class QuoteRepository {
   Future<QuoteStatusSummaryVm> getQuoteSummary();
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode});
+
+  /// 汇率列表（只读）：用于估值状态面板判断币种是否有到本位币的路径，
+  /// 以及区分"较旧/缓存/缺失"；前端不用它做任何换算。
+  Future<List<FxRateVm>> listFxRates();
 }
 
 abstract interface class AiProposalRepository {
@@ -134,4 +257,12 @@ abstract interface class SubscriptionRepository {
   /// 生成本期待确认扣费候选（pending_review）。返回 atomic group，交 AI 复核确认。
   /// 本期已有候选时服务端返回 409。
   Future<AiAtomicGroupVm> createChargeProposal(Id id);
+
+  /// 到期扫描：为 nextChargeDate <= throughDate 的 trial/active 计划批量生成
+  /// 待确认候选。limit（1–200）只限本次新建数量，skip 照常报告。
+  /// 用户显式触发的命令；不自动确认、不扣款、不推进日期。
+  Future<SubscriptionDueScanResultVm> scanDueChargeProposals({
+    required IsoDate throughDate,
+    int limit = 100,
+  });
 }

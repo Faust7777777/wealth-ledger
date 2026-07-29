@@ -25,6 +25,7 @@ tags:
   - name: Snapshots
   - name: Taxonomy
   - name: Sync
+  - name: Agent
 
 paths:
   /health:
@@ -241,6 +242,27 @@ paths:
               schema:
                 $ref: "#/components/schemas/HoldingListResponse"
 
+  /accounts/{accountId}/holding-adjustment-proposals:
+    post:
+      tags: [Portfolio]
+      summary: Propose importing or correcting one current holding quantity.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HoldingAdjustmentInput"
+      responses:
+        "200":
+          description: Pending holding-adjustment atomic group.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
+
   /portfolio/overview:
     get:
       tags: [Portfolio]
@@ -252,6 +274,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PortfolioOverviewResponse"
+
+  /portfolio/valuation-issues:
+    get:
+      tags: [Portfolio]
+      summary: List assets whose value is stale, cached, failed, or unavailable.
+      responses:
+        "200":
+          description: Structured valuation issues.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ValuationIssueListResponse"
 
   /portfolio/holdings:
     get:
@@ -276,6 +310,166 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HoldingListResponse"
+
+  /yield-positions:
+    get:
+      tags: [Portfolio]
+      summary: List fixed-yield positions with accrued interest.
+      parameters:
+        - in: query
+          name: throughDate
+          schema:
+            $ref: "#/components/schemas/ISODate"
+      responses:
+        "200":
+          description: Yield positions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/YieldPositionListResponse"
+
+  /holdings/{holdingId}/yield-terms:
+    patch:
+      tags: [Portfolio]
+      summary: Configure interest terms for one concrete holding.
+      parameters:
+        - $ref: "#/components/parameters/holdingId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/YieldTermsInput"
+      responses:
+        "200":
+          description: Holding with updated yield terms.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HoldingResponse"
+
+  /holdings/{holdingId}/interest-proposals:
+    post:
+      tags: [Portfolio]
+      summary: Propose accrued interest through a date for review.
+      parameters:
+        - $ref: "#/components/parameters/holdingId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InterestProposalInput"
+      responses:
+        "200":
+          description: Pending interest atomic group.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
+
+  /liability-positions:
+    get:
+      tags: [Accounts]
+      summary: List loan positions with accrued interest and the next scheduled payment split.
+      parameters:
+        - in: query
+          name: throughDate
+          schema:
+            $ref: "#/components/schemas/ISODate"
+      responses:
+        "200":
+          description: Liability positions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiabilityPositionListResponse"
+
+  /accounts/{accountId}/liability-terms:
+    patch:
+      tags: [Accounts]
+      summary: Configure interest and scheduled-payment terms for a liability account.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LiabilityTermsInput"
+      responses:
+        "200":
+          description: Account with updated liability terms.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountResponse"
+
+  /accounts/{accountId}/repayment-schedule:
+    get:
+      tags: [Accounts]
+      summary: Project a bounded monthly repayment schedule from current liability terms.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 360
+            default: 24
+      responses:
+        "200":
+          description: Projected repayment schedule.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoanRepaymentScheduleResponse"
+
+  /accounts/{accountId}/loan-interest-proposals:
+    post:
+      tags: [Accounts]
+      summary: Propose accrued loan interest through a date for review.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InterestProposalInput"
+      responses:
+        "200":
+          description: Pending loan-interest atomic group.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
+
+  /accounts/{accountId}/loan-payment-proposals:
+    post:
+      tags: [Accounts]
+      summary: Propose accrued interest and a loan payment as one reviewed atomic group.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoanPaymentProposalInput"
+      responses:
+        "200":
+          description: Pending loan-payment atomic group.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
 
   /portfolio/allocation:
     get:
@@ -403,6 +597,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AiAtomicGroupResponse"
+        "400":
+          description: Invalid or no-op correction input.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The target already has a pending correction.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
 
   /atomic-groups/{atomicGroupId}/confirm:
     post:
@@ -506,6 +712,12 @@ paths:
       parameters:
         - $ref: "#/components/parameters/reminderId"
         - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DcaExecutionInput"
       responses:
         "200":
           description: Candidate atomic group.
@@ -604,6 +816,49 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SubscriptionListResponse"
+
+  /subscriptions/charge-proposals/due-scan:
+    post:
+      tags: [Subscriptions]
+      summary: Generate bounded pending charge proposals for subscriptions due through a date.
+      description: >-
+        Scans trial and active subscriptions in stable nextChargeDate/id order.
+        The limit bounds newly created proposals, while already-pending and
+        payment-blocked items are reported as skips. No balance is changed and
+        no schedule is advanced until each returned atomic group is confirmed.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscriptionDueScanRequest"
+      responses:
+        "200":
+          description: Due scan completed and its pending candidates were persisted atomically.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionDueScanResponse"
+        "400":
+          description: Invalid throughDate, limit, or unsupported request field.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The Idempotency-Key was reused with a different request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "501":
+          description: No real local ledger is mounted for this command.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
 
   /subscriptions/{subscriptionId}:
     parameters:
@@ -1239,7 +1494,13 @@ paths:
   /sync/push:
     post:
       tags: [Sync]
-      summary: Push local changes. Debug fixture data must be rejected.
+      summary: Apply authenticated-device account creates from a remote ledger.
+      description: >-
+        The bearer token determines the source device. The body deviceId and
+        every change deviceId must match it. This first inbound slice accepts
+        only entityType=account, operation=create, baseVersion=0, with a full
+        Account payload whose id equals entityId. Applied remote changes are
+        logged atomically with the account but never enter the server outbox.
       parameters:
         - $ref: "#/components/parameters/idempotencyKey"
       requestBody:
@@ -1291,6 +1552,556 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/status:
+    get:
+      tags: [Agent]
+      summary: Read the authenticated account's Agent runtime status.
+      responses:
+        "200":
+          description: Agent status. configured=false means no usable Pi model is configured.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentStatusResponse"
+        "503":
+          description: The loopback Agent service is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/models:
+    get:
+      tags: [Agent]
+      summary: List Pi models permitted for the authenticated account.
+      responses:
+        "200":
+          description: Server-configured models; provider credentials are never returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentModelListResponse"
+
+  /agent/attachments:
+    post:
+      tags: [Agent]
+      summary: Archive one image or workspace document for a later Agent message.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: PNG, JPEG, WEBP, UTF-8 TXT/CSV, PDF, XLSX, or ZIP, at most 15 MiB.
+      responses:
+        "201":
+          description: Attachment archived in the authenticated account workspace.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentAttachmentResponse"
+
+  /agent/attachments/{attachmentId}:
+    get:
+      tags: [Agent]
+      summary: Read attachment metadata without exposing server storage paths.
+      parameters:
+        - name: attachmentId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+      responses:
+        "200":
+          description: Owned attachment metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentAttachmentResponse"
+        "404":
+          description: Attachment is absent or belongs to another account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/attachments/{attachmentId}/content:
+    get:
+      tags: [Agent]
+      summary: Read the authenticated account's original archived attachment bytes.
+      parameters:
+        - name: attachmentId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+      responses:
+        "200":
+          description: Original validated attachment with private no-store caching.
+          headers:
+            ETag:
+              description: SHA-256 validator for the original archived bytes.
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+                enum: ["private, no-store"]
+            X-Content-Type-Options:
+              schema:
+                type: string
+                enum: [nosniff]
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
+            text/plain:
+              schema:
+                type: string
+                format: binary
+            text/csv:
+              schema:
+                type: string
+                format: binary
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Attachment is absent or belongs to another account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/memories:
+    get:
+      tags: [Agent]
+      summary: List suggested, active, and rejected Agent memories.
+      responses:
+        "200":
+          description: Account-scoped memory records.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentMemoryListResponse"
+
+  /agent/memories/{memoryId}/review:
+    post:
+      tags: [Agent]
+      summary: Approve or reject an Agent-proposed general memory.
+      parameters:
+        - name: memoryId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [decision]
+              properties:
+                decision:
+                  enum: [active, rejected]
+      responses:
+        "200":
+          description: Reviewed memory.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentMemoryResponse"
+
+  /agent/quote-candidates:
+    get:
+      tags: [Agent]
+      summary: List account-scoped web quote candidates and their review status.
+      responses:
+        "200":
+          description: Quote candidates; suggested entries have not changed authoritative valuation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentQuoteCandidateListResponse"
+
+  /agent/quote-candidates/{candidateId}/review:
+    post:
+      tags: [Agent]
+      summary: Apply or reject one Agent-proposed web quote candidate.
+      description: Applying is the only transition that writes the candidate through the authoritative quote refresh API.
+      parameters:
+        - name: candidateId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [decision]
+              properties:
+                decision:
+                  enum: [apply, reject]
+      responses:
+        "200":
+          description: Reviewed candidate. `applied` means the authoritative quote cache accepted exactly one item.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentQuoteCandidateResponse"
+        "404":
+          description: Candidate is absent or belongs to another account.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: Candidate was already applied or rejected.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/automations:
+    get:
+      tags: [Agent]
+      summary: List persisted Agent automations for the authenticated ledger.
+      responses:
+        "200":
+          description: Automation schedules and last-run status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentAutomationListResponse"
+    post:
+      tags: [Agent]
+      summary: Create one automation kind for the authenticated ledger.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAgentAutomationRequest"
+      responses:
+        "201":
+          description: Automation created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentAutomationResponse"
+        "409":
+          description: This ledger already has the requested automation kind.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/automations/{automationId}:
+    patch:
+      tags: [Agent]
+      summary: Enable, disable, or reschedule an Agent automation.
+      parameters:
+        - name: automationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateAgentAutomationRequest"
+      responses:
+        "200":
+          description: Automation updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentAutomationResponse"
+        "404":
+          description: Automation not found for this ledger.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/automations/{automationId}/run:
+    post:
+      tags: [Agent]
+      summary: Run an automation now without changing its next scheduled time.
+      parameters:
+        - name: automationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Automation after the manual run.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentAutomationResponse"
+        "409":
+          description: The same automation is already running.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/notifications:
+    get:
+      tags: [Agent]
+      summary: List newest-first Agent automation notifications.
+      responses:
+        "200":
+          description: Account-scoped notifications.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentNotificationListResponse"
+
+  /agent/notifications/{notificationId}/read:
+    post:
+      tags: [Agent]
+      summary: Mark one Agent notification as read.
+      parameters:
+        - name: notificationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Read notification.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentNotificationResponse"
+
+  /agent/conversations:
+    get:
+      tags: [Agent]
+      summary: List the account's primary and additional Agent conversations.
+      responses:
+        "200":
+          description: Conversations ordered by most recent activity.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentConversationListResponse"
+    post:
+      tags: [Agent]
+      summary: Create an additional Agent conversation.
+      parameters:
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                  maxLength: 100
+      responses:
+        "201":
+          description: Conversation created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentConversationResponse"
+
+  /agent/conversations/{conversationId}:
+    patch:
+      tags: [Agent]
+      summary: Rename, archive, restore, or change the selected model.
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                status:
+                  enum: [active, archived]
+                modelId:
+                  type: string
+      responses:
+        "200":
+          description: Updated conversation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentConversationResponse"
+
+  /agent/conversations/{conversationId}/messages:
+    get:
+      tags: [Agent]
+      summary: List normalized messages without hidden reasoning or raw tool payloads.
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+      responses:
+        "200":
+          description: Conversation messages.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentMessageListResponse"
+    post:
+      tags: [Agent]
+      summary: Queue a user message for the Pi session.
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+                  minLength: 1
+                  maxLength: 100000
+                attachmentIds:
+                  type: array
+                  maxItems: 8
+                  uniqueItems: true
+                  items:
+                    $ref: "#/components/schemas/ID"
+      responses:
+        "202":
+          description: Message accepted and queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentRunAcceptedResponse"
+        "503":
+          description: No permitted Pi model is configured.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+
+  /agent/conversations/{conversationId}/events:
+    get:
+      tags: [Agent]
+      summary: Stream resumable normalized Agent events over SSE.
+      parameters:
+        - name: conversationId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - name: after
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+        - name: Last-Event-ID
+          in: header
+          description: Last applied numeric cursor; ignored when `after` is present.
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: |-
+            Resumable `text/event-stream`. Each frame contains a numeric `id`,
+            an `event` name, and one JSON object in `data`.
+
+            Event payloads:
+            - `run.queued`: `runId`, `userMessageId`, `assistantMessageId`.
+            - `run.started`: `runId`, `assistantMessageId`.
+            - `message.delta`: `assistantMessageId`, `delta`.
+            - `tool.started`: `runId`, `name`.
+            - `tool.completed`: `runId`, `name`, `isError`.
+            - `run.completed`: `runId`, `assistantMessageId`.
+            - `run.failed`: `runId`, `assistantMessageId`, `code`.
+
+            Clients persist the largest fully applied cursor. Reconnecting with
+            `after` or `Last-Event-ID` replays only later retained events before
+            continuing the live stream. Tool payloads and hidden reasoning are
+            never included.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /agent/runs/{runId}/cancel:
+    post:
+      tags: [Agent]
+      summary: Abort the active Pi operation for an owned run.
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/ID"
+        - $ref: "#/components/parameters/idempotencyKey"
+      responses:
+        "200":
+          description: Cancellation result.
 
 components:
   securitySchemes:
@@ -1356,6 +2167,12 @@ components:
       required: true
       schema:
         $ref: "#/components/schemas/ID"
+    holdingId:
+      name: holdingId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/ID"
     categoryId:
       name: categoryId
       in: path
@@ -1386,7 +2203,7 @@ components:
       format: date-time
     DecimalString:
       type: string
-      pattern: "^-?[0-9]+(\\.[0-9]+)?$"
+      pattern: "^-?[0-9]+(\\.[0-9]{1,8})?$"
     CurrencyCode:
       type: string
       minLength: 2
@@ -1584,6 +2401,8 @@ components:
             type: string
         note:
           type: string
+        liabilityTerms:
+          $ref: "#/components/schemas/LiabilityTerms"
         createdAt:
           $ref: "#/components/schemas/ISODateTime"
         updatedAt:
@@ -1782,6 +2601,8 @@ components:
           $ref: "#/components/schemas/ISODateTime"
         note:
           type: string
+        yieldTerms:
+          $ref: "#/components/schemas/YieldTerms"
     HoldingListResponse:
       type: object
       required: [ok, data]
@@ -1792,6 +2613,332 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Holding"
+    HoldingResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/Holding"
+    YieldTermsInput:
+      type: object
+      additionalProperties: false
+      required:
+        - principal
+        - annualRate
+        - rateType
+        - interestMethod
+        - dayCountBasis
+        - compoundingFrequency
+        - interestStartDate
+        - maturityDate
+        - payoutAccountId
+      properties:
+        principal:
+          $ref: "#/components/schemas/Money"
+        annualRate:
+          $ref: "#/components/schemas/DecimalString"
+        rateType:
+          enum: [fixed, floating]
+        interestMethod:
+          enum: [simple, compound]
+        dayCountBasis:
+          enum: [360, 365]
+        compoundingFrequency:
+          enum: [none, monthly, quarterly, annual]
+        interestStartDate:
+          $ref: "#/components/schemas/ISODate"
+        maturityDate:
+          $ref: "#/components/schemas/ISODate"
+        payoutAccountId:
+          $ref: "#/components/schemas/ID"
+    YieldTerms:
+      allOf:
+        - $ref: "#/components/schemas/YieldTermsInput"
+        - type: object
+          required: [lastAccruedThrough, updatedAt]
+          properties:
+            lastAccruedThrough:
+              $ref: "#/components/schemas/ISODate"
+            pendingInterestMovementId:
+              $ref: "#/components/schemas/ID"
+            pendingInterestThroughDate:
+              $ref: "#/components/schemas/ISODate"
+            lastInterestMovementId:
+              $ref: "#/components/schemas/ID"
+            updatedAt:
+              $ref: "#/components/schemas/ISODateTime"
+    InterestProposalInput:
+      type: object
+      additionalProperties: false
+      required: [throughDate]
+      properties:
+        throughDate:
+          $ref: "#/components/schemas/ISODate"
+        note:
+          type: string
+    YieldPosition:
+      type: object
+      required:
+        - holdingId
+        - accountId
+        - instrumentId
+        - instrumentName
+        - terms
+        - accruedThrough
+        - accrualDays
+        - fullCompoundingPeriods
+        - accruedInterest
+        - status
+      properties:
+        holdingId:
+          $ref: "#/components/schemas/ID"
+        accountId:
+          $ref: "#/components/schemas/ID"
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        instrumentName:
+          type: string
+        terms:
+          $ref: "#/components/schemas/YieldTerms"
+        accruedThrough:
+          $ref: "#/components/schemas/ISODate"
+        accrualDays:
+          type: integer
+        fullCompoundingPeriods:
+          type: integer
+        accruedInterest:
+          $ref: "#/components/schemas/Money"
+        status:
+          enum: [active, matured]
+    YieldPositionListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/YieldPosition"
+
+    LiabilityTermsInput:
+      type: object
+      additionalProperties: false
+      required:
+        - liabilityType
+        - annualRate
+        - rateType
+        - dayCountBasis
+        - interestStartDate
+        - maturityDate
+        - repaymentStartDate
+        - nextDueDate
+        - repaymentFrequency
+        - scheduledPayment
+        - paymentAccountId
+      properties:
+        liabilityType:
+          enum: [student_loan, mortgage, consumer_loan, credit_card, other]
+        annualRate:
+          $ref: "#/components/schemas/DecimalString"
+        rateType:
+          enum: [fixed, floating]
+        dayCountBasis:
+          enum: [360, 365]
+        interestStartDate:
+          $ref: "#/components/schemas/ISODate"
+        maturityDate:
+          $ref: "#/components/schemas/ISODate"
+        repaymentStartDate:
+          $ref: "#/components/schemas/ISODate"
+        nextDueDate:
+          $ref: "#/components/schemas/ISODate"
+        repaymentFrequency:
+          enum: [monthly]
+        scheduledPayment:
+          $ref: "#/components/schemas/Money"
+        paymentAccountId:
+          $ref: "#/components/schemas/ID"
+    LiabilityTerms:
+      allOf:
+        - $ref: "#/components/schemas/LiabilityTermsInput"
+        - type: object
+          required: [repaymentAnchorDay, lastInterestAccruedThrough, updatedAt]
+          properties:
+            repaymentAnchorDay:
+              type: integer
+              minimum: 1
+              maximum: 31
+            lastInterestAccruedThrough:
+              $ref: "#/components/schemas/ISODate"
+            pendingLoanInterestMovementId:
+              $ref: "#/components/schemas/ID"
+            pendingLoanInterestThroughDate:
+              $ref: "#/components/schemas/ISODate"
+            lastLoanInterestMovementId:
+              $ref: "#/components/schemas/ID"
+            pendingLoanPaymentMovementId:
+              $ref: "#/components/schemas/ID"
+            pendingLoanPaymentDate:
+              $ref: "#/components/schemas/ISODate"
+            lastLoanPaymentMovementId:
+              $ref: "#/components/schemas/ID"
+            lastPaymentDate:
+              $ref: "#/components/schemas/ISODate"
+            updatedAt:
+              $ref: "#/components/schemas/ISODateTime"
+    LiabilityNextPayment:
+      type: object
+      required: [dueDate, scheduledAmount, projectedInterest, projectedPrincipal]
+      properties:
+        dueDate:
+          $ref: "#/components/schemas/ISODate"
+        scheduledAmount:
+          $ref: "#/components/schemas/Money"
+        projectedInterest:
+          $ref: "#/components/schemas/Money"
+        projectedPrincipal:
+          $ref: "#/components/schemas/Money"
+    LiabilityPosition:
+      type: object
+      required:
+        - accountId
+        - accountName
+        - currency
+        - terms
+        - outstandingPrincipal
+        - accruedThrough
+        - accrualDays
+        - accruedInterest
+        - nextPayment
+        - status
+      properties:
+        accountId:
+          $ref: "#/components/schemas/ID"
+        accountName:
+          type: string
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+        terms:
+          $ref: "#/components/schemas/LiabilityTerms"
+        outstandingPrincipal:
+          $ref: "#/components/schemas/Money"
+        accruedThrough:
+          $ref: "#/components/schemas/ISODate"
+        accrualDays:
+          type: integer
+        accruedInterest:
+          $ref: "#/components/schemas/Money"
+        nextPayment:
+          $ref: "#/components/schemas/LiabilityNextPayment"
+        status:
+          enum: [active, matured, paid_off]
+    LiabilityPositionListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/LiabilityPosition"
+    LoanRepaymentScheduleItem:
+      type: object
+      required:
+        - sequence
+        - dueDate
+        - accrualDays
+        - openingBalance
+        - interest
+        - principal
+        - payment
+        - unpaidInterest
+        - closingBalance
+        - kind
+      properties:
+        sequence:
+          type: integer
+        dueDate:
+          $ref: "#/components/schemas/ISODate"
+        accrualDays:
+          type: integer
+        openingBalance:
+          $ref: "#/components/schemas/Money"
+        interest:
+          $ref: "#/components/schemas/Money"
+        principal:
+          $ref: "#/components/schemas/Money"
+        payment:
+          $ref: "#/components/schemas/Money"
+        unpaidInterest:
+          $ref: "#/components/schemas/Money"
+        closingBalance:
+          $ref: "#/components/schemas/Money"
+        kind:
+          enum: [scheduled, balloon]
+    LoanRepaymentSchedule:
+      type: object
+      required:
+        - accountId
+        - accountName
+        - currency
+        - generatedFrom
+        - maturityDate
+        - items
+        - projectedTotals
+        - remainingBalanceAfterPage
+        - hasMore
+      properties:
+        accountId:
+          $ref: "#/components/schemas/ID"
+        accountName:
+          type: string
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+        generatedFrom:
+          $ref: "#/components/schemas/ISODate"
+        maturityDate:
+          $ref: "#/components/schemas/ISODate"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/LoanRepaymentScheduleItem"
+        projectedTotals:
+          type: object
+          required: [payments, interest, principal]
+          properties:
+            payments:
+              $ref: "#/components/schemas/Money"
+            interest:
+              $ref: "#/components/schemas/Money"
+            principal:
+              $ref: "#/components/schemas/Money"
+        remainingBalanceAfterPage:
+          $ref: "#/components/schemas/Money"
+        hasMore:
+          type: boolean
+    LoanRepaymentScheduleResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/LoanRepaymentSchedule"
+    LoanPaymentProposalInput:
+      type: object
+      additionalProperties: false
+      required: [paymentDate]
+      properties:
+        paymentDate:
+          $ref: "#/components/schemas/ISODate"
+        amount:
+          $ref: "#/components/schemas/Money"
+        note:
+          type: string
 
     MovementEntry:
       type: object
@@ -1799,6 +2946,22 @@ components:
       properties:
         id:
           $ref: "#/components/schemas/ID"
+        accountId:
+          $ref: "#/components/schemas/ID"
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        amount:
+          $ref: "#/components/schemas/DecimalString"
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+        direction:
+          enum: [in, out]
+        role:
+          enum: [source, destination, fee, discount, pnl, tax, adjustment]
+    MovementEntryInput:
+      type: object
+      required: [accountId, amount, currency, direction, role]
+      properties:
         accountId:
           $ref: "#/components/schemas/ID"
         instrumentId:
@@ -1823,6 +2986,85 @@ components:
           $ref: "#/components/schemas/Money"
         benefitSource:
           enum: [coupon, platform_subsidy, merchant_discount, free_order, other]
+    ExecutionFxBasis:
+      type: object
+      additionalProperties: false
+      required: [baseCurrency, quoteCurrency, rate, asOf, sourceRateId, source, inverted]
+      description: >-
+        Immutable FX basis actually used for an investment cost or proceeds
+        conversion. The selected source rate is the latest rate whose asOf is not
+        later than the movement occurredAt.
+      properties:
+        baseCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        quoteCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        rate:
+          $ref: "#/components/schemas/DecimalString"
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+        sourceRateId:
+          $ref: "#/components/schemas/ID"
+        source:
+          type: string
+        sourceUrl:
+          type: string
+        inverted:
+          type: boolean
+    InvestmentSaleResult:
+      type: object
+      additionalProperties: false
+      required:
+        - costBasisMethod
+        - grossProceeds
+        - feeAndTaxTotal
+        - netProceeds
+        - realizedPnlStatus
+      description: >-
+        Server-derived immutable accounting result added when a sell movement is
+        confirmed. Realized PnL uses the average-cost basis released by this sale.
+        Different currencies are never subtracted without an execution-time FX basis.
+      properties:
+        costBasisMethod:
+          const: average_cost
+        grossProceeds:
+          $ref: "#/components/schemas/Money"
+        feeAndTaxTotal:
+          $ref: "#/components/schemas/Money"
+        netProceeds:
+          $ref: "#/components/schemas/Money"
+        costBasisReleased:
+          $ref: "#/components/schemas/Money"
+        realizedPnl:
+          $ref: "#/components/schemas/Money"
+        netProceedsInCostBasisCurrency:
+          $ref: "#/components/schemas/Money"
+        fxBasis:
+          $ref: "#/components/schemas/ExecutionFxBasis"
+        realizedPnlStatus:
+          enum: [calculated, calculated_with_fx, cost_basis_unavailable, currency_mismatch]
+    InvestmentReplacement:
+      type: object
+      additionalProperties: false
+      required: [targetType, targetOccurredAt, replacementEntries]
+      description: >-
+        Immutable audit metadata for replacing the latest confirmed buy or sell
+        affecting one holding. Confirmation reverses the original frozen cash,
+        quantity, and cost-basis effect before applying these complete entries.
+      properties:
+        targetType:
+          enum: [buy, sell]
+        targetOccurredAt:
+          $ref: "#/components/schemas/ISODateTime"
+        replacementEntries:
+          type: array
+          minItems: 2
+          items:
+            $ref: "#/components/schemas/MovementEntryInput"
+        saleResult:
+          $ref: "#/components/schemas/InvestmentSaleResult"
+        costBasisFx:
+          $ref: "#/components/schemas/ExecutionFxBasis"
     SettlementInfo:
       type: object
       required: [status]
@@ -1866,6 +3108,134 @@ components:
           $ref: "#/components/schemas/ID"
         createdBy:
           enum: [user, ai, system]
+    HoldingAdjustment:
+      type: object
+      required: [accountId, instrumentId, previousQuantity, targetQuantity]
+      properties:
+        accountId:
+          $ref: "#/components/schemas/ID"
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        previousQuantity:
+          $ref: "#/components/schemas/DecimalString"
+        targetQuantity:
+          $ref: "#/components/schemas/DecimalString"
+    HoldingAdjustmentInput:
+      type: object
+      required: [instrumentId, targetQuantity]
+      additionalProperties: false
+      properties:
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        targetQuantity:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Desired current quantity; must be non-negative.
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+        note:
+          type: string
+    YieldAccrual:
+      type: object
+      required:
+        - holdingId
+        - previousAccruedThrough
+        - throughDate
+        - principal
+        - annualRate
+        - interestMethod
+        - dayCountBasis
+        - compoundingFrequency
+        - accrualDays
+        - fullCompoundingPeriods
+        - interestAmount
+      properties:
+        holdingId:
+          $ref: "#/components/schemas/ID"
+        previousAccruedThrough:
+          $ref: "#/components/schemas/ISODate"
+        throughDate:
+          $ref: "#/components/schemas/ISODate"
+        principal:
+          $ref: "#/components/schemas/Money"
+        annualRate:
+          $ref: "#/components/schemas/DecimalString"
+        interestMethod:
+          enum: [simple, compound]
+        dayCountBasis:
+          enum: [360, 365]
+        compoundingFrequency:
+          enum: [none, monthly, quarterly, annual]
+        accrualDays:
+          type: integer
+        fullCompoundingPeriods:
+          type: integer
+        interestAmount:
+          $ref: "#/components/schemas/Money"
+    LoanInterestAccrual:
+      type: object
+      required:
+        - accountId
+        - previousAccruedThrough
+        - throughDate
+        - outstandingPrincipal
+        - annualRate
+        - rateType
+        - dayCountBasis
+        - accrualDays
+        - interestAmount
+      properties:
+        accountId:
+          $ref: "#/components/schemas/ID"
+        previousAccruedThrough:
+          $ref: "#/components/schemas/ISODate"
+        throughDate:
+          $ref: "#/components/schemas/ISODate"
+        outstandingPrincipal:
+          $ref: "#/components/schemas/Money"
+        annualRate:
+          $ref: "#/components/schemas/DecimalString"
+        rateType:
+          enum: [fixed, floating]
+        dayCountBasis:
+          enum: [360, 365]
+        accrualDays:
+          type: integer
+        interestAmount:
+          $ref: "#/components/schemas/Money"
+    LoanPayment:
+      type: object
+      required:
+        - accountId
+        - paymentAccountId
+        - paymentDate
+        - previousNextDueDate
+        - nextDueDate
+        - paymentAmount
+        - interestAmount
+        - principalAmount
+        - unpaidInterest
+      properties:
+        accountId:
+          $ref: "#/components/schemas/ID"
+        paymentAccountId:
+          $ref: "#/components/schemas/ID"
+        paymentDate:
+          $ref: "#/components/schemas/ISODate"
+        previousNextDueDate:
+          $ref: "#/components/schemas/ISODate"
+        nextDueDate:
+          $ref: "#/components/schemas/ISODate"
+        paymentAmount:
+          $ref: "#/components/schemas/Money"
+        interestAmount:
+          $ref: "#/components/schemas/Money"
+        principalAmount:
+          $ref: "#/components/schemas/Money"
+        unpaidInterest:
+          $ref: "#/components/schemas/Money"
+        linkedInterestMovementId:
+          $ref: "#/components/schemas/ID"
     Movement:
       type: object
       required:
@@ -1899,6 +3269,7 @@ components:
             - adjustment
             - loan_disbursement
             - loan_repayment
+            - loan_interest
             - correction
         occurredAt:
           $ref: "#/components/schemas/ISODateTime"
@@ -1913,7 +3284,7 @@ components:
         entries:
           type: array
           items:
-            $ref: "#/components/schemas/MovementEntry"
+            $ref: "#/components/schemas/MovementEntryInput"
         categoryId:
           $ref: "#/components/schemas/ID"
         counterpartyId:
@@ -1928,6 +3299,20 @@ components:
           $ref: "#/components/schemas/SettlementInfo"
         transferMeta:
           $ref: "#/components/schemas/TransferMeta"
+        saleResult:
+          $ref: "#/components/schemas/InvestmentSaleResult"
+        costBasisFx:
+          $ref: "#/components/schemas/ExecutionFxBasis"
+        investmentReplacement:
+          $ref: "#/components/schemas/InvestmentReplacement"
+        holdingAdjustment:
+          $ref: "#/components/schemas/HoldingAdjustment"
+        yieldAccrual:
+          $ref: "#/components/schemas/YieldAccrual"
+        loanInterestAccrual:
+          $ref: "#/components/schemas/LoanInterestAccrual"
+        loanPayment:
+          $ref: "#/components/schemas/LoanPayment"
         source:
           $ref: "#/components/schemas/DataSourceInfo"
         createdAt:
@@ -1954,10 +3339,36 @@ components:
             $ref: "#/components/schemas/Movement"
     CreateMovementDraftInput:
       type: object
+      description: >-
+        Current server mode validates accounting semantics by movement type.
+        Income/dividend/interest are one in/source cash entry; expense/fee are
+        one out/source cash entry; adjustment is one adjustment cash entry.
+        Buy/sell use one principal cash leg and one holding quantity leg, with
+        optional fee/tax cash outflow legs from the same account and currency.
+        Buy cash outflow and cost basis are principal + fee + tax; sell net
+        cash inflow is gross proceeds - fee - tax while cost basis decreases
+        in proportion to quantity sold. Quote valuation still uses quantity
+        times price. Loan
+        disbursement/repayment use equal same-currency legs between liability
+        and non-liability accounts. Direct correction drafts are rejected; use
+        /movements/corrections.
       required: [type, occurredAt, title, entries]
       properties:
         type:
           type: string
+          enum:
+            - income
+            - expense
+            - transfer
+            - buy
+            - sell
+            - dividend
+            - interest
+            - fee
+            - adjustment
+            - loan_disbursement
+            - loan_repayment
+            - correction
         occurredAt:
           $ref: "#/components/schemas/ISODateTime"
         title:
@@ -1965,7 +3376,7 @@ components:
         entries:
           type: array
           items:
-            $ref: "#/components/schemas/MovementEntry"
+            $ref: "#/components/schemas/MovementEntryInput"
         categoryId:
           $ref: "#/components/schemas/ID"
         counterpartyId:
@@ -1979,6 +3390,18 @@ components:
     CreateCorrectionInput:
       type: object
       required: [targetMovementId, reason]
+      description: >-
+        Provide proposedDiffs for the legacy single-entry amount adjustment, or
+        replacementEntries for a complete multi-leg replacement. The server
+        creates one correction movement containing reversals of every original
+        entry followed by the complete replacement entries. The original
+        confirmed movement is never modified. Buy/sell corrections require
+        replacementEntries and are limited to the latest confirmed trade for the
+        affected holding; targets with later trades or missing frozen sale cost
+        basis are rejected rather than guessed.
+      anyOf:
+        - required: [proposedDiffs]
+        - required: [replacementEntries]
       properties:
         targetMovementId:
           $ref: "#/components/schemas/ID"
@@ -1986,8 +3409,15 @@ components:
           type: string
         proposedDiffs:
           type: array
+          minItems: 1
           items:
             $ref: "#/components/schemas/AiFieldDiff"
+        replacementEntries:
+          type: array
+          minItems: 1
+          description: Complete desired entries, not a partial patch.
+          items:
+            $ref: "#/components/schemas/MovementEntryInput"
 
     DcaPlan:
       type: object
@@ -2038,6 +3468,30 @@ components:
           $ref: "#/components/schemas/ISODate"
         note:
           type: string
+    DcaExecutionInput:
+      type: object
+      additionalProperties: false
+      required: [holdingAccountId, quantity, totalCost, quoteCurrency]
+      description: >-
+        Actual user-reported execution. The plan amount is only a reminder/default;
+        it is never reused as the acquired quantity. This command records a pending
+        proposal and never places an order.
+      properties:
+        holdingAccountId:
+          $ref: "#/components/schemas/ID"
+        quantity:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Positive quantity actually acquired.
+        totalCost:
+          allOf:
+            - $ref: "#/components/schemas/Money"
+          description: Positive actual total cash cost in the funding-account currency.
+        quoteCurrency:
+          type: string
+          description: Quote currency of the target instrument and holding entry.
+        executedAt:
+          $ref: "#/components/schemas/ISODateTime"
     DcaReminder:
       type: object
       required: [id, planId, dueDate, status]
@@ -2182,6 +3636,10 @@ components:
     CreateSubscriptionRequest:
       type: object
       required: [displayName, provider, amount, paymentAccountId, billingCycle, startDate]
+      description: >-
+        duration and endDate are mutually exclusive. paymentAccountId must
+        reference a non-archived account whose supportedCurrencies contains
+        amount.currency.
       properties:
         displayName:
           type: string
@@ -2216,11 +3674,18 @@ components:
           default: active
         note:
           type: string
-      description: duration and endDate are mutually exclusive.
     UpdateSubscriptionRequest:
       type: object
       minProperties: 1
-      description: Nullable duration and endDate form one schedule replacement group. Two non-null values conflict; non-null duration computes endDate from startDate; only non-null endDate removes duration; two null values clear the finite schedule.
+      description: >-
+        Nullable duration and endDate form one schedule replacement group. Two
+        non-null values conflict; non-null duration computes endDate from
+        startDate; only non-null endDate removes duration; two null values clear
+        the finite schedule. The complete patched subscription is rejected
+        unless its payment account is non-archived and supports amount.currency.
+        When startDate moves beyond an inherited nextChargeDate and the request
+        does not explicitly replace nextChargeDate, the server advances the
+        inherited date to the new startDate.
       properties:
         displayName:
           type: string
@@ -2275,6 +3740,98 @@ components:
           items:
             $ref: "#/components/schemas/Subscription"
 
+    SubscriptionDueScanRequest:
+      type: object
+      additionalProperties: false
+      required: [throughDate]
+      properties:
+        throughDate:
+          $ref: "#/components/schemas/ISODate"
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 100
+          description: Maximum number of newly created proposals, not the number of inspected or skipped subscriptions.
+    SubscriptionDueScanSkipReason:
+      type: string
+      enum:
+        - already_pending
+        - payment_account_unavailable
+        - payment_currency_unsupported
+    SubscriptionDueScanSkip:
+      type: object
+      additionalProperties: false
+      required: [subscriptionId, scheduledChargeDate, reason]
+      properties:
+        subscriptionId:
+          $ref: "#/components/schemas/ID"
+        scheduledChargeDate:
+          $ref: "#/components/schemas/ISODate"
+        reason:
+          $ref: "#/components/schemas/SubscriptionDueScanSkipReason"
+    SubscriptionDueScanCreated:
+      allOf:
+        - $ref: "#/components/schemas/AiAtomicGroup"
+        - type: object
+          required: [subscriptionId, scheduledChargeDate]
+          properties:
+            subscriptionId:
+              $ref: "#/components/schemas/ID"
+            scheduledChargeDate:
+              $ref: "#/components/schemas/ISODate"
+    SubscriptionDueScanResult:
+      type: object
+      additionalProperties: false
+      required:
+        - throughDate
+        - createdCount
+        - alreadyPendingCount
+        - blockedCount
+        - remainingEligibleCount
+        - hasMore
+        - created
+        - skipped
+      properties:
+        throughDate:
+          $ref: "#/components/schemas/ISODate"
+        createdCount:
+          type: integer
+          minimum: 0
+          description: Equal to the length of created.
+        alreadyPendingCount:
+          type: integer
+          minimum: 0
+          description: Count of skipped items whose reason is already_pending.
+        blockedCount:
+          type: integer
+          minimum: 0
+          description: Count of skipped items whose reason is payment_account_unavailable or payment_currency_unsupported.
+        remainingEligibleCount:
+          type: integer
+          minimum: 0
+          description: Otherwise creatable subscriptions left uncreated only because limit was reached.
+        hasMore:
+          type: boolean
+          description: True exactly when remainingEligibleCount is greater than zero.
+        created:
+          type: array
+          items:
+            $ref: "#/components/schemas/SubscriptionDueScanCreated"
+        skipped:
+          type: array
+          description: Already-pending and payment-blocked candidates in stable scan order.
+          items:
+            $ref: "#/components/schemas/SubscriptionDueScanSkip"
+    SubscriptionDueScanResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/SubscriptionDueScanResult"
+
     EvidenceRef:
       type: object
       required: [id, type, label]
@@ -2296,7 +3853,7 @@ components:
       required: [kind, evidenceRefs]
       properties:
         kind:
-          enum: [user_text, image, csv, manual_import, web_lookup]
+          enum: [user_text, user_image, csv_import, manual_import, web_lookup]
         evidenceRefs:
           type: array
           items:
@@ -2382,6 +3939,10 @@ components:
           enum: [pending, approved, rejected, edited]
         validation:
           $ref: "#/components/schemas/AiValidationResult"
+        subscriptionId:
+          $ref: "#/components/schemas/ID"
+        scheduledChargeDate:
+          $ref: "#/components/schemas/ISODate"
     AiProposal:
       type: object
       required: [id, status, source, atomicGroups, warnings, createdAt]
@@ -2420,10 +3981,20 @@ components:
             $ref: "#/components/schemas/ID"
     AiImageInput:
       type: object
-      required: [imageRef, contextScope]
+      additionalProperties: false
+      required: [fileName, mimeType, imageBase64]
       properties:
-        imageRef:
-          $ref: "#/components/schemas/EvidenceRef"
+        fileName:
+          type: string
+          minLength: 1
+          maxLength: 255
+        mimeType:
+          type: string
+          enum: [image/png, image/jpeg, image/webp]
+        imageBase64:
+          type: string
+          contentEncoding: base64
+          maxLength: 14680064
         contextScope:
           enum: [selected_accounts, full_ledger]
         selectedAccountIds:
@@ -2758,6 +4329,7 @@ components:
           type: integer
         quoteProblemCount:
           type: integer
+          description: Total stale, offline-cached, unpriceable, and error valuation items.
         syncProblemCount:
           type: integer
     PortfolioOverview:
@@ -2788,6 +4360,66 @@ components:
           const: true
         data:
           $ref: "#/components/schemas/PortfolioOverview"
+    ValuationIssue:
+      type: object
+      required:
+        - id
+        - accountId
+        - accountName
+        - assetKind
+        - assetId
+        - assetLabel
+        - quantity
+        - quantityUnit
+        - status
+        - reason
+        - sourceCurrency
+        - targetCurrency
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        accountId:
+          $ref: "#/components/schemas/ID"
+        accountName:
+          type: string
+        assetKind:
+          enum: [cash, holding]
+        assetId:
+          type: string
+        assetLabel:
+          type: string
+        quantity:
+          $ref: "#/components/schemas/DecimalString"
+        quantityUnit:
+          type: string
+        status:
+          enum: [stale, offline_cached, unpriceable, error]
+        reason:
+          enum:
+            - missing_quote
+            - missing_fx_path
+            - stale_quote
+            - stale_fx
+            - offline_cached_quote
+            - offline_cached_fx
+            - quote_error
+            - fx_error
+        sourceCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        targetCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+    ValuationIssueListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ValuationIssue"
     AssetAllocationResponse:
       type: object
       required: [ok, data]
@@ -3015,6 +4647,8 @@ components:
       properties:
         id:
           $ref: "#/components/schemas/ID"
+        kind:
+          enum: [entity_already_exists]
         entityType:
           type: string
         entityId:
@@ -3065,12 +4699,37 @@ components:
       properties:
         deviceId:
           $ref: "#/components/schemas/ID"
+          description: Must equal the device identity resolved from the bearer token.
         lastKnownCursor:
           type: string
         changes:
           type: array
           items:
-            $ref: "#/components/schemas/SyncChange"
+            $ref: "#/components/schemas/InboundAccountCreateSyncChange"
+    InboundAccountCreateSyncChange:
+      type: object
+      required:
+        [id, deviceId, entityType, entityId, operation, payload, baseVersion, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        deviceId:
+          $ref: "#/components/schemas/ID"
+          description: Must equal the authenticated request device.
+        entityType:
+          const: account
+        entityId:
+          $ref: "#/components/schemas/ID"
+        operation:
+          const: create
+        payload:
+          allOf:
+            - $ref: "#/components/schemas/Account"
+          description: payload.id must equal entityId.
+        baseVersion:
+          const: 0
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
     SyncPushResultResponse:
       type: object
       required: [ok, data]
@@ -3079,19 +4738,425 @@ components:
           const: true
         data:
           type: object
-          required: [cursor, conflicts]
+          required:
+            [cursor, acceptedChangeIds, appliedChangeIds, skippedChangeIds, conflicts]
           properties:
             cursor:
               type: string
             acceptedChangeIds:
               type: array
+              description: Remote IDs whose entity and relay log were persisted.
+              items:
+                type: string
+            appliedChangeIds:
+              type: array
+              description: Remote IDs whose account entities were applied in this request.
               items:
                 type: string
             skippedChangeIds:
               type: array
+              description: Idempotent replays already identified by source device and ID.
               items:
                 type: string
             conflicts:
               type: array
               items:
                 $ref: "#/components/schemas/SyncConflict"
+    AgentModel:
+      type: object
+      required: [id, provider, displayName, supportsImages]
+      properties:
+        id:
+          type: string
+          description: Stable provider/model identifier accepted when selecting a conversation model.
+        provider:
+          type: string
+        displayName:
+          type: string
+        supportsImages:
+          type: boolean
+    AgentConversation:
+      type: object
+      required:
+        [id, userId, ledgerId, title, isPrimary, status, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        userId:
+          $ref: "#/components/schemas/ID"
+        ledgerId:
+          $ref: "#/components/schemas/ID"
+        title:
+          type: string
+        isPrimary:
+          type: boolean
+        status:
+          enum: [active, archived]
+        selectedModelId:
+          type: string
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        updatedAt:
+          $ref: "#/components/schemas/ISODateTime"
+    AgentMessage:
+      type: object
+      required: [id, conversationId, role, text, status, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        conversationId:
+          $ref: "#/components/schemas/ID"
+        role:
+          enum: [user, assistant, system]
+        text:
+          type: string
+        status:
+          enum: [queued, streaming, completed, failed]
+        runId:
+          $ref: "#/components/schemas/ID"
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        completedAt:
+          $ref: "#/components/schemas/ISODateTime"
+        errorCode:
+          type: string
+        attachmentIds:
+          type: array
+          items:
+            $ref: "#/components/schemas/ID"
+    AgentAttachment:
+      type: object
+      required: [id, userId, ledgerId, fileName, mimeType, sizeBytes, sha256, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        userId:
+          $ref: "#/components/schemas/ID"
+        ledgerId:
+          $ref: "#/components/schemas/ID"
+        fileName:
+          type: string
+        mimeType:
+          enum:
+            - image/png
+            - image/jpeg
+            - image/webp
+            - text/plain
+            - text/csv
+            - application/pdf
+            - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+            - application/zip
+        sizeBytes:
+          type: integer
+          minimum: 1
+          maximum: 15728640
+        sha256:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+    AgentMemory:
+      type: object
+      required: [id, userId, ledgerId, content, reason, status, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        userId:
+          $ref: "#/components/schemas/ID"
+        ledgerId:
+          $ref: "#/components/schemas/ID"
+        content:
+          type: string
+        reason:
+          type: string
+        status:
+          enum: [suggested, active, rejected]
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        updatedAt:
+          $ref: "#/components/schemas/ISODateTime"
+    AgentQuoteCandidate:
+      type: object
+      additionalProperties: false
+      required: [id, userId, ledgerId, kind, asOf, source, sourceUrl, status, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        userId:
+          $ref: "#/components/schemas/ID"
+        ledgerId:
+          $ref: "#/components/schemas/ID"
+        kind:
+          enum: [instrument, fx]
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        price:
+          $ref: "#/components/schemas/DecimalString"
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+        baseCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        quoteCurrency:
+          $ref: "#/components/schemas/CurrencyCode"
+        rate:
+          $ref: "#/components/schemas/DecimalString"
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+        source:
+          type: string
+          maxLength: 120
+        sourceUrl:
+          type: string
+          format: uri
+        status:
+          enum: [suggested, applied, rejected]
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        updatedAt:
+          $ref: "#/components/schemas/ISODateTime"
+        appliedAt:
+          $ref: "#/components/schemas/ISODateTime"
+    AgentAutomationKind:
+      type: string
+      enum: [quote_refresh, subscription_due_scan, dca_due_check, financial_summary]
+    AgentAutomation:
+      type: object
+      additionalProperties: false
+      required: [id, userId, ledgerId, deviceId, kind, intervalHours, enabled, nextRunAt, createdAt, updatedAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        userId:
+          $ref: "#/components/schemas/ID"
+        ledgerId:
+          $ref: "#/components/schemas/ID"
+        deviceId:
+          $ref: "#/components/schemas/ID"
+        kind:
+          $ref: "#/components/schemas/AgentAutomationKind"
+        intervalHours:
+          type: integer
+          minimum: 1
+          maximum: 720
+        enabled:
+          type: boolean
+        nextRunAt:
+          $ref: "#/components/schemas/ISODateTime"
+        lastRunAt:
+          $ref: "#/components/schemas/ISODateTime"
+        lastStatus:
+          enum: [success, failed]
+        lastErrorCode:
+          type: string
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        updatedAt:
+          $ref: "#/components/schemas/ISODateTime"
+    CreateAgentAutomationRequest:
+      type: object
+      additionalProperties: false
+      required: [kind, intervalHours]
+      properties:
+        kind:
+          $ref: "#/components/schemas/AgentAutomationKind"
+        intervalHours:
+          type: integer
+          minimum: 1
+          maximum: 720
+        enabled:
+          type: boolean
+          default: true
+        startAt:
+          $ref: "#/components/schemas/ISODateTime"
+    UpdateAgentAutomationRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        intervalHours:
+          type: integer
+          minimum: 1
+          maximum: 720
+        enabled:
+          type: boolean
+        nextRunAt:
+          $ref: "#/components/schemas/ISODateTime"
+    AgentNotification:
+      type: object
+      additionalProperties: false
+      required: [id, userId, ledgerId, kind, title, body, createdAt]
+      properties:
+        id:
+          $ref: "#/components/schemas/ID"
+        userId:
+          $ref: "#/components/schemas/ID"
+        ledgerId:
+          $ref: "#/components/schemas/ID"
+        kind:
+          $ref: "#/components/schemas/AgentAutomationKind"
+        title:
+          type: string
+        body:
+          type: string
+        action:
+          enum: [review, quotes, dca, agent]
+        createdAt:
+          $ref: "#/components/schemas/ISODateTime"
+        readAt:
+          $ref: "#/components/schemas/ISODateTime"
+    AgentStatusResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: object
+          required: [service, configured, userId, ledgerId, modelCount]
+          properties:
+            service:
+              const: finwealth-agent
+            configured:
+              type: boolean
+            userId:
+              $ref: "#/components/schemas/ID"
+            ledgerId:
+              $ref: "#/components/schemas/ID"
+            modelCount:
+              type: integer
+              minimum: 0
+            primaryConversationId:
+              $ref: "#/components/schemas/ID"
+    AgentModelListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentModel"
+    AgentAttachmentResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AgentAttachment"
+    AgentMemoryResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AgentMemory"
+    AgentMemoryListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentMemory"
+    AgentQuoteCandidateResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AgentQuoteCandidate"
+    AgentQuoteCandidateListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentQuoteCandidate"
+    AgentAutomationResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AgentAutomation"
+    AgentAutomationListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentAutomation"
+    AgentNotificationResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AgentNotification"
+    AgentNotificationListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentNotification"
+    AgentConversationResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/AgentConversation"
+    AgentConversationListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentConversation"
+    AgentMessageListResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentMessage"
+    AgentRunAcceptedResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          type: object
+          required: [runId, userMessageId, assistantMessageId]
+          properties:
+            runId:
+              $ref: "#/components/schemas/ID"
+            userMessageId:
+              $ref: "#/components/schemas/ID"
+            assistantMessageId:
+              $ref: "#/components/schemas/ID"

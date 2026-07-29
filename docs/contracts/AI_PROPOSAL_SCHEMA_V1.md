@@ -2,7 +2,7 @@
 
 状态：草案冻结给前端 AI Review 使用。  
 用途：定义 AI 导入、AI 修改、AI 更正、AI 归档建议的候选数据结构与审批边界。  
-非用途：不定义具体模型供应商、不定义 prompt、不允许 AI 直接写账。
+非用途：不允许 AI 直接写账；具体 provider 凭据不属于账本契约。
 
 ## 0. 强约束
 
@@ -13,6 +13,21 @@
 5. 修改已有记录必须显示 old → new diff。
 6. 修改 confirmed 记录时，默认生成更正事件；除非用户显式选择“修改原记录”。
 7. confidence 不作为盲签依据；证据、diff、警告必须可见。
+8. 已持久化在 `movements` 的 standalone `pending_review` 候选只做读取投影，不得为了进入 AI Review 再复制成 `aiProposals` 记录。
+9. 远端模型只返回受限结构化草稿；服务端必须再次执行正式 movement 校验，provider 成功不能绕过审核。
+
+### 0.1 文本与图片整理 provider
+
+- 默认 `FINWEALTH_AI_PROVIDER=none`，原始文本进入待补全候选。
+- `openai_responses` 使用 Responses API 的 strict JSON Schema；schema 根为 object，字段全部 required，所有 object 均 `additionalProperties=false`。
+- 第一阶段只整理单账户现金 `income|expense`，不让模型生成转账、投资买卖、贷款、订阅或直接写账动作。
+- 输入只包含用户文本、当前时间和可选账户的 ID/名称/类型/币种，不发送余额、完整流水或完整账本。
+- `usable=false` 不生成 movement；refusal、incomplete、网络/API 错误和非法结构 fail closed。
+- provider 返回的账户 ID、币种、金额、RFC3339 时间和方向由服务端重新校验并规范化。
+- 成功 proposal 的 source 可记录 `modelName` 与固定 `promptVersion`，但不记录 API key 或完整 provider 响应。
+- 图片输入只接受 PNG、JPEG、WEBP，解码后上限 10 MiB；服务端校验 Base64、MIME 和文件头后才调用 provider。
+- 图片以 Responses API `input_image` data URL 发送，请求固定 `store=false`。原始图片和 data URL 不写入账本、响应、evidence 摘要或日志。
+- 图片阶段仍只生成单账户现金 `income|expense`，与文本整理共用结构化输出和账本复验规则。
 
 ## 1. 顶层结构
 
@@ -46,7 +61,7 @@ AiProposalStatus =
 
 ```ts
 AiProposalSource {
-  kind: "user_text" | "image" | "csv" | "manual_import" | "web_lookup";
+  kind: "user_text" | "user_image" | "csv_import" | "manual_import" | "web_lookup";
   evidenceRefs: EvidenceRef[];
   modelName?: string;
   promptVersion?: string;
@@ -84,6 +99,8 @@ AiAtomicGroup {
   warnings: AiWarning[];
   status: AiAtomicGroupStatus;
   validation: AiValidationResult;
+  subscriptionId?: ID;
+  scheduledChargeDate?: ISODate;
 }
 
 AiOperation =
@@ -113,8 +130,10 @@ AiAtomicGroupStatus =
 - `create`：创建新账户、记录、分类、对手方等候选。
 - `modify`：修改未确认或允许直接编辑的对象，必须展示 diff。
 - `correction`：对 confirmed 记录生成反向/更正事件，优先于原地改写。
+- 多腿 correction 必须整组包含原分录反向腿与完整替换腿，不允许只更正其中一腿或拆分审批。
 - `merge`：用于对手方归并，例如“瑞幸”与“瑞幸咖啡”。
 - `classify`：用于分类/标签建议。
+- subscription 扣费候选的 group 必须携带 `subscriptionId` 与 `scheduledChargeDate`，便于调用方定位计划和计费期。
 
 ## 4. Proposed Entity
 
@@ -218,6 +237,7 @@ EditAtomicGroup {
 DcaExecutedProposal {
   reminderId: ID;
   planId: ID;
+  execution: DcaExecutionInput;
   proposedMovement: Movement;
 }
 ```
@@ -225,8 +245,37 @@ DcaExecutedProposal {
 规则：
 
 - 不连接券商。
+- 现金腿来自 `execution.totalCost`，持仓腿数量来自 `execution.quantity`；计划金额不能冒充数量。
+- `execution.holdingAccountId` 决定持仓归属，资金账户仍来自 DCA plan。
 - 不下单。
 - 不转账。
 - pending proposal / draft 可以持久化，以便刷新或重启后继续复核。
 - 用户确认前不写 confirmed/effective ledger，不影响余额、持仓、净值或快照。
 - 用户确认 atomic group 后才生成正式 Movement。
+
+## 9. Standalone pending movement 投影
+
+订阅扣费、DCA 记录或手工候选可以直接以 `Movement.status = "pending_review"` 持久化，而不属于 AI 模型生成的 `aiProposals`。AI Review 读取层必须让这些候选在刷新或服务重启后仍可发现。
+
+```ts
+StandalonePendingProjection {
+  id: `proposal_movement_${movementId}`;
+  status: "pending";
+  source: {
+    kind: "manual_import";
+    evidenceRefs: EvidenceRef[];
+  };
+  atomicGroups: AiAtomicGroup[];
+  warnings: AiWarning[];
+  createdAt: ISODateTime;
+}
+```
+
+规则：
+
+- 读取 `movements` 中的 `pending_review` 项，按 `atomicGroupId` 分组；组内 movement 按 ID 稳定排序，再动态构造 proposal。
+- synthetic proposal 不是新的磁盘实体，不写入 `aiProposals`，也不产生第二份 movement。
+- `GET /ai/proposals/pending`、`GET /ai/proposals/{proposalId}` 与 overview `aiPendingCount` 都包含该投影。
+- approve/reject 直接消费底层 movement atomic group；处理完成后投影自动从 pending 读取结果消失。
+- standalone 投影不可原地 edit；编辑请求返回冲突，用户应拒绝后从订阅、DCA 或手工录入命令重新生成。
+- subscription 投影使用 `subscription_charge_requires_confirmation` warning；确认前不扣款、不推进 `nextChargeDate`。

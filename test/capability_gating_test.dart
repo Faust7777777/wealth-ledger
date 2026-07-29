@@ -83,6 +83,16 @@ AiProposalVm _pendingProposal() => const AiProposalVm(
       title: '测试组',
       operation: AiOperation.create,
       status: AiGroupStatus.pending,
+      // 结构化候选才有「接受整组」；无 movement 的组走待补全门控。
+      proposedMovement: MovementVm(
+        id: 'mov_g1',
+        atomicGroupId: 'ag_1',
+        type: MovementType.expense,
+        status: MovementStatus.pendingReview,
+        title: '测试支出',
+        occurredAt: '2026-07-19T12:00:00Z',
+        displayAmount: Money(amount: '18.00', currency: 'CNY'),
+      ),
     ),
   ],
 );
@@ -131,7 +141,7 @@ void main() {
       await tester.pumpAndSettle();
 
       // WriteGate 用 AbsorbPointer 吸收点击并显示原因文案。
-      expect(find.textContaining('当前数据源只读'), findsOneWidget);
+      expect(find.textContaining('当前为只读模式'), findsOneWidget);
       expect(
         find.ancestor(
           of: find.byType(FilledButton),
@@ -152,7 +162,7 @@ void main() {
 
       final button = tester.widget<FilledButton>(find.byType(FilledButton));
       expect(button.onPressed, isNotNull);
-      expect(find.textContaining('当前数据源只读'), findsNothing);
+      expect(find.textContaining('当前为只读模式'), findsNothing);
     });
   });
 
@@ -187,7 +197,7 @@ void main() {
       for (final label in ['手动记账', '转账', '余额观察', 'AI 文本导入']) {
         expect(tileOf(tester, label).enabled, isFalse, reason: label);
       }
-      expect(find.textContaining('当前数据源只读'), findsOneWidget);
+      expect(find.textContaining('当前为只读模式'), findsOneWidget);
     });
 
     testWidgets('只可持久化候选时记账禁用、AI 导入可用（dev server 形态）', (tester) async {
@@ -231,7 +241,7 @@ void main() {
       await tester.pumpAndSettle();
 
       // 分类创建卡 + 对手方创建卡 + 合并卡，共 3 处 WriteGate 原因文案。
-      expect(find.textContaining('当前数据源只读'), findsNWidgets(3));
+      expect(find.textContaining('当前为只读模式'), findsNWidgets(3));
     });
   });
 
@@ -277,7 +287,7 @@ void main() {
         ),
       );
       expect(find.textContaining('已入账'), findsNothing);
-      expect(find.textContaining('未产生新入账'), findsOneWidget);
+      expect(find.textContaining('尚未入账'), findsOneWidget);
     });
 
     testWidgets('无 canConfirmProposal 时「接受整组」禁用', (tester) async {

@@ -8,6 +8,16 @@ on:
         required: false
         default: false
         type: boolean
+      remote_api_base:
+        description: Optional fixed HTTPS API origin; leave empty for a universal runtime-configured client
+        required: false
+        default: ''
+        type: string
+      include_android_server_client:
+        description: Build the writable Android server client (debug-signed for private self-use)
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: package-${{ github.ref }}
@@ -34,6 +44,7 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: 3.44.4
           cache: true
 
       - name: Get Flutter dependencies
@@ -70,6 +81,10 @@ jobs:
         shell: pwsh
         run: python tools/local_ledger_smoke.py
 
+      - name: Run production TLS/auth/persistence topology smoke
+        shell: pwsh
+        run: python tools/production_topology_smoke.py
+
       - name: Run local Windows backup and restore smoke
         shell: pwsh
         run: ./tools/local_backup_restore_smoke.ps1
@@ -91,13 +106,52 @@ jobs:
         timeout-minutes: 10
         run: ./tools/frontend_local_server_smoke.ps1
 
+      - name: Verify source remained clean
+        shell: pwsh
+        run: |
+          $status = @(git status --porcelain)
+          if ($status.Count -gt 0) {
+            $status | Write-Output
+            throw "Verification steps modified the source worktree."
+          }
+
       - name: Check Windows package readiness
         shell: pwsh
         run: ./tools/package_release.ps1 -WindowsOnly -CheckReadinessOnly
 
+      - name: Check Windows server-client readiness
+        shell: pwsh
+        run: ./tools/package_remote_windows.ps1 -CheckReadinessOnly
+
+  verify-linux-server:
+    name: Verify Linux VPS topology
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server-rs
+
+      - name: Install Python tooling dependencies
+        run: python -m pip install --disable-pip-version-check -r tools/requirements.txt
+
+      - name: Check Linux deployment scripts
+        run: bash -n tools/install_vps_systemd.sh tools/install_vps_bundle.sh tools/package_vps_server.sh tools/check_vps_readiness.sh tools/backup_vps_ledger.sh tools/restore_vps_ledger.sh tools/vps_backup_restore_smoke.sh
+
+      - name: Run VPS backup and restore smoke
+        run: bash tools/vps_backup_restore_smoke.sh
+
+      - name: Run production TLS/auth/persistence topology smoke
+        run: python tools/production_topology_smoke.py
+
   package-windows:
     name: Package Windows
-    needs: verify-windows-source
+    needs: [verify-windows-source, verify-linux-server]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -114,6 +168,7 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: 3.44.4
           cache: true
 
       - name: Get Flutter dependencies
@@ -132,9 +187,101 @@ jobs:
             dist/*-windows-self-use-x64.zip.sha256
           if-no-files-found: error
 
+  package-linux-server:
+    name: Package Linux VPS server
+    needs: [verify-windows-source, verify-linux-server]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install static Linux build tools
+        run: |
+          sudo sed -i 's|http://ports.ubuntu.com|https://ports.ubuntu.com|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::ForceIPv4=true update && \
+               sudo apt-get -o Acquire::ForceIPv4=true install -y musl-tools; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server-rs
+
+      - name: Build precompiled VPS bundle
+        env:
+          FINWEALTH_LINUX_TARGET: x86_64-unknown-linux-musl
+        run: bash tools/package_vps_server.sh dist
+
+      - name: Upload VPS server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finwealth-linux-x86_64-vps-server
+          path: |
+            dist/*-linux-x86_64-vps.tar.gz
+            dist/*-linux-x86_64-vps.tar.gz.sha256
+          if-no-files-found: error
+
+  package-linux-server-arm64:
+    name: Package Linux ARM64 VPS server
+    needs: [verify-windows-source, verify-linux-server]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install static Linux build tools
+        run: |
+          sudo sed -i 's|http://ports.ubuntu.com|https://ports.ubuntu.com|g' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::ForceIPv4=true update && \
+               sudo apt-get -o Acquire::ForceIPv4=true install -y musl-tools; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server-rs
+
+      - name: Build precompiled ARM64 VPS bundle
+        env:
+          FINWEALTH_LINUX_TARGET: aarch64-unknown-linux-musl
+        run: bash tools/package_vps_server.sh dist
+
+      - name: Upload ARM64 VPS server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finwealth-linux-aarch64-vps-server
+          path: |
+            dist/*-linux-aarch64-vps.tar.gz
+            dist/*-linux-aarch64-vps.tar.gz.sha256
+          if-no-files-found: error
+
   package-android:
     name: Package Android read-only preview
-    needs: verify-windows-source
+    needs: [verify-windows-source, verify-linux-server]
     if: ${{ inputs.include_android_readonly_preview }}
     runs-on: ubuntu-latest
     steps:
@@ -150,6 +297,7 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: 3.44.4
           cache: true
 
       - name: Get Flutter dependencies
@@ -166,4 +314,76 @@ jobs:
           path: |
             dist/*-android-readonly-preview-debug.apk
             dist/*-android-readonly-preview-debug.apk.sha256
+          if-no-files-found: error
+
+  package-windows-remote:
+    name: Package Windows server client
+    needs: [verify-windows-source, verify-linux-server]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.4
+          cache: true
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Build Windows server client
+        shell: pwsh
+        env:
+          FINWEALTH_REMOTE_API_BASE: ${{ inputs.remote_api_base }}
+        run: ./tools/package_remote_windows.ps1 -ApiBase $env:FINWEALTH_REMOTE_API_BASE -OutputDir dist
+
+      - name: Upload Windows server-client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finwealth-windows-server-client-x64
+          path: |
+            dist/*-windows-server-client-x64.zip
+            dist/*-windows-server-client-x64.zip.sha256
+          if-no-files-found: error
+
+  package-android-remote:
+    name: Package Android server client
+    needs: [verify-windows-source, verify-linux-server]
+    if: ${{ inputs.include_android_server_client }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.44.4
+          cache: true
+
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      - name: Build Android server client
+        shell: pwsh
+        env:
+          FINWEALTH_REMOTE_API_BASE: ${{ inputs.remote_api_base }}
+        run: ./tools/package_remote_android.ps1 -ApiBase $env:FINWEALTH_REMOTE_API_BASE -OutputDir dist
+
+      - name: Upload Android server-client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: finwealth-android-server-client-debug
+          path: |
+            dist/*-android-server-client-debug.apk
+            dist/*-android-server-client-debug.apk.sha256
+            dist/*-android-server-client-debug.apk.manifest.json
           if-no-files-found: error

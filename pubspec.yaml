@@ -38,11 +38,15 @@ dependencies:
   go_router: ^17.3.0
   http: ^1.6.0
   file_selector: ^1.1.0
+  url_launcher: ^6.3.2
   win32: ^6.3.0
   ffi: ^2.2.0
 
 dev_dependencies:
   flutter_test:
+    sdk: flutter
+  # 真机/AVD 触摸复验：会话菜单的命中测试无法只靠 widget test 保证。
+  integration_test:
     sdk: flutter
 
   # The "flutter_lints" package below contains a set of recommended lints to

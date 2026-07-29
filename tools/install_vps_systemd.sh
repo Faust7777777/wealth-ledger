@@ -7,6 +7,19 @@ DATA_DIR="${FINWEALTH_DATA_DIR:-/var/lib/finwealth}"
 CONFIG_DIR="${FINWEALTH_CONFIG_DIR:-/etc/finwealth}"
 ENV_FILE="${FINWEALTH_ENV_FILE:-$CONFIG_DIR/server.env}"
 SERVICE_FILE="${FINWEALTH_SERVICE_FILE:-/etc/systemd/system/finwealth-server.service}"
+
+start_proxy_sockets() {
+  local socket
+  while read -r socket; do
+    if [ -n "$socket" ] && ! systemctl is-active --quiet "$socket"; then
+      systemctl stop "${socket%.socket}.service"
+      systemctl start "$socket"
+    fi
+  done < <(
+    find /etc/systemd/system -maxdepth 3 -type l \
+      -name 'finwealth-docker-proxy@*.socket' -printf '%f\n' | sort -u
+  )
+}
 SERVICE_NAME="${FINWEALTH_SERVICE_NAME:-finwealth-server.service}"
 BIN_NAME="finwealth-server"
 
@@ -29,12 +42,17 @@ if ! id "$APP_USER" >/dev/null 2>&1; then
 fi
 
 install -d -m 0755 "$APP_DIR"
+install -d -m 0755 "$APP_DIR/tools"
 install -d -m 0700 -o "$APP_USER" -g "$APP_USER" "$DATA_DIR"
 install -d -m 0750 "$CONFIG_DIR"
 
 echo "Building release binary..."
 cargo build --manifest-path "$MANIFEST" --release
 install -m 0755 "$RELEASE_BIN" "$APP_DIR/$BIN_NAME"
+install -m 0755 "$ROOT/tools/configure_vps_auth.sh" "$APP_DIR/tools/"
+install -m 0755 "$ROOT/tools/check_vps_readiness.sh" "$APP_DIR/tools/"
+install -m 0755 "$ROOT/tools/backup_vps_ledger.sh" "$APP_DIR/tools/"
+install -m 0755 "$ROOT/tools/restore_vps_ledger.sh" "$APP_DIR/tools/"
 
 if [ ! -f "$ENV_FILE" ]; then
   install -m 0600 "$ROOT/deploy/finwealth-server.env.example" "$ENV_FILE"
@@ -44,6 +62,10 @@ chown root:root "$ENV_FILE"
 chmod 0600 "$ENV_FILE"
 
 install -m 0644 "$ROOT/deploy/systemd/finwealth-server.service" "$SERVICE_FILE"
+install -m 0644 "$ROOT/deploy/systemd/finwealth-docker-proxy@.socket" \
+  /etc/systemd/system/finwealth-docker-proxy@.socket
+install -m 0644 "$ROOT/deploy/systemd/finwealth-docker-proxy@.service" \
+  /etc/systemd/system/finwealth-docker-proxy@.service
 systemctl daemon-reload
 
 if grep -q "change-me" "$ENV_FILE"; then
@@ -64,5 +86,19 @@ EOF
   exit 0
 fi
 
-systemctl enable --now "$SERVICE_NAME"
+echo "Validating production configuration..."
+systemd-run \
+  --wait \
+  --pipe \
+  --quiet \
+  --collect \
+  --unit="finwealth-config-check-$$" \
+  --property="User=$APP_USER" \
+  --property="Group=$APP_USER" \
+  --property="EnvironmentFile=$ENV_FILE" \
+  "$APP_DIR/$BIN_NAME" --check-production-config
+
+systemctl enable "$SERVICE_NAME"
+systemctl restart "$SERVICE_NAME"
+start_proxy_sockets
 systemctl status "$SERVICE_NAME" --no-pager

@@ -153,7 +153,13 @@ def smoke_mock(base: str) -> None:
         base,
         "/v1/dca/reminders/reminder_001/mark-executed-as-proposal",
         method="POST",
-        body={},
+        body={
+            "holdingAccountId": "acct_fund",
+            "quantity": "10",
+            "totalCost": {"amount": "1000.00", "currency": "CNY"},
+            "quoteCurrency": "CNY",
+            "executedAt": "2026-07-10T09:00:00+08:00",
+        },
     )
     assert dca["data"]["proposedMovements"][0]["status"] == "pending_review"
 
@@ -249,7 +255,13 @@ def smoke_rust(base: str) -> None:
         base,
         "/v1/dca/reminders/reminder_001/mark-executed-as-proposal",
         method="POST",
-        body={},
+        body={
+            "holdingAccountId": "acct_fund",
+            "quantity": "10",
+            "totalCost": {"amount": "1000.00", "currency": "CNY"},
+            "quoteCurrency": "CNY",
+            "executedAt": "2026-07-10T09:00:00+08:00",
+        },
     )
     assert dca["data"]["proposedMovements"][0]["status"] == "pending_review"
 

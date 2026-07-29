@@ -109,6 +109,7 @@ PendingSummary {
 
 - 首页默认展示“较上次快照”。
 - 只有报价与汇率全 fresh 才允许展示“今日涨跌”。
+- `quoteProblemCount` 是 stale、offline cached、unpriceable 与 error 估值项数量之和；不得只统计缺失报价，也不得把所有问题统一描述成“本地缓存”。
 - `primaryHoldings` 按市值占比排序，不按收益率排序。
 
 ## 4. MovementService
@@ -134,6 +135,9 @@ CreateMovementDraftInput {
   amountBreakdown?: TransactionAmountBreakdown;
   settlement?: SettlementInfo;
   transferMeta?: TransferMeta;
+  saleResult?: InvestmentSaleResult; // sell 确认时由服务端生成，客户端不可提交
+  costBasisFx?: ExecutionFxBasis;     // 跨币种买入成本换算时由服务端生成
+  investmentReplacement?: InvestmentReplacement; // 投资 correction 的完整替代与派生结果
 }
 
 ConfirmResult {
@@ -150,6 +154,18 @@ ConfirmResult {
 - `ledgerWrite` 是前端显示“已入账”和刷新账本派生视图的唯一依据。
 - draft / pending review 不影响正式余额。
 - 已确认记录的修改优先走 correction。
+- 当前 server mode 的 `transfer` 只接受两个不同账户间的同币种同金额分录；来源必须
+  `out/source`、目标必须 `in/destination`；若提供 `transferMeta`，其中的账户与金额
+  必须一致。
+- 当前 server mode 同时校验 movement 类型语义：收入类为单现金 `in/source`，支出类
+  为单现金 `out/source`，余额校准为单 `adjustment` 分录；买卖由 principal 现金腿、
+  数量持仓腿及可选同账户同币种 `fee|tax` 现金流出腿组成。买入费用计入成本基础，卖出
+  费用从 gross proceeds 扣除；贷款放款/还款必须在负债账户与非负债账户之间同额流转。
+- 每条分录币种必须由账户支持；持仓腿只能进入 `holdings` / `mixed` 账户。普通 draft
+  不得直接声明 `correction`，必须走 `createCorrection`。
+- 已确认 sell 返回服务端固化的平均成本结果：毛回款、费用税费合计、净回款、释放成本及
+  可计算时的已实现盈亏。跨币种按 `occurredAt` 选择历史 FX 并固化依据；无可用历史汇率
+  时只返回 `currency_mismatch`。
 
 ## 5. DcaService
 
@@ -159,15 +175,26 @@ DcaService {
   listDueReminders(): Result<DcaReminder[]>;
   createPlan(input: CreateDcaPlanInput): Result<DcaPlan>;
   updatePlan(planId: ID, patch: UpdateDcaPlanPatch): Result<DcaPlan>;
-  markExecutedAsProposal(reminderId: ID): Result<AiAtomicGroup>;
+  markExecutedAsProposal(reminderId: ID, input: DcaExecutionInput): Result<AiAtomicGroup>;
   skipReminder(reminderId: ID): Result<DcaReminder>;
   snoozeReminder(reminderId: ID, until: ISODateTime): Result<DcaReminder>;
+}
+
+DcaExecutionInput {
+  holdingAccountId: ID;
+  quantity: DecimalString;
+  totalCost: Money;
+  quoteCurrency: CurrencyCode;
+  executedAt?: ISODateTime;
 }
 ```
 
 约束：
 
 - `markExecutedAsProposal` 只生成候选 Movement。
+- `quantity` 是真实成交数量，`totalCost` 是真实现金总成本；不得使用 `plannedAmount.amount`
+  同时填充两条分录。
+- 资金账户来自 plan，持仓账户来自执行输入；调用方必须让用户确认实际成交数据。
 - 不连接券商。
 - 不下单。
 - 不转账。
@@ -183,6 +210,7 @@ SubscriptionService {
   updateSubscription(subscriptionId: ID, patch: UpdateSubscriptionPatch): Result<Subscription>;
   cancelSubscription(subscriptionId: ID): Result<Subscription>;
   createChargeProposal(subscriptionId: ID): Result<AiAtomicGroup>;
+  scanDueChargeProposals(input: SubscriptionDueScanInput): Result<SubscriptionDueScanResult>;
 }
 
 CreateSubscriptionInput {
@@ -218,14 +246,44 @@ UpdateSubscriptionPatch {
   status?: "trial" | "active" | "paused";
   note?: string | null;
 }
+
+SubscriptionDueScanInput {
+  throughDate: ISODate;
+  limit?: number;
+}
+
+SubscriptionDueScanSkipReason =
+  | "already_pending"
+  | "payment_account_unavailable"
+  | "payment_currency_unsupported";
+
+SubscriptionDueScanResult {
+  throughDate: ISODate;
+  createdCount: number;
+  alreadyPendingCount: number;
+  blockedCount: number;
+  remainingEligibleCount: number;
+  hasMore: boolean;
+  created: (AiAtomicGroup & {
+    subscriptionId: ID;
+    scheduledChargeDate: ISODate;
+  })[];
+  skipped: {
+    subscriptionId: ID;
+    scheduledChargeDate: ISODate;
+    reason: SubscriptionDueScanSkipReason;
+  }[];
+}
 ```
 
 约束：
 
 - 订阅计划本身不是已发生的 Movement，不得在创建或编辑计划时扣款。
 - `listUpcoming` 默认窗口为 30 天，`days` 只接受 1–365。
-- `amount` 保留原币种；`duration` 与 `endDate` 最多一个为非空值。
+- `amount` 保留原币种；`duration` 与 `endDate` 最多一个为非空值。创建/PATCH 后的完整计划必须引用未归档且支持该币种的付款账户，否则原计划保持不变。
 - `createChargeProposal` 只生成 `pending_review` 支出候选；同一计费日期不得重复生成候选。
+- `scanDueChargeProposals` 的 `throughDate` 必填；limit 默认 100、范围 1–200。它按 `(nextChargeDate,id)` 稳定扫描 active/trial 到期项，limit 只限制 created，已 pending 和付款能力阻塞按 item skip。
+- 付款账户后来归档或移除支持币种时，单条和批量生成必须重新校验；不得自动换汇、修改订阅币种或阻断批次中的其他有效计划。
 - 候选确认后才写正式流水、影响余额并推进 `nextChargeDate`；拒绝后保留原计费日期。
 - 存在待确认扣费候选时取消订阅必须返回冲突；取消不删除历史扣费记录。
 - 该服务不连接支付平台，不自动续费或代扣。
@@ -268,6 +326,8 @@ AiCsvInput {
 - full ledger context 只用于生成 proposal。
 - 修改已有记录必须包含 old → new diff。
 - approve 前必须重新校验。
+- `listPending` / `getProposal` 同时返回从 standalone `pending_review` movement group 动态生成的只读 proposal；其 ID 为 `proposal_movement_{movementId}`，不要求在 `aiProposals` 中重复保存。
+- 这类投影支持 approve/reject；edit 返回冲突，调用方应 reject 后通过原业务命令重新生成。处理后它不再出现在 pending 列表或 `aiPendingCount`。
 
 ## 7. QuoteService
 

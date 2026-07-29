@@ -41,6 +41,30 @@ class MainActivity : FlutterActivity() {
                     result.error("secure_store_error", "secure token store operation failed", null)
                 }
             }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CONFIG_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                try {
+                    when (call.method) {
+                        "readApiBase" -> result.success(configPrefs().getString(PREF_API_BASE, null))
+                        "writeApiBase" -> {
+                            val value = call.argument<String>("value")
+                            if (value.isNullOrEmpty()) {
+                                result.error("invalid_argument", "value must be non-empty", null)
+                            } else {
+                                configPrefs().edit().putString(PREF_API_BASE, value).apply()
+                                result.success(null)
+                            }
+                        }
+                        "clearApiBase" -> {
+                            configPrefs().edit().remove(PREF_API_BASE).apply()
+                            result.success(null)
+                        }
+                        else -> result.notImplemented()
+                    }
+                } catch (error: Exception) {
+                    result.error("config_store_error", "app config operation failed", null)
+                }
+            }
     }
 
     private fun readTokenJson(): String? {
@@ -63,6 +87,9 @@ class MainActivity : FlutterActivity() {
 
     private fun prefs() =
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    private fun configPrefs() =
+        getSharedPreferences(CONFIG_PREFS_NAME, Context.MODE_PRIVATE)
 
     private fun encrypt(value: String): String {
         val cipher = Cipher.getInstance(TRANSFORMATION)
@@ -103,8 +130,11 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val CHANNEL = "finwealth.secure_token_store"
+        private const val CONFIG_CHANNEL = "finwealth.app_config"
         private const val PREFS_NAME = "finwealth_secure_tokens"
         private const val PREF_TOKEN_PAYLOAD = "auth_tokens"
+        private const val CONFIG_PREFS_NAME = "finwealth_app_config"
+        private const val PREF_API_BASE = "api_base"
         private const val ANDROID_KEYSTORE = "AndroidKeyStore"
         private const val KEY_ALIAS = "finwealth_auth_token_key"
         private const val TRANSFORMATION = "AES/GCM/NoPadding"

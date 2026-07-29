@@ -61,9 +61,7 @@ class _CorrectionPageState extends ConsumerState<CorrectionPage> {
             ),
           );
       ref.invalidate(aiPendingProvider);
-      messenger.showSnackBar(
-        const SnackBar(content: Text('已生成更正候选，请在 AI 复核中确认')),
-      );
+      messenger.showSnackBar(const SnackBar(content: Text('已加入待确认')));
       if (mounted) router.go('/ai-review');
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
@@ -99,8 +97,7 @@ class _CorrectionPageState extends ConsumerState<CorrectionPage> {
               return const EmptyState(
                 icon: Icons.lock_outline,
                 title: '当前记录暂不支持更正',
-                message:
-                    'MVP 只支持 confirmed / in_transit 的单分录金额更正。转账、多腿交易和 correction 本身需要更完整的 diff。',
+                message: '仅支持已确认或在途的单分录金额更正。',
               );
             }
             final oldAmount = entry.amount;
@@ -152,10 +149,8 @@ class _CorrectionPageState extends ConsumerState<CorrectionPage> {
                   onPressed: _canSubmit(oldAmount)
                       ? () => _submit(m, entry)
                       : null,
-                  child: Text(_busy ? '生成中…' : '生成更正候选'),
+                  child: Text(_busy ? '提交中…' : '提交更正'),
                 ),
-                const SizedBox(height: AppSpacing.sm),
-                Text('这是候选变更；AI 复核中接受整组后才写账本。', style: AppType.caption),
               ],
             );
           },

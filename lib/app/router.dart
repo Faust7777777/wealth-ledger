@@ -9,6 +9,9 @@ import '../dev/tokens_preview.dart';
 import '../features/account_detail_page.dart';
 import '../features/account_form_page.dart';
 import '../features/accounts_page.dart';
+import '../features/agent_automations_page.dart';
+import '../features/agent_page.dart';
+import '../features/agent_providers_page.dart';
 import '../features/ai_edit_page.dart';
 import '../features/ai_import_csv_page.dart';
 import '../features/ai_import_image_page.dart';
@@ -18,7 +21,9 @@ import '../features/anomalies_page.dart';
 import '../features/correction_page.dart';
 import '../features/dca_plan_form_page.dart';
 import '../features/investment_page.dart';
+import '../features/investment_trade_page.dart';
 import '../features/liabilities_page.dart';
+import '../features/liability_terms_page.dart';
 import '../features/manual_record_page.dart';
 import '../features/movement_detail_page.dart';
 import '../features/overview_page.dart';
@@ -67,6 +72,15 @@ final appRouter = GoRouter(
         ),
       ],
     ),
+    GoRoute(path: '/agent', builder: (c, s) => const AgentPage()),
+    GoRoute(
+      path: '/agent/providers',
+      builder: (c, s) => const AgentProvidersPage(),
+    ),
+    GoRoute(
+      path: '/agent/automations',
+      builder: (c, s) => const AgentAutomationsPage(),
+    ),
     GoRoute(path: '/ai-review', builder: (c, s) => const AiReviewPage()),
     GoRoute(
       path: '/ai-import/text',
@@ -77,10 +91,21 @@ final appRouter = GoRouter(
       builder: (c, s) => const AiImportImagePage(),
     ),
     GoRoute(path: '/ai-import/csv', builder: (c, s) => const AiImportCsvPage()),
-    GoRoute(path: '/accounts/new', builder: (c, s) => const AccountFormPage()),
+    GoRoute(
+      path: '/accounts/new',
+      // ?type=creditCard 等：入口可预选类型（负债页默认信用卡）。
+      builder: (c, s) => AccountFormPage(
+        initialType: AccountType.values
+            .asNameMap()[s.uri.queryParameters['type']],
+      ),
+    ),
     GoRoute(
       path: '/account/:id',
       builder: (c, s) => AccountDetailPage(accountId: s.pathParameters['id']!),
+    ),
+    GoRoute(
+      path: '/account/:id/liability-terms',
+      builder: (c, s) => LiabilityTermsPage(accountId: s.pathParameters['id']!),
     ),
     GoRoute(
       path: '/account/:id/edit',
@@ -94,6 +119,10 @@ final appRouter = GoRouter(
     GoRoute(
       path: '/record/reconcile',
       builder: (c, s) => const ReconcilePage(),
+    ),
+    GoRoute(
+      path: '/investment/trade/new',
+      builder: (c, s) => const InvestmentTradePage(),
     ),
     GoRoute(
       path: '/investment/dca/new',

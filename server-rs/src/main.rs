@@ -3,14 +3,20 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use axum::{
-    Json, Router,
-    extract::{Json as JsonExtractor, Path, Query, Request, State},
+    Extension, Json, Router,
+    body::{Body, to_bytes},
+    extract::{DefaultBodyLimit, Json as JsonExtractor, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get, patch, post},
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+mod ledger_lease;
+mod ledger_migrations;
 mod local_ledger;
 
 use rand_core::{OsRng, RngCore};
@@ -19,7 +25,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     env, fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     process,
@@ -41,6 +47,11 @@ const EMPTY_BOOTSTRAP: &str =
 const REFRESH_TOKEN_TTL_DAYS: i64 = 30;
 const IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
 const IDEMPOTENCY_RETENTION_DAYS: i64 = 30;
+const DEV_UNAUTHENTICATED_DEVICE_ID: &str = "dev_unauthenticated_device";
+const AGENT_INTERNAL_DEVICE_ID: &str = "dev_agent_sidecar";
+const OWNER_USER_ID: &str = "usr_owner";
+const OWNER_LEDGER_ID: &str = "ledger_default";
+const AGENT_PROXY_BODY_LIMIT: usize = 55 * 1024 * 1024;
 const OVERVIEW_EMPTY: &str =
     include_str!("../../docs/contracts/examples/portfolio_overview_empty.response.json");
 const OVERVIEW_DEGRADED: &str =
@@ -57,9 +68,35 @@ static LOCAL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 struct AppState {
     ledger: DevLedgerCore,
     local_ledger_path: Option<PathBuf>,
+    _ledger_lease: Option<Arc<ledger_lease::LedgerLease>>,
     auth: AuthStore,
     allow_ledger_scenario: bool,
     allowed_hosts: Vec<String>,
+    agent_gateway: AgentGateway,
+}
+
+#[derive(Clone)]
+struct AgentGateway {
+    base_url: Option<String>,
+    internal_token: Option<String>,
+    client: reqwest::Client,
+}
+
+impl AgentGateway {
+    fn from_env() -> Self {
+        Self::new(
+            env::var("FINWEALTH_AGENT_BASE_URL").ok(),
+            env::var("FINWEALTH_AGENT_INTERNAL_TOKEN").ok(),
+        )
+    }
+
+    fn new(base_url: Option<String>, internal_token: Option<String>) -> Self {
+        Self {
+            base_url: base_url.map(|value| value.trim_end_matches('/').to_string()),
+            internal_token,
+            client: reqwest::Client::new(),
+        }
+    }
 }
 
 impl AppState {
@@ -67,20 +104,33 @@ impl AppState {
         Self {
             ledger: DevLedgerCore::new(),
             local_ledger_path: None,
+            _ledger_lease: None,
             auth: AuthStore::from_env_or_dev_with_default_state_path(None),
             allow_ledger_scenario: env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
             allowed_hosts: allowed_hosts_from_env(),
+            agent_gateway: AgentGateway::from_env(),
         }
     }
 
+    fn local_with_lease(path: PathBuf, lease: Arc<ledger_lease::LedgerLease>) -> Self {
+        Self::local_state(path, Some(lease))
+    }
+
+    #[cfg(test)]
     fn local(path: PathBuf) -> Self {
+        Self::local_state(path, None)
+    }
+
+    fn local_state(path: PathBuf, lease: Option<Arc<ledger_lease::LedgerLease>>) -> Self {
         let auth_state_path = default_auth_state_path(&path);
         Self {
             ledger: DevLedgerCore::new(),
             local_ledger_path: Some(path),
+            _ledger_lease: lease,
             auth: AuthStore::from_env_or_dev_with_default_state_path(Some(auth_state_path)),
             allow_ledger_scenario: env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
             allowed_hosts: allowed_hosts_from_env(),
+            agent_gateway: AgentGateway::from_env(),
         }
     }
 
@@ -93,6 +143,12 @@ impl AppState {
     #[cfg(test)]
     fn with_allow_ledger_scenario(mut self, allow: bool) -> Self {
         self.allow_ledger_scenario = allow;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_agent_gateway(mut self, base_url: String, internal_token: &str) -> Self {
+        self.agent_gateway = AgentGateway::new(Some(base_url), Some(internal_token.to_string()));
         self
     }
 
@@ -143,10 +199,12 @@ struct AuthDevice {
     last_seen_at: String,
 }
 
+#[derive(Debug)]
 enum AuthError {
     Request(Vec<String>),
     Credentials,
     RefreshToken,
+    Storage,
 }
 
 struct AuthTokens {
@@ -154,6 +212,18 @@ struct AuthTokens {
     refresh_token: String,
     expires_at: String,
     refresh_expires_at: String,
+    device_id: String,
+}
+
+#[derive(Clone)]
+struct AuthenticatedDevice {
+    id: String,
+}
+
+#[derive(Clone)]
+struct AuthenticatedPrincipal {
+    user_id: String,
+    ledger_id: String,
     device_id: String,
 }
 
@@ -165,13 +235,13 @@ impl AuthStore {
             .or(default_state_path);
         let state = state_path
             .as_ref()
-            .and_then(|path| match read_auth_state(path) {
-                Ok(state) => Some(state),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    eprintln!("failed to read auth state: {error}");
-                    None
-                }
+            .map(|path| match read_auth_state(path) {
+                Ok(state) => state,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => AuthState::default(),
+                Err(error) => panic!(
+                    "failed to read auth state {}; refusing to start: {error}",
+                    path.display()
+                ),
             })
             .unwrap_or_default();
         let config = AuthConfig {
@@ -207,7 +277,25 @@ impl AuthStore {
     ) -> Self {
         let state = state_path
             .as_ref()
-            .and_then(|path| read_auth_state(path).ok())
+            .map(|path| match read_auth_state(path) {
+                Ok(state) => state,
+                // The test fixture uses a regular file as the would-be parent.
+                // Windows reports its missing child as NotFound while Unix
+                // reports NotADirectory. Production startup does not use this
+                // helper and continues to fail closed for NotADirectory.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    AuthState::default()
+                }
+                Err(error) => panic!(
+                    "failed to read auth state {}; refusing to start: {error}",
+                    path.display()
+                ),
+            })
             .unwrap_or_default();
         Self {
             inner: Arc::new(Mutex::new(state)),
@@ -242,7 +330,7 @@ impl AuthStore {
             return Err(AuthError::Credentials);
         }
 
-        Ok(self.issue_tokens(&device_name, None, now))
+        self.issue_tokens(&device_name, None, now)
     }
 
     fn refresh(&self, input: Value, now: &str) -> Result<AuthTokens, AuthError> {
@@ -268,14 +356,16 @@ impl AuthStore {
             return Err(AuthError::RefreshToken);
         };
         if token_expired(&device.refresh_expires_at) {
-            state.devices.remove(&device_id);
-            self.persist_state(&state);
+            let mut updated = state.clone();
+            updated.devices.remove(&device_id);
+            self.persist_state(&updated)?;
+            *state = updated;
             return Err(AuthError::RefreshToken);
         }
         let device_name = device.name;
         drop(state);
 
-        Ok(self.issue_tokens(&device_name, Some(device_id), now))
+        self.issue_tokens(&device_name, Some(device_id), now)
     }
 
     fn devices(&self) -> Value {
@@ -296,35 +386,44 @@ impl AuthStore {
         )
     }
 
-    fn revoke_device(&self, device_id: &str) {
+    fn revoke_device(&self, device_id: &str) -> Result<(), AuthError> {
         let mut state = self.inner.lock().expect("auth store mutex should lock");
-        state.devices.remove(device_id);
-        self.persist_state(&state);
+        let mut updated = state.clone();
+        updated.devices.remove(device_id);
+        self.persist_state(&updated)?;
+        *state = updated;
+        Ok(())
     }
 
-    fn revoke_refresh_token(&self, refresh_token: &str) {
+    fn revoke_refresh_token(&self, refresh_token: &str) -> Result<(), AuthError> {
         let refresh_hash = token_hash(refresh_token);
         let mut state = self.inner.lock().expect("auth store mutex should lock");
-        state
+        let mut updated = state.clone();
+        updated
             .devices
             .retain(|_, device| !token_hash_eq(&device.refresh_token_hash, &refresh_hash));
-        self.persist_state(&state);
+        self.persist_state(&updated)?;
+        *state = updated;
+        Ok(())
     }
 
-    fn revoke_access_token(&self, access_token: &str) {
+    fn revoke_access_token(&self, access_token: &str) -> Result<(), AuthError> {
         let access_hash = token_hash(access_token);
         let mut state = self.inner.lock().expect("auth store mutex should lock");
-        state
+        let mut updated = state.clone();
+        updated
             .devices
             .retain(|_, device| !token_hash_eq(&device.access_token_hash, &access_hash));
-        self.persist_state(&state);
+        self.persist_state(&updated)?;
+        *state = updated;
+        Ok(())
     }
 
     fn should_require_auth(&self) -> bool {
         self.config.require_auth
     }
 
-    fn verify_access_token(&self, access_token: &str) -> bool {
+    fn device_id_for_access_token(&self, access_token: &str) -> Option<String> {
         let access_hash = token_hash(access_token);
         let mut state = self.inner.lock().expect("auth store mutex should lock");
         if let Some(device) = state
@@ -333,13 +432,16 @@ impl AuthStore {
             .find(|device| token_hash_eq(&device.access_token_hash, &access_hash))
         {
             if access_token_expired(&device.access_expires_at) {
-                return false;
+                return None;
             }
             device.last_seen_at = current_timestamp();
-            self.persist_state(&state);
-            return true;
+            let device_id = device.id.clone();
+            if let Err(error) = self.persist_state(&state) {
+                eprintln!("failed to persist auth last-seen metadata: {error:?}");
+            }
+            return Some(device_id);
         }
-        false
+        None
     }
 
     fn verify_password(&self, username: &str, password: &str) -> bool {
@@ -367,7 +469,7 @@ impl AuthStore {
         device_name: &str,
         existing_device_id: Option<String>,
         now: &str,
-    ) -> AuthTokens {
+    ) -> Result<AuthTokens, AuthError> {
         let dev_mode = self.config.username.is_none();
         let access_token = random_token(if dev_mode {
             "dev_access_"
@@ -393,7 +495,8 @@ impl AuthStore {
             .get(&device_id)
             .map(|device| device.created_at.clone())
             .unwrap_or_else(|| now.to_string());
-        state.devices.insert(
+        let mut updated = state.clone();
+        updated.devices.insert(
             device_id.clone(),
             AuthDevice {
                 id: device_id.clone(),
@@ -406,24 +509,23 @@ impl AuthStore {
                 last_seen_at: now.to_string(),
             },
         );
-        self.persist_state(&state);
+        self.persist_state(&updated)?;
+        *state = updated;
 
-        AuthTokens {
+        Ok(AuthTokens {
             access_token,
             refresh_token,
             expires_at,
             refresh_expires_at,
             device_id,
-        }
+        })
     }
 
-    fn persist_state(&self, state: &AuthState) {
+    fn persist_state(&self, state: &AuthState) -> Result<(), AuthError> {
         let Some(path) = self.config.state_path.as_ref() else {
-            return;
+            return Ok(());
         };
-        if let Err(error) = write_auth_state(path, state) {
-            eprintln!("failed to persist auth state: {error}");
-        }
+        write_auth_state(path, state).map_err(|_| AuthError::Storage)
     }
 }
 
@@ -639,7 +741,7 @@ impl DevLedgerCore {
         })
     }
 
-    fn mark_dca_executed_as_proposal(&self, reminder_id: &str) -> Option<Value> {
+    fn mark_dca_executed_as_proposal(&self, reminder_id: &str, input: &Value) -> Option<Value> {
         if !matches!(
             reminder_id,
             "reminder_001" | "dca_reminder_001" | "rem_csi300_20260710"
@@ -649,6 +751,19 @@ impl DevLedgerCore {
 
         let mut proposal = example_data(DCA_PROPOSAL);
         proposal["requestedReminderId"] = json!(reminder_id);
+        proposal["proposedMovements"][0]["occurredAt"] = input
+            .get("executedAt")
+            .cloned()
+            .unwrap_or_else(|| proposal["proposedMovements"][0]["occurredAt"].clone());
+        proposal["proposedMovements"][0]["entries"][0]["amount"] =
+            input["totalCost"]["amount"].clone();
+        proposal["proposedMovements"][0]["entries"][0]["currency"] =
+            input["totalCost"]["currency"].clone();
+        proposal["proposedMovements"][0]["entries"][1]["accountId"] =
+            input["holdingAccountId"].clone();
+        proposal["proposedMovements"][0]["entries"][1]["amount"] = input["quantity"].clone();
+        proposal["proposedMovements"][0]["entries"][1]["currency"] = input["quoteCurrency"].clone();
+        proposal["proposedMovements"][0]["source"]["sourceId"] = json!(reminder_id);
         if let Some(group_id) = proposal.get("id").and_then(Value::as_str) {
             self.with_store(|store| {
                 store
@@ -810,6 +925,19 @@ async fn main() {
         print_password_hash_from_stdin();
         return;
     }
+    if should_check_production_config(env::args()) {
+        check_production_config_from_env().unwrap_or_else(|errors| {
+            eprintln!("invalid Finwealth production configuration:");
+            for error in errors {
+                eprintln!("- {error}");
+            }
+            process::exit(2);
+        });
+        println!(
+            "production configuration validated: loopback bind, required auth, and public Host allow-list"
+        );
+        return;
+    }
     if let Some(command) = read_ledger_command_from(env::args()) {
         run_ledger_command(command).expect("ledger command failed");
         return;
@@ -818,10 +946,23 @@ async fn main() {
     let addr = read_addr();
     assert_loopback(addr);
     let state = read_ledger_path(env::args())
-        .map(|path| {
+        .map(|requested_path| {
+            let lease =
+                ledger_lease::acquire_ledger_lease(&requested_path).unwrap_or_else(|error| {
+                    eprintln!(
+                        "failed to acquire exclusive local-ledger lease for {}: {error}",
+                        requested_path.display()
+                    );
+                    process::exit(2);
+                });
+            let path = lease.ledger_path().to_path_buf();
             local_ledger::load_or_initialize(&path).expect("real_local ledger should initialize");
             println!("real_local ledger enabled at {}", path.display());
-            AppState::local(path)
+            println!(
+                "exclusive local-ledger lease held at {}",
+                lease.lock_path().display()
+            );
+            AppState::local_with_lease(path, Arc::new(lease))
         })
         .unwrap_or_else(AppState::dev);
     let local_ledger_enabled = state.local_ledger_path.is_some();
@@ -832,7 +973,7 @@ async fn main() {
     println!("finwealth rust server listening on http://{addr}");
     if local_ledger_enabled {
         println!(
-            "dev server: real_local JSON persistence enabled; configurable auth and Yahoo quotes available; no real AI or sync merge effects"
+            "dev server: real_local JSON persistence enabled; configurable auth and opt-in quote providers available; no real AI or sync merge effects"
         );
     } else {
         println!(
@@ -843,6 +984,114 @@ async fn main() {
     axum::serve(listener, app_with_state(state))
         .await
         .expect("serve finwealth rust server");
+}
+
+fn should_check_production_config<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    args.into_iter()
+        .map(Into::into)
+        .skip(1)
+        .any(|arg| arg == "--check-production-config")
+}
+
+fn check_production_config_from_env() -> Result<(), Vec<String>> {
+    let config = AuthConfig {
+        username: env::var("FINWEALTH_AUTH_USERNAME").ok(),
+        password_hash: env::var("FINWEALTH_AUTH_PASSWORD_HASH").ok(),
+        dev_plain_password: env::var("FINWEALTH_AUTH_PASSWORD").ok(),
+        require_auth: env_flag("FINWEALTH_REQUIRE_AUTH"),
+        state_path: None,
+    };
+    let addr = env::var("FINWEALTH_RS_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8790".to_string())
+        .parse::<SocketAddr>()
+        .map_err(|_| vec!["FINWEALTH_RS_ADDR must be a valid socket address".to_string()])?;
+    let quote_provider = env::var("FINWEALTH_QUOTE_PROVIDER").ok();
+    let errors = production_config_errors(
+        &config,
+        addr,
+        &allowed_hosts_from_env(),
+        env_flag("FINWEALTH_ALLOW_LEDGER_SCENARIO"),
+        quote_provider.as_deref(),
+        env::var("FINWEALTH_AGENT_BASE_URL").ok().as_deref(),
+        env::var("FINWEALTH_AGENT_INTERNAL_TOKEN").ok().as_deref(),
+    );
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn production_config_errors(
+    config: &AuthConfig,
+    addr: SocketAddr,
+    allowed_hosts: &[String],
+    allow_ledger_scenario: bool,
+    quote_provider: Option<&str>,
+    agent_base_url: Option<&str>,
+    agent_internal_token: Option<&str>,
+) -> Vec<String> {
+    let mut errors = validate_auth_config(config).err().unwrap_or_default();
+    if !config.require_auth {
+        errors.push("FINWEALTH_REQUIRE_AUTH must be true for server deployment".to_string());
+    }
+    if !addr.ip().is_loopback() {
+        errors.push("FINWEALTH_RS_ADDR must bind to a loopback address".to_string());
+    }
+    if !allowed_hosts
+        .iter()
+        .any(|host| !matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1"))
+    {
+        errors
+            .push("FINWEALTH_ALLOWED_HOSTS must include the public reverse-proxy host".to_string());
+    }
+    if allow_ledger_scenario {
+        errors.push("FINWEALTH_ALLOW_LEDGER_SCENARIO must be disabled in production".to_string());
+    }
+    if !matches!(
+        quote_provider.map(str::trim),
+        None | Some("") | Some("none") | Some("yahoo") | Some("public")
+    ) {
+        errors.push("FINWEALTH_QUOTE_PROVIDER must be none, yahoo, or public".to_string());
+    }
+    match (
+        agent_base_url.map(str::trim).filter(|value| !value.is_empty()),
+        agent_internal_token
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        (None, None) => {}
+        (Some(base_url), Some(token)) => {
+            let valid_url = reqwest::Url::parse(base_url).ok().is_some_and(|url| {
+                url.scheme() == "http"
+                    && url.port().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+            });
+            if !valid_url {
+                errors.push(
+                    "FINWEALTH_AGENT_BASE_URL must be an explicit loopback http URL with a port"
+                        .to_string(),
+                );
+            }
+            if token.len() < 32 || token == "change-me" {
+                errors.push(
+                    "FINWEALTH_AGENT_INTERNAL_TOKEN must be a non-placeholder value of at least 32 characters"
+                        .to_string(),
+                );
+            }
+        }
+        _ => errors.push(
+            "FINWEALTH_AGENT_BASE_URL and FINWEALTH_AGENT_INTERNAL_TOKEN must be configured together"
+                .to_string(),
+        ),
+    }
+    errors
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -935,7 +1184,9 @@ where
 
 fn run_ledger_command(command: LedgerCommand) -> std::io::Result<()> {
     match command {
-        LedgerCommand::Init(path) => {
+        LedgerCommand::Init(requested_path) => {
+            let lease = ledger_lease::acquire_ledger_lease(&requested_path)?;
+            let path = lease.ledger_path().to_path_buf();
             let document = local_ledger::load_or_initialize(&path)?;
             println!(
                 "initialized real_local ledger at {} (version {}, base {})",
@@ -946,7 +1197,7 @@ fn run_ledger_command(command: LedgerCommand) -> std::io::Result<()> {
             Ok(())
         }
         LedgerCommand::Validate(path) => {
-            let document = local_ledger::read_document(&path)?;
+            let document = local_ledger::validate_supported_ledger(&path)?;
             println!(
                 "validated real_local ledger at {} (version {}, base {})",
                 path.display(),
@@ -1023,9 +1274,40 @@ fn app_with_state(state: AppState) -> Router {
         )
         .route("/v1/accounts/{account_id}/archive", post(archive_account))
         .route("/v1/accounts/{account_id}/holdings", get(account_holdings))
+        .route("/v1/liability-positions", get(liability_positions))
+        .route(
+            "/v1/accounts/{account_id}/repayment-schedule",
+            get(loan_repayment_schedule),
+        )
+        .route(
+            "/v1/accounts/{account_id}/liability-terms",
+            patch(update_account_liability_terms),
+        )
+        .route(
+            "/v1/accounts/{account_id}/loan-interest-proposals",
+            post(create_loan_interest_proposal),
+        )
+        .route(
+            "/v1/accounts/{account_id}/loan-payment-proposals",
+            post(create_loan_payment_proposal),
+        )
+        .route(
+            "/v1/accounts/{account_id}/holding-adjustment-proposals",
+            post(create_holding_adjustment_proposal),
+        )
         .route("/v1/portfolio/overview", get(portfolio_overview))
+        .route("/v1/portfolio/valuation-issues", get(valuation_issues))
         .route("/v1/portfolio/holdings", get(holdings))
         .route("/v1/holdings", get(holdings))
+        .route("/v1/yield-positions", get(yield_positions))
+        .route(
+            "/v1/holdings/{holding_id}/yield-terms",
+            patch(update_holding_yield_terms),
+        )
+        .route(
+            "/v1/holdings/{holding_id}/interest-proposals",
+            post(create_holding_interest_proposal),
+        )
         .route("/v1/portfolio/allocation", get(asset_allocation))
         .route("/v1/movements", get(movements))
         .route("/v1/movements/recent", get(recent_movements))
@@ -1065,6 +1347,10 @@ fn app_with_state(state: AppState) -> Router {
         )
         .route("/v1/subscriptions/upcoming", get(upcoming_subscriptions))
         .route(
+            "/v1/subscriptions/charge-proposals/due-scan",
+            post(create_due_subscription_charge_proposals),
+        )
+        .route(
             "/v1/subscriptions/{subscription_id}",
             get(subscription_detail).patch(update_subscription),
         )
@@ -1077,7 +1363,10 @@ fn app_with_state(state: AppState) -> Router {
             post(create_subscription_charge_proposal),
         )
         .route("/v1/ai/proposals/from-text", post(ai_proposal_from_text))
-        .route("/v1/ai/proposals/from-image", post(ai_proposal_from_image))
+        .route(
+            "/v1/ai/proposals/from-image",
+            post(ai_proposal_from_image).layer(DefaultBodyLimit::max(15 * 1024 * 1024)),
+        )
         .route("/v1/ai/proposals/from-csv", post(ai_proposal_from_csv))
         .route("/v1/ai/proposals/pending", get(ai_pending))
         .route("/v1/ai/proposals/{proposal_id}", get(ai_proposal))
@@ -1131,6 +1420,8 @@ fn app_with_state(state: AppState) -> Router {
         .route("/v1/sync/changes", get(sync_changes))
         .route("/v1/sync/push", post(sync_push))
         .route("/v1/sync/ack", post(sync_ack))
+        .route("/v1/agent", any(agent_proxy))
+        .route("/v1/agent/{*path}", any(agent_proxy))
         .route("/v1/transfers/execute", any(forbidden))
         .route("/v1/broker/orders", any(forbidden))
         .route("/v1/broker/buy", any(forbidden))
@@ -1147,7 +1438,7 @@ fn app_with_state(state: AppState) -> Router {
 
 async fn require_auth_middleware(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     if state.rejects_host_header(request.headers()) {
@@ -1175,16 +1466,146 @@ async fn require_auth_middleware(
             }),
         );
     }
-    if !state.auth.should_require_auth() || is_public_auth_path(request.uri().path()) {
+    if is_public_auth_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+    if agent_internal_token_matches(&state, request.headers()) {
+        if request.uri().path().starts_with("/v1/agent") {
+            return forbidden().await;
+        }
+        insert_authenticated_principal(&mut request, AGENT_INTERNAL_DEVICE_ID.to_string());
+        return next.run(request).await;
+    }
+    if !state.auth.should_require_auth() {
+        insert_authenticated_principal(&mut request, DEV_UNAUTHENTICATED_DEVICE_ID.to_string());
         return next.run(request).await;
     }
     let Some(token) = bearer_token(request.headers()) else {
         return unauthorized("auth_required", "Bearer access token is required.");
     };
-    if !state.auth.verify_access_token(&token) {
+    let Some(device_id) = state.auth.device_id_for_access_token(&token) else {
         return unauthorized("auth_required", "Bearer access token is required.");
-    }
+    };
+    insert_authenticated_principal(&mut request, device_id);
     next.run(request).await
+}
+
+fn agent_internal_token_matches(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(expected) = state.agent_gateway.internal_token.as_deref() else {
+        return false;
+    };
+    let Some(candidate) = headers
+        .get("x-finwealth-internal-token")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    expected.len() == candidate.len() && bool::from(expected.as_bytes().ct_eq(candidate.as_bytes()))
+}
+
+fn insert_authenticated_principal(request: &mut Request, device_id: String) {
+    request.extensions_mut().insert(AuthenticatedDevice {
+        id: device_id.clone(),
+    });
+    request.extensions_mut().insert(AuthenticatedPrincipal {
+        user_id: OWNER_USER_ID.to_string(),
+        ledger_id: OWNER_LEDGER_ID.to_string(),
+        device_id,
+    });
+}
+
+async fn agent_proxy(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    request: Request,
+) -> Response {
+    let Some(base_url) = state.agent_gateway.base_url.as_deref() else {
+        return service_unavailable(
+            "agent_service_unavailable",
+            "Agent service is not configured.",
+            json!({}),
+            true,
+        );
+    };
+    let Some(internal_token) = state.agent_gateway.internal_token.as_deref() else {
+        return service_unavailable(
+            "agent_service_unavailable",
+            "Agent service authentication is not configured.",
+            json!({}),
+            false,
+        );
+    };
+
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or(request.uri().path());
+    let upstream_url = format!("{base_url}{path_and_query}");
+    let method = request.method().clone();
+    let forwarded_headers = request.headers().clone();
+    let body = match to_bytes(request.into_body(), AGENT_PROXY_BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(_) => {
+            return bad_request(
+                "agent_request_too_large",
+                "Agent request body is too large.",
+                json!({ "maxBytes": AGENT_PROXY_BODY_LIMIT }),
+            );
+        }
+    };
+
+    let mut upstream = state
+        .agent_gateway
+        .client
+        .request(method, &upstream_url)
+        .header("x-finwealth-internal-token", internal_token)
+        .header("x-finwealth-user-id", &principal.user_id)
+        .header("x-finwealth-ledger-id", &principal.ledger_id)
+        .header("x-finwealth-device-id", &principal.device_id)
+        .body(body);
+    for header_name in [
+        axum::http::header::ACCEPT,
+        axum::http::header::CONTENT_TYPE,
+        axum::http::header::IF_MATCH,
+        axum::http::HeaderName::from_static("last-event-id"),
+    ] {
+        if let Some(value) = forwarded_headers.get(&header_name) {
+            upstream = upstream.header(header_name, value);
+        }
+    }
+    if let Some(value) = forwarded_headers.get("idempotency-key") {
+        upstream = upstream.header("idempotency-key", value);
+    }
+
+    let upstream_response = match upstream.send().await {
+        Ok(response) => response,
+        Err(_) => {
+            return service_unavailable(
+                "agent_service_unavailable",
+                "Agent service could not be reached.",
+                json!({}),
+                true,
+            );
+        }
+    };
+    let status = upstream_response.status();
+    let response_headers = upstream_response.headers().clone();
+    let mut response = Response::new(Body::from_stream(upstream_response.bytes_stream()));
+    *response.status_mut() = status;
+    for header_name in [
+        axum::http::header::CONTENT_TYPE,
+        axum::http::header::CACHE_CONTROL,
+        axum::http::header::ETAG,
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderName::from_static("idempotency-replayed"),
+        axum::http::HeaderName::from_static("x-content-type-options"),
+    ] {
+        if let Some(value) = response_headers.get(&header_name) {
+            response.headers_mut().insert(header_name, value.clone());
+        }
+    }
+    response
 }
 
 fn is_public_auth_path(path: &str) -> bool {
@@ -1319,25 +1740,31 @@ async fn auth_logout(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Option<JsonExtractor<Value>>,
-) -> StatusCode {
+) -> Response {
     if let Some(refresh_token) = body
         .as_ref()
         .and_then(|JsonExtractor(value)| value.get("refreshToken").and_then(Value::as_str))
     {
-        state.auth.revoke_refresh_token(refresh_token);
-    } else if let Some(token) = bearer_token(&headers) {
-        state.auth.revoke_access_token(&token);
+        if let Err(error) = state.auth.revoke_refresh_token(refresh_token) {
+            return auth_error_response(error);
+        }
+    } else if let Some(token) = bearer_token(&headers)
+        && let Err(error) = state.auth.revoke_access_token(&token)
+    {
+        return auth_error_response(error);
     }
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn auth_devices(State(state): State<AppState>) -> Json<Value> {
     envelope(state.auth.devices())
 }
 
-async fn revoke_device(State(state): State<AppState>, Path(device_id): Path<String>) -> StatusCode {
-    state.auth.revoke_device(&device_id);
-    StatusCode::NO_CONTENT
+async fn revoke_device(State(state): State<AppState>, Path(device_id): Path<String>) -> Response {
+    match state.auth.revoke_device(&device_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => auth_error_response(error),
+    }
 }
 
 async fn portfolio_overview(
@@ -1446,6 +1873,36 @@ async fn archive_account(
     }
 }
 
+async fn create_holding_adjustment_proposal(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+
+    let now = current_timestamp();
+    let operation = format!("POST /v1/accounts/{account_id}/holding-adjustment-proposals");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_holding_adjustment_proposal(
+        path,
+        &account_id,
+        &input,
+        &next_local_movement_id(),
+        &next_local_atomic_group_id(),
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_holding_adjustment_input"),
+    }
+}
+
 async fn account_detail(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
@@ -1499,6 +1956,24 @@ async fn account_anomalies(
             .account_anomalies(DevScenario::from_query(&query)),
     )
     .into_response()
+}
+
+async fn valuation_issues(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if state.should_use_local_ledger(&query) {
+        let path = state
+            .local_ledger_path
+            .as_ref()
+            .expect("local ledger path should exist when local ledger is selected");
+        return match local_ledger::list_valuation_issues(path, &current_timestamp()) {
+            Ok(issues) => envelope(issues).into_response(),
+            Err(error) => ledger_io_error(error),
+        };
+    }
+
+    envelope(json!([])).into_response()
 }
 
 async fn holdings(
@@ -1564,6 +2039,187 @@ async fn asset_allocation(
             .asset_allocation(DevScenario::from_query(&query)),
     )
     .into_response()
+}
+
+async fn yield_positions(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return envelope(json!([])).into_response();
+    };
+    match local_ledger::list_yield_positions(path, query.get("throughDate").map(String::as_str)) {
+        Ok(positions) => envelope(positions).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_yield_position_query"),
+    }
+}
+
+async fn update_holding_yield_terms(
+    State(state): State<AppState>,
+    Path(holding_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("PATCH /v1/holdings/{holding_id}/yield-terms");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::update_holding_yield_terms(path, &holding_id, &input, &now, &idempotency) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_yield_terms_input"),
+    }
+}
+
+async fn create_holding_interest_proposal(
+    State(state): State<AppState>,
+    Path(holding_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("POST /v1/holdings/{holding_id}/interest-proposals");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_holding_interest_proposal(
+        path,
+        &holding_id,
+        &input,
+        &next_local_movement_id(),
+        &next_local_atomic_group_id(),
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_interest_proposal_input"),
+    }
+}
+
+async fn liability_positions(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return envelope(json!([])).into_response();
+    };
+    match local_ledger::list_liability_positions(path, query.get("throughDate").map(String::as_str))
+    {
+        Ok(positions) => envelope(positions).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_liability_position_query"),
+    }
+}
+
+async fn loan_repayment_schedule(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    match local_ledger::loan_repayment_schedule(
+        path,
+        &account_id,
+        query.get("limit").map(String::as_str),
+    ) {
+        Ok(schedule) => envelope(schedule).into_response(),
+        Err(error) => local_ledger_error(error, "invalid_loan_repayment_schedule_query"),
+    }
+}
+
+async fn update_account_liability_terms(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("PATCH /v1/accounts/{account_id}/liability-terms");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::update_account_liability_terms(
+        path,
+        &account_id,
+        &input,
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_liability_terms_input"),
+    }
+}
+
+async fn create_loan_interest_proposal(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("POST /v1/accounts/{account_id}/loan-interest-proposals");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_loan_interest_proposal(
+        path,
+        &account_id,
+        &input,
+        &next_local_movement_id(),
+        &next_local_atomic_group_id(),
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_loan_interest_proposal_input"),
+    }
+}
+
+async fn create_loan_payment_proposal(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("POST /v1/accounts/{account_id}/loan-payment-proposals");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_loan_payment_proposal(
+        path,
+        &account_id,
+        &input,
+        &next_local_movement_id(),
+        &next_local_movement_id(),
+        &next_local_atomic_group_id(),
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_loan_payment_proposal_input"),
+    }
 }
 
 async fn movements(
@@ -1934,6 +2590,69 @@ async fn create_ai_import_proposal(
             Ok(request) => request,
             Err(_) => return invalid_idempotency_key(),
         };
+        match local_ledger::replay_idempotency(path, &idempotency) {
+            Ok(Some(response)) => return idempotent_response(response),
+            Ok(None) => {}
+            Err(error) => return local_ledger_error(error, "ai_import_idempotency_failed"),
+        }
+        let input = if matches!(source_kind, "user_text" | "user_image") {
+            let image_url = if source_kind == "user_image" {
+                match validated_ai_image_data_url(&input) {
+                    Ok(image_url) => Some(image_url),
+                    Err(failure) => {
+                        return bad_request(
+                            failure.code,
+                            failure.message,
+                            json!({"source": "user_image"}),
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+            match ai_provider_config() {
+                Ok(Some(config)) => {
+                    let accounts = match local_ledger::list_accounts(path) {
+                        Ok(accounts) => accounts,
+                        Err(error) => return ledger_io_error(error),
+                    };
+                    let organized = if source_kind == "user_text" {
+                        organize_ai_text_with_provider(&config, input, &accounts, &now).await
+                    } else {
+                        organize_ai_image_with_provider(
+                            &config,
+                            input,
+                            image_url.expect("validated image URL"),
+                            &accounts,
+                            &now,
+                        )
+                        .await
+                    };
+                    match organized {
+                        Ok(input) => input,
+                        Err(failure) => {
+                            return service_unavailable(
+                                failure.code,
+                                failure.message,
+                                json!({"provider": "openai_responses"}),
+                                failure.retryable,
+                            );
+                        }
+                    }
+                }
+                Ok(None) => input,
+                Err(message) => {
+                    return service_unavailable(
+                        "ai_provider_configuration_invalid",
+                        "AI provider configuration is incomplete or invalid.",
+                        json!({"reason": message}),
+                        false,
+                    );
+                }
+            }
+        } else {
+            input
+        };
         let context = local_ledger::AiImportContext {
             proposal_id: next_local_ai_proposal_id(),
             atomic_group_id: next_local_atomic_group_id(),
@@ -1955,15 +2674,665 @@ async fn create_ai_import_proposal(
     envelope(state.ledger.create_ai_proposal(source_kind)).into_response()
 }
 
+struct AiProviderConfig {
+    endpoint: String,
+    api_key: String,
+    model: String,
+}
+
+#[derive(Debug)]
+struct AiProviderFailure {
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+}
+
+fn ai_provider_config() -> Result<Option<AiProviderConfig>, String> {
+    let provider = env::var("FINWEALTH_AI_PROVIDER").ok();
+    let api_key = env::var("FINWEALTH_AI_API_KEY").ok();
+    let model = env::var("FINWEALTH_AI_MODEL").ok();
+    let base_url = env::var("FINWEALTH_AI_BASE_URL").ok();
+    ai_provider_config_from(
+        provider.as_deref(),
+        api_key.as_deref(),
+        model.as_deref(),
+        base_url.as_deref(),
+    )
+}
+
+fn ai_provider_config_from(
+    provider: Option<&str>,
+    api_key: Option<&str>,
+    model: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<Option<AiProviderConfig>, String> {
+    match provider
+        .unwrap_or("none")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "none" | "disabled" => return Ok(None),
+        "openai" | "openai_responses" => {}
+        _ => return Err("FINWEALTH_AI_PROVIDER must be none or openai_responses".to_string()),
+    }
+    let api_key = api_key
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "FINWEALTH_AI_API_KEY is required".to_string())?
+        .to_string();
+    let model = model
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "FINWEALTH_AI_MODEL is required".to_string())?
+        .to_string();
+    let mut url = reqwest::Url::parse(base_url.unwrap_or("https://api.openai.com/v1").trim())
+        .map_err(|_| "FINWEALTH_AI_BASE_URL must be an absolute URL".to_string())?;
+    let loopback_http =
+        url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
+    if url.scheme() != "https" && !loopback_http {
+        return Err("FINWEALTH_AI_BASE_URL must use HTTPS or loopback HTTP".to_string());
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(
+            "FINWEALTH_AI_BASE_URL must not contain credentials, query, or fragment".to_string(),
+        );
+    }
+    let path = format!("{}/responses", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    Ok(Some(AiProviderConfig {
+        endpoint: url.to_string(),
+        api_key,
+        model,
+    }))
+}
+
+async fn organize_ai_text_with_provider(
+    config: &AiProviderConfig,
+    mut input: Value,
+    accounts: &Value,
+    now: &str,
+) -> Result<Value, AiProviderFailure> {
+    let text = input
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(AiProviderFailure {
+            code: "ai_input_invalid",
+            message: "Text input is required for AI organization.",
+            retryable: false,
+        })?;
+    if text.len() > 20_000 {
+        return Err(AiProviderFailure {
+            code: "ai_input_too_large",
+            message: "Text input is too large for AI organization.",
+            retryable: false,
+        });
+    }
+    let account_context = ai_provider_account_context(accounts);
+    let account_ids = account_context
+        .iter()
+        .filter_map(|account| account.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let currencies = account_context
+        .iter()
+        .filter_map(|account| account.get("supportedCurrencies").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if account_ids.is_empty() || currencies.is_empty() {
+        return Err(AiProviderFailure {
+            code: "ai_context_unavailable",
+            message: "No active cash account is available for AI organization.",
+            retryable: false,
+        });
+    }
+    let schema = ai_text_organization_schema(&account_ids, &currencies);
+    let body = json!({
+        "model": config.model,
+        "store": false,
+        "max_output_tokens": 1200,
+        "instructions": concat!(
+            "Convert one Chinese personal-finance note into at most one cash movement. ",
+            "Return usable=false and movement=null when amount, direction, currency, or account cannot be determined from the note and account context. ",
+            "Never invent an account or amount. Use the supplied current timestamp only when the note omits a date. ",
+            "Income means cash in; expense means cash out. Keep the title short and factual."
+        ),
+        "input": format!(
+            "Current timestamp: {now}\nAccounts: {}\nUser note: {text}",
+            serde_json::to_string(&account_context).expect("account context should serialize")
+        ),
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "finwealth_cash_movement",
+                "strict": true,
+                "schema": schema
+            }
+        }
+    });
+    let response = request_ai_structured_output(config, &body).await?;
+    apply_ai_provider_output(
+        &mut input,
+        config,
+        response,
+        &account_context,
+        now,
+        "finwealth_cash_movement_text_v1",
+    )?;
+    Ok(input)
+}
+
+async fn organize_ai_image_with_provider(
+    config: &AiProviderConfig,
+    mut input: Value,
+    image_url: String,
+    accounts: &Value,
+    now: &str,
+) -> Result<Value, AiProviderFailure> {
+    let account_context = ai_provider_account_context(accounts);
+    let account_ids = account_context
+        .iter()
+        .filter_map(|account| account.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let currencies = account_context
+        .iter()
+        .filter_map(|account| account.get("supportedCurrencies").and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if account_ids.is_empty() || currencies.is_empty() {
+        return Err(AiProviderFailure {
+            code: "ai_context_unavailable",
+            message: "No active cash account is available for AI organization.",
+            retryable: false,
+        });
+    }
+    let schema = ai_text_organization_schema(&account_ids, &currencies);
+    let context = format!(
+        "Current timestamp: {now}\nAccounts: {}\nExtract at most one completed cash transaction from this image.",
+        serde_json::to_string(&account_context).expect("account context should serialize")
+    );
+    let body = json!({
+        "model": config.model,
+        "store": false,
+        "max_output_tokens": 1200,
+        "instructions": concat!(
+            "Read one receipt, payment screenshot, or transaction image and return at most one cash movement. ",
+            "Return usable=false and movement=null unless amount, direction, currency, and a matching account are supported by visible evidence. ",
+            "Never invent an account, amount, merchant, currency, or date. Use the supplied timestamp only when the image omits a date. ",
+            "Income means cash in; expense means cash out. Keep the title short and factual."
+        ),
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": context},
+                {"type": "input_image", "image_url": image_url, "detail": "high"}
+            ]
+        }],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "finwealth_cash_movement",
+                "strict": true,
+                "schema": schema
+            }
+        }
+    });
+    let response = request_ai_structured_output(config, &body).await?;
+    apply_ai_provider_output(
+        &mut input,
+        config,
+        response,
+        &account_context,
+        now,
+        "finwealth_cash_movement_image_v1",
+    )?;
+    Ok(input)
+}
+
+fn validated_ai_image_data_url(input: &Value) -> Result<String, AiProviderFailure> {
+    const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+    const MAX_ENCODED_BYTES: usize = 14 * 1024 * 1024;
+    let object = input.as_object().ok_or(AiProviderFailure {
+        code: "ai_image_input_invalid",
+        message: "Image input is invalid.",
+        retryable: false,
+    })?;
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "fileName" | "mimeType" | "imageBase64" | "contextScope" | "selectedAccountIds"
+        )
+    }) {
+        return Err(AiProviderFailure {
+            code: "ai_image_input_invalid",
+            message: "Image input contains unsupported fields.",
+            retryable: false,
+        });
+    }
+    let _file_name = object
+        .get("fileName")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.chars().count() <= 255
+                && !value.chars().any(char::is_control)
+        })
+        .ok_or(AiProviderFailure {
+            code: "ai_image_input_file_name_invalid",
+            message: "Image file name is missing or invalid.",
+            retryable: false,
+        })?;
+    let mime_type = input
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .ok_or(AiProviderFailure {
+            code: "ai_image_input_mime_invalid",
+            message: "Choose a PNG, JPEG, or WEBP image.",
+            retryable: false,
+        })?;
+    if !matches!(mime_type, "image/png" | "image/jpeg" | "image/webp") {
+        return Err(AiProviderFailure {
+            code: "ai_image_input_mime_invalid",
+            message: "Choose a PNG, JPEG, or WEBP image.",
+            retryable: false,
+        });
+    }
+    let encoded = input
+        .get("imageBase64")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_ENCODED_BYTES)
+        .ok_or(AiProviderFailure {
+            code: "ai_image_input_data_invalid",
+            message: "Image data is missing or invalid.",
+            retryable: false,
+        })?;
+    let bytes = STANDARD.decode(encoded).map_err(|_| AiProviderFailure {
+        code: "ai_image_input_data_invalid",
+        message: "Image data is missing or invalid.",
+        retryable: false,
+    })?;
+    if bytes.is_empty()
+        || bytes.len() > MAX_IMAGE_BYTES
+        || !ai_image_magic_matches(mime_type, &bytes)
+    {
+        return Err(AiProviderFailure {
+            code: if bytes.len() > MAX_IMAGE_BYTES {
+                "ai_image_input_too_large"
+            } else {
+                "ai_image_input_data_invalid"
+            },
+            message: if bytes.len() > MAX_IMAGE_BYTES {
+                "Image exceeds the 10 MiB limit."
+            } else {
+                "Image data does not match its declared format."
+            },
+            retryable: false,
+        });
+    }
+    Ok(format!("data:{mime_type};base64,{encoded}"))
+}
+
+fn ai_image_magic_matches(mime_type: &str, bytes: &[u8]) -> bool {
+    match mime_type {
+        "image/png" => {
+            bytes.len() >= 24
+                && bytes.starts_with(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+                && bytes[16..20] != [0, 0, 0, 0]
+                && bytes[20..24] != [0, 0, 0, 0]
+        }
+        "image/jpeg" => {
+            bytes.len() >= 4
+                && bytes.starts_with(&[0xff, 0xd8, 0xff])
+                && bytes.ends_with(&[0xff, 0xd9])
+        }
+        "image/webp" => {
+            bytes.len() >= 16
+                && bytes.starts_with(b"RIFF")
+                && &bytes[8..12] == b"WEBP"
+                && matches!(&bytes[12..16], b"VP8 " | b"VP8L" | b"VP8X")
+                && u32::from_le_bytes(bytes[4..8].try_into().expect("WEBP size bytes")) as usize + 8
+                    == bytes.len()
+        }
+        _ => false,
+    }
+}
+
+async fn request_ai_structured_output(
+    config: &AiProviderConfig,
+    body: &Value,
+) -> Result<Value, AiProviderFailure> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("finwealth/0.1 self-use AI organizer")
+        .build()
+        .map_err(|_| AiProviderFailure {
+            code: "ai_provider_client_failed",
+            message: "AI provider client could not be initialized.",
+            retryable: true,
+        })?;
+    let mut response = client
+        .post(&config.endpoint)
+        .bearer_auth(&config.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| AiProviderFailure {
+            code: "ai_provider_unavailable",
+            message: "AI provider request failed.",
+            retryable: true,
+        })?;
+    if !response.status().is_success() {
+        return Err(AiProviderFailure {
+            code: "ai_provider_rejected_request",
+            message: "AI provider rejected the request.",
+            retryable: response.status().is_server_error() || response.status().as_u16() == 429,
+        });
+    }
+    const MAX_AI_RESPONSE_BYTES: usize = 1_048_576;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_AI_RESPONSE_BYTES as u64)
+    {
+        return Err(AiProviderFailure {
+            code: "ai_provider_response_too_large",
+            message: "AI provider response exceeded the allowed size.",
+            retryable: false,
+        });
+    }
+    let mut response_bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| AiProviderFailure {
+        code: "ai_provider_response_invalid",
+        message: "AI provider returned an invalid response.",
+        retryable: true,
+    })? {
+        if response_bytes.len().saturating_add(chunk.len()) > MAX_AI_RESPONSE_BYTES {
+            return Err(AiProviderFailure {
+                code: "ai_provider_response_too_large",
+                message: "AI provider response exceeded the allowed size.",
+                retryable: false,
+            });
+        }
+        response_bytes.extend_from_slice(&chunk);
+    }
+    let response: Value =
+        serde_json::from_slice(&response_bytes).map_err(|_| AiProviderFailure {
+            code: "ai_provider_response_invalid",
+            message: "AI provider returned an invalid response.",
+            retryable: true,
+        })?;
+    Ok(response)
+}
+
+fn apply_ai_provider_output(
+    input: &mut Value,
+    config: &AiProviderConfig,
+    response: Value,
+    account_context: &[Value],
+    now: &str,
+    prompt_version: &str,
+) -> Result<(), AiProviderFailure> {
+    let structured = ai_structured_output(&response)?;
+    if structured.get("usable").and_then(Value::as_bool) == Some(true) {
+        let movement = ai_provider_movement_input(&structured, account_context, now)?;
+        input["movement"] = movement;
+    }
+    input["_aiProvider"] = json!({
+        "kind": "openai_responses",
+        "model": config.model,
+        "promptVersion": prompt_version,
+        "responseId": response.get("id").cloned().unwrap_or(Value::Null),
+        "usable": structured.get("usable").cloned().unwrap_or(json!(false)),
+        "confidence": structured.get("confidence").cloned().unwrap_or(json!(0))
+    });
+    Ok(())
+}
+
+fn ai_provider_account_context(accounts: &Value) -> Vec<Value> {
+    accounts
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|account| {
+            account.get("status").and_then(Value::as_str) == Some("active")
+                && matches!(
+                    account.get("balanceMode").and_then(Value::as_str),
+                    Some("cash_balance" | "mixed")
+                )
+                && !matches!(
+                    account.get("accountType").and_then(Value::as_str),
+                    Some("loan" | "credit_card")
+                )
+                && account
+                    .get("supportedCurrencies")
+                    .and_then(Value::as_array)
+                    .is_some_and(|currencies| !currencies.is_empty())
+        })
+        .map(|account| {
+            json!({
+                "id": account["id"],
+                "displayName": account["displayName"],
+                "accountType": account["accountType"],
+                "defaultCurrency": account["defaultCurrency"],
+                "supportedCurrencies": account["supportedCurrencies"]
+            })
+        })
+        .collect()
+}
+
+fn ai_text_organization_schema(account_ids: &[String], currencies: &[String]) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["usable", "reason", "confidence", "movement"],
+        "properties": {
+            "usable": {"type": "boolean"},
+            "reason": {"type": "string"},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "movement": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["type", "occurredAt", "title", "accountId", "amount", "currency"],
+                        "properties": {
+                            "type": {"type": "string", "enum": ["income", "expense"]},
+                            "occurredAt": {"type": "string", "format": "date-time"},
+                            "title": {"type": "string"},
+                            "accountId": {"type": "string", "enum": account_ids},
+                            "amount": {"type": "string", "pattern": "^[0-9]+(?:\\.[0-9]{1,8})?$"},
+                            "currency": {"type": "string", "enum": currencies}
+                        }
+                    },
+                    {"type": "null"}
+                ]
+            }
+        }
+    })
+}
+
+fn ai_structured_output(response: &Value) -> Result<Value, AiProviderFailure> {
+    if response.get("status").and_then(Value::as_str) != Some("completed") {
+        return Err(AiProviderFailure {
+            code: "ai_provider_response_incomplete",
+            message: "AI provider response was incomplete.",
+            retryable: true,
+        });
+    }
+    for content in response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+    {
+        if content.get("type").and_then(Value::as_str) == Some("refusal") {
+            return Err(AiProviderFailure {
+                code: "ai_provider_refused",
+                message: "AI provider refused to organize this input.",
+                retryable: false,
+            });
+        }
+        if content.get("type").and_then(Value::as_str) == Some("output_text")
+            && let Some(text) = content.get("text").and_then(Value::as_str)
+        {
+            let structured: Value = serde_json::from_str(text).map_err(|_| AiProviderFailure {
+                code: "ai_provider_output_invalid",
+                message: "AI provider output did not match the required structure.",
+                retryable: true,
+            })?;
+            let confidence = structured.get("confidence").and_then(Value::as_f64);
+            if structured.get("usable").and_then(Value::as_bool).is_none()
+                || structured.get("reason").and_then(Value::as_str).is_none()
+                || confidence
+                    .is_none_or(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+                || !matches!(
+                    structured.get("movement"),
+                    Some(Value::Object(_) | Value::Null)
+                )
+            {
+                return Err(AiProviderFailure {
+                    code: "ai_provider_output_invalid",
+                    message: "AI provider output did not match the required structure.",
+                    retryable: true,
+                });
+            }
+            return Ok(structured);
+        }
+    }
+    Err(AiProviderFailure {
+        code: "ai_provider_output_missing",
+        message: "AI provider returned no structured output.",
+        retryable: true,
+    })
+}
+
+fn ai_provider_movement_input(
+    structured: &Value,
+    accounts: &[Value],
+    now: &str,
+) -> Result<Value, AiProviderFailure> {
+    let movement = structured
+        .get("movement")
+        .and_then(Value::as_object)
+        .ok_or(AiProviderFailure {
+            code: "ai_provider_output_invalid",
+            message: "AI provider marked output usable without a movement.",
+            retryable: true,
+        })?;
+    let movement_type = movement.get("type").and_then(Value::as_str);
+    let account_id = movement.get("accountId").and_then(Value::as_str);
+    let currency = movement.get("currency").and_then(Value::as_str);
+    let account = account_id.and_then(|id| {
+        accounts
+            .iter()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(id))
+    });
+    let valid_currency = account.is_some_and(|account| {
+        account
+            .get("supportedCurrencies")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == currency))
+    });
+    let amount = movement.get("amount").and_then(Value::as_str);
+    let valid_amount = amount.is_some_and(local_decimal_is_positive);
+    let occurred_at = movement
+        .get("occurredAt")
+        .and_then(Value::as_str)
+        .filter(|value| OffsetDateTime::parse(value, &Rfc3339).is_ok());
+    let title = movement
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.chars().count() <= 120);
+    if !matches!(movement_type, Some("income" | "expense"))
+        || account.is_none()
+        || !valid_currency
+        || !valid_amount
+        || occurred_at.is_none()
+        || title.is_none()
+    {
+        return Err(AiProviderFailure {
+            code: "ai_provider_output_invalid",
+            message: "AI provider output failed ledger validation.",
+            retryable: true,
+        });
+    }
+    let movement_type = movement_type.expect("validated movement type");
+    let amount = amount.expect("validated amount");
+    let currency = currency.expect("validated currency");
+    Ok(json!({
+        "type": movement_type,
+        "occurredAt": occurred_at.unwrap_or(now),
+        "title": title.expect("validated title"),
+        "entries": [{
+            "accountId": account_id.expect("validated account"),
+            "amount": amount,
+            "currency": currency,
+            "direction": if movement_type == "income" {"in"} else {"out"},
+            "role": "source"
+        }],
+        "amountBreakdown": {
+            "paidAmount": {"amount": amount, "currency": currency}
+        },
+        "tags": ["ai_organized"]
+    }))
+}
+
+fn local_decimal_is_positive(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 32
+        || value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| matches!(byte, b'-' | b'+'))
+    {
+        return false;
+    }
+    let mut parts = value.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fraction = parts.next();
+    if parts.next().is_some()
+        || integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.is_some_and(|fraction| {
+            fraction.is_empty()
+                || fraction.len() > 8
+                || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return false;
+    }
+    integer.bytes().any(|byte| byte != b'0')
+        || fraction.is_some_and(|fraction| fraction.bytes().any(|byte| byte != b'0'))
+}
+
 async fn mark_dca_executed_as_proposal(
     State(state): State<AppState>,
     Path(reminder_id): Path<String>,
     headers: HeaderMap,
+    body: Option<Json<Value>>,
 ) -> Response {
+    let input = body.map(|Json(value)| value).unwrap_or(Value::Null);
     if let Some(path) = state.local_ledger_path.as_ref() {
         let now = current_timestamp();
         let operation = format!("POST /v1/dca/reminders/{reminder_id}/mark-executed-as-proposal");
-        let idempotency = match idempotency_request(&headers, &operation, &Value::Null, &now) {
+        let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
             Ok(request) => request,
             Err(_) => return invalid_idempotency_key(),
         };
@@ -1974,6 +3343,7 @@ async fn mark_dca_executed_as_proposal(
             &reminder_id,
             &movement_id,
             &atomic_group_id,
+            &input,
             &now,
             &idempotency,
         ) {
@@ -1982,7 +3352,29 @@ async fn mark_dca_executed_as_proposal(
         };
     }
 
-    match state.ledger.mark_dca_executed_as_proposal(&reminder_id) {
+    let Some(object) = input.as_object() else {
+        return bad_request(
+            "invalid_dca_mark_executed",
+            "DCA execution input must be a JSON object.",
+            json!({}),
+        );
+    };
+    let missing = ["holdingAccountId", "quantity", "totalCost", "quoteCurrency"]
+        .into_iter()
+        .filter(|key| !object.contains_key(*key))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return bad_request(
+            "invalid_dca_mark_executed",
+            "DCA execution input is incomplete.",
+            json!({"missingFields": missing}),
+        );
+    }
+
+    match state
+        .ledger
+        .mark_dca_executed_as_proposal(&reminder_id, &input)
+    {
         Some(proposal) => envelope(proposal).into_response(),
         None => not_found(
             "dca_reminder_not_found",
@@ -2197,6 +3589,32 @@ async fn create_subscription_charge_proposal(
     ) {
         Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_subscription_charge_proposal"),
+    }
+}
+
+async fn create_due_subscription_charge_proposals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = "POST /v1/subscriptions/charge-proposals/due-scan";
+    let idempotency = match idempotency_request(&headers, operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::create_due_subscription_charge_proposals(
+        path,
+        input,
+        &now,
+        &idempotency,
+        || (next_local_movement_id(), next_local_atomic_group_id()),
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_subscription_due_scan"),
     }
 }
 
@@ -2445,11 +3863,15 @@ async fn enrich_quote_refresh_with_yahoo(
             "fxRates": [],
             "errors": [{
                 "targetType": "request",
-                "message": "quote provider is disabled; set FINWEALTH_QUOTE_PROVIDER=yahoo to opt in, or pass quotes/fxRates payload",
+                "message": "quote provider is disabled; explicitly configure public or yahoo, or pass quotes/fxRates payload",
                 "retryable": false
             }],
             "completedAt": now
         }));
+    }
+
+    if quote_provider_public() {
+        return enrich_quote_refresh_with_public(input, quote_targets, fx_targets, now).await;
     }
 
     let provider = match yahoo::YahooConnector::new() {
@@ -2545,7 +3967,386 @@ fn quote_provider_disabled() -> bool {
 }
 
 fn quote_provider_disabled_value(value: Option<&str>) -> bool {
-    !value.is_some_and(|value| value.trim().eq_ignore_ascii_case("yahoo"))
+    !value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "yahoo" | "public"
+        )
+    })
+}
+
+fn quote_provider_public() -> bool {
+    env::var("FINWEALTH_QUOTE_PROVIDER")
+        .ok()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("public"))
+}
+
+fn quote_provider_yahoo() -> bool {
+    env::var("FINWEALTH_QUOTE_PROVIDER")
+        .ok()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("yahoo"))
+}
+
+async fn enrich_quote_refresh_with_public(
+    mut input: Value,
+    quote_targets: Vec<Value>,
+    fx_targets: Vec<Value>,
+    now: &str,
+) -> Result<Value, Value> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent("finwealth/0.1 self-use quote refresh")
+        .build()
+        .map_err(|error| public_provider_failure(now, format!("HTTP client failed: {error}")))?;
+    let needs_coingecko = quote_targets.iter().any(public_crypto_coin_id_for_target)
+        || fx_targets.iter().any(public_fx_uses_coingecko);
+    let coingecko = if needs_coingecko {
+        match fetch_coingecko_prices(&client).await {
+            Ok(value) => Some(value),
+            Err(error) => {
+                let mut errors = Vec::new();
+                for target in &quote_targets {
+                    if public_crypto_coin_id_for_target(target) {
+                        errors.push(public_provider_error(
+                            "instrument",
+                            target.get("instrumentId").and_then(Value::as_str),
+                            &error,
+                            true,
+                        ));
+                    }
+                }
+                for target in &fx_targets {
+                    if public_fx_uses_coingecko(target) {
+                        errors.push(public_provider_error(
+                            "fx_pair",
+                            public_fx_target_id(target).as_deref(),
+                            &error,
+                            true,
+                        ));
+                    }
+                }
+                if let Some(object) = input.as_object_mut() {
+                    object.insert("_providerErrors".to_string(), json!(errors));
+                }
+                return Ok(input);
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut quotes = Vec::new();
+    let mut fx_rates = Vec::new();
+    let mut errors = Vec::new();
+    for target in &quote_targets {
+        match public_latest_quote(target, coingecko.as_ref(), now) {
+            Ok(quote) => quotes.push(quote),
+            Err(message) => errors.push(public_provider_error(
+                "instrument",
+                target.get("instrumentId").and_then(Value::as_str),
+                &message,
+                false,
+            )),
+        }
+    }
+    for target in &fx_targets {
+        let result = if public_fx_uses_coingecko(target) {
+            public_crypto_fx_rate(target, coingecko.as_ref(), now)
+        } else {
+            public_fiat_fx_rate(&client, target, now).await
+        };
+        match result {
+            Ok(rate) => fx_rates.push(rate),
+            Err(message) => errors.push(public_provider_error(
+                "fx_pair",
+                public_fx_target_id(target).as_deref(),
+                &message,
+                true,
+            )),
+        }
+    }
+
+    if let Some(object) = input.as_object_mut() {
+        if !quotes.is_empty() {
+            object.insert("quotes".to_string(), json!(quotes));
+        }
+        if !fx_rates.is_empty() {
+            object.insert("fxRates".to_string(), json!(fx_rates));
+        }
+        if !errors.is_empty() {
+            object.insert("_providerErrors".to_string(), json!(errors));
+        }
+    }
+    Ok(input)
+}
+
+fn public_provider_failure(now: &str, message: String) -> Value {
+    json!({
+        "status": "offline",
+        "quotes": [],
+        "fxRates": [],
+        "errors": [{
+            "targetType": "request",
+            "message": message,
+            "retryable": true
+        }],
+        "completedAt": now
+    })
+}
+
+fn public_provider_error(
+    target_type: &str,
+    target_id: Option<&str>,
+    message: &str,
+    retryable: bool,
+) -> Value {
+    let mut error = json!({
+        "targetType": target_type,
+        "message": message,
+        "retryable": retryable
+    });
+    if let Some(target_id) = target_id {
+        error["targetId"] = json!(target_id);
+    }
+    error
+}
+
+async fn fetch_coingecko_prices(client: &reqwest::Client) -> Result<Value, String> {
+    client
+        .get("https://api.coingecko.com/api/v3/simple/price")
+        .query(&[
+            ("ids", "bitcoin,ethereum,tether"),
+            ("vs_currencies", "usd,cny"),
+            ("include_last_updated_at", "true"),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("CoinGecko request failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("CoinGecko returned an error: {error}"))?
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("CoinGecko response was invalid: {error}"))
+}
+
+fn public_crypto_coin_id_for_target(target: &Value) -> bool {
+    target
+        .get("symbol")
+        .and_then(Value::as_str)
+        .and_then(public_coin_id_for_symbol)
+        .is_some()
+}
+
+fn public_coin_id_for_symbol(symbol: &str) -> Option<&'static str> {
+    let asset = symbol
+        .split(['-', '/', '_'])
+        .next()
+        .unwrap_or(symbol)
+        .to_ascii_uppercase();
+    match asset.as_str() {
+        "BTC" => Some("bitcoin"),
+        "ETH" => Some("ethereum"),
+        "USDT" => Some("tether"),
+        _ => None,
+    }
+}
+
+fn public_latest_quote(
+    target: &Value,
+    coingecko: Option<&Value>,
+    now: &str,
+) -> Result<Value, String> {
+    let instrument_id = target
+        .get("instrumentId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "quote target has no instrumentId".to_string())?;
+    let symbol = target
+        .get("symbol")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "instrument has no public-provider symbol".to_string())?;
+    let coin_id = public_coin_id_for_symbol(symbol)
+        .ok_or_else(|| format!("public provider does not support instrument symbol: {symbol}"))?;
+    let quote_currency = target
+        .get("quoteCurrency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "quote target has no quoteCurrency".to_string())?;
+    let data = coingecko.ok_or_else(|| "CoinGecko data is unavailable".to_string())?;
+    let price = public_coin_price(data, coin_id, quote_currency)?;
+    let price = provider_decimal_string(price)?;
+    let as_of = public_coin_as_of(data, coin_id).unwrap_or_else(|| now.to_string());
+    let expires_at = (OffsetDateTime::now_utc() + Duration::minutes(5))
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
+    Ok(json!({
+        "instrumentId": instrument_id,
+        "price": price,
+        "currency": quote_currency,
+        "asOf": as_of,
+        "source": "coingecko",
+        "sourceUrl": "https://www.coingecko.com/",
+        "status": "fresh",
+        "expiresAt": expires_at
+    }))
+}
+
+fn public_coin_price(data: &Value, coin_id: &str, quote_currency: &str) -> Result<f64, String> {
+    let direct_currency = quote_currency.to_ascii_lowercase();
+    let price = if matches!(direct_currency.as_str(), "usd" | "cny") {
+        data.get(coin_id)
+            .and_then(|coin| coin.get(&direct_currency))
+            .and_then(Value::as_f64)
+    } else if direct_currency == "usdt" {
+        let asset_usd = data
+            .get(coin_id)
+            .and_then(|coin| coin.get("usd"))
+            .and_then(Value::as_f64);
+        let tether_usd = data
+            .get("tether")
+            .and_then(|coin| coin.get("usd"))
+            .and_then(Value::as_f64);
+        asset_usd
+            .zip(tether_usd)
+            .map(|(asset, tether)| asset / tether)
+    } else {
+        None
+    }
+    .filter(|price| price.is_finite() && *price > 0.0)
+    .ok_or_else(|| format!("CoinGecko has no usable {coin_id}/{quote_currency} price"))?;
+    Ok(price)
+}
+
+fn public_coin_as_of(data: &Value, coin_id: &str) -> Option<String> {
+    let timestamp = data.get(coin_id)?.get("last_updated_at")?.as_i64()?;
+    OffsetDateTime::from_unix_timestamp(timestamp)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
+}
+
+fn public_fx_uses_coingecko(target: &Value) -> bool {
+    let base = target.get("baseCurrency").and_then(Value::as_str);
+    let quote = target.get("quoteCurrency").and_then(Value::as_str);
+    matches!(base, Some("USDT")) || matches!(quote, Some("USDT"))
+}
+
+fn public_fx_target_id(target: &Value) -> Option<String> {
+    Some(format!(
+        "{}/{}",
+        target.get("baseCurrency")?.as_str()?,
+        target.get("quoteCurrency")?.as_str()?
+    ))
+}
+
+fn public_crypto_fx_rate(
+    target: &Value,
+    coingecko: Option<&Value>,
+    now: &str,
+) -> Result<Value, String> {
+    let base = target
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "FX target has no baseCurrency".to_string())?;
+    let quote = target
+        .get("quoteCurrency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "FX target has no quoteCurrency".to_string())?;
+    let data = coingecko.ok_or_else(|| "CoinGecko data is unavailable".to_string())?;
+    let (currency, inverted) = if base == "USDT" {
+        (quote, false)
+    } else if quote == "USDT" {
+        (base, true)
+    } else {
+        return Err(format!("unsupported crypto FX pair: {base}/{quote}"));
+    };
+    let direct = public_coin_price(data, "tether", currency)?;
+    let rate = if inverted { 1.0 / direct } else { direct };
+    let rate = provider_decimal_string(rate)?;
+    let as_of = public_coin_as_of(data, "tether").unwrap_or_else(|| now.to_string());
+    let expires_at = (OffsetDateTime::now_utc() + Duration::minutes(5))
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
+    Ok(json!({
+        "baseCurrency": base,
+        "quoteCurrency": quote,
+        "rate": rate,
+        "asOf": as_of,
+        "source": "coingecko",
+        "sourceUrl": "https://www.coingecko.com/",
+        "status": "fresh",
+        "expiresAt": expires_at
+    }))
+}
+
+async fn public_fiat_fx_rate(
+    client: &reqwest::Client,
+    target: &Value,
+    _now: &str,
+) -> Result<Value, String> {
+    let base = target
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "FX target has no baseCurrency".to_string())?;
+    let quote = target
+        .get("quoteCurrency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "FX target has no quoteCurrency".to_string())?;
+    let response = client
+        .get("https://api.frankfurter.app/latest")
+        .query(&[("from", base), ("to", quote)])
+        .send()
+        .await
+        .map_err(|error| format!("Frankfurter request failed for {base}/{quote}: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Frankfurter returned an error for {base}/{quote}: {error}"))?
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Frankfurter response was invalid: {error}"))?;
+    public_fiat_fx_rate_from_response(base, quote, &response)
+}
+
+fn public_fiat_fx_rate_from_response(
+    base: &str,
+    quote: &str,
+    response: &Value,
+) -> Result<Value, String> {
+    let rate = response
+        .get("rates")
+        .and_then(|rates| rates.get(quote))
+        .and_then(Value::as_f64)
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .ok_or_else(|| format!("Frankfurter has no usable {base}/{quote} rate"))?;
+    let rate = provider_decimal_string(rate)?;
+    let date = response
+        .get("date")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Frankfurter response has no date".to_string())?;
+    let as_of = format!("{date}T00:00:00Z");
+    let expires_at = (OffsetDateTime::now_utc() + Duration::hours(24))
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
+    Ok(json!({
+        "baseCurrency": base,
+        "quoteCurrency": quote,
+        "rate": rate,
+        "asOf": as_of,
+        "source": "frankfurter_ecb",
+        "sourceUrl": "https://frankfurter.app/",
+        "status": "fresh",
+        "expiresAt": expires_at
+    }))
+}
+
+fn provider_decimal_string(value: f64) -> Result<String, String> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err("provider value must be finite and positive".to_string());
+    }
+    let fixed = format!("{value:.8}");
+    let normalized = fixed.trim_end_matches('0').trim_end_matches('.');
+    if normalized.is_empty() || normalized == "0" {
+        Err("provider value is below ledger precision".to_string())
+    } else {
+        Ok(normalized.to_string())
+    }
 }
 
 async fn yahoo_latest_quote(
@@ -3194,6 +4995,14 @@ async fn historical_prices(
             false,
         );
     }
+    if !quote_provider_yahoo() {
+        return service_unavailable(
+            "historical_prices_provider_unsupported",
+            "The configured quote provider does not supply historical prices.",
+            json!({ "instrumentId": instrument_id, "symbol": symbol }),
+            false,
+        );
+    }
     let fallback_currency = instrument
         .get("quoteCurrency")
         .and_then(Value::as_str)
@@ -3475,17 +5284,18 @@ async fn sync_changes(
 
 async fn sync_push(
     State(state): State<AppState>,
+    Extension(authenticated_device): Extension<AuthenticatedDevice>,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
     Json(input): Json<Value>,
 ) -> Response {
+    let now = current_timestamp();
     let local_idempotency = if state.should_use_local_ledger(&query) {
-        let now = current_timestamp();
         let idempotency = match idempotency_request(&headers, "POST /v1/sync/push", &input, &now) {
             Ok(request) => request,
             Err(_) => return invalid_idempotency_key(),
         };
-        Some((now, idempotency))
+        Some(idempotency)
     } else {
         None
     };
@@ -3515,15 +5325,26 @@ async fn sync_push(
             json!({ "errors": errors }),
         );
     }
+    if let Err(error) =
+        local_ledger::validate_sync_push_input(&input, &authenticated_device.id, &now)
+    {
+        return local_ledger_error(error, "invalid_sync_push");
+    }
 
     if state.should_use_local_ledger(&query) {
         let path = state
             .local_ledger_path
             .as_ref()
             .expect("local ledger path should exist when local ledger is selected");
-        let (now, idempotency) =
+        let idempotency =
             local_idempotency.expect("local idempotency should exist for local ledger");
-        return match local_ledger::ingest_sync_push(path, input, &now, &idempotency) {
+        return match local_ledger::ingest_sync_push(
+            path,
+            input,
+            &authenticated_device.id,
+            &now,
+            &idempotency,
+        ) {
             Ok(response) => idempotent_response(response),
             Err(error) => local_ledger_error(error, "invalid_sync_push"),
         };
@@ -3531,6 +5352,9 @@ async fn sync_push(
 
     envelope(json!({
         "cursor": current_sync_cursor(&state, &query),
+        "acceptedChangeIds": [],
+        "appliedChangeIds": [],
+        "skippedChangeIds": [],
         "conflicts": []
     }))
     .into_response()
@@ -3784,6 +5608,19 @@ fn auth_error_response(error: AuthError) -> Response {
             "invalid_credentials",
             "Username, password, or refresh token is invalid.",
         ),
+        AuthError::Storage => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "ok": false,
+                "error": {
+                    "code": "auth_state_io_error",
+                    "message": "Authentication state could not be persisted.",
+                    "severity": "error",
+                    "retryable": false
+                }
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -3905,8 +5742,34 @@ fn write_auth_state(path: &FsPath, state: &AuthState) -> io::Result<()> {
     let tmp_path = path.with_extension("auth.json.tmp");
     let bytes =
         serde_json::to_vec_pretty(&auth_state_to_json(state)).map_err(invalid_auth_state_data)?;
-    fs::write(&tmp_path, bytes)?;
-    fs::rename(tmp_path, path)?;
+    let mut temporary = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp_path)?;
+    temporary.write_all(&bytes)?;
+    temporary.sync_all()?;
+    drop(temporary);
+    fs::rename(&tmp_path, path)?;
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    sync_auth_parent_directory(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_auth_parent_directory(path: &FsPath) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::OpenOptions::new().read(true).open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_auth_parent_directory(_path: &FsPath) -> io::Result<()> {
     Ok(())
 }
 
@@ -4539,6 +6402,131 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    async fn test_response_json(response: Response) -> Value {
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body");
+        serde_json::from_slice(&bytes).expect("JSON response")
+    }
+
+    #[tokio::test]
+    async fn agent_gateway_injects_owner_principal_and_streams_upstream_response() {
+        async fn upstream(headers: HeaderMap) -> Json<Value> {
+            Json(json!({
+                "ok": true,
+                "data": {
+                    "userId": headers
+                        .get("x-finwealth-user-id")
+                        .and_then(|value| value.to_str().ok()),
+                    "ledgerId": headers
+                        .get("x-finwealth-ledger-id")
+                        .and_then(|value| value.to_str().ok()),
+                    "deviceId": headers
+                        .get("x-finwealth-device-id")
+                        .and_then(|value| value.to_str().ok()),
+                    "internalToken": headers
+                        .get("x-finwealth-internal-token")
+                        .and_then(|value| value.to_str().ok()),
+                }
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("agent gateway listener");
+        let address = listener.local_addr().expect("agent gateway address");
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/agent/status", get(upstream)),
+            )
+            .await
+            .expect("agent gateway server");
+        });
+
+        let response = app_with_state(
+            AppState::dev().with_agent_gateway(format!("http://{address}"), "test-internal-token"),
+        )
+        .oneshot(
+            Request::builder()
+                .uri("/v1/agent/status")
+                .body(Body::empty())
+                .expect("agent status request"),
+        )
+        .await
+        .expect("agent gateway response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = test_response_json(response).await;
+        assert_eq!(body["data"]["userId"], OWNER_USER_ID);
+        assert_eq!(body["data"]["ledgerId"], OWNER_LEDGER_ID);
+        assert_eq!(body["data"]["deviceId"], DEV_UNAUTHENTICATED_DEVICE_ID);
+        assert_eq!(body["data"]["internalToken"], "test-internal-token");
+    }
+
+    #[tokio::test]
+    async fn agent_gateway_is_fail_closed_when_not_configured() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/agent/status")
+                    .body(Body::empty())
+                    .expect("agent status request"),
+            )
+            .await
+            .expect("agent gateway response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = test_response_json(response).await;
+        assert_eq!(body["error"]["code"], "agent_service_unavailable");
+    }
+
+    #[tokio::test]
+    async fn agent_internal_token_authenticates_sidecar_without_a_bearer_token() {
+        let auth = AuthStore::configured("wu", hash_password_for_test("correct horse"), true);
+        let router = app_with_state(
+            AppState::dev()
+                .with_auth(auth)
+                .with_agent_gateway("http://127.0.0.1:9".to_string(), "sidecar-secret"),
+        );
+
+        let allowed = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/accounts")
+                    .header("x-finwealth-internal-token", "sidecar-secret")
+                    .body(Body::empty())
+                    .expect("internal request"),
+            )
+            .await
+            .expect("internal response");
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        let denied = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/accounts")
+                    .header("x-finwealth-internal-token", "wrong-secret")
+                    .body(Body::empty())
+                    .expect("invalid internal request"),
+            )
+            .await
+            .expect("invalid internal response");
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let recursion = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/agent/status")
+                    .header("x-finwealth-internal-token", "sidecar-secret")
+                    .body(Body::empty())
+                    .expect("recursive internal request"),
+            )
+            .await
+            .expect("recursive internal response");
+        assert_eq!(recursion.status(), StatusCode::FORBIDDEN);
+    }
+
     #[test]
     fn refuses_non_loopback_addresses() {
         let result = std::panic::catch_unwind(|| {
@@ -4606,6 +6594,39 @@ mod tests {
             read_ledger_command_from(["finwealth-server", "--port", "8791"]),
             None
         );
+    }
+
+    #[test]
+    fn app_state_holds_ledger_lease_for_its_lifetime() {
+        let requested_path = unique_test_ledger_path("app_state_lease");
+        let lease = ledger_lease::acquire_ledger_lease_with_timeout(
+            &requested_path,
+            std::time::Duration::from_millis(60),
+        )
+        .expect("first lease should be acquired");
+        let ledger_path = lease.ledger_path().to_path_buf();
+        let lock_path = lease.lock_path().to_path_buf();
+        let state = AppState::local_with_lease(ledger_path.clone(), Arc::new(lease));
+
+        let error = ledger_lease::acquire_ledger_lease_with_timeout(
+            &ledger_path,
+            std::time::Duration::from_millis(60),
+        )
+        .expect_err("AppState must keep the lease held");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+        drop(state);
+        let reacquired = ledger_lease::acquire_ledger_lease_with_timeout(
+            &ledger_path,
+            std::time::Duration::ZERO,
+        )
+        .expect("dropping AppState should release the OS lease");
+        drop(reacquired);
+        assert!(lock_path.is_file(), "the permanent sidecar must remain");
+        let _ = fs::remove_file(lock_path);
+        if let Some(parent) = ledger_path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
     }
 
     #[test]
@@ -4770,6 +6791,63 @@ mod tests {
         (status, headers, body)
     }
 
+    async fn create_test_subscription(
+        router: Router,
+        account_id: &str,
+        display_name: &str,
+        next_charge_date: &str,
+        status: &str,
+    ) -> String {
+        let (status_code, body) = request_json_body_from(
+            router,
+            Method::POST,
+            "/v1/subscriptions",
+            json!({
+                "displayName": display_name,
+                "provider": "Integration provider",
+                "amount": {"amount": "20.00", "currency": "USD"},
+                "paymentAccountId": account_id,
+                "billingCycle": {"unit": "month", "interval": 1},
+                "startDate": next_charge_date,
+                "nextChargeDate": next_charge_date,
+                "status": status
+            }),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::CREATED, "{body}");
+        body["data"]["id"]
+            .as_str()
+            .expect("subscription id")
+            .to_string()
+    }
+
+    fn sync_account_create_change(device_id: &str, change_id: &str, account_id: &str) -> Value {
+        json!({
+            "id": change_id,
+            "deviceId": device_id,
+            "entityType": "account",
+            "entityId": account_id,
+            "operation": "create",
+            "baseVersion": 0,
+            "payload": {
+                "id": account_id,
+                "displayName": "远端同步账户",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "visibility": "normal",
+                "status": "active",
+                "balanceMode": "cash_balance",
+                "cashBalances": [],
+                "tags": [],
+                "createdAt": "2026-07-13T00:00:00Z",
+                "updatedAt": "2026-07-13T00:00:00Z"
+            },
+            "createdAt": "2026-07-13T00:00:00Z"
+        })
+    }
+
     async fn request_json_with_bearer_from(
         router: Router,
         method: Method,
@@ -4784,6 +6862,41 @@ mod tests {
                     .header("authorization", format!("Bearer {token}"))
                     .header("host", "127.0.0.1")
                     .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should respond");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body should read");
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("response body should be JSON")
+        };
+        (status, body)
+    }
+
+    async fn request_json_body_with_bearer_from(
+        router: Router,
+        method: Method,
+        uri: &str,
+        token: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", next_local_id("test_idempotency"))
+                    .header("host", "127.0.0.1")
+                    .body(Body::from(
+                        serde_json::to_vec(&body).expect("request body should serialize"),
+                    ))
                     .expect("request should build"),
             )
             .await
@@ -4855,6 +6968,64 @@ mod tests {
 
         let errors = validate_auth_config(&config).expect_err("non-Argon2 hash must fail closed");
         assert!(errors.iter().any(|error| error.contains("Argon2")));
+    }
+
+    #[test]
+    fn production_config_requires_loopback_auth_and_public_host() {
+        let secure = AuthConfig {
+            username: Some("wu".to_string()),
+            password_hash: Some(hash_password_for_test("correct horse")),
+            dev_plain_password: None,
+            require_auth: true,
+            state_path: None,
+        };
+        let valid = production_config_errors(
+            &secure,
+            "127.0.0.1:8790".parse().expect("test address"),
+            &["127.0.0.1".to_string(), "api.example.com".to_string()],
+            false,
+            Some("none"),
+            None,
+            None,
+        );
+        assert!(valid.is_empty(), "{valid:?}");
+        let public_provider = production_config_errors(
+            &secure,
+            "127.0.0.1:8790".parse().expect("test address"),
+            &["127.0.0.1".to_string(), "api.example.com".to_string()],
+            false,
+            Some("public"),
+            Some("http://127.0.0.1:8792"),
+            Some("0123456789abcdef0123456789abcdef"),
+        );
+        assert!(public_provider.is_empty(), "{public_provider:?}");
+
+        let open = AuthConfig {
+            username: None,
+            password_hash: None,
+            dev_plain_password: None,
+            require_auth: false,
+            state_path: None,
+        };
+        let errors = production_config_errors(
+            &open,
+            "0.0.0.0:8790".parse().expect("test address"),
+            &["127.0.0.1".to_string(), "localhost".to_string()],
+            true,
+            Some("typo"),
+            Some("https://agent.example.com"),
+            None,
+        );
+        assert!(errors.iter().any(|error| error.contains("REQUIRE_AUTH")));
+        assert!(errors.iter().any(|error| error.contains("loopback")));
+        assert!(errors.iter().any(|error| error.contains("ALLOWED_HOSTS")));
+        assert!(errors.iter().any(|error| error.contains("LEDGER_SCENARIO")));
+        assert!(errors.iter().any(|error| error.contains("QUOTE_PROVIDER")));
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("configured together"))
+        );
     }
 
     #[test]
@@ -5127,6 +7298,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_push_binds_account_create_to_authenticated_device() {
+        let path = unique_test_ledger_path("sync_authenticated_device");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let auth = AuthStore::configured("wu", hash_password_for_test("correct horse"), true);
+        let router = app_with_state(AppState::local(path.clone()).with_auth(auth));
+
+        let (login_status, login_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/auth/login",
+            json!({
+                "username": "wu",
+                "password": "correct horse",
+                "deviceName": "Windows sync client"
+            }),
+        )
+        .await;
+        assert_eq!(login_status, StatusCode::OK, "{login_body}");
+        let access_token = login_body["data"]["accessToken"]
+            .as_str()
+            .expect("access token should be string");
+        let device_id = login_body["data"]["deviceId"]
+            .as_str()
+            .expect("device id should be string");
+
+        let push = json!({
+            "deviceId": device_id,
+            "changes": [{
+                "id": "authenticated_change_000001",
+                "deviceId": device_id,
+                "entityType": "account",
+                "entityId": "acct_authenticated_remote",
+                "operation": "create",
+                "baseVersion": 0,
+                "payload": {
+                    "id": "acct_authenticated_remote",
+                    "displayName": "认证远端账户",
+                    "accountType": "bank",
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "visibility": "normal",
+                    "status": "active",
+                    "balanceMode": "cash_balance",
+                    "cashBalances": [],
+                    "tags": [],
+                    "createdAt": "2026-07-13T00:00:00Z",
+                    "updatedAt": "2026-07-13T00:00:00Z"
+                },
+                "createdAt": "2026-07-13T00:00:00Z"
+            }]
+        });
+        let mut impersonated_push = push.clone();
+        impersonated_push["deviceId"] = json!("dev_auth_device_impersonated");
+        impersonated_push["changes"][0]["deviceId"] = json!("dev_auth_device_impersonated");
+        let (impersonated_status, impersonated_body) = request_json_body_with_bearer_from(
+            router.clone(),
+            Method::POST,
+            "/v1/sync/push",
+            access_token,
+            impersonated_push,
+        )
+        .await;
+        assert_eq!(impersonated_status, StatusCode::BAD_REQUEST);
+        assert_eq!(impersonated_body["error"]["code"], "invalid_sync_push");
+        let unchanged = local_ledger::read_document(&path).expect("rejected push must not mutate");
+        assert_eq!(unchanged["accounts"], json!([]));
+        assert_eq!(unchanged["syncChanges"], json!([]));
+
+        let (push_status, push_body) = request_json_body_with_bearer_from(
+            router,
+            Method::POST,
+            "/v1/sync/push",
+            access_token,
+            push,
+        )
+        .await;
+        assert_eq!(push_status, StatusCode::OK, "{push_body}");
+        assert_eq!(
+            push_body["data"]["appliedChangeIds"],
+            json!(["authenticated_change_000001"])
+        );
+        let document = local_ledger::read_document(&path).expect("push should persist atomically");
+        assert_eq!(document["accounts"][0]["id"], "acct_authenticated_remote");
+        assert_eq!(document["syncChanges"][0]["sourceDeviceId"], device_id);
+        assert_eq!(document["syncState"]["pendingChangeIds"], json!([]));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn auth_state_persists_refresh_tokens_across_store_restarts() {
         let auth_path = unique_test_ledger_path("auth_state_persistence");
         let password_hash = hash_password_for_test("correct horse");
@@ -5221,6 +7483,70 @@ mod tests {
         .await;
         assert_eq!(revoked_status, StatusCode::UNAUTHORIZED);
         assert_eq!(revoked_body["error"]["code"], "invalid_credentials");
+
+        let _ = std::fs::remove_file(auth_path);
+    }
+
+    #[test]
+    fn auth_login_fails_closed_when_device_state_cannot_be_persisted() {
+        let parent_file = unique_test_ledger_path("auth_unwritable_parent");
+        std::fs::create_dir_all(
+            parent_file
+                .parent()
+                .expect("test parent file should have a parent"),
+        )
+        .expect("test directory should be created");
+        std::fs::write(&parent_file, "not a directory")
+            .expect("test parent file should be created");
+        let state_path = parent_file.join("ledger.auth.json");
+        let auth = AuthStore::configured_with_state_path(
+            "wu",
+            hash_password_for_test("correct horse"),
+            true,
+            Some(state_path),
+        );
+
+        let result = auth.login(
+            json!({
+                "username": "wu",
+                "password": "correct horse",
+                "deviceName": "Windows"
+            }),
+            "2026-07-14T00:00:00Z",
+        );
+        assert!(matches!(result, Err(AuthError::Storage)));
+        assert!(
+            auth.inner
+                .lock()
+                .expect("auth state should lock")
+                .devices
+                .is_empty(),
+            "failed persistence must not leave a live in-memory session"
+        );
+
+        let _ = std::fs::remove_file(parent_file);
+    }
+
+    #[test]
+    fn corrupt_auth_state_refuses_store_startup() {
+        let auth_path = unique_test_ledger_path("auth_corrupt_startup");
+        std::fs::create_dir_all(
+            auth_path
+                .parent()
+                .expect("test auth path should have a parent"),
+        )
+        .expect("test directory should be created");
+        std::fs::write(&auth_path, "{not-json").expect("corrupt auth test state should be written");
+
+        let result = std::panic::catch_unwind(|| {
+            AuthStore::configured_with_state_path(
+                "wu",
+                hash_password_for_test("correct horse"),
+                true,
+                Some(auth_path.clone()),
+            )
+        });
+        assert!(result.is_err(), "corrupt auth state must fail closed");
 
         let _ = std::fs::remove_file(auth_path);
     }
@@ -5378,6 +7704,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_push_rejects_invalid_account_create_batches_atomically() {
+        let path = unique_test_ledger_path("sync_invalid_account_create");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let valid_change = sync_account_create_change(
+            DEV_UNAUTHENTICATED_DEVICE_ID,
+            "remote_valid_before_invalid",
+            "acct_valid_before_invalid",
+        );
+        let mut unsupported_change = sync_account_create_change(
+            DEV_UNAUTHENTICATED_DEVICE_ID,
+            "remote_unsupported_update",
+            "acct_unsupported_update",
+        );
+        unsupported_change["operation"] = json!("update");
+        let (batch_status, batch_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/sync/push",
+            json!({
+                "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
+                "changes": [valid_change, unsupported_change]
+            }),
+        )
+        .await;
+        assert_eq!(batch_status, StatusCode::BAD_REQUEST, "{batch_body}");
+        let unchanged = local_ledger::read_document(&path).expect("invalid batch must not mutate");
+        assert_eq!(unchanged["accounts"], json!([]));
+        assert_eq!(unchanged["syncChanges"], json!([]));
+
+        let mut invalid_changes = Vec::new();
+        let mut mismatched_payload = sync_account_create_change(
+            DEV_UNAUTHENTICATED_DEVICE_ID,
+            "remote_payload_mismatch",
+            "acct_payload_mismatch",
+        );
+        mismatched_payload["payload"]["id"] = json!("acct_other");
+        invalid_changes.push(mismatched_payload);
+
+        let mut unsupported_entity = sync_account_create_change(
+            DEV_UNAUTHENTICATED_DEVICE_ID,
+            "remote_unsupported_entity",
+            "acct_unsupported_entity",
+        );
+        unsupported_entity["entityType"] = json!("movement");
+        invalid_changes.push(unsupported_entity);
+
+        let mut invalid_base_version = sync_account_create_change(
+            DEV_UNAUTHENTICATED_DEVICE_ID,
+            "remote_invalid_base_version",
+            "acct_invalid_base_version",
+        );
+        invalid_base_version["baseVersion"] = json!(1);
+        invalid_changes.push(invalid_base_version);
+
+        let mut incomplete_payload = sync_account_create_change(
+            DEV_UNAUTHENTICATED_DEVICE_ID,
+            "remote_incomplete_payload",
+            "acct_incomplete_payload",
+        );
+        incomplete_payload["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("tags");
+        invalid_changes.push(incomplete_payload);
+
+        for invalid_change in invalid_changes {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/sync/push",
+                json!({
+                    "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
+                    "changes": [invalid_change]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["code"], "invalid_sync_push");
+        }
+        let final_document =
+            local_ledger::read_document(&path).expect("invalid pushes must remain atomic");
+        assert_eq!(final_document["accounts"], json!([]));
+        assert_eq!(final_document["syncChanges"], json!([]));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_bootstrap_and_sync_cursor_use_real_local_state() {
         let path = unique_test_ledger_path("bootstrap_sync_cursor");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
@@ -5499,15 +7915,30 @@ mod tests {
         assert_eq!(ack_invalid_body["error"]["code"], "invalid_sync_ack");
 
         let remote_push = json!({
-            "deviceId": "device_remote",
+            "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
             "changes": [
                 {
                     "id": "remote_change_000001",
-                    "deviceId": "device_remote",
+                    "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
                     "entityType": "account",
                     "entityId": "acct_remote",
                     "operation": "create",
-                    "payload": {"displayName": "远端账户"},
+                    "baseVersion": 0,
+                    "payload": {
+                        "id": "acct_remote",
+                        "displayName": "远端账户",
+                        "accountType": "bank",
+                        "defaultCurrency": "CNY",
+                        "supportedCurrencies": ["CNY"],
+                        "includeInNetWorth": true,
+                        "visibility": "normal",
+                        "status": "active",
+                        "balanceMode": "cash_balance",
+                        "cashBalances": [],
+                        "tags": [],
+                        "createdAt": "2026-06-28T00:00:00Z",
+                        "updatedAt": "2026-06-28T00:00:00Z"
+                    },
                     "createdAt": "2026-06-28T00:00:00Z"
                 }
             ]
@@ -5524,6 +7955,10 @@ mod tests {
             remote_push_body["data"]["acceptedChangeIds"],
             json!(["remote_change_000001"])
         );
+        assert_eq!(
+            remote_push_body["data"]["appliedChangeIds"],
+            json!(["remote_change_000001"])
+        );
         assert_eq!(remote_push_body["data"]["skippedChangeIds"], json!([]));
         assert_eq!(remote_push_body["data"]["cursor"], "local_change_000002");
 
@@ -5532,10 +7967,11 @@ mod tests {
         assert_eq!(
             pushed_document["accounts"]
                 .as_array()
-                .expect("remote sync push must not apply account payload")
+                .expect("remote sync push must apply account payload")
                 .len(),
-            1
+            2
         );
+        assert_eq!(pushed_document["accounts"][1]["id"], "acct_remote");
         assert_eq!(pushed_document["syncState"]["pendingChangeIds"], json!([]));
         assert_eq!(
             pushed_document["syncChanges"][1]["sourceChangeId"],
@@ -5543,7 +7979,7 @@ mod tests {
         );
         assert_eq!(
             pushed_document["syncChanges"][1]["deviceId"],
-            "device_remote"
+            DEV_UNAUTHENTICATED_DEVICE_ID
         );
         assert_eq!(
             pushed_document["syncChanges"][1]["payload"]["displayName"],
@@ -5555,6 +7991,7 @@ mod tests {
                 .await;
         assert_eq!(remote_retry_status, StatusCode::OK);
         assert_eq!(remote_retry_body["data"]["acceptedChangeIds"], json!([]));
+        assert_eq!(remote_retry_body["data"]["appliedChangeIds"], json!([]));
         assert_eq!(
             remote_retry_body["data"]["skippedChangeIds"],
             json!(["remote_change_000001"])
@@ -5569,19 +8006,85 @@ mod tests {
             2
         );
         assert_eq!(
+            retried_document["accounts"]
+                .as_array()
+                .expect("duplicate push should not duplicate accounts")
+                .len(),
+            2
+        );
+        assert_eq!(
             retried_document["syncState"]["cursor"],
             "local_change_000002"
         );
 
+        let (conflict_status, conflict_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/sync/push",
+            json!({
+                "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
+                "changes": [{
+                    "id": "remote_change_000002",
+                    "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
+                    "entityType": "account",
+                    "entityId": "acct_remote",
+                    "operation": "create",
+                    "baseVersion": 0,
+                    "payload": {
+                        "id": "acct_remote",
+                        "displayName": "冲突账户",
+                        "accountType": "bank",
+                        "defaultCurrency": "CNY",
+                        "supportedCurrencies": ["CNY"],
+                        "includeInNetWorth": true,
+                        "visibility": "normal",
+                        "status": "active",
+                        "balanceMode": "cash_balance",
+                        "cashBalances": [],
+                        "tags": [],
+                        "createdAt": "2026-06-28T00:00:00Z",
+                        "updatedAt": "2026-06-28T00:00:00Z"
+                    },
+                    "createdAt": "2026-06-28T00:00:00Z"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(conflict_status, StatusCode::OK, "{conflict_body}");
+        assert_eq!(conflict_body["data"]["acceptedChangeIds"], json!([]));
+        assert_eq!(conflict_body["data"]["appliedChangeIds"], json!([]));
+        assert_eq!(
+            conflict_body["data"]["conflicts"][0]["kind"],
+            "entity_already_exists"
+        );
+        assert_eq!(
+            conflict_body["data"]["conflicts"][0]["entityId"],
+            "acct_remote"
+        );
+        let conflicted_document =
+            local_ledger::read_document(&path).expect("conflict must keep ledger valid");
+        assert_eq!(
+            conflicted_document["syncState"]["cursor"],
+            "local_change_000002"
+        );
+        assert_eq!(
+            conflicted_document["syncChanges"]
+                .as_array()
+                .expect("conflict must not append a remote log entry")
+                .len(),
+            2
+        );
+
         for invalid_push in [
             json!({
-                "deviceId": "device_bad_time",
+                "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
                 "changes": [{
                     "id": "remote_bad_time",
-                    "deviceId": "device_bad_time",
+                    "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
                     "entityType": "account",
                     "entityId": "acct_bad_time",
                     "operation": "create",
+                    "baseVersion": 0,
                     "payload": {},
                     "createdAt": "not-a-time"
                 }]
@@ -5611,11 +8114,11 @@ mod tests {
             Method::POST,
             "/v1/sync/push",
             json!({
-                "deviceId": "device_test",
+                "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
                 "changes": [
                     {
                         "id": "change_demo",
-                        "deviceId": "device_test",
+                        "deviceId": DEV_UNAUTHENTICATED_DEVICE_ID,
                         "entityType": "account",
                         "entityId": "acct_demo",
                         "operation": "create",
@@ -5756,6 +8259,7 @@ mod tests {
             (Method::POST, "/v1/dca/reminders/missing/skip"),
             (Method::POST, "/v1/dca/reminders/missing/snooze"),
             (Method::POST, "/v1/subscriptions"),
+            (Method::POST, "/v1/subscriptions/charge-proposals/due-scan"),
             (Method::PATCH, "/v1/subscriptions/missing"),
             (Method::POST, "/v1/subscriptions/missing/cancel"),
             (Method::POST, "/v1/subscriptions/missing/charge-proposal"),
@@ -6190,6 +8694,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ledger_positive_credit_card_balance_is_an_asset_not_debt() {
+        let path = unique_test_ledger_path("positive_credit_card_balance");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let credit_balance_input = json!({
+            "displayName": "信用卡溢缴款",
+            "accountType": "credit_card",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "balanceMode": "liability",
+            "openingBalances": [
+                {"currency": "CNY", "amount": "5.00"}
+            ]
+        });
+        let (account_status, _) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            credit_balance_input,
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+
+        let (overview_status, overview_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_status, StatusCode::OK);
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["grossAssets"]["amount"],
+            "5.00"
+        );
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["totalLiabilities"]["amount"],
+            "0.00"
+        );
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "5.00"
+        );
+        assert_eq!(
+            overview_body["data"]["pendingSummary"]["accountAnomalyCount"],
+            0
+        );
+
+        let (allocation_status, allocation_body) =
+            request_json_from(router, Method::GET, "/v1/portfolio/allocation").await;
+        assert_eq!(allocation_status, StatusCode::OK);
+        assert_eq!(allocation_body["data"]["totalAssets"]["amount"], "5.00");
+        assert_eq!(
+            allocation_body["data"]["totalLiabilities"]["amount"],
+            "0.00"
+        );
+        assert_eq!(allocation_body["data"]["netWorth"]["amount"], "5.00");
+        assert_eq!(allocation_body["data"]["slices"][0]["category"], "其他");
+        assert_eq!(allocation_body["data"]["slices"][0]["percent"], "100.0");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_account_anomalies_use_real_ledger_data() {
         let path = unique_test_ledger_path("account_anomalies");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
@@ -6565,6 +9130,602 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ledger_holding_adjustment_proposal_imports_a_current_position() {
+        let path = unique_test_ledger_path("holding_adjustment_import");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "OKX",
+                "accountType": "exchange",
+                "defaultCurrency": "USDT",
+                "supportedCurrencies": ["USDT"],
+                "includeInNetWorth": true,
+                "balanceMode": "holdings",
+                "openingBalances": []
+            }),
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED, "{account_body}");
+        let account_id = account_body["data"]["id"].as_str().expect("account id");
+
+        let (instrument_status, instrument_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            json!({
+                "id": "inst_btc_usdt",
+                "type": "crypto",
+                "symbol": "BTC-USDT",
+                "displayName": "Bitcoin",
+                "quoteCurrency": "USDT",
+                "market": "CRYPTO"
+            }),
+        )
+        .await;
+        assert_eq!(instrument_status, StatusCode::CREATED, "{instrument_body}");
+
+        let endpoint = format!("/v1/accounts/{account_id}/holding-adjustment-proposals");
+        let (proposal_status, proposal_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt",
+                "targetQuantity": "0.00076078",
+                "asOf": "2026-07-18T03:30:00Z",
+                "note": "Imported from exchange balance"
+            }),
+        )
+        .await;
+        assert_eq!(proposal_status, StatusCode::OK, "{proposal_body}");
+        let atomic_group_id = proposal_body["data"]["id"]
+            .as_str()
+            .expect("atomic group id");
+
+        let (_, holdings_before) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(holdings_before["data"], json!([]));
+
+        let (duplicate_status, duplicate_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt",
+                "targetQuantity": "0.001"
+            }),
+        )
+        .await;
+        assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate_body}");
+
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{atomic_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+        assert_eq!(confirm_body["data"]["ledgerWrite"], true);
+
+        let (_, holdings_after) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(holdings_after["data"][0]["accountId"], account_id);
+        assert_eq!(holdings_after["data"][0]["instrumentId"], "inst_btc_usdt");
+        assert_eq!(holdings_after["data"][0]["quantity"], "0.00076078");
+        assert_eq!(holdings_after["data"][0]["quoteStatus"], "unpriceable");
+        assert_eq!(holdings_after["data"][0]["asOf"], "2026-07-18T03:30:00Z");
+        assert!(holdings_after["data"][0].get("costBasisTotal").is_none());
+
+        let (same_status, same_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt",
+                "targetQuantity": "0.00076078"
+            }),
+        )
+        .await;
+        assert_eq!(same_status, StatusCode::CONFLICT, "{same_body}");
+
+        let reduction_key = "holding-adjustment-reduction-retry";
+        let reduction_input = json!({
+            "instrumentId": "inst_btc_usdt",
+            "targetQuantity": "0.0005"
+        });
+        let (reduction_status, reduction_headers, reduction_body) =
+            request_json_body_with_idempotency_from(
+                router.clone(),
+                Method::POST,
+                &endpoint,
+                reduction_input.clone(),
+                Some(reduction_key),
+            )
+            .await;
+        assert_eq!(reduction_status, StatusCode::OK, "{reduction_body}");
+        assert!(reduction_headers.get("idempotency-replayed").is_none());
+        let reduction_group_id = reduction_body["data"]["id"]
+            .as_str()
+            .expect("reduction group id");
+        let (replay_status, replay_headers, replay_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            reduction_input,
+            Some(reduction_key),
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::OK, "{replay_body}");
+        assert_eq!(replay_body, reduction_body);
+        assert_eq!(
+            replay_headers
+                .get("idempotency-replayed")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        let (confirm_reduction_status, confirm_reduction_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{reduction_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_reduction_status,
+            StatusCode::OK,
+            "{confirm_reduction_body}"
+        );
+        let (_, reduced_holdings) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(reduced_holdings["data"][0]["quantity"], "0.0005");
+
+        let (zero_status, zero_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt",
+                "targetQuantity": "0"
+            }),
+        )
+        .await;
+        assert_eq!(zero_status, StatusCode::OK, "{zero_body}");
+        let zero_group_id = zero_body["data"]["id"].as_str().expect("zero group id");
+        let (confirm_zero_status, confirm_zero_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{zero_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_zero_status, StatusCode::OK, "{confirm_zero_body}");
+        let (_, empty_holdings) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(empty_holdings["data"], json!([]));
+
+        let (unsupported_instrument_status, unsupported_instrument_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            json!({
+                "id": "inst_eth_usd",
+                "type": "crypto",
+                "symbol": "ETH-USD",
+                "displayName": "Ethereum",
+                "quoteCurrency": "USD",
+                "market": "CRYPTO"
+            }),
+        )
+        .await;
+        assert_eq!(
+            unsupported_instrument_status,
+            StatusCode::CREATED,
+            "{unsupported_instrument_body}"
+        );
+        let (unsupported_status, unsupported_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_eth_usd",
+                "targetQuantity": "1"
+            }),
+        )
+        .await;
+        assert_eq!(
+            unsupported_status,
+            StatusCode::BAD_REQUEST,
+            "{unsupported_body}"
+        );
+
+        let (draft_status, draft_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            json!({
+                "type": "adjustment",
+                "occurredAt": "2026-07-18T03:30:00Z",
+                "title": "Direct holding adjustment",
+                "entries": [{
+                    "accountId": account_id,
+                    "instrumentId": "inst_btc_usdt",
+                    "amount": "1",
+                    "currency": "USDT",
+                    "direction": "in",
+                    "role": "adjustment"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(draft_status, StatusCode::BAD_REQUEST, "{draft_body}");
+        assert_eq!(draft_body["error"]["code"], "invalid_movement_draft_input");
+
+        let (restore_status, restore_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt",
+                "targetQuantity": "1"
+            }),
+        )
+        .await;
+        assert_eq!(restore_status, StatusCode::OK, "{restore_body}");
+        let restore_group_id = restore_body["data"]["id"]
+            .as_str()
+            .expect("restore group id");
+        let (confirm_restore_status, confirm_restore_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{restore_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_restore_status,
+            StatusCode::OK,
+            "{confirm_restore_body}"
+        );
+
+        let (conflict_proposal_status, conflict_proposal_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt",
+                "targetQuantity": "2"
+            }),
+        )
+        .await;
+        assert_eq!(
+            conflict_proposal_status,
+            StatusCode::OK,
+            "{conflict_proposal_body}"
+        );
+        let conflict_group_id = conflict_proposal_body["data"]["id"]
+            .as_str()
+            .expect("conflict group id");
+        let mut changed_document =
+            local_ledger::read_document(&path).expect("ledger should remain readable");
+        changed_document["holdings"][0]["quantity"] = json!("1.5");
+        local_ledger::write_document(&path, &changed_document)
+            .expect("concurrent holding change should remain a valid ledger");
+        let (confirm_conflict_status, confirm_conflict_body) = request_json_from(
+            router,
+            Method::POST,
+            &format!("/v1/atomic-groups/{conflict_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_conflict_status,
+            StatusCode::CONFLICT,
+            "{confirm_conflict_body}"
+        );
+        let unchanged_document = local_ledger::read_document(&path)
+            .expect("failed confirmation must not corrupt ledger");
+        assert_eq!(unchanged_document["holdings"][0]["quantity"], "1.5");
+        assert_eq!(
+            unchanged_document["movements"]
+                .as_array()
+                .expect("movements")
+                .iter()
+                .find(|movement| {
+                    movement.get("atomicGroupId").and_then(Value::as_str) == Some(conflict_group_id)
+                })
+                .and_then(|movement| movement.get("status"))
+                .and_then(Value::as_str),
+            Some("pending_review")
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_yield_terms_accrue_and_confirm_interest_without_touching_principal() {
+        let path = unique_test_ledger_path("yield_interest_flow");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let mut account_ids = Vec::new();
+        for (display_name, account_type, balance_mode, opening_balances) in [
+            (
+                "利息收款账户",
+                "bank",
+                "cash_balance",
+                json!([{"currency": "CNY", "amount": "100.00"}]),
+            ),
+            ("定期存款账户", "brokerage", "holdings", json!([])),
+        ] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/accounts",
+                json!({
+                    "displayName": display_name,
+                    "accountType": account_type,
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": balance_mode,
+                    "openingBalances": opening_balances
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            account_ids.push(body["data"]["id"].as_str().expect("account id").to_string());
+        }
+        let payout_account_id = &account_ids[0];
+        let holding_account_id = &account_ids[1];
+
+        let (instrument_status, instrument_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            json!({
+                "id": "inst_fixed_deposit_cny",
+                "type": "fund",
+                "displayName": "一年期定期存款",
+                "quoteCurrency": "CNY"
+            }),
+        )
+        .await;
+        assert_eq!(instrument_status, StatusCode::CREATED, "{instrument_body}");
+
+        let adjustment_endpoint =
+            format!("/v1/accounts/{holding_account_id}/holding-adjustment-proposals");
+        let (proposal_status, proposal_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &adjustment_endpoint,
+            json!({
+                "instrumentId": "inst_fixed_deposit_cny",
+                "targetQuantity": "10000",
+                "asOf": "2026-01-01T00:00:00Z"
+            }),
+        )
+        .await;
+        assert_eq!(proposal_status, StatusCode::OK, "{proposal_body}");
+        let adjustment_group = proposal_body["data"]["id"]
+            .as_str()
+            .expect("adjustment group");
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{adjustment_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+        let (_, holdings_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        let holding_id = holdings_body["data"][0]["id"].as_str().expect("holding id");
+
+        let terms_endpoint = format!("/v1/holdings/{holding_id}/yield-terms");
+        let terms_input = json!({
+            "principal": {"amount": "10000", "currency": "CNY"},
+            "annualRate": "0.0365",
+            "rateType": "fixed",
+            "interestMethod": "simple",
+            "dayCountBasis": 365,
+            "compoundingFrequency": "none",
+            "interestStartDate": "2026-01-01",
+            "maturityDate": "2027-01-01",
+            "payoutAccountId": payout_account_id
+        });
+        let (terms_status, terms_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &terms_endpoint,
+            terms_input.clone(),
+        )
+        .await;
+        assert_eq!(terms_status, StatusCode::OK, "{terms_body}");
+        assert_eq!(terms_body["data"]["yieldTerms"]["annualRate"], "0.0365");
+
+        let (positions_status, positions_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/yield-positions?throughDate=2026-01-31",
+        )
+        .await;
+        assert_eq!(positions_status, StatusCode::OK, "{positions_body}");
+        assert_eq!(positions_body["data"][0]["accrualDays"], 30);
+        assert_eq!(positions_body["data"][0]["accruedInterest"]["amount"], "30");
+        let (matured_status, matured_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/yield-positions?throughDate=2028-01-01",
+        )
+        .await;
+        assert_eq!(matured_status, StatusCode::OK, "{matured_body}");
+        assert_eq!(matured_body["data"][0]["accruedThrough"], "2027-01-01");
+        assert_eq!(matured_body["data"][0]["status"], "matured");
+        assert_eq!(matured_body["data"][0]["accruedInterest"]["amount"], "365");
+
+        let interest_endpoint = format!("/v1/holdings/{holding_id}/interest-proposals");
+        let interest_input = json!({"throughDate": "2026-01-31"});
+        let interest_idempotency = next_local_id("yield_interest_replay");
+        let (interest_status, _, interest_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            interest_input.clone(),
+            Some(&interest_idempotency),
+        )
+        .await;
+        assert_eq!(interest_status, StatusCode::OK, "{interest_body}");
+        assert_eq!(
+            interest_body["data"]["proposedMovements"][0]["entries"][0]["amount"],
+            "30"
+        );
+        let interest_group = interest_body["data"]["id"]
+            .as_str()
+            .expect("interest group");
+        let (replay_status, _, replay_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            interest_input.clone(),
+            Some(&interest_idempotency),
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::OK, "{replay_body}");
+        assert_eq!(replay_body["data"]["id"], interest_body["data"]["id"]);
+        let (pending_patch_status, pending_patch_body) =
+            request_json_body_from(router.clone(), Method::PATCH, &terms_endpoint, terms_input)
+                .await;
+        assert_eq!(
+            pending_patch_status,
+            StatusCode::CONFLICT,
+            "{pending_patch_body}"
+        );
+
+        let mut broken_link =
+            local_ledger::read_document(&path).expect("ledger should remain readable");
+        broken_link["holdings"][0]["yieldTerms"]
+            .as_object_mut()
+            .expect("yield terms")
+            .remove("pendingInterestMovementId");
+        assert!(
+            local_ledger::write_document(&path, &broken_link).is_err(),
+            "a pending interest movement without the holding pointer must be rejected"
+        );
+
+        let (_, payout_before) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{payout_account_id}"),
+        )
+        .await;
+        assert_eq!(payout_before["data"]["cashBalances"][0]["amount"], "100.00");
+        let (duplicate_status, duplicate_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            interest_input,
+        )
+        .await;
+        assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate_body}");
+
+        let (reject_status, reject_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{interest_group}/reject"),
+        )
+        .await;
+        assert_eq!(reject_status, StatusCode::NO_CONTENT, "{reject_body}");
+        let (_, holding_after_reject) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{holding_account_id}/holdings"),
+        )
+        .await;
+        assert!(
+            holding_after_reject["data"][0]["yieldTerms"]
+                .get("pendingInterestMovementId")
+                .is_none(),
+            "reject must release the holding for a later proposal"
+        );
+        let (replacement_status, replacement_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            json!({"throughDate": "2026-01-31"}),
+        )
+        .await;
+        assert_eq!(replacement_status, StatusCode::OK, "{replacement_body}");
+        let replacement_group = replacement_body["data"]["id"]
+            .as_str()
+            .expect("replacement interest group");
+
+        let mut conflicted_document =
+            local_ledger::read_document(&path).expect("ledger should remain readable");
+        conflicted_document["holdings"][0]["yieldTerms"]["lastAccruedThrough"] =
+            json!("2026-01-02");
+        local_ledger::write_document(&path, &conflicted_document)
+            .expect("the independently valid concurrent terms change should persist");
+        let (conflict_status, conflict_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{replacement_group}/confirm"),
+        )
+        .await;
+        assert_eq!(conflict_status, StatusCode::CONFLICT, "{conflict_body}");
+        let (_, payout_after_conflict) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{payout_account_id}"),
+        )
+        .await;
+        assert_eq!(
+            payout_after_conflict["data"]["cashBalances"][0]["amount"], "100.00",
+            "a failed confirmation must not apply the cash entry"
+        );
+        conflicted_document["holdings"][0]["yieldTerms"]["lastAccruedThrough"] =
+            json!("2026-01-01");
+        local_ledger::write_document(&path, &conflicted_document)
+            .expect("restored terms should remain valid");
+
+        let (confirm_interest_status, confirm_interest_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{replacement_group}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_interest_status,
+            StatusCode::OK,
+            "{confirm_interest_body}"
+        );
+        let (_, payout_after) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{payout_account_id}"),
+        )
+        .await;
+        assert_eq!(payout_after["data"]["cashBalances"][0]["amount"], "130.00");
+        let (_, holding_after) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{holding_account_id}/holdings"),
+        )
+        .await;
+        assert_eq!(holding_after["data"][0]["quantity"], "10000");
+        assert_eq!(
+            holding_after["data"][0]["yieldTerms"]["lastAccruedThrough"],
+            "2026-01-31"
+        );
+        assert!(
+            holding_after["data"][0]["yieldTerms"]
+                .get("pendingInterestMovementId")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_movement_draft_rejects_unknown_account() {
         let path = unique_test_ledger_path("movement_invalid_account");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
@@ -6588,6 +9749,1537 @@ mod tests {
             request_json_body_from(router, Method::POST, "/v1/movements/drafts", draft_input).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_movement_draft_input");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_rejects_unbalanced_same_currency_transfer() {
+        let path = unique_test_ledger_path("unbalanced_transfer");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let mut account_ids = Vec::new();
+        for display_name in ["转出账户", "转入账户"] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/accounts",
+                json!({
+                    "displayName": display_name,
+                    "accountType": "bank",
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": "cash_balance",
+                    "openingBalances": [{"currency": "CNY", "amount": "100.00"}]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            account_ids.push(
+                body["data"]["id"]
+                    .as_str()
+                    .expect("account id should be a string")
+                    .to_string(),
+            );
+        }
+
+        let draft_input = json!({
+            "type": "transfer",
+            "occurredAt": "2026-07-15T12:00:00Z",
+            "title": "不守恒转账",
+            "entries": [
+                {
+                    "accountId": account_ids[0],
+                    "amount": "60.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "amount": "50.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ],
+            "transferMeta": {
+                "fromAccountId": account_ids[0],
+                "toAccountId": account_ids[1]
+            }
+        });
+        let (status, body) =
+            request_json_body_from(router, Method::POST, "/v1/movements/drafts", draft_input).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_movement_draft_input");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_rejects_directionally_invalid_or_unsupported_cash_movements() {
+        let path = unique_test_ledger_path("movement_semantics");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "语义校验账户",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "CNY", "amount": "100.00"}]
+            }),
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED);
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id should be a string");
+
+        let invalid_inputs = [
+            json!({
+                "type": "income",
+                "occurredAt": "2026-07-15T12:00:00Z",
+                "title": "反向收入",
+                "entries": [{
+                    "accountId": account_id,
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }]
+            }),
+            json!({
+                "type": "expense",
+                "occurredAt": "2026-07-15T12:00:00Z",
+                "title": "反向支出",
+                "entries": [{
+                    "accountId": account_id,
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "source"
+                }]
+            }),
+            json!({
+                "type": "adjustment",
+                "occurredAt": "2026-07-15T12:00:00Z",
+                "title": "错误校准角色",
+                "entries": [{
+                    "accountId": account_id,
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "source"
+                }]
+            }),
+            json!({
+                "type": "income",
+                "occurredAt": "2026-07-15T12:00:00Z",
+                "title": "账户不支持的币种",
+                "entries": [{
+                    "accountId": account_id,
+                    "amount": "10.00",
+                    "currency": "USD",
+                    "direction": "in",
+                    "role": "source"
+                }]
+            }),
+            json!({
+                "type": "correction",
+                "occurredAt": "2026-07-15T12:00:00Z",
+                "title": "绕过更正入口",
+                "entries": [{
+                    "accountId": account_id,
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "adjustment"
+                }]
+            }),
+        ];
+
+        for input in invalid_inputs {
+            let (status, body) =
+                request_json_body_from(router.clone(), Method::POST, "/v1/movements/drafts", input)
+                    .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["code"], "invalid_movement_draft_input");
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_buy_and_sell_require_conserved_cash_and_holding_legs() {
+        let path = unique_test_ledger_path("buy_sell_semantics");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let mut account_ids = Vec::new();
+        for (display_name, account_type, balance_mode, amount) in [
+            ("买卖资金账户", "bank", "cash_balance", "1000.00"),
+            ("买卖证券账户", "brokerage", "holdings", "0.00"),
+        ] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/accounts",
+                json!({
+                    "displayName": display_name,
+                    "accountType": account_type,
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": balance_mode,
+                    "openingBalances": [{"currency": "CNY", "amount": amount}]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            account_ids.push(
+                body["data"]["id"]
+                    .as_str()
+                    .expect("account id should be a string")
+                    .to_string(),
+            );
+        }
+
+        let invalid_buy = json!({
+            "type": "buy",
+            "occurredAt": "2026-07-15T12:00:00Z",
+            "title": "缺少持仓标识的买入",
+            "entries": [
+                {
+                    "accountId": account_ids[0],
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        let (invalid_status, invalid_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            invalid_buy,
+        )
+        .await;
+        assert_eq!(invalid_status, StatusCode::BAD_REQUEST, "{invalid_body}");
+
+        let invalid_fee = json!({
+            "type": "buy",
+            "occurredAt": "2026-07-15T12:00:00Z",
+            "title": "费用账户错误的买入",
+            "entries": [
+                {
+                    "accountId": account_ids[0],
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "instrumentId": "inst_semantic_fund",
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "amount": "2.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "fee"
+                }
+            ]
+        });
+        let (invalid_fee_status, invalid_fee_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            invalid_fee,
+        )
+        .await;
+        assert_eq!(
+            invalid_fee_status,
+            StatusCode::BAD_REQUEST,
+            "{invalid_fee_body}"
+        );
+
+        let buy = json!({
+            "type": "buy",
+            "occurredAt": "2026-07-15T12:00:00Z",
+            "title": "守恒买入",
+            "entries": [
+                {
+                    "accountId": account_ids[0],
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "instrumentId": "inst_semantic_fund",
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "2.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "fee"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "tax"
+                }
+            ]
+        });
+        let (buy_status, buy_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/movements/drafts", buy).await;
+        assert_eq!(buy_status, StatusCode::CREATED, "{buy_body}");
+        let buy_id = buy_body["data"]["id"].as_str().expect("buy movement id");
+        let buy_group = buy_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("buy atomic group id");
+        let (confirm_buy_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{buy_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_buy_status, StatusCode::OK);
+        let (_, cash_after_buy) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        assert_eq!(
+            cash_after_buy["data"]["cashBalances"][0]["amount"],
+            "897.00"
+        );
+        let (_, holdings_after_buy) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(
+            holdings_after_buy["data"][0]["costBasisTotal"]["amount"],
+            "103.00"
+        );
+
+        let (correction_status, correction_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": buy_id,
+                "reason": "投资成本更正尚未定义",
+                "proposedDiffs": [{
+                    "fieldPath": "entries[0].amount",
+                    "oldValue": "100.00",
+                    "newValue": "90.00",
+                    "severity": "danger"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            correction_status,
+            StatusCode::BAD_REQUEST,
+            "{correction_body}"
+        );
+
+        let excessive_sell_fee = json!({
+            "type": "sell",
+            "occurredAt": "2026-07-15T13:00:00Z",
+            "title": "费用超过回款的卖出",
+            "entries": [
+                {
+                    "accountId": account_ids[1],
+                    "instrumentId": "inst_semantic_fund",
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "2.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "fee"
+                }
+            ]
+        });
+        let (excessive_fee_status, excessive_fee_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            excessive_sell_fee,
+        )
+        .await;
+        assert_eq!(
+            excessive_fee_status,
+            StatusCode::BAD_REQUEST,
+            "{excessive_fee_body}"
+        );
+
+        let sell = json!({
+            "type": "sell",
+            "occurredAt": "2026-07-15T13:00:00Z",
+            "title": "守恒卖出",
+            "entries": [
+                {
+                    "accountId": account_ids[1],
+                    "instrumentId": "inst_semantic_fund",
+                    "amount": "4.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "40.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "fee"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "tax"
+                }
+            ]
+        });
+        let (sell_status, sell_body) =
+            request_json_body_from(router.clone(), Method::POST, "/v1/movements/drafts", sell)
+                .await;
+        assert_eq!(sell_status, StatusCode::CREATED, "{sell_body}");
+        let sell_id = sell_body["data"]["id"].as_str().expect("sell movement id");
+        let sell_group = sell_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("sell atomic group id");
+        let (confirm_sell_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{sell_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_sell_status, StatusCode::OK);
+
+        let (_, overview) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(
+            overview["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "996.80"
+        );
+        let (_, cash_after_sell) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        assert_eq!(
+            cash_after_sell["data"]["cashBalances"][0]["amount"],
+            "935.00"
+        );
+        let (_, holdings) = request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(holdings["data"][0]["quantity"], "6");
+        assert_eq!(holdings["data"][0]["costBasisTotal"]["amount"], "61.80");
+        let (_, confirmed_sell) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/movements/{sell_id}"),
+        )
+        .await;
+        let sale_result = &confirmed_sell["data"]["saleResult"];
+        assert_eq!(sale_result["costBasisMethod"], "average_cost");
+        assert_eq!(sale_result["grossProceeds"]["amount"], "40.00");
+        assert_eq!(sale_result["feeAndTaxTotal"]["amount"], "2.00");
+        assert_eq!(sale_result["netProceeds"]["amount"], "38.00");
+        assert_eq!(sale_result["costBasisReleased"]["amount"], "41.20");
+        assert_eq!(sale_result["realizedPnl"]["amount"], "-3.20");
+        assert_eq!(sale_result["realizedPnlStatus"], "calculated");
+
+        let (refresh_status, refresh_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "quotes": [{
+                    "instrumentId": "inst_semantic_fund",
+                    "price": "12.00",
+                    "currency": "CNY",
+                    "asOf": "2026-07-15T14:00:00Z",
+                    "expiresAt": "2099-01-01T00:00:00Z",
+                    "source": "test"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::OK, "{refresh_body}");
+        let (_, quoted_holdings) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(quoted_holdings["data"][0]["marketValue"]["amount"], "72.00");
+        assert_eq!(
+            quoted_holdings["data"][0]["unrealizedPnl"]["amount"],
+            "10.20"
+        );
+        let (_, quoted_overview) =
+            request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(
+            quoted_overview["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "1007.00"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_investment_replacement_correction_preserves_cost_basis() {
+        let path = unique_test_ledger_path("investment_replacement_correction");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let mut account_ids = Vec::new();
+        for (display_name, account_type, balance_mode, amount) in [
+            ("更正资金账户", "bank", "cash_balance", "1000.00"),
+            ("更正证券账户", "brokerage", "holdings", "0.00"),
+        ] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/accounts",
+                json!({
+                    "displayName": display_name,
+                    "accountType": account_type,
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": balance_mode,
+                    "openingBalances": [{"currency": "CNY", "amount": amount}]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            account_ids.push(body["data"]["id"].as_str().unwrap().to_string());
+        }
+
+        let (buy_status, buy_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            json!({
+                "type": "buy",
+                "occurredAt": "2026-07-16T10:00:00Z",
+                "title": "待更正买入",
+                "entries": [
+                    {"accountId": account_ids[0], "amount": "100.00", "currency": "CNY", "direction": "out", "role": "source"},
+                    {"accountId": account_ids[1], "instrumentId": "inst_correction_fund", "amount": "10", "currency": "CNY", "direction": "in", "role": "destination"},
+                    {"accountId": account_ids[0], "amount": "2.00", "currency": "CNY", "direction": "out", "role": "fee"},
+                    {"accountId": account_ids[0], "amount": "1.00", "currency": "CNY", "direction": "out", "role": "tax"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(buy_status, StatusCode::CREATED, "{buy_body}");
+        let buy_id = buy_body["data"]["id"].as_str().unwrap().to_string();
+        let buy_group = buy_body["data"]["atomicGroupId"].as_str().unwrap();
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{buy_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+
+        let replacement_buy = json!({
+            "targetMovementId": buy_id,
+            "reason": "成交回单显示数量和费用录入错误",
+            "replacementEntries": [
+                {"accountId": account_ids[0], "amount": "120.00", "currency": "CNY", "direction": "out", "role": "source"},
+                {"accountId": account_ids[1], "instrumentId": "inst_correction_fund", "amount": "12", "currency": "CNY", "direction": "in", "role": "destination"},
+                {"accountId": account_ids[0], "amount": "4.00", "currency": "CNY", "direction": "out", "role": "fee"},
+                {"accountId": account_ids[0], "amount": "1.00", "currency": "CNY", "direction": "out", "role": "tax"}
+            ]
+        });
+        let (correction_status, correction_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            replacement_buy.clone(),
+        )
+        .await;
+        assert_eq!(correction_status, StatusCode::OK, "{correction_body}");
+        let buy_correction_id = correction_body["data"]["proposedMovements"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let correction_group = correction_body["data"]["id"].as_str().unwrap();
+
+        let (_, pending_cash) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        let (_, pending_holdings) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(pending_cash["data"]["cashBalances"][0]["amount"], "897.00");
+        assert_eq!(pending_holdings["data"][0]["quantity"], "10");
+        assert_eq!(
+            pending_holdings["data"][0]["costBasisTotal"]["amount"],
+            "103.00"
+        );
+
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{correction_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+        let (_, corrected_cash) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        let (_, corrected_holdings) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(
+            corrected_cash["data"]["cashBalances"][0]["amount"],
+            "875.00"
+        );
+        assert_eq!(corrected_holdings["data"][0]["quantity"], "12");
+        assert_eq!(
+            corrected_holdings["data"][0]["costBasisTotal"]["amount"],
+            "125.00"
+        );
+        let (_, original_buy) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/movements/{buy_id}"),
+        )
+        .await;
+        assert_eq!(original_buy["data"]["entries"][0]["amount"], "100.00");
+        let (_, confirmed_correction) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/movements/{buy_correction_id}"),
+        )
+        .await;
+        assert_eq!(
+            confirmed_correction["data"]["investmentReplacement"]["targetType"],
+            "buy"
+        );
+
+        let (duplicate_status, duplicate_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            replacement_buy,
+        )
+        .await;
+        assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate_body}");
+
+        let (correction_target_status, correction_target_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": buy_correction_id,
+                "reason": "不得把投资 correction 当普通 adjustment 再更正",
+                "replacementEntries": [
+                    {"accountId": account_ids[0], "amount": "125.00", "currency": "CNY", "direction": "out", "role": "source"},
+                    {"accountId": account_ids[1], "instrumentId": "inst_correction_fund", "amount": "12", "currency": "CNY", "direction": "in", "role": "destination"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            correction_target_status,
+            StatusCode::BAD_REQUEST,
+            "{correction_target_body}"
+        );
+
+        let (sell_status, sell_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            json!({
+                "type": "sell",
+                "occurredAt": "2026-07-16T11:00:00Z",
+                "title": "待更正卖出",
+                "entries": [
+                    {"accountId": account_ids[1], "instrumentId": "inst_correction_fund", "amount": "2", "currency": "CNY", "direction": "out", "role": "source"},
+                    {"accountId": account_ids[0], "amount": "30.00", "currency": "CNY", "direction": "in", "role": "destination"},
+                    {"accountId": account_ids[0], "amount": "1.00", "currency": "CNY", "direction": "out", "role": "fee"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(sell_status, StatusCode::CREATED, "{sell_body}");
+        let sell_id = sell_body["data"]["id"].as_str().unwrap().to_string();
+        let sell_group = sell_body["data"]["atomicGroupId"].as_str().unwrap();
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{sell_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+
+        let (stale_status, stale_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": buy_id,
+                "reason": "后续成交后不得回改旧买入",
+                "replacementEntries": [
+                    {"accountId": account_ids[0], "amount": "110.00", "currency": "CNY", "direction": "out", "role": "source"},
+                    {"accountId": account_ids[1], "instrumentId": "inst_correction_fund", "amount": "11", "currency": "CNY", "direction": "in", "role": "destination"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(stale_status, StatusCode::CONFLICT, "{stale_body}");
+
+        let (sell_correction_status, sell_correction_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": sell_id,
+                "reason": "卖出数量和回款更正",
+                "replacementEntries": [
+                    {"accountId": account_ids[1], "instrumentId": "inst_correction_fund", "amount": "3", "currency": "CNY", "direction": "out", "role": "source"},
+                    {"accountId": account_ids[0], "amount": "45.00", "currency": "CNY", "direction": "in", "role": "destination"},
+                    {"accountId": account_ids[0], "amount": "1.00", "currency": "CNY", "direction": "out", "role": "fee"},
+                    {"accountId": account_ids[0], "amount": "1.00", "currency": "CNY", "direction": "out", "role": "tax"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            sell_correction_status,
+            StatusCode::OK,
+            "{sell_correction_body}"
+        );
+        let sell_correction_id = sell_correction_body["data"]["proposedMovements"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sell_correction_group = sell_correction_body["data"]["id"].as_str().unwrap();
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{sell_correction_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+
+        let (_, final_cash) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        let (_, final_holdings) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(final_cash["data"]["cashBalances"][0]["amount"], "918.00");
+        assert_eq!(final_holdings["data"][0]["quantity"], "9");
+        assert_eq!(
+            final_holdings["data"][0]["costBasisTotal"]["amount"],
+            "93.75"
+        );
+        let (_, final_correction) = request_json_from(
+            router,
+            Method::GET,
+            &format!("/v1/movements/{sell_correction_id}"),
+        )
+        .await;
+        let result = &final_correction["data"]["investmentReplacement"]["saleResult"];
+        assert_eq!(result["grossProceeds"]["amount"], "45.00");
+        assert_eq!(result["feeAndTaxTotal"]["amount"], "2.00");
+        assert_eq!(result["netProceeds"]["amount"], "43.00");
+        assert_eq!(result["costBasisReleased"]["amount"], "31.25");
+        assert_eq!(result["realizedPnl"]["amount"], "11.75");
+        assert_eq!(result["realizedPnlStatus"], "calculated");
+
+        local_ledger::validate_supported_ledger(&path)
+            .expect("corrected investment ledger should remain valid");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_loan_disbursement_and_repayment_preserve_accounting_identity() {
+        let path = unique_test_ledger_path("loan_semantics");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let mut account_ids = Vec::new();
+        for (display_name, account_type, balance_mode) in [
+            ("放款银行卡", "bank", "cash_balance"),
+            ("测试贷款", "loan", "liability"),
+        ] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/accounts",
+                json!({
+                    "displayName": display_name,
+                    "accountType": account_type,
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": balance_mode,
+                    "openingBalances": [{"currency": "CNY", "amount": "0.00"}]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            account_ids.push(
+                body["data"]["id"]
+                    .as_str()
+                    .expect("account id should be a string")
+                    .to_string(),
+            );
+        }
+
+        let invalid_disbursement = json!({
+            "type": "loan_disbursement",
+            "occurredAt": "2026-07-15T12:00:00Z",
+            "title": "反向贷款放款",
+            "entries": [
+                {
+                    "accountId": account_ids[0],
+                    "amount": "500.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "amount": "500.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        let (invalid_status, invalid_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            invalid_disbursement,
+        )
+        .await;
+        assert_eq!(invalid_status, StatusCode::BAD_REQUEST, "{invalid_body}");
+
+        let disbursement = json!({
+            "type": "loan_disbursement",
+            "occurredAt": "2026-07-15T12:00:00Z",
+            "title": "贷款放款",
+            "entries": [
+                {
+                    "accountId": account_ids[1],
+                    "amount": "500.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[0],
+                    "amount": "500.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        let (disbursement_status, disbursement_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            disbursement,
+        )
+        .await;
+        assert_eq!(
+            disbursement_status,
+            StatusCode::CREATED,
+            "{disbursement_body}"
+        );
+        let disbursement_group = disbursement_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("disbursement atomic group id");
+        let (confirm_disbursement_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{disbursement_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_disbursement_status, StatusCode::OK);
+
+        let repayment = json!({
+            "type": "loan_repayment",
+            "occurredAt": "2026-07-15T13:00:00Z",
+            "title": "贷款还款",
+            "entries": [
+                {
+                    "accountId": account_ids[0],
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": account_ids[1],
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        let (repayment_status, repayment_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            repayment,
+        )
+        .await;
+        assert_eq!(repayment_status, StatusCode::CREATED, "{repayment_body}");
+        let repayment_group = repayment_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("repayment atomic group id");
+        let (confirm_repayment_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{repayment_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_repayment_status, StatusCode::OK);
+
+        let terms_endpoint = format!("/v1/accounts/{}/liability-terms", account_ids[1]);
+        let terms_input = json!({
+            "liabilityType": "consumer_loan",
+            "annualRate": "0.365",
+            "rateType": "fixed",
+            "dayCountBasis": 365,
+            "interestStartDate": "2026-01-01",
+            "maturityDate": "2027-01-01",
+            "repaymentStartDate": "2026-02-01",
+            "nextDueDate": "2026-02-01",
+            "repaymentFrequency": "monthly",
+            "scheduledPayment": {"amount": "100", "currency": "CNY"},
+            "paymentAccountId": account_ids[0]
+        });
+        let (terms_status, terms_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &terms_endpoint,
+            terms_input.clone(),
+        )
+        .await;
+        assert_eq!(terms_status, StatusCode::OK, "{terms_body}");
+
+        let (positions_status, positions_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/liability-positions?throughDate=2026-01-31",
+        )
+        .await;
+        assert_eq!(positions_status, StatusCode::OK, "{positions_body}");
+        assert_eq!(
+            positions_body["data"][0]["outstandingPrincipal"]["amount"],
+            "400"
+        );
+        assert_eq!(positions_body["data"][0]["accruedInterest"]["amount"], "12");
+        assert_eq!(
+            positions_body["data"][0]["nextPayment"]["projectedInterest"]["amount"],
+            "12.4"
+        );
+        assert_eq!(
+            positions_body["data"][0]["nextPayment"]["projectedPrincipal"]["amount"],
+            "87.6"
+        );
+        let schedule_endpoint =
+            format!("/v1/accounts/{}/repayment-schedule?limit=2", account_ids[1]);
+        let (schedule_status, schedule_body) =
+            request_json_from(router.clone(), Method::GET, &schedule_endpoint).await;
+        assert_eq!(schedule_status, StatusCode::OK, "{schedule_body}");
+        assert_eq!(schedule_body["data"]["items"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            schedule_body["data"]["items"][0]["interest"]["amount"],
+            "12.4"
+        );
+        assert_eq!(
+            schedule_body["data"]["items"][0]["principal"]["amount"],
+            "87.6"
+        );
+        assert_eq!(
+            schedule_body["data"]["items"][1]["interest"]["amount"],
+            "8.7472"
+        );
+        assert_eq!(
+            schedule_body["data"]["remainingBalanceAfterPage"]["amount"],
+            "221.1472"
+        );
+        assert_eq!(schedule_body["data"]["hasMore"], true);
+        let (invalid_schedule_status, _) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}/repayment-schedule?limit=0", account_ids[1]),
+        )
+        .await;
+        assert_eq!(invalid_schedule_status, StatusCode::BAD_REQUEST);
+
+        let interest_endpoint = format!("/v1/accounts/{}/loan-interest-proposals", account_ids[1]);
+        let interest_idempotency = next_local_id("loan_interest_replay");
+        let (interest_status, _, interest_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            json!({"throughDate": "2026-01-31"}),
+            Some(&interest_idempotency),
+        )
+        .await;
+        assert_eq!(interest_status, StatusCode::OK, "{interest_body}");
+        let interest_group = interest_body["data"]["id"]
+            .as_str()
+            .expect("loan interest group");
+        let (replay_status, _, replay_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            json!({"throughDate": "2026-01-31"}),
+            Some(&interest_idempotency),
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::OK, "{replay_body}");
+        assert_eq!(replay_body["data"]["id"], interest_body["data"]["id"]);
+        let mut broken_loan_link =
+            local_ledger::read_document(&path).expect("loan ledger should remain readable");
+        broken_loan_link["accounts"][1]["liabilityTerms"]
+            .as_object_mut()
+            .expect("liability terms")
+            .remove("pendingLoanInterestMovementId");
+        assert!(
+            local_ledger::write_document(&path, &broken_loan_link).is_err(),
+            "a pending loan interest movement without its account pointer must be rejected"
+        );
+        let (pending_terms_status, pending_terms_body) =
+            request_json_body_from(router.clone(), Method::PATCH, &terms_endpoint, terms_input)
+                .await;
+        assert_eq!(
+            pending_terms_status,
+            StatusCode::CONFLICT,
+            "{pending_terms_body}"
+        );
+        let (_, loan_before_interest) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[1]),
+        )
+        .await;
+        assert_eq!(
+            loan_before_interest["data"]["cashBalances"][0]["amount"],
+            "-400.00"
+        );
+        let (reject_interest_status, reject_interest_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{interest_group}/reject"),
+        )
+        .await;
+        assert_eq!(
+            reject_interest_status,
+            StatusCode::NO_CONTENT,
+            "{reject_interest_body}"
+        );
+        let (replacement_interest_status, replacement_interest_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &interest_endpoint,
+            json!({"throughDate": "2026-01-31"}),
+        )
+        .await;
+        assert_eq!(
+            replacement_interest_status,
+            StatusCode::OK,
+            "{replacement_interest_body}"
+        );
+        let replacement_interest_group = replacement_interest_body["data"]["id"]
+            .as_str()
+            .expect("replacement loan interest group");
+        let mut conflicted_loan_document =
+            local_ledger::read_document(&path).expect("loan ledger should remain readable");
+        conflicted_loan_document["accounts"][1]["liabilityTerms"]["lastInterestAccruedThrough"] =
+            json!("2026-01-02");
+        local_ledger::write_document(&path, &conflicted_loan_document)
+            .expect("the independently valid loan terms change should persist");
+        let (conflict_status, conflict_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{replacement_interest_group}/confirm"),
+        )
+        .await;
+        assert_eq!(conflict_status, StatusCode::CONFLICT, "{conflict_body}");
+        let (_, loan_after_conflict) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[1]),
+        )
+        .await;
+        assert_eq!(
+            loan_after_conflict["data"]["cashBalances"][0]["amount"], "-400.00",
+            "a failed loan interest confirmation must not change the debt"
+        );
+        conflicted_loan_document["accounts"][1]["liabilityTerms"]["lastInterestAccruedThrough"] =
+            json!("2026-01-01");
+        local_ledger::write_document(&path, &conflicted_loan_document)
+            .expect("restored loan terms should remain valid");
+        let (confirm_interest_status, confirm_interest_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{replacement_interest_group}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_interest_status,
+            StatusCode::OK,
+            "{confirm_interest_body}"
+        );
+
+        let (_, bank) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        let (_, loan) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[1]),
+        )
+        .await;
+        let (_, overview) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(bank["data"]["cashBalances"][0]["amount"], "400.00");
+        assert_eq!(loan["data"]["cashBalances"][0]["amount"], "-412.00");
+        assert_eq!(
+            loan["data"]["liabilityTerms"]["lastInterestAccruedThrough"],
+            "2026-01-31"
+        );
+        assert_eq!(
+            overview["data"]["latestSnapshot"]["grossAssets"]["amount"],
+            "400.00"
+        );
+        assert_eq!(
+            overview["data"]["latestSnapshot"]["totalLiabilities"]["amount"],
+            "412.00"
+        );
+        assert_eq!(
+            overview["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "-12.00"
+        );
+
+        let payment_endpoint = format!("/v1/accounts/{}/loan-payment-proposals", account_ids[1]);
+        let payment_input = json!({"paymentDate": "2026-02-01"});
+        let payment_idempotency = next_local_id("loan_payment_replay");
+        let (payment_status, _, payment_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &payment_endpoint,
+            payment_input.clone(),
+            Some(&payment_idempotency),
+        )
+        .await;
+        assert_eq!(payment_status, StatusCode::OK, "{payment_body}");
+        assert_eq!(
+            payment_body["data"]["proposedMovements"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            payment_body["data"]["proposedMovements"][1]["loanPayment"]["interestAmount"]["amount"],
+            "0.412"
+        );
+        assert_eq!(
+            payment_body["data"]["proposedMovements"][1]["loanPayment"]["principalAmount"]["amount"],
+            "99.588"
+        );
+        let payment_group = payment_body["data"]["id"]
+            .as_str()
+            .expect("loan payment group");
+        let (payment_replay_status, _, payment_replay_body) =
+            request_json_body_with_idempotency_from(
+                router.clone(),
+                Method::POST,
+                &payment_endpoint,
+                payment_input.clone(),
+                Some(&payment_idempotency),
+            )
+            .await;
+        assert_eq!(payment_replay_status, StatusCode::OK);
+        assert_eq!(
+            payment_replay_body["data"]["id"],
+            payment_body["data"]["id"]
+        );
+        let (reject_payment_status, reject_payment_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{payment_group}/reject"),
+        )
+        .await;
+        assert_eq!(
+            reject_payment_status,
+            StatusCode::NO_CONTENT,
+            "{reject_payment_body}"
+        );
+        let (replacement_payment_status, replacement_payment_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &payment_endpoint,
+            payment_input,
+        )
+        .await;
+        assert_eq!(
+            replacement_payment_status,
+            StatusCode::OK,
+            "{replacement_payment_body}"
+        );
+        let replacement_payment_group = replacement_payment_body["data"]["id"]
+            .as_str()
+            .expect("replacement loan payment group");
+        let mut conflicted_payment_document =
+            local_ledger::read_document(&path).expect("loan payment ledger should remain readable");
+        conflicted_payment_document["accounts"][1]["liabilityTerms"]["nextDueDate"] =
+            json!("2026-02-02");
+        local_ledger::write_document(&path, &conflicted_payment_document)
+            .expect("independently valid next due date change should persist");
+        let (payment_conflict_status, payment_conflict_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{replacement_payment_group}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            payment_conflict_status,
+            StatusCode::CONFLICT,
+            "{payment_conflict_body}"
+        );
+        let (_, bank_after_payment_conflict) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        let (_, loan_after_payment_conflict) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[1]),
+        )
+        .await;
+        assert_eq!(
+            bank_after_payment_conflict["data"]["cashBalances"][0]["amount"],
+            "400.00"
+        );
+        assert_eq!(
+            loan_after_payment_conflict["data"]["cashBalances"][0]["amount"],
+            "-412.00"
+        );
+        assert_eq!(
+            loan_after_payment_conflict["data"]["liabilityTerms"]["lastInterestAccruedThrough"],
+            "2026-01-31"
+        );
+        conflicted_payment_document["accounts"][1]["liabilityTerms"]["nextDueDate"] =
+            json!("2026-02-01");
+        local_ledger::write_document(&path, &conflicted_payment_document)
+            .expect("restored next due date should remain valid");
+        let (confirm_payment_status, confirm_payment_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{replacement_payment_group}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_payment_status,
+            StatusCode::OK,
+            "{confirm_payment_body}"
+        );
+        let (_, bank_after_payment) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[0]),
+        )
+        .await;
+        let (_, loan_after_payment) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{}", account_ids[1]),
+        )
+        .await;
+        assert_eq!(
+            bank_after_payment["data"]["cashBalances"][0]["amount"],
+            "300.00"
+        );
+        assert_eq!(
+            loan_after_payment["data"]["cashBalances"][0]["amount"],
+            "-312.412"
+        );
+        assert_eq!(
+            loan_after_payment["data"]["liabilityTerms"]["lastInterestAccruedThrough"],
+            "2026-02-01"
+        );
+        assert_eq!(
+            loan_after_payment["data"]["liabilityTerms"]["nextDueDate"],
+            "2026-03-01"
+        );
+        assert!(
+            loan_after_payment["data"]["liabilityTerms"]
+                .get("pendingLoanPaymentMovementId")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_credit_card_purchase_and_repayment_preserve_accounting_identity() {
+        let path = unique_test_ledger_path("credit_card_repayment");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (bank_status, bank_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "还款银行卡",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "CNY", "amount": "1000.00"}]
+            }),
+        )
+        .await;
+        assert_eq!(bank_status, StatusCode::CREATED);
+        let bank_id = bank_body["data"]["id"]
+            .as_str()
+            .expect("bank id should be a string")
+            .to_string();
+
+        let (card_status, card_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "测试信用卡",
+                "accountType": "credit_card",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "liability",
+                "openingBalances": [{"currency": "CNY", "amount": "0.00"}]
+            }),
+        )
+        .await;
+        assert_eq!(card_status, StatusCode::CREATED);
+        let card_id = card_body["data"]["id"]
+            .as_str()
+            .expect("credit card id should be a string")
+            .to_string();
+
+        let (purchase_status, purchase_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            json!({
+                "type": "expense",
+                "occurredAt": "2026-07-15T12:00:00Z",
+                "title": "信用卡消费",
+                "entries": [{
+                    "accountId": card_id,
+                    "amount": "100.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(purchase_status, StatusCode::CREATED);
+        let purchase_id = purchase_body["data"]["id"]
+            .as_str()
+            .expect("purchase id should be a string");
+        let purchase_group_id = purchase_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("purchase group id should be a string");
+        let (submit_purchase_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/movements/{purchase_id}/submit-review"),
+        )
+        .await;
+        assert_eq!(submit_purchase_status, StatusCode::OK);
+        let (confirm_purchase_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{purchase_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_purchase_status, StatusCode::OK);
+
+        let (_, after_purchase) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(
+            after_purchase["data"]["latestSnapshot"]["grossAssets"]["amount"],
+            "1000.00"
+        );
+        assert_eq!(
+            after_purchase["data"]["latestSnapshot"]["totalLiabilities"]["amount"],
+            "100.00"
+        );
+        assert_eq!(
+            after_purchase["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "900.00"
+        );
+
+        let (repayment_status, repayment_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            json!({
+                "type": "transfer",
+                "occurredAt": "2026-07-15T13:00:00Z",
+                "title": "信用卡还款",
+                "entries": [
+                    {
+                        "accountId": bank_id,
+                        "amount": "60.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source"
+                    },
+                    {
+                        "accountId": card_id,
+                        "amount": "60.0",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination"
+                    }
+                ],
+                "transferMeta": {
+                    "fromAccountId": bank_id,
+                    "toAccountId": card_id
+                }
+            }),
+        )
+        .await;
+        assert_eq!(repayment_status, StatusCode::CREATED);
+        let repayment_id = repayment_body["data"]["id"]
+            .as_str()
+            .expect("repayment id should be a string");
+        let repayment_group_id = repayment_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("repayment group id should be a string");
+        let (submit_repayment_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/movements/{repayment_id}/submit-review"),
+        )
+        .await;
+        assert_eq!(submit_repayment_status, StatusCode::OK);
+        let (confirm_repayment_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{repayment_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_repayment_status, StatusCode::OK);
+
+        let (_, bank_after) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{bank_id}"),
+        )
+        .await;
+        let (_, card_after) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{card_id}"),
+        )
+        .await;
+        assert_eq!(bank_after["data"]["cashBalances"][0]["amount"], "940.00");
+        assert_eq!(card_after["data"]["cashBalances"][0]["amount"], "-40.00");
+
+        let (_, after_repayment) =
+            request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(
+            after_repayment["data"]["latestSnapshot"]["grossAssets"]["amount"],
+            "940.00"
+        );
+        assert_eq!(
+            after_repayment["data"]["latestSnapshot"]["totalLiabilities"]["amount"],
+            "40.00"
+        );
+        assert_eq!(
+            after_repayment["data"]["latestSnapshot"]["netWorth"]["amount"],
+            "900.00"
+        );
+        assert_eq!(
+            after_repayment["data"]["pendingSummary"]["accountAnomalyCount"],
+            0
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -6824,7 +11516,7 @@ mod tests {
         assert_eq!(refresh_body["data"]["quotes"], json!([]));
         assert_eq!(
             refresh_body["data"]["errors"][0]["message"],
-            "quote provider is disabled; set FINWEALTH_QUOTE_PROVIDER=yahoo to opt in, or pass quotes/fxRates payload"
+            "quote provider is disabled; explicitly configure public or yahoo, or pass quotes/fxRates payload"
         );
 
         let persisted = local_ledger::read_document(&path).expect("ledger should be readable");
@@ -6842,12 +11534,12 @@ mod tests {
         let cash_input = json!({
             "displayName": "现金账户",
             "accountType": "bank",
-            "defaultCurrency": "CNY",
-            "supportedCurrencies": ["CNY"],
+            "defaultCurrency": "USD",
+            "supportedCurrencies": ["USD"],
             "includeInNetWorth": true,
             "balanceMode": "cash_balance",
             "openingBalances": [
-                {"currency": "CNY", "amount": "1000.00"}
+                {"currency": "USD", "amount": "100.00"}
             ]
         });
         let (_, cash_body) =
@@ -6881,8 +11573,8 @@ mod tests {
             "entries": [
                 {
                     "accountId": cash_account_id,
-                    "amount": "100.00",
-                    "currency": "CNY",
+                    "amount": "10.00",
+                    "currency": "USD",
                     "direction": "out",
                     "role": "source"
                 },
@@ -7033,6 +11725,349 @@ mod tests {
         assert!(quote_provider_disabled_value(Some("unknown")));
         assert!(!quote_provider_disabled_value(Some("yahoo")));
         assert!(!quote_provider_disabled_value(Some(" Yahoo ")));
+        assert!(!quote_provider_disabled_value(Some("public")));
+    }
+
+    #[tokio::test]
+    async fn openai_responses_provider_returns_a_valid_review_only_movement() {
+        let captured = Arc::new(Mutex::new(Value::Null));
+        let captured_for_route = captured.clone();
+        let provider = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_for_route.clone();
+                async move {
+                    *captured.lock().expect("capture lock") = body;
+                    Json(json!({
+                        "id": "resp_test_ai_001",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "content": [{
+                                "type": "output_text",
+                                "text": serde_json::to_string(&json!({
+                                    "usable": true,
+                                    "reason": "金额和唯一账户明确",
+                                    "confidence": 0.98,
+                                    "movement": {
+                                        "type": "expense",
+                                        "occurredAt": "2026-07-18T12:00:00+08:00",
+                                        "title": "午餐",
+                                        "accountId": "acct_ai_cash",
+                                        "amount": "18",
+                                        "currency": "CNY"
+                                    }
+                                })).expect("structured output")
+                            }]
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("provider listener");
+        let address = listener.local_addr().expect("provider address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, provider)
+                .await
+                .expect("provider server");
+        });
+        let config = AiProviderConfig {
+            endpoint: format!("http://{address}/v1/responses"),
+            api_key: "test-only-key".to_string(),
+            model: "test-structured-model".to_string(),
+        };
+        let accounts = json!([{
+            "id": "acct_ai_cash",
+            "displayName": "日常账户",
+            "accountType": "bank",
+            "balanceMode": "cash_balance",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "status": "active",
+            "cashBalances": [{"currency": "CNY", "amount": "100"}]
+        }]);
+        let enriched = organize_ai_text_with_provider(
+            &config,
+            json!({"text": "午餐 18 元"}),
+            &accounts,
+            "2026-07-18T12:30:00+08:00",
+        )
+        .await
+        .expect("provider enrichment");
+        assert_eq!(enriched["movement"]["type"], "expense");
+        assert_eq!(enriched["movement"]["entries"][0]["amount"], "18");
+        assert_eq!(enriched["movement"]["entries"][0]["direction"], "out");
+        assert_eq!(enriched["_aiProvider"]["responseId"], "resp_test_ai_001");
+        let request = captured.lock().expect("captured request").clone();
+        assert_eq!(request["store"], false);
+        assert_eq!(request["text"]["format"]["type"], "json_schema");
+        assert_eq!(request["text"]["format"]["strict"], true);
+        assert_eq!(
+            request["text"]["format"]["schema"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            request["text"]["format"]["schema"]["required"],
+            json!(["usable", "reason", "confidence", "movement"])
+        );
+        assert!(
+            !request["input"]
+                .as_str()
+                .expect("provider input")
+                .contains("cashBalances")
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn openai_responses_provider_organizes_validated_image_evidence() {
+        let captured = Arc::new(Mutex::new(Value::Null));
+        let captured_for_route = captured.clone();
+        let provider = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_for_route.clone();
+                async move {
+                    *captured.lock().expect("capture lock") = body;
+                    Json(json!({
+                        "id": "resp_test_image_001",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "content": [{
+                                "type": "output_text",
+                                "text": serde_json::to_string(&json!({
+                                    "usable": true,
+                                    "reason": "票据金额和账户明确",
+                                    "confidence": 0.96,
+                                    "movement": {
+                                        "type": "expense",
+                                        "occurredAt": "2026-07-19T09:15:00+08:00",
+                                        "title": "便利店",
+                                        "accountId": "acct_ai_cash",
+                                        "amount": "26.50",
+                                        "currency": "CNY"
+                                    }
+                                })).expect("structured output")
+                            }]
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("provider listener");
+        let address = listener.local_addr().expect("provider address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, provider)
+                .await
+                .expect("provider server");
+        });
+        let config = AiProviderConfig {
+            endpoint: format!("http://{address}/v1/responses"),
+            api_key: "test-only-key".to_string(),
+            model: "test-vision-model".to_string(),
+        };
+        let accounts = json!([{
+            "id": "acct_ai_cash",
+            "displayName": "日常账户",
+            "accountType": "bank",
+            "balanceMode": "cash_balance",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "status": "active",
+            "cashBalances": [{"currency": "CNY", "amount": "100"}]
+        }]);
+        let png =
+            STANDARD.encode(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01");
+        let image_url = format!("data:image/png;base64,{png}");
+        let enriched = organize_ai_image_with_provider(
+            &config,
+            json!({
+                "fileName": "receipt.png",
+                "mimeType": "image/png",
+                "imageBase64": png
+            }),
+            image_url,
+            &accounts,
+            "2026-07-19T10:00:00+08:00",
+        )
+        .await
+        .expect("image provider enrichment");
+        assert_eq!(enriched["movement"]["type"], "expense");
+        assert_eq!(enriched["movement"]["entries"][0]["amount"], "26.50");
+        assert_eq!(enriched["_aiProvider"]["responseId"], "resp_test_image_001");
+        assert_eq!(
+            enriched["_aiProvider"]["promptVersion"],
+            "finwealth_cash_movement_image_v1"
+        );
+        let request = captured.lock().expect("captured request").clone();
+        assert_eq!(request["store"], false);
+        assert_eq!(request["input"][0]["content"][1]["type"], "input_image");
+        assert!(
+            request["input"][0]["content"][1]["image_url"]
+                .as_str()
+                .expect("image data URL")
+                .starts_with("data:image/png;base64,")
+        );
+        assert!(
+            !request["input"][0]["content"][0]["text"]
+                .as_str()
+                .expect("provider context")
+                .contains("cashBalances")
+        );
+        task.abort();
+    }
+
+    #[test]
+    fn openai_responses_provider_detects_refusal_invalid_decimals_and_images() {
+        let refusal = json!({
+            "status": "completed",
+            "output": [{"content": [{"type": "refusal", "refusal": "no"}]}]
+        });
+        let error = ai_structured_output(&refusal).expect_err("refusal should fail closed");
+        assert_eq!(error.code, "ai_provider_refused");
+        assert!(local_decimal_is_positive("18.25"));
+        assert!(!local_decimal_is_positive("0"));
+        assert!(!local_decimal_is_positive("1e3"));
+        assert!(!local_decimal_is_positive("-1"));
+        assert!(!local_decimal_is_positive("1.123456789"));
+        let png =
+            STANDARD.encode(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01");
+        assert!(
+            validated_ai_image_data_url(&json!({
+                "fileName": "receipt.png",
+                "mimeType": "image/png",
+                "imageBase64": png
+            }))
+            .is_ok()
+        );
+        assert!(
+            validated_ai_image_data_url(&json!({
+                "fileName": "receipt.heic",
+                "mimeType": "image/heic",
+                "imageBase64": "AAAA"
+            }))
+            .is_err()
+        );
+        assert!(
+            validated_ai_image_data_url(&json!({
+                "fileName": "receipt.png",
+                "mimeType": "image/png",
+                "imageBase64": STANDARD.encode(b"not a png")
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn openai_responses_provider_configuration_is_explicit_and_tls_first() {
+        assert!(
+            ai_provider_config_from(None, None, None, None)
+                .expect("private default")
+                .is_none()
+        );
+        let official = ai_provider_config_from(
+            Some("openai_responses"),
+            Some("test-key"),
+            Some("test-model"),
+            None,
+        )
+        .expect("official config")
+        .expect("enabled provider");
+        assert_eq!(official.endpoint, "https://api.openai.com/v1/responses");
+        assert!(
+            ai_provider_config_from(
+                Some("openai_responses"),
+                Some("test-key"),
+                Some("test-model"),
+                Some("http://provider.example/v1"),
+            )
+            .is_err()
+        );
+        assert!(
+            ai_provider_config_from(
+                Some("openai_responses"),
+                Some("test-key"),
+                Some("test-model"),
+                Some("http://127.0.0.1:9000/v1"),
+            )
+            .expect("loopback config")
+            .is_some()
+        );
+        assert!(
+            ai_provider_config_from(Some("openai_responses"), None, Some("test-model"), None,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn public_provider_maps_crypto_quotes_and_fiat_rates_without_fabrication() {
+        let now = "2026-07-18T03:30:00Z";
+        let prices = json!({
+            "bitcoin": {"usd": 64000.0, "cny": 433000.0, "last_updated_at": 1784376947},
+            "ethereum": {"usd": 1800.0, "cny": 12174.0, "last_updated_at": 1784376948},
+            "tether": {"usd": 0.999, "cny": 6.77, "last_updated_at": 1784376935}
+        });
+        let quote = public_latest_quote(
+            &json!({
+                "instrumentId": "inst_btc_usdt",
+                "symbol": "BTC-USDT",
+                "quoteCurrency": "USDT"
+            }),
+            Some(&prices),
+            now,
+        )
+        .expect("BTC/USDT quote should map");
+        assert_eq!(quote["instrumentId"], "inst_btc_usdt");
+        assert_eq!(quote["currency"], "USDT");
+        assert_eq!(quote["source"], "coingecko");
+        assert!(
+            quote["price"]
+                .as_str()
+                .and_then(|value| value.parse::<f64>().ok())
+                .is_some_and(|value| value > 64_000.0)
+        );
+
+        let stablecoin_rate = public_crypto_fx_rate(
+            &json!({"baseCurrency": "USDT", "quoteCurrency": "USD"}),
+            Some(&prices),
+            now,
+        )
+        .expect("USDT/USD should map");
+        assert_eq!(stablecoin_rate["rate"], "0.999");
+
+        let fiat_rate = public_fiat_fx_rate_from_response(
+            "USD",
+            "CNY",
+            &json!({"date": "2026-07-17", "rates": {"CNY": 6.7775}}),
+        )
+        .expect("USD/CNY should map");
+        assert_eq!(fiat_rate["rate"], "6.7775");
+        assert_eq!(fiat_rate["asOf"], "2026-07-17T00:00:00Z");
+        assert_eq!(fiat_rate["source"], "frankfurter_ecb");
+        assert_eq!(
+            provider_decimal_string(1.234567891).expect("provider decimal"),
+            "1.23456789"
+        );
+        assert!(provider_decimal_string(0.000000001).is_err());
+
+        assert!(
+            public_latest_quote(
+                &json!({
+                    "instrumentId": "inst_unknown",
+                    "symbol": "UNKNOWN-USD",
+                    "quoteCurrency": "USD"
+                }),
+                Some(&prices),
+                now,
+            )
+            .is_err(),
+            "unknown symbols must not receive a fabricated price"
+        );
     }
 
     #[tokio::test]
@@ -7156,6 +12191,289 @@ mod tests {
         assert_eq!(rates_status, StatusCode::OK);
         assert_eq!(rates_body["data"][0]["baseCurrency"], "USD");
         assert_eq!(rates_body["data"][0]["quoteCurrency"], "CNY");
+
+        for rate in ["7.10", "7.20"] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/quotes/refresh",
+                json!({
+                    "mode": "manual",
+                    "fxRates": [{
+                        "baseCurrency": "USD",
+                        "quoteCurrency": "CNY",
+                        "rate": rate,
+                        "asOf": "2026-06-29T09:30:00Z",
+                        "source": "history_test"
+                    }]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["data"]["status"], "success");
+        }
+        let (_, historical_rates) =
+            request_json_from(router.clone(), Method::GET, "/v1/fx-rates").await;
+        assert_eq!(historical_rates["data"].as_array().expect("rates").len(), 2);
+        let (_, account_with_latest_rate) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(account_with_latest_rate["data"]["value"]["amount"], "72.00");
+
+        let (invalid_time_status, invalid_time_body) = request_json_body_from(
+            router,
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "fxRates": [{
+                    "baseCurrency": "USD",
+                    "quoteCurrency": "CNY",
+                    "rate": "7.30",
+                    "asOf": "not-a-time",
+                    "source": "invalid_time_test"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(invalid_time_status, StatusCode::OK, "{invalid_time_body}");
+        assert_eq!(invalid_time_body["data"]["status"], "offline");
+        assert!(
+            invalid_time_body["data"]["errors"][0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("RFC3339"))
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_multi_hop_fx_values_a_usdt_quoted_crypto_holding() {
+        let path = unique_test_ledger_path("multi_hop_crypto_valuation");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "OKX",
+                "accountType": "exchange",
+                "defaultCurrency": "USDT",
+                "supportedCurrencies": ["USDT"],
+                "includeInNetWorth": true,
+                "balanceMode": "holdings",
+                "openingBalances": []
+            }),
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED, "{account_body}");
+        let account_id = account_body["data"]["id"].as_str().expect("account id");
+
+        let (instrument_status, instrument_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            json!({
+                "id": "inst_btc_usdt_multihop",
+                "type": "crypto",
+                "symbol": "BTC-USDT",
+                "displayName": "Bitcoin",
+                "quoteCurrency": "USDT",
+                "market": "CRYPTO"
+            }),
+        )
+        .await;
+        assert_eq!(instrument_status, StatusCode::CREATED, "{instrument_body}");
+
+        let endpoint = format!("/v1/accounts/{account_id}/holding-adjustment-proposals");
+        let (proposal_status, proposal_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({
+                "instrumentId": "inst_btc_usdt_multihop",
+                "targetQuantity": "0.05",
+                "asOf": "2026-07-18T03:30:00Z"
+            }),
+        )
+        .await;
+        assert_eq!(proposal_status, StatusCode::OK, "{proposal_body}");
+        let group_id = proposal_body["data"]["id"].as_str().expect("group id");
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+
+        let (missing_quote_status, missing_quote_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/portfolio/valuation-issues",
+        )
+        .await;
+        assert_eq!(missing_quote_status, StatusCode::OK, "{missing_quote_body}");
+        assert_eq!(missing_quote_body["data"][0]["accountName"], "OKX");
+        assert_eq!(missing_quote_body["data"][0]["assetLabel"], "BTC");
+        assert_eq!(missing_quote_body["data"][0]["quantity"], "0.05");
+        assert_eq!(missing_quote_body["data"][0]["reason"], "missing_quote");
+
+        let (refresh_status, refresh_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "quotes": [{
+                    "instrumentId": "inst_btc_usdt_multihop",
+                    "price": "100",
+                    "currency": "USDT",
+                    "asOf": "2026-07-18T03:30:00Z",
+                    "expiresAt": "2099-01-01T00:00:00Z",
+                    "source": "test"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::OK, "{refresh_body}");
+        assert_eq!(refresh_body["data"]["status"], "success");
+
+        let (missing_fx_status, missing_fx_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/portfolio/valuation-issues",
+        )
+        .await;
+        assert_eq!(missing_fx_status, StatusCode::OK, "{missing_fx_body}");
+        assert_eq!(missing_fx_body["data"][0]["reason"], "missing_fx_path");
+        assert_eq!(missing_fx_body["data"][0]["sourceCurrency"], "USDT");
+        assert_eq!(missing_fx_body["data"][0]["targetCurrency"], "CNY");
+
+        let (fx_refresh_status, fx_refresh_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "fxRates": [
+                    {
+                        "baseCurrency": "USDT",
+                        "quoteCurrency": "USD",
+                        "rate": "1",
+                        "asOf": "2026-07-18T03:30:00Z",
+                        "expiresAt": "2099-01-01T00:00:00Z",
+                        "source": "test"
+                    },
+                    {
+                        "baseCurrency": "USD",
+                        "quoteCurrency": "CNY",
+                        "rate": "7.2",
+                        "asOf": "2026-07-18T03:30:00Z",
+                        "expiresAt": "2099-01-01T00:00:00Z",
+                        "source": "test"
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(fx_refresh_status, StatusCode::OK, "{fx_refresh_body}");
+        assert_eq!(fx_refresh_body["data"]["status"], "success");
+
+        let (valued_issues_status, valued_issues_body) = request_json_from(
+            router.clone(),
+            Method::GET,
+            "/v1/portfolio/valuation-issues",
+        )
+        .await;
+        assert_eq!(valued_issues_status, StatusCode::OK, "{valued_issues_body}");
+        assert_eq!(valued_issues_body["data"], json!([]));
+
+        let (holdings_status, holdings_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
+        assert_eq!(holdings_status, StatusCode::OK, "{holdings_body}");
+        assert_eq!(holdings_body["data"][0]["quantity"], "0.05");
+        assert_eq!(holdings_body["data"][0]["marketValue"]["amount"], "36.00");
+        assert_eq!(holdings_body["data"][0]["marketValue"]["currency"], "CNY");
+        assert_eq!(holdings_body["data"][0]["quoteStatus"], "fresh");
+
+        let (account_after_status, account_after_body) =
+            request_json_from(router, Method::GET, &format!("/v1/accounts/{account_id}")).await;
+        assert_eq!(account_after_status, StatusCode::OK, "{account_after_body}");
+        assert_eq!(account_after_body["data"]["value"]["amount"], "36.00");
+        assert_eq!(account_after_body["data"]["value"]["currency"], "CNY");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_quote_problem_count_includes_stale_fx_valuation() {
+        let path = unique_test_ledger_path("stale_fx_problem_count");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "外币账户",
+                "accountType": "wallet",
+                "defaultCurrency": "USD",
+                "supportedCurrencies": ["USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "USD", "amount": "10.00"}]
+            }),
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED, "{account_body}");
+
+        let (refresh_status, refresh_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "fxRates": [{
+                    "baseCurrency": "USD",
+                    "quoteCurrency": "CNY",
+                    "rate": "7.00",
+                    "asOf": "2026-07-01T00:00:00Z",
+                    "expiresAt": "2026-07-02T00:00:00Z",
+                    "source": "stale_test"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(refresh_status, StatusCode::OK, "{refresh_body}");
+
+        let (overview_status, overview_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview_status, StatusCode::OK, "{overview_body}");
+        assert_eq!(
+            overview_body["data"]["latestSnapshot"]["quoteStatusSummary"]["staleCount"],
+            1
+        );
+        assert_eq!(
+            overview_body["data"]["pendingSummary"]["quoteProblemCount"], 1,
+            "a stale valuation still needs the compact quote-status entry"
+        );
+
+        let (issues_status, issues_body) =
+            request_json_from(router, Method::GET, "/v1/portfolio/valuation-issues").await;
+        assert_eq!(issues_status, StatusCode::OK, "{issues_body}");
+        assert_eq!(issues_body["data"].as_array().expect("issues").len(), 1);
+        assert_eq!(issues_body["data"][0]["assetKind"], "cash");
+        assert_eq!(issues_body["data"][0]["assetLabel"], "USD");
+        assert_eq!(issues_body["data"][0]["quantity"], "10.00");
+        assert_eq!(issues_body["data"][0]["status"], "stale");
+        assert_eq!(issues_body["data"][0]["reason"], "stale_fx");
 
         let _ = std::fs::remove_file(path);
     }
@@ -7438,13 +12756,62 @@ mod tests {
             .expect("reminder id should be string")
             .to_string();
 
-        let (mark_status, mark_body) = request_json_from(
+        let execution_input = json!({
+            "holdingAccountId": account_id,
+            "quantity": "10",
+            "totalCost": {"amount": "200.00", "currency": "CNY"},
+            "quoteCurrency": "CNY",
+            "executedAt": "2026-07-15T10:30:00Z"
+        });
+        for invalid_input in [
+            json!({}),
+            json!({
+                "holdingAccountId": account_id,
+                "quantity": "0",
+                "totalCost": {"amount": "200.00", "currency": "CNY"},
+                "quoteCurrency": "CNY"
+            }),
+            json!({
+                "holdingAccountId": account_id,
+                "quantity": "10",
+                "totalCost": {"amount": "200.00", "currency": "USD"},
+                "quoteCurrency": "CNY"
+            }),
+            json!({
+                "holdingAccountId": account_id,
+                "quantity": "10",
+                "totalCost": {"amount": "200.00", "currency": "CNY"},
+                "quoteCurrency": "USD"
+            }),
+            json!({
+                "holdingAccountId": account_id,
+                "quantity": "10",
+                "totalCost": {"amount": "200.00", "currency": "CNY"},
+                "quoteCurrency": "CNY",
+                "unexpected": true
+            }),
+        ] {
+            let (invalid_status, invalid_body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                &format!("/v1/dca/reminders/{reminder_id}/mark-executed-as-proposal"),
+                invalid_input,
+            )
+            .await;
+            assert_eq!(invalid_status, StatusCode::BAD_REQUEST, "{invalid_body}");
+        }
+
+        let idempotency_key = "dca-execution-retry";
+        let (mark_status, mark_headers, mark_body) = request_json_body_with_idempotency_from(
             router.clone(),
             Method::POST,
             &format!("/v1/dca/reminders/{reminder_id}/mark-executed-as-proposal"),
+            execution_input.clone(),
+            Some(idempotency_key),
         )
         .await;
         assert_eq!(mark_status, StatusCode::OK);
+        assert!(mark_headers.get("idempotency-replayed").is_none());
         assert_eq!(mark_body["data"]["status"], "pending");
         assert_eq!(
             mark_body["data"]["proposedMovements"][0]["status"],
@@ -7454,6 +12821,44 @@ mod tests {
             .as_str()
             .expect("atomic group id should be string")
             .to_string();
+        assert_eq!(
+            mark_body["data"]["proposedMovements"][0]["entries"][0]["amount"],
+            "200.00"
+        );
+        assert_eq!(
+            mark_body["data"]["proposedMovements"][0]["entries"][1]["amount"],
+            "10"
+        );
+        assert_eq!(
+            mark_body["data"]["proposedMovements"][0]["occurredAt"],
+            "2026-07-15T10:30:00Z"
+        );
+
+        let (replay_status, replay_headers, replay_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/dca/reminders/{reminder_id}/mark-executed-as-proposal"),
+            execution_input.clone(),
+            Some(idempotency_key),
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::OK, "{replay_body}");
+        assert_eq!(replay_body, mark_body);
+        assert_eq!(
+            replay_headers
+                .get("idempotency-replayed")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+
+        let (duplicate_status, duplicate_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/dca/reminders/{reminder_id}/mark-executed-as-proposal"),
+            execution_input,
+        )
+        .await;
+        assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate_body}");
 
         let (holdings_before_status, holdings_before_body) =
             request_json_from(router.clone(), Method::GET, "/v1/holdings").await;
@@ -7498,7 +12903,11 @@ mod tests {
         let persisted =
             local_ledger::read_document(&path).expect("ledger should persist DCA execution");
         assert_eq!(persisted["dcaReminders"][0]["status"], "recorded");
-        assert_eq!(persisted["holdings"][0]["quantity"], "200");
+        assert_eq!(persisted["holdings"][0]["quantity"], "10");
+        assert_eq!(
+            persisted["holdings"][0]["costBasisTotal"]["amount"],
+            "200.00"
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -7594,6 +13003,124 @@ mod tests {
         let persisted = local_ledger::read_document(&path).expect("ledger should persist taxonomy");
         assert_eq!(persisted["categories"][0]["displayName"], "咖啡饮品");
         assert_eq!(persisted["counterparties"][0]["isUserMerged"], true);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_integrity_failures_return_400_without_changing_the_document() {
+        let path = unique_test_ledger_path("integrity_fail_closed");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let unchanged_empty = std::fs::read(&path).expect("empty ledger should be readable");
+        let (parent_status, parent_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/categories",
+            json!({
+                "displayName": "悬空分类",
+                "kind": "expense",
+                "parentId": "cat_missing"
+            }),
+        )
+        .await;
+        assert_eq!(parent_status, StatusCode::BAD_REQUEST, "{parent_body}");
+        assert_eq!(parent_body["error"]["code"], "invalid_category_input");
+        assert_eq!(
+            std::fs::read(&path).expect("ledger should remain readable"),
+            unchanged_empty
+        );
+
+        let (hint_status, hint_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/counterparties",
+            json!({
+                "displayName": "悬空对手方",
+                "aliases": [],
+                "categoryHintId": "cat_missing"
+            }),
+        )
+        .await;
+        assert_eq!(hint_status, StatusCode::BAD_REQUEST, "{hint_body}");
+        assert_eq!(hint_body["error"]["code"], "invalid_counterparty_input");
+        assert_eq!(
+            std::fs::read(&path).expect("ledger should remain readable"),
+            unchanged_empty
+        );
+
+        let (instrument_status, instrument_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            json!({
+                "id": "inst_integrity",
+                "type": "equity",
+                "symbol": "SAFE",
+                "displayName": "Integrity Equity",
+                "quoteCurrency": "USD",
+                "market": "US"
+            }),
+        )
+        .await;
+        assert_eq!(instrument_status, StatusCode::CREATED, "{instrument_body}");
+
+        let before_invalid_quote = std::fs::read(&path).expect("ledger should be readable");
+        let (quote_status, quote_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "quotes": [{
+                    "instrumentId": "inst_integrity",
+                    "price": "12.34",
+                    "currency": "CNY",
+                    "asOf": "2026-07-17T00:00:00Z",
+                    "source": "integrity_test"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(quote_status, StatusCode::BAD_REQUEST, "{quote_body}");
+        assert_eq!(
+            std::fs::read(&path).expect("ledger should remain readable"),
+            before_invalid_quote
+        );
+
+        let (valid_quote_status, valid_quote_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/quotes/refresh",
+            json!({
+                "mode": "manual",
+                "quotes": [{
+                    "instrumentId": "inst_integrity",
+                    "price": "12.34",
+                    "currency": "USD",
+                    "asOf": "2026-07-17T00:00:00Z",
+                    "source": "integrity_test"
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(valid_quote_status, StatusCode::OK, "{valid_quote_body}");
+
+        let before_invalid_patch = std::fs::read(&path).expect("ledger should be readable");
+        let (patch_status, patch_body) = request_json_body_from(
+            router,
+            Method::PATCH,
+            "/v1/instruments/inst_integrity",
+            json!({"quoteCurrency": "CNY"}),
+        )
+        .await;
+        assert_eq!(patch_status, StatusCode::BAD_REQUEST, "{patch_body}");
+        assert_eq!(patch_body["error"]["code"], "invalid_instrument_patch");
+        assert_eq!(
+            std::fs::read(&path).expect("ledger should remain readable"),
+            before_invalid_patch
+        );
 
         let _ = std::fs::remove_file(path);
     }
@@ -7946,6 +13473,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_ledger_multileg_correction_replaces_transfer_effect_atomically() {
+        let path = unique_test_ledger_path("multileg_correction");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        async fn create_account_with_balance(router: Router, name: &str, amount: &str) -> String {
+            let (status, body) = request_json_body_from(
+                router,
+                Method::POST,
+                "/v1/accounts",
+                json!({
+                    "displayName": name,
+                    "accountType": "bank",
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": "cash_balance",
+                    "openingBalances": [{"currency": "CNY", "amount": amount}]
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            body["data"]["id"].as_str().expect("account id").to_string()
+        }
+
+        let source_id = create_account_with_balance(router.clone(), "转出账户", "100.00").await;
+        let destination_id = create_account_with_balance(router.clone(), "转入账户", "0.00").await;
+        let (draft_status, draft_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            json!({
+                "type": "transfer",
+                "occurredAt": "2026-07-13T12:00:00+08:00",
+                "title": "账户调拨",
+                "entries": [
+                    {
+                        "accountId": source_id,
+                        "amount": "40.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source"
+                    },
+                    {
+                        "accountId": destination_id,
+                        "amount": "40.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination"
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(draft_status, StatusCode::CREATED, "{draft_body}");
+        let original_movement_id = draft_body["data"]["id"]
+            .as_str()
+            .expect("movement id")
+            .to_string();
+        let original_group_id = draft_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("group id")
+            .to_string();
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{original_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+
+        let (noop_status, noop_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": original_movement_id,
+                "reason": "没有实际变化",
+                "replacementEntries": [
+                    {
+                        "accountId": source_id,
+                        "amount": "40.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source"
+                    },
+                    {
+                        "accountId": destination_id,
+                        "amount": "40.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination"
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(noop_status, StatusCode::BAD_REQUEST, "{noop_body}");
+        assert_eq!(noop_body["error"]["code"], "invalid_correction_input");
+
+        let (correction_status, correction_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": original_movement_id,
+                "reason": "实际只转了 25 元",
+                "replacementEntries": [
+                    {
+                        "accountId": source_id,
+                        "amount": "25.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source"
+                    },
+                    {
+                        "accountId": destination_id,
+                        "amount": "25.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination"
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(correction_status, StatusCode::OK, "{correction_body}");
+        assert_eq!(correction_body["data"]["operation"], "correction");
+        assert_eq!(
+            correction_body["data"]["proposedMovements"][0]["entries"]
+                .as_array()
+                .expect("correction entries")
+                .len(),
+            4
+        );
+
+        let (duplicate_status, duplicate_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/corrections",
+            json!({
+                "targetMovementId": original_movement_id,
+                "reason": "重复候选",
+                "replacementEntries": [
+                    {
+                        "accountId": source_id,
+                        "amount": "20.00",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source"
+                    },
+                    {
+                        "accountId": destination_id,
+                        "amount": "20.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination"
+                    }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(duplicate_status, StatusCode::CONFLICT, "{duplicate_body}");
+        assert_eq!(duplicate_body["error"]["code"], "local_ledger_conflict");
+
+        for (account_id, expected) in [(&source_id, "60.00"), (&destination_id, "40.00")] {
+            let (status, body) = request_json_from(
+                router.clone(),
+                Method::GET,
+                &format!("/v1/accounts/{account_id}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["data"]["value"]["amount"], expected);
+        }
+
+        let correction_group_id = correction_body["data"]["id"]
+            .as_str()
+            .expect("correction group id");
+        let (confirm_correction_status, confirm_correction_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{correction_group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(
+            confirm_correction_status,
+            StatusCode::OK,
+            "{confirm_correction_body}"
+        );
+
+        for (account_id, expected) in [(&source_id, "75.00"), (&destination_id, "25.00")] {
+            let (status, body) = request_json_from(
+                router.clone(),
+                Method::GET,
+                &format!("/v1/accounts/{account_id}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["data"]["value"]["amount"], expected);
+        }
+
+        let (original_status, original_body) = request_json_from(
+            router,
+            Method::GET,
+            &format!("/v1/movements/{original_movement_id}"),
+        )
+        .await;
+        assert_eq!(original_status, StatusCode::OK, "{original_body}");
+        assert_eq!(
+            original_body["data"]["entries"]
+                .as_array()
+                .expect("original entries")
+                .len(),
+            2
+        );
+        assert_eq!(original_body["data"]["entries"][0]["amount"], "40.00");
+        assert_eq!(original_body["data"]["entries"][1]["amount"], "40.00");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn local_ledger_manual_snapshot_persists_current_net_worth() {
         let path = unique_test_ledger_path("manual_snapshot");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
@@ -8029,6 +13779,26 @@ mod tests {
     async fn movement_and_snapshot_queries_apply_documented_filters_and_ordering() {
         let path = unique_test_ledger_path("movement_snapshot_queries");
         let mut document = local_ledger::empty_document("CNY");
+        document["accounts"] = json!([{
+            "id": "acct_query",
+            "displayName": "查询测试账户",
+            "accountType": "bank",
+            "defaultCurrency": "CNY",
+            "supportedCurrencies": ["CNY"],
+            "includeInNetWorth": true,
+            "visibility": "normal",
+            "status": "active",
+            "balanceMode": "cash_balance",
+            "cashBalances": [{
+                "currency": "CNY",
+                "amount": "100.00",
+                "asOf": "2026-01-01T00:00:00Z",
+                "quality": "exact"
+            }],
+            "tags": [],
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z"
+        }]);
         document["movements"] = json!([
             {
                 "id": "mov_query_1",
@@ -8038,7 +13808,19 @@ mod tests {
                 "recordedAt": "2026-01-01T09:00:00Z",
                 "status": "confirmed",
                 "title": "old confirmed",
-                "entries": []
+                "entries": [{
+                    "id": "entry_query_1",
+                    "accountId": "acct_query",
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }],
+                "tags": [],
+                "settlement": {"status": "settled"},
+                "source": {"kind": "manual", "createdBy": "user"},
+                "createdAt": "2026-01-01T09:00:00Z",
+                "updatedAt": "2026-01-01T09:00:00Z"
             },
             {
                 "id": "mov_query_2",
@@ -8048,7 +13830,19 @@ mod tests {
                 "recordedAt": "2026-01-03T09:00:00Z",
                 "status": "pending_review",
                 "title": "new pending",
-                "entries": []
+                "entries": [{
+                    "id": "entry_query_2",
+                    "accountId": "acct_query",
+                    "amount": "2.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }],
+                "tags": [],
+                "settlement": {"status": "settled"},
+                "source": {"kind": "manual", "createdBy": "user"},
+                "createdAt": "2026-01-03T09:00:00Z",
+                "updatedAt": "2026-01-03T09:00:00Z"
             },
             {
                 "id": "mov_query_3",
@@ -8058,7 +13852,51 @@ mod tests {
                 "recordedAt": "2026-01-02T09:00:00Z",
                 "status": "confirmed",
                 "title": "middle confirmed",
-                "entries": []
+                "entries": [{
+                    "id": "entry_query_3",
+                    "accountId": "acct_query",
+                    "amount": "3.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "source"
+                }],
+                "tags": [],
+                "settlement": {"status": "settled"},
+                "source": {"kind": "manual", "createdBy": "user"},
+                "createdAt": "2026-01-02T09:00:00Z",
+                "updatedAt": "2026-01-02T09:00:00Z"
+            }
+        ]);
+        document["movementEntries"] = json!([
+            {
+                "id": "entry_query_1",
+                "movementId": "mov_query_1",
+                "atomicGroupId": "ag_query_1",
+                "accountId": "acct_query",
+                "amount": "1.00",
+                "currency": "CNY",
+                "direction": "out",
+                "role": "source"
+            },
+            {
+                "id": "entry_query_2",
+                "movementId": "mov_query_2",
+                "atomicGroupId": "ag_query_2",
+                "accountId": "acct_query",
+                "amount": "2.00",
+                "currency": "CNY",
+                "direction": "out",
+                "role": "source"
+            },
+            {
+                "id": "entry_query_3",
+                "movementId": "mov_query_3",
+                "atomicGroupId": "ag_query_3",
+                "accountId": "acct_query",
+                "amount": "3.00",
+                "currency": "CNY",
+                "direction": "in",
+                "role": "source"
             }
         ]);
         document["snapshots"] = json!([
@@ -8225,12 +14063,55 @@ mod tests {
         assert_eq!(draft_status, StatusCode::BAD_REQUEST);
         assert_eq!(draft_body["error"]["code"], "invalid_movement_draft_input");
 
+        let valid_draft = json!({
+            "type": "expense",
+            "occurredAt": "2026-06-26T10:01:00+08:00",
+            "title": "八位小数支出",
+            "entries": [
+                {
+                    "accountId": account_id,
+                    "amount": "0.00000001",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }
+            ]
+        });
+        let (valid_status, valid_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/movements/drafts",
+            valid_draft,
+        )
+        .await;
+        assert_eq!(valid_status, StatusCode::CREATED, "{valid_body}");
+        let valid_group = valid_body["data"]["atomicGroupId"]
+            .as_str()
+            .expect("valid decimal atomic group");
+        let (confirm_status, confirm_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{valid_group}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+        let (_, account_after) = request_json_from(
+            router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(
+            account_after["data"]["cashBalances"][0]["amount"],
+            "10.12345677"
+        );
+
         let (overview_status, overview_body) =
             request_json_from(router, Method::GET, "/v1/portfolio/overview").await;
         assert_eq!(overview_status, StatusCode::OK);
         assert_eq!(
             overview_body["data"]["latestSnapshot"]["netWorth"]["amount"],
-            "10.12"
+            "10.12345677"
         );
 
         let _ = std::fs::remove_file(path);
@@ -8416,6 +14297,559 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standalone_subscription_charge_is_discoverable_in_ai_review_after_restart() {
+        let path = unique_test_ledger_path("subscription_ai_review_discovery");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+        let (_, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "Review USD card",
+                "accountType": "virtual_card",
+                "defaultCurrency": "USD",
+                "supportedCurrencies": ["USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "USD", "amount": "100.00"}]
+            }),
+        )
+        .await;
+        let account_id = account_body["data"]["id"].as_str().expect("account id");
+        let subscription_id = create_test_subscription(
+            router.clone(),
+            account_id,
+            "Discoverable subscription",
+            "2026-01-31",
+            "active",
+        )
+        .await;
+        let (proposal_status, proposal_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/subscriptions/{subscription_id}/charge-proposal"),
+        )
+        .await;
+        assert_eq!(proposal_status, StatusCode::CREATED, "{proposal_body}");
+        let group_id = proposal_body["data"]["id"]
+            .as_str()
+            .expect("atomic group id")
+            .to_string();
+
+        let restarted_router = app_with_state(AppState::local(path.clone()));
+        let (pending_status, pending_body) = request_json_from(
+            restarted_router.clone(),
+            Method::GET,
+            "/v1/ai/proposals/pending",
+        )
+        .await;
+        assert_eq!(pending_status, StatusCode::OK);
+        let proposals = pending_body["data"].as_array().expect("pending proposals");
+        let proposal = proposals
+            .iter()
+            .find(|proposal| {
+                proposal["atomicGroups"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|group| group["id"] == group_id)
+            })
+            .expect("subscription proposal should remain discoverable after restart");
+        let proposal_id = proposal["id"].as_str().expect("synthetic proposal id");
+
+        let (detail_status, detail_body) = request_json_from(
+            restarted_router.clone(),
+            Method::GET,
+            &format!("/v1/ai/proposals/{proposal_id}"),
+        )
+        .await;
+        assert_eq!(detail_status, StatusCode::OK, "{detail_body}");
+        assert_eq!(detail_body["data"], *proposal);
+
+        let (edit_status, edit_body) = request_json_body_from(
+            restarted_router.clone(),
+            Method::POST,
+            &format!("/v1/ai/atomic-groups/{group_id}/edit"),
+            json!({
+                "type": "expense",
+                "occurredAt": "2026-01-31T00:00:00Z",
+                "title": "Must reject and regenerate",
+                "entries": []
+            }),
+        )
+        .await;
+        assert_eq!(edit_status, StatusCode::CONFLICT, "{edit_body}");
+
+        let (reject_status, _) = request_json_from(
+            restarted_router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{group_id}/reject"),
+        )
+        .await;
+        assert_eq!(reject_status, StatusCode::NO_CONTENT);
+        let (_, after_reject) = request_json_from(
+            restarted_router.clone(),
+            Method::GET,
+            "/v1/ai/proposals/pending",
+        )
+        .await;
+        assert!(
+            after_reject["data"]
+                .as_array()
+                .expect("pending proposals")
+                .iter()
+                .all(|proposal| {
+                    proposal["atomicGroups"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .all(|group| group["id"] != group_id)
+                })
+        );
+        let (_, overview) =
+            request_json_from(restarted_router, Method::GET, "/v1/portfolio/overview").await;
+        assert_eq!(overview["data"]["pendingSummary"]["aiPendingCount"], 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn subscription_due_scan_is_bounded_idempotent_and_never_auto_confirms() {
+        let (unmounted_status, _) = request_json_body_from(
+            app(),
+            Method::POST,
+            "/v1/subscriptions/charge-proposals/due-scan",
+            json!({"throughDate": "2026-07-13"}),
+        )
+        .await;
+        assert_eq!(unmounted_status, StatusCode::NOT_IMPLEMENTED);
+
+        let path = unique_test_ledger_path("subscription_due_scan");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (_, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "Primary USD card",
+                "accountType": "virtual_card",
+                "defaultCurrency": "USD",
+                "supportedCurrencies": ["USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "USD", "amount": "100.00"}]
+            }),
+        )
+        .await;
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("primary account id")
+            .to_string();
+        let (_, blocked_account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "Archived USD card",
+                "accountType": "virtual_card",
+                "defaultCurrency": "USD",
+                "supportedCurrencies": ["USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "USD", "amount": "50.00"}]
+            }),
+        )
+        .await;
+        let blocked_account_id = blocked_account_body["data"]["id"]
+            .as_str()
+            .expect("blocked account id")
+            .to_string();
+        let (_, currency_account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "Multi-currency card",
+                "accountType": "virtual_card",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY", "USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "CNY", "amount": "100.00"}]
+            }),
+        )
+        .await;
+        let currency_account_id = currency_account_body["data"]["id"]
+            .as_str()
+            .expect("currency account id")
+            .to_string();
+
+        let blocked_id = create_test_subscription(
+            router.clone(),
+            &blocked_account_id,
+            "Blocked due",
+            "2026-01-10",
+            "active",
+        )
+        .await;
+        let pending_id = create_test_subscription(
+            router.clone(),
+            &account_id,
+            "Already pending",
+            "2026-01-15",
+            "active",
+        )
+        .await;
+        let currency_blocked_id = create_test_subscription(
+            router.clone(),
+            &currency_account_id,
+            "Unsupported currency",
+            "2026-01-20",
+            "active",
+        )
+        .await;
+        let first_due_id = create_test_subscription(
+            router.clone(),
+            &account_id,
+            "First due",
+            "2026-01-31",
+            "active",
+        )
+        .await;
+        let second_due_id = create_test_subscription(
+            router.clone(),
+            &account_id,
+            "Second due",
+            "2026-01-31",
+            "trial",
+        )
+        .await;
+        let paused_id = create_test_subscription(
+            router.clone(),
+            &account_id,
+            "Paused due",
+            "2026-01-05",
+            "paused",
+        )
+        .await;
+        let future_id = create_test_subscription(
+            router.clone(),
+            &account_id,
+            "Future charge",
+            "2026-08-01",
+            "active",
+        )
+        .await;
+
+        let (archive_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/accounts/{blocked_account_id}/archive"),
+        )
+        .await;
+        assert_eq!(archive_status, StatusCode::OK);
+        let (pending_status, _) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/subscriptions/{pending_id}/charge-proposal"),
+        )
+        .await;
+        assert_eq!(pending_status, StatusCode::CREATED);
+        let (currency_patch_status, currency_patch_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/accounts/{currency_account_id}"),
+            json!({"supportedCurrencies": ["CNY"]}),
+        )
+        .await;
+        assert_eq!(
+            currency_patch_status,
+            StatusCode::OK,
+            "{currency_patch_body}"
+        );
+        let (blocked_single_status, blocked_single_body) = request_json_from(
+            router.clone(),
+            Method::POST,
+            &format!("/v1/subscriptions/{currency_blocked_id}/charge-proposal"),
+        )
+        .await;
+        assert_eq!(
+            blocked_single_status,
+            StatusCode::BAD_REQUEST,
+            "{blocked_single_body}"
+        );
+        let mut reordered = local_ledger::read_document(&path).expect("ledger should be readable");
+        reordered["subscriptions"]
+            .as_array_mut()
+            .expect("subscriptions should be an array")
+            .reverse();
+        local_ledger::write_document(&path, &reordered).expect("reordered ledger should persist");
+
+        for invalid in [
+            json!([]),
+            json!({}),
+            json!({"throughDate": "not-a-date"}),
+            json!({"throughDate": "2026-07-13", "limit": 0}),
+            json!({"throughDate": "2026-07-13", "limit": 201}),
+            json!({"throughDate": "2026-07-13", "limit": 1.5}),
+            json!({"throughDate": "2026-07-13", "unexpected": true}),
+        ] {
+            let (status, body) = request_json_body_from(
+                router.clone(),
+                Method::POST,
+                "/v1/subscriptions/charge-proposals/due-scan",
+                invalid,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["code"], "invalid_subscription_due_scan");
+        }
+
+        let first_key = "subscription-due-scan-replay";
+        let first_input = json!({"throughDate": "2026-07-13", "limit": 1});
+        let (first_status, first_headers, first_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            "/v1/subscriptions/charge-proposals/due-scan",
+            first_input.clone(),
+            Some(first_key),
+        )
+        .await;
+        assert_eq!(first_status, StatusCode::OK, "{first_body}");
+        assert_eq!(first_body["data"]["createdCount"], 1);
+        assert_eq!(first_body["data"]["alreadyPendingCount"], 1);
+        assert_eq!(first_body["data"]["blockedCount"], 2);
+        assert_eq!(first_body["data"]["remainingEligibleCount"], 1);
+        assert_eq!(first_body["data"]["hasMore"], true);
+        assert_eq!(
+            first_body["data"]["created"][0]["subscriptionId"],
+            first_due_id
+        );
+        assert_eq!(
+            first_body["data"]["skipped"],
+            json!([
+                {
+                    "subscriptionId": blocked_id,
+                    "scheduledChargeDate": "2026-01-10",
+                    "reason": "payment_account_unavailable"
+                },
+                {
+                    "subscriptionId": pending_id,
+                    "scheduledChargeDate": "2026-01-15",
+                    "reason": "already_pending"
+                },
+                {
+                    "subscriptionId": currency_blocked_id,
+                    "scheduledChargeDate": "2026-01-20",
+                    "reason": "payment_currency_unsupported"
+                }
+            ])
+        );
+        assert!(first_headers.get("idempotency-replayed").is_none());
+
+        let restarted_router = app_with_state(AppState::local(path.clone()));
+        let (replay_status, replay_headers, replay_body) = request_json_body_with_idempotency_from(
+            restarted_router.clone(),
+            Method::POST,
+            "/v1/subscriptions/charge-proposals/due-scan",
+            first_input,
+            Some(first_key),
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::OK);
+        assert_eq!(replay_body, first_body);
+        assert_eq!(
+            replay_headers
+                .get("idempotency-replayed")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+
+        let (reuse_status, _, reuse_body) = request_json_body_with_idempotency_from(
+            restarted_router.clone(),
+            Method::POST,
+            "/v1/subscriptions/charge-proposals/due-scan",
+            json!({"throughDate": "2026-07-13", "limit": 2}),
+            Some(first_key),
+        )
+        .await;
+        assert_eq!(reuse_status, StatusCode::CONFLICT);
+        assert_eq!(reuse_body["error"]["code"], "idempotency_key_reused");
+
+        let (second_status, second_body) = request_json_body_from(
+            restarted_router.clone(),
+            Method::POST,
+            "/v1/subscriptions/charge-proposals/due-scan",
+            json!({"throughDate": "2026-07-13", "limit": 200}),
+        )
+        .await;
+        assert_eq!(second_status, StatusCode::OK, "{second_body}");
+        assert_eq!(second_body["data"]["createdCount"], 1);
+        assert_eq!(second_body["data"]["alreadyPendingCount"], 2);
+        assert_eq!(second_body["data"]["blockedCount"], 2);
+        assert_eq!(second_body["data"]["remainingEligibleCount"], 0);
+        assert_eq!(second_body["data"]["hasMore"], false);
+        assert_eq!(
+            second_body["data"]["created"][0]["subscriptionId"],
+            second_due_id
+        );
+
+        let (_, account_before_confirm) = request_json_from(
+            restarted_router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(account_before_confirm["data"]["value"]["amount"], "100.00");
+        for subscription_id in [
+            blocked_id.clone(),
+            currency_blocked_id.clone(),
+            paused_id,
+            future_id,
+            first_due_id.clone(),
+            second_due_id.clone(),
+        ] {
+            let (_, detail) = request_json_from(
+                restarted_router.clone(),
+                Method::GET,
+                &format!("/v1/subscriptions/{subscription_id}"),
+            )
+            .await;
+            assert_eq!(detail["data"]["lastChargeDate"], Value::Null);
+        }
+
+        let group_id = second_body["data"]["created"][0]["id"]
+            .as_str()
+            .expect("created group id");
+        let (confirm_status, confirm_body) = request_json_from(
+            restarted_router.clone(),
+            Method::POST,
+            &format!("/v1/atomic-groups/{group_id}/confirm"),
+        )
+        .await;
+        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
+        assert_eq!(confirm_body["data"]["ledgerWrite"], true);
+        let (_, account_after_confirm) = request_json_from(
+            restarted_router.clone(),
+            Method::GET,
+            &format!("/v1/accounts/{account_id}"),
+        )
+        .await;
+        assert_eq!(account_after_confirm["data"]["value"]["amount"], "80.00");
+        let (_, confirmed_subscription) = request_json_from(
+            restarted_router,
+            Method::GET,
+            &format!("/v1/subscriptions/{second_due_id}"),
+        )
+        .await;
+        assert_eq!(
+            confirmed_subscription["data"]["lastChargeDate"],
+            "2026-01-31"
+        );
+        assert_eq!(
+            confirmed_subscription["data"]["nextChargeDate"],
+            "2026-02-28"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn subscriptions_reject_unsupported_payment_currency_on_create_and_patch() {
+        let path = unique_test_ledger_path("subscription_payment_currency_validation");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (_, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "CNY-only card",
+                "accountType": "virtual_card",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "CNY", "amount": "500.00"}]
+            }),
+        )
+        .await;
+        let account_id = account_body["data"]["id"]
+            .as_str()
+            .expect("account id")
+            .to_string();
+
+        let (invalid_create_status, invalid_create_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/subscriptions",
+            json!({
+                "displayName": "GPT Plus",
+                "provider": "OpenAI",
+                "amount": {"amount": "20.00", "currency": "USD"},
+                "paymentAccountId": account_id,
+                "billingCycle": {"unit": "month", "interval": 1},
+                "startDate": "2026-07-13"
+            }),
+        )
+        .await;
+        assert_eq!(
+            invalid_create_status,
+            StatusCode::BAD_REQUEST,
+            "{invalid_create_body}"
+        );
+        assert_eq!(
+            invalid_create_body["error"]["code"],
+            "invalid_subscription_input"
+        );
+
+        let (_, create_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/subscriptions",
+            json!({
+                "displayName": "国内会员",
+                "provider": "Example",
+                "amount": {"amount": "88.00", "currency": "CNY"},
+                "paymentAccountId": account_id,
+                "billingCycle": {"unit": "month", "interval": 1},
+                "startDate": "2026-07-13"
+            }),
+        )
+        .await;
+        let subscription_id = create_body["data"]["id"]
+            .as_str()
+            .expect("subscription id")
+            .to_string();
+
+        let (patch_status, patch_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/subscriptions/{subscription_id}"),
+            json!({"amount": {"amount": "20.00", "currency": "USD"}}),
+        )
+        .await;
+        assert_eq!(patch_status, StatusCode::BAD_REQUEST, "{patch_body}");
+        assert_eq!(patch_body["error"]["code"], "invalid_subscription_patch");
+
+        let (detail_status, detail_body) = request_json_from(
+            router,
+            Method::GET,
+            &format!("/v1/subscriptions/{subscription_id}"),
+        )
+        .await;
+        assert_eq!(detail_status, StatusCode::OK);
+        assert_eq!(detail_body["data"]["amount"]["amount"], "88.00");
+        assert_eq!(detail_body["data"]["amount"]["currency"], "CNY");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn subscription_patch_accepts_nullable_schedule_replacement_fields() {
         let path = unique_test_ledger_path("subscription_patch_nullable_schedule");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
@@ -8529,6 +14963,20 @@ mod tests {
         assert_eq!(clear_status, StatusCode::OK, "{clear_body}");
         assert!(clear_body["data"].get("duration").is_none());
         assert_eq!(clear_body["data"]["endDate"], Value::Null);
+
+        let (start_shift_status, start_shift_body) = request_json_body_from(
+            router.clone(),
+            Method::PATCH,
+            &format!("/v1/subscriptions/{subscription_id}"),
+            json!({"startDate": "2026-08-17"}),
+        )
+        .await;
+        assert_eq!(start_shift_status, StatusCode::OK, "{start_shift_body}");
+        assert_eq!(start_shift_body["data"]["startDate"], "2026-08-17");
+        assert_eq!(
+            start_shift_body["data"]["nextChargeDate"], "2026-08-17",
+            "moving the start beyond an inherited next charge must not create an impossible subscription"
+        );
 
         let (conflict_status, conflict_body) = request_json_body_from(
             router,
@@ -8681,9 +15129,17 @@ mod tests {
 
     #[tokio::test]
     async fn dca_mark_executed_only_returns_pending_proposal() {
-        let (status, body) = request_json(
+        let (status, body) = request_json_body_from(
+            app(),
             Method::POST,
             "/v1/dca/reminders/reminder_001/mark-executed-as-proposal",
+            json!({
+                "holdingAccountId": "acct_fund",
+                "quantity": "10",
+                "totalCost": {"amount": "1000.00", "currency": "CNY"},
+                "quoteCurrency": "CNY",
+                "executedAt": "2026-07-10T09:00:00+08:00"
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -8701,9 +15157,16 @@ mod tests {
 
     #[tokio::test]
     async fn dca_mark_executed_rejects_unknown_reminder() {
-        let (status, body) = request_json(
+        let (status, body) = request_json_body_from(
+            app(),
             Method::POST,
             "/v1/dca/reminders/missing_reminder/mark-executed-as-proposal",
+            json!({
+                "holdingAccountId": "acct_fund",
+                "quantity": "10",
+                "totalCost": {"amount": "1000.00", "currency": "CNY"},
+                "quoteCurrency": "CNY"
+            }),
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -9056,6 +15519,29 @@ mod tests {
                 "{uri}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn local_ledger_image_import_rejects_mismatched_evidence_before_persistence() {
+        let path = unique_test_ledger_path("invalid_image_import");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+        let (status, body) = request_json_body_from(
+            router,
+            Method::POST,
+            "/v1/ai/proposals/from-image",
+            json!({
+                "fileName": "receipt.png",
+                "mimeType": "image/png",
+                "imageBase64": STANDARD.encode(b"not a png")
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "ai_image_input_data_invalid");
+        let persisted = local_ledger::read_document(&path).expect("ledger should remain readable");
+        assert_eq!(persisted["aiProposals"], json!([]));
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

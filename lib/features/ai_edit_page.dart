@@ -8,7 +8,6 @@ import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
-import '../theme/app_typography.dart';
 
 const List<String> _currencies = ['CNY', 'USD', 'HKD', 'USDT', 'BTC', 'ETH'];
 
@@ -66,9 +65,7 @@ class _AiEditPageState extends ConsumerState<AiEditPage> {
             ),
           );
       ref.invalidate(aiPendingProvider);
-      messenger.showSnackBar(
-        const SnackBar(content: Text('已补全候选，请回 AI 复核「接受整组」入账')),
-      );
+      messenger.showSnackBar(const SnackBar(content: Text('已保存，可在「AI 待确认」确认')));
       if (mounted) router.pop();
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
@@ -81,7 +78,7 @@ class _AiEditPageState extends ConsumerState<AiEditPage> {
   Widget build(BuildContext context) {
     final accountsAsync = ref.watch(accountsProvider);
     return Scaffold(
-      appBar: AppBar(title: const Text('编辑 AI 候选')),
+      appBar: AppBar(title: const Text('编辑待确认记录')),
       body: ContentMaxWidth(
         child: accountsAsync.when(
           loading: () => const Center(child: CircularProgressIndicator()),
@@ -94,7 +91,7 @@ class _AiEditPageState extends ConsumerState<AiEditPage> {
               return EmptyState(
                 icon: Icons.account_balance_wallet_outlined,
                 title: '还没有账户',
-                message: '先添加账户，才能把候选补成结构化记录。',
+                message: '先添加账户，才能补全这条记录。',
                 action: WriteGate(
                   enabled: ref.writeCapabilities.canCreateAccount,
                   child: FilledButton(
@@ -112,11 +109,6 @@ class _AiEditPageState extends ConsumerState<AiEditPage> {
             return ListView(
               padding: const EdgeInsets.all(AppSpacing.base),
               children: [
-                Text(
-                  'AI 文本候选不含金额；补全为结构化收支后，回 AI 复核点「接受整组」才写账本。',
-                  style: AppType.caption,
-                ),
-                const SizedBox(height: AppSpacing.base),
                 SegmentedButton<MovementType>(
                   segments: const [
                     ButtonSegment(
@@ -188,7 +180,7 @@ class _AiEditPageState extends ConsumerState<AiEditPage> {
                 const SizedBox(height: AppSpacing.base),
                 FilledButton(
                   onPressed: _canSave ? _save : null,
-                  child: Text(_busy ? '保存中…' : '保存候选'),
+                  child: Text(_busy ? '保存中…' : '保存'),
                 ),
               ],
             );

@@ -1,6 +1,8 @@
 // Wealth Ledger — real_local 仓库：默认空账本。
 // 不加载 fixture、不写真实账本、不报错、不接真实行情/AI/同步。
 // TODO(LOCAL_LEDGER_FORMAT_V1): 接真实本地账本（由后端线 / Rust core 提供）；当前一律返回空。
+import 'dart:typed_data';
+
 import '../core/types.dart';
 import 'repositories.dart';
 import 'view_models.dart';
@@ -90,6 +92,11 @@ class RealLocalPortfolioRepository implements PortfolioRepository {
         totalLiabilities: Money(amount: '0', currency: 'CNY'),
         netWorth: Money(amount: '0', currency: 'CNY'),
       );
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingAdjustment(
+    Id accountId,
+    HoldingAdjustmentInput input,
+  ) async => throw UnsupportedError('real_local 暂不支持持仓校准；请用 local_server');
 }
 
 class RealLocalMovementRepository implements MovementRepository {
@@ -111,6 +118,20 @@ class RealLocalMovementRepository implements MovementRepository {
   @override
   Future<void> createCorrectionProposal(CreateCorrectionInput input) async =>
       throw UnsupportedError('real_local 暂不支持发起更正；请用 local_server');
+
+  @override
+  Future<ConfirmResultVm> createInvestmentTrade(
+    InvestmentTradeInput input,
+  ) async => throw UnsupportedError('real_local 暂不支持记录投资成交；请用 local_server');
+}
+
+class RealLocalInstrumentRepository implements InstrumentRepository {
+  const RealLocalInstrumentRepository();
+  @override
+  Future<List<InstrumentVm>> listInstruments() async => const [];
+  @override
+  Future<InstrumentVm> createInstrument(CreateInstrumentInput input) async =>
+      throw UnsupportedError('real_local 暂不支持创建标的；请用 local_server');
 }
 
 class RealLocalDcaRepository implements DcaRepository {
@@ -126,8 +147,10 @@ class RealLocalDcaRepository implements DcaRepository {
   Future<DcaPlanVm> updatePlan(Id planId, UpdateDcaPlanPatch patch) async =>
       throw UnsupportedError('real_local 暂不支持更新定投计划；请用 local_server');
   @override
-  Future<void> markExecutedAsProposal(Id reminderId) async =>
-      throw UnsupportedError('real_local 暂不支持写入；请用 local_server 联调');
+  Future<void> markExecutedAsProposal(
+    Id reminderId,
+    DcaExecutionInput input,
+  ) async => throw UnsupportedError('real_local 暂不支持写入；请用 local_server 联调');
   @override
   Future<void> skipReminder(Id reminderId) async =>
       throw UnsupportedError('real_local 暂不支持跳过定投提醒；请用 local_server');
@@ -136,11 +159,136 @@ class RealLocalDcaRepository implements DcaRepository {
       throw UnsupportedError('real_local 暂不支持暂缓定投提醒；请用 local_server');
 }
 
+class RealLocalLoanRepository implements LoanRepository {
+  const RealLocalLoanRepository();
+  @override
+  Future<List<LiabilityPositionVm>> listLiabilityPositions({
+    IsoDate? throughDate,
+  }) async => const [];
+  @override
+  Future<LoanRepaymentScheduleVm> getRepaymentSchedule(
+    Id accountId, {
+    int limit = 24,
+  }) async => throw UnsupportedError('real_local 暂不支持还款计划；请用 local_server');
+  @override
+  Future<AccountVm> updateLiabilityTerms(
+    Id accountId,
+    LiabilityTermsInput input,
+  ) async => throw UnsupportedError('real_local 暂不支持贷款条款；请用 local_server');
+  @override
+  Future<AiAtomicGroupVm> proposeLoanInterest(
+    Id accountId, {
+    required IsoDate throughDate,
+    String? note,
+  }) async => throw UnsupportedError('real_local 暂不支持记录利息；请用 local_server');
+}
+
+class RealLocalAgentRepository implements AgentRepository {
+  const RealLocalAgentRepository();
+  Never _unsupported() =>
+      throw UnsupportedError('real_local 暂不支持 Agent；请用 local_server');
+  @override
+  Future<AgentStatusVm> getStatus() async =>
+      const AgentStatusVm(configured: false, modelCount: 0);
+  @override
+  Future<List<AgentModelVm>> listModels() async => const [];
+  @override
+  Future<List<AgentProviderVm>> listProviders() async => const [];
+  @override
+  Future<AgentProviderOAuthAttemptVm> startProviderOAuth(
+    String providerId,
+  ) async => _unsupported();
+  @override
+  Future<AgentProviderOAuthAttemptVm> getProviderOAuthAttempt(
+    Id attemptId,
+  ) async => _unsupported();
+  @override
+  Future<void> disconnectProvider(String providerId) async => _unsupported();
+  @override
+  Future<List<AgentMemoryVm>> listMemories() async => const [];
+  @override
+  Future<List<AgentConversationVm>> listConversations() async => const [];
+  @override
+  Future<AgentAttachmentVm> uploadAttachment({
+    required String fileName,
+    required String mimeType,
+    required Uint8List bytes,
+  }) async => _unsupported();
+  @override
+  Future<AgentAttachmentVm> getAttachment(Id attachmentId) async =>
+      _unsupported();
+  @override
+  Future<Uint8List> getAttachmentContent(Id attachmentId) async =>
+      _unsupported();
+  @override
+  Future<AgentMemoryVm> reviewMemory(
+    Id memoryId, {
+    required AgentMemoryStatus decision,
+  }) async => _unsupported();
+  @override
+  Future<AgentConversationVm> createConversation({String? title}) async =>
+      _unsupported();
+  @override
+  Future<AgentConversationVm> updateConversation(
+    Id conversationId, {
+    String? title,
+    AgentConversationStatus? status,
+    String? modelId,
+  }) async => _unsupported();
+  @override
+  Future<List<AgentMessageVm>> listMessages(Id conversationId) async =>
+      const [];
+  @override
+  Future<AgentRunAcceptedVm> sendMessage(
+    Id conversationId, {
+    required String text,
+    List<Id> attachmentIds = const [],
+  }) async => _unsupported();
+  @override
+  Future<List<AgentAutomationVm>> listAutomations() async => const [];
+  @override
+  Future<List<AgentNotificationVm>> listNotifications() async => const [];
+  @override
+  Future<AgentAutomationVm> createAutomation({
+    required AgentAutomationKind kind,
+    required int intervalHours,
+    bool enabled = true,
+    IsoDateTime? startAt,
+  }) async => _unsupported();
+  @override
+  Future<AgentAutomationVm> updateAutomation(
+    Id automationId, {
+    int? intervalHours,
+    bool? enabled,
+    IsoDateTime? nextRunAt,
+  }) async => _unsupported();
+  @override
+  Future<AgentAutomationVm> runAutomation(Id automationId) async =>
+      _unsupported();
+  @override
+  Future<AgentNotificationVm> markNotificationRead(Id notificationId) async =>
+      _unsupported();
+  @override
+  Future<List<AgentQuoteCandidateVm>> listQuoteCandidates() async => const [];
+  @override
+  Future<AgentQuoteCandidateVm> reviewQuoteCandidate(
+    Id candidateId, {
+    required AgentQuoteCandidateStatus decision,
+  }) async => _unsupported();
+  @override
+  Stream<AgentEventVm> events(Id conversationId, {int? after}) =>
+      const Stream.empty();
+  @override
+  Future<void> cancelRun(Id runId) async => _unsupported();
+}
+
 class RealLocalQuoteRepository implements QuoteRepository {
   const RealLocalQuoteRepository();
   @override
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       const QuoteStatusSummaryVm();
+  @override
+  Future<List<FxRateVm>> listFxRates() async => const [];
   @override
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>
       QuoteRefreshResultVm(
@@ -223,4 +371,9 @@ class RealLocalSubscriptionRepository implements SubscriptionRepository {
   @override
   Future<AiAtomicGroupVm> createChargeProposal(Id id) async =>
       throw UnsupportedError('real_local 暂不支持生成扣费候选；请用 local_server');
+  @override
+  Future<SubscriptionDueScanResultVm> scanDueChargeProposals({
+    required IsoDate throughDate,
+    int limit = 100,
+  }) async => throw UnsupportedError('real_local 暂不支持到期扫描；请用 local_server');
 }

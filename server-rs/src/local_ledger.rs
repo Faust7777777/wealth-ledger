@@ -1,3 +1,7 @@
+use crate::{
+    ledger_lease::normalized_ledger_path,
+    ledger_migrations::{MIGRATION_REGISTRY, plan_migrations, validate_history},
+};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -31,6 +35,12 @@ const INSTRUMENT_TYPES: &[&str] = &[
 
 static LEDGER_WRITE_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 
+#[derive(Clone, Copy)]
+enum LedgerReadPolicy {
+    Current,
+    SupportedForValidation,
+}
+
 macro_rules! with_ledger_write_lock {
     ($path:expr, $body:block) => {{
         let lock = ledger_write_lock($path);
@@ -54,14 +64,15 @@ fn ledger_write_lock(path: &Path) -> Arc<Mutex<()>> {
 }
 
 fn normalized_lock_path(path: &Path) -> PathBuf {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    };
-    absolute.canonicalize().unwrap_or(absolute)
+    normalized_ledger_path(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        }
+    })
 }
 
 pub fn empty_document(base_currency: &str) -> Value {
@@ -117,10 +128,17 @@ pub fn load_or_initialize(path: &Path) -> io::Result<Value> {
 }
 
 pub fn read_document(path: &Path) -> io::Result<Value> {
+    read_document_with_policy(path, LedgerReadPolicy::Current)
+}
+
+pub fn validate_supported_ledger(path: &Path) -> io::Result<Value> {
+    read_document_with_policy(path, LedgerReadPolicy::SupportedForValidation)
+}
+
+fn read_document_with_policy(path: &Path, policy: LedgerReadPolicy) -> io::Result<Value> {
     let raw = fs::read_to_string(path)?;
     let mut document: Value = serde_json::from_str(&raw).map_err(invalid_data)?;
-    normalize_document_for_read(&mut document);
-    validate_document(&document).map_err(validation_error)?;
+    prepare_document_for_read(&mut document, policy).map_err(validation_error)?;
     Ok(document)
 }
 
@@ -184,8 +202,7 @@ fn recover_unpublished_document(path: &Path) -> io::Result<Option<Value>> {
             ),
         )
     })?;
-    normalize_document_for_read(&mut document);
-    validate_document(&document).map_err(|errors| {
+    prepare_document_for_read(&mut document, LedgerReadPolicy::Current).map_err(|errors| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -209,6 +226,47 @@ fn recover_unpublished_document(path: &Path) -> io::Result<Option<Value>> {
     Ok(Some(document))
 }
 
+fn prepare_document_for_read(
+    document: &mut Value,
+    policy: LedgerReadPolicy,
+) -> Result<(), Vec<String>> {
+    let version = document
+        .as_object()
+        .ok_or_else(|| vec!["ledger document must be a JSON object".to_string()])?
+        .get("ledgerVersion")
+        .and_then(Value::as_i64)
+        .filter(|version| *version >= 1)
+        .ok_or_else(|| vec!["ledgerVersion must be a positive integer".to_string()])?;
+
+    match policy {
+        LedgerReadPolicy::Current if version != LEDGER_VERSION => {
+            return Err(vec![format!(
+                "ledgerVersion {version} is not the current supported version {LEDGER_VERSION}"
+            )]);
+        }
+        LedgerReadPolicy::SupportedForValidation => {
+            if version > LEDGER_VERSION {
+                return Err(vec![format!(
+                    "ledgerVersion {version} is newer than supported version {LEDGER_VERSION}"
+                )]);
+            }
+            plan_migrations(MIGRATION_REGISTRY, version, LEDGER_VERSION)
+                .map_err(|error| vec![error])?;
+        }
+        LedgerReadPolicy::Current => {}
+    }
+
+    match version {
+        1 => apply_v1_read_compatibility(document),
+        _ => {
+            return Err(vec![format!(
+                "ledgerVersion {version} has no registered validation implementation"
+            )]);
+        }
+    }
+    validate_document_for_version(document, version)
+}
+
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -222,7 +280,7 @@ fn sync_parent_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn normalize_document_for_read(document: &mut Value) {
+fn apply_v1_read_compatibility(document: &mut Value) {
     let Some(object) = document.as_object_mut() else {
         return;
     };
@@ -240,19 +298,10 @@ fn normalize_document_for_read(document: &mut Value) {
                 "records": {}
             })
         });
-    let sync_state = object
-        .entry("syncState".to_string())
-        .or_insert_with(|| json!({}));
-    if let Some(sync_state) = sync_state.as_object_mut() {
-        sync_state
-            .entry("cursor".to_string())
-            .or_insert(Value::Null);
+    if let Some(sync_state) = object.get_mut("syncState").and_then(Value::as_object_mut) {
         sync_state
             .entry("nextChangeSequence".to_string())
             .or_insert_with(|| json!(1));
-        sync_state
-            .entry("pendingChangeIds".to_string())
-            .or_insert_with(|| json!([]));
     }
 }
 
@@ -448,7 +497,7 @@ where
     F: FnOnce(&mut Value) -> Result<Value, LedgerError>,
 {
     with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+        let mut document = read_document(path)?;
         if let Some(response) = idempotency_replay(&mut document, request, &request.created_at)? {
             return Ok(response);
         }
@@ -456,6 +505,9 @@ where
         let data = mutation(&mut document)?;
         let response = successful_idempotent_response(status_code, data);
         store_idempotency_response(&mut document, request, &response);
+        if let Err(errors) = validate_document(&document) {
+            return Err(LedgerError::InvalidInput(errors));
+        }
         write_document(path, &document)?;
         Ok(response)
     })
@@ -466,7 +518,7 @@ pub fn replay_idempotency(
     request: &IdempotencyRequest,
 ) -> Result<Option<IdempotentResponse>, LedgerError> {
     with_ledger_write_lock!(path, {
-        let mut document = load_or_initialize(path)?;
+        let mut document = read_document(path)?;
         idempotency_replay(&mut document, request, &request.created_at)
     })
 }
@@ -487,7 +539,7 @@ impl From<io::Error> for LedgerError {
 }
 
 pub fn list_accounts(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let accounts = document["accounts"]
         .as_array()
         .expect("validated local ledger accounts should be an array")
@@ -508,7 +560,7 @@ pub fn get_account(path: &Path, account_id: &str) -> io::Result<Option<Value>> {
 }
 
 pub fn list_sync_changes(path: &Path, since: Option<&str>) -> Result<(String, Value), LedgerError> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let cursor = sync_cursor_from_document(&document);
     let changes = sync_changes_for_document(&document, since)?;
     Ok((cursor, changes))
@@ -546,13 +598,17 @@ pub fn ack_sync_changes(
 pub fn ingest_sync_push(
     path: &Path,
     input: Value,
+    authenticated_device_id: &str,
     now: &str,
     idempotency: &IdempotencyRequest,
 ) -> Result<IdempotentResponse, LedgerError> {
     idempotent_ledger_write(path, idempotency, 200, |document| {
-        let (device_id, incoming_changes) = sync_push_changes_for_input(&input, now)?;
+        let (device_id, incoming_changes) =
+            sync_push_changes_for_input(&input, authenticated_device_id, now)?;
         let mut accepted_change_ids = Vec::new();
+        let mut applied_change_ids = Vec::new();
         let mut skipped_change_ids = Vec::new();
+        let mut conflicts = Vec::new();
 
         for mut incoming_change in incoming_changes {
             let source_change_id = incoming_change
@@ -565,27 +621,73 @@ pub fn ingest_sync_push(
                 continue;
             }
 
+            let entity_id = incoming_change
+                .get("entityId")
+                .and_then(Value::as_str)
+                .expect("validated entityId should be a string")
+                .to_string();
+            let payload = incoming_change
+                .get("payload")
+                .expect("validated account create payload should exist")
+                .clone();
+            let existing_account = document["accounts"]
+                .as_array()
+                .expect("validated local ledger accounts should be an array")
+                .iter()
+                .find(|account| account.get("id").and_then(Value::as_str) == Some(&entity_id))
+                .cloned();
+            if let Some(existing_account) = existing_account {
+                conflicts.push(account_create_sync_conflict(
+                    &device_id,
+                    &source_change_id,
+                    &entity_id,
+                    &existing_account,
+                    &incoming_change,
+                    now,
+                ));
+                continue;
+            }
+
+            document["accounts"]
+                .as_array_mut()
+                .expect("validated local ledger accounts should be an array")
+                .push(payload);
             incoming_change["id"] = json!(next_sync_change_id(document));
             append_sync_log_change(document, incoming_change);
-            accepted_change_ids.push(source_change_id);
+            accepted_change_ids.push(source_change_id.clone());
+            applied_change_ids.push(source_change_id);
         }
 
         Ok(json!({
             "cursor": document["syncState"]["cursor"],
             "acceptedChangeIds": accepted_change_ids,
+            "appliedChangeIds": applied_change_ids,
             "skippedChangeIds": skipped_change_ids,
-            "conflicts": []
+            "conflicts": conflicts
         }))
     })
 }
 
+pub fn validate_sync_push_input(
+    input: &Value,
+    authenticated_device_id: &str,
+    now: &str,
+) -> Result<(), LedgerError> {
+    sync_push_changes_for_input(input, authenticated_device_id, now).map(|_| ())
+}
+
 pub fn list_account_anomalies(path: &Path, now: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(account_anomalies_for_document(&document, now)?))
 }
 
+pub fn list_valuation_issues(path: &Path, now: &str) -> io::Result<Value> {
+    let document = read_document(path)?;
+    Ok(json!(valuation_issues_for_document(&document, now)?))
+}
+
 pub fn list_quotes(path: &Path, now: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(project_quote_items(
         document["quotes"]
             .as_array()
@@ -595,7 +697,7 @@ pub fn list_quotes(path: &Path, now: &str) -> io::Result<Value> {
 }
 
 pub fn list_fx_rates(path: &Path, now: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(project_quote_items(
         document["fxRates"]
             .as_array()
@@ -668,8 +770,16 @@ pub fn refresh_quotes(
                 for item in items {
                     match fx_rate_from_refresh_input(item, now) {
                         Ok(rate) => {
-                            upsert_fx_rate(document, rate.clone());
-                            refreshed_fx_rates.push(project_quote_item(&rate, now));
+                            if let Err(error) = upsert_fx_rate(document, rate.clone()) {
+                                errors.push(quote_refresh_error(
+                                    "fx_pair",
+                                    fx_pair_target_id(item).as_deref(),
+                                    &error,
+                                    false,
+                                ));
+                            } else {
+                                refreshed_fx_rates.push(project_quote_item(&rate, now));
+                            }
                         }
                         Err(error) => errors.push(quote_refresh_error(
                             "fx_pair",
@@ -718,7 +828,7 @@ pub fn refresh_quotes(
 }
 
 pub fn quote_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value>> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let requested_ids = input
         .get("instruments")
         .and_then(Value::as_array)
@@ -787,7 +897,7 @@ pub fn quote_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value
 }
 
 pub fn fx_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value>> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let base_currency = document
         .get("baseCurrency")
         .and_then(Value::as_str)
@@ -807,7 +917,7 @@ pub fn fx_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value>> 
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| {
-            document["accounts"]
+            let mut pairs = document["accounts"]
                 .as_array()
                 .expect("validated local ledger accounts should be an array")
                 .iter()
@@ -823,27 +933,86 @@ pub fn fx_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value>> 
                         .map(|currency| (currency.to_string(), base_currency.clone()))
                         .collect::<Vec<_>>()
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            for holding in document["holdings"]
+                .as_array()
+                .expect("validated local ledger holdings should be an array")
+                .iter()
+                .filter(|holding| {
+                    holding
+                        .get("quantity")
+                        .and_then(Value::as_str)
+                        .and_then(|value| parse_decimal(value).ok())
+                        .is_some_and(|quantity| quantity > DecimalAmount::ZERO)
+                })
+            {
+                let Some(instrument_id) = holding.get("instrumentId").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(quote_currency) = document["instruments"]
+                    .as_array()
+                    .expect("validated local ledger instruments should be an array")
+                    .iter()
+                    .find(|instrument| {
+                        instrument.get("id").and_then(Value::as_str) == Some(instrument_id)
+                    })
+                    .and_then(|instrument| instrument.get("quoteCurrency"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                if quote_currency != base_currency {
+                    pairs.push((quote_currency.to_string(), base_currency.clone()));
+                }
+            }
+            pairs
         });
 
     let mut targets = Vec::new();
     for (base, quote) in requested_pairs {
-        if base == quote
-            || targets.iter().any(|target: &Value| {
-                target.get("baseCurrency").and_then(Value::as_str) == Some(base.as_str())
-                    && target.get("quoteCurrency").and_then(Value::as_str) == Some(quote.as_str())
-            })
-        {
-            continue;
+        for (base, quote) in yahoo_fx_path(&base, &quote) {
+            if base == quote
+                || targets.iter().any(|target: &Value| {
+                    target.get("baseCurrency").and_then(Value::as_str) == Some(base.as_str())
+                        && target.get("quoteCurrency").and_then(Value::as_str)
+                            == Some(quote.as_str())
+                })
+            {
+                continue;
+            }
+            targets.push(json!({
+                "baseCurrency": base,
+                "quoteCurrency": quote,
+                "symbol": yahoo_fx_symbol(&base, &quote)
+            }));
         }
-        targets.push(json!({
-            "baseCurrency": base,
-            "quoteCurrency": quote,
-            "symbol": format!("{}{}=X", base, quote)
-        }));
     }
 
     Ok(targets)
+}
+
+fn yahoo_fx_path(from_currency: &str, to_currency: &str) -> Vec<(String, String)> {
+    if is_yahoo_crypto_currency(from_currency) && from_currency != "USD" && to_currency != "USD" {
+        vec![
+            (from_currency.to_string(), "USD".to_string()),
+            ("USD".to_string(), to_currency.to_string()),
+        ]
+    } else {
+        vec![(from_currency.to_string(), to_currency.to_string())]
+    }
+}
+
+fn yahoo_fx_symbol(base_currency: &str, quote_currency: &str) -> String {
+    if is_yahoo_crypto_currency(base_currency) || is_yahoo_crypto_currency(quote_currency) {
+        format!("{base_currency}-{quote_currency}")
+    } else {
+        format!("{base_currency}{quote_currency}=X")
+    }
+}
+
+fn is_yahoo_crypto_currency(currency: &str) -> bool {
+    matches!(currency, "BTC" | "ETH" | "USDT" | "USDC")
 }
 
 pub fn create_account(
@@ -916,12 +1085,12 @@ pub fn archive_account(
 }
 
 pub fn list_holdings(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(project_holdings_for_api(&document)))
 }
 
 pub fn list_holdings_by_account(path: &Path, account_id: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(
         project_holdings_for_api(&document)
             .into_iter()
@@ -930,8 +1099,967 @@ pub fn list_holdings_by_account(path: &Path, account_id: &str) -> io::Result<Val
     ))
 }
 
+pub fn list_yield_positions(path: &Path, through_date: Option<&str>) -> Result<Value, LedgerError> {
+    let document = read_document(path)?;
+    let through_date = match through_date {
+        Some(value) => Date::parse(value, &Iso8601::DATE).map_err(|_| {
+            LedgerError::InvalidInput(vec!["throughDate must be an ISO date".to_string()])
+        })?,
+        None => OffsetDateTime::now_utc().date(),
+    };
+    Ok(json!(yield_positions_for_document(
+        &document,
+        through_date
+    )?))
+}
+
+pub fn update_holding_yield_terms(
+    path: &Path,
+    holding_id: &str,
+    input: &Value,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let holding = document["holdings"]
+            .as_array()
+            .expect("validated local ledger holdings should be an array")
+            .iter()
+            .find(|holding| holding.get("id").and_then(Value::as_str) == Some(holding_id))
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("holding does not exist: {holding_id}"))
+            })?;
+        if holding
+            .get("yieldTerms")
+            .and_then(|terms| terms.get("pendingInterestMovementId"))
+            .is_some()
+        {
+            return Err(LedgerError::Conflict(
+                "holding has a pending interest proposal".to_string(),
+            ));
+        }
+        if holding_has_pending_adjustment(document, &holding) {
+            return Err(LedgerError::Conflict(
+                "holding has a pending quantity adjustment".to_string(),
+            ));
+        }
+        let terms = yield_terms_from_input(document, &holding, input, now)?;
+        let updated = document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .iter_mut()
+            .find(|holding| holding.get("id").and_then(Value::as_str) == Some(holding_id))
+            .expect("holding should still exist");
+        updated["yieldTerms"] = terms;
+        let payload = updated.clone();
+        append_sync_change(document, "holding", holding_id, "update", &payload, now);
+        Ok(payload)
+    })
+}
+
+pub fn create_holding_interest_proposal(
+    path: &Path,
+    holding_id: &str,
+    input: &Value,
+    movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let Some(object) = input.as_object() else {
+            return Err(LedgerError::InvalidInput(vec![
+                "interest proposal input must be a JSON object".to_string(),
+            ]));
+        };
+        let mut errors = Vec::new();
+        for key in object.keys() {
+            if !matches!(key.as_str(), "throughDate" | "note") {
+                errors.push(format!("unsupported interest proposal field: {key}"));
+            }
+        }
+        let through_date = required_string(object, "throughDate", &mut errors);
+        let note = optional_string(object, "note", &mut errors);
+        let through_date_value = through_date
+            .as_deref()
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+        if through_date.is_some() && through_date_value.is_none() {
+            errors.push("throughDate must be an ISO date".to_string());
+        }
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
+
+        let holding = document["holdings"]
+            .as_array()
+            .expect("validated local ledger holdings should be an array")
+            .iter()
+            .find(|holding| holding.get("id").and_then(Value::as_str) == Some(holding_id))
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("holding does not exist: {holding_id}"))
+            })?;
+        let terms = holding.get("yieldTerms").ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["holding has no yield terms".to_string()])
+        })?;
+        if terms.get("pendingInterestMovementId").is_some() {
+            return Err(LedgerError::Conflict(
+                "holding already has a pending interest proposal".to_string(),
+            ));
+        }
+        if holding_has_pending_adjustment(document, &holding) {
+            return Err(LedgerError::Conflict(
+                "holding has a pending quantity adjustment".to_string(),
+            ));
+        }
+        let start = Date::parse(
+            terms
+                .get("lastAccruedThrough")
+                .or_else(|| terms.get("interestStartDate"))
+                .and_then(Value::as_str)
+                .expect("validated yield accrual start date"),
+            &Iso8601::DATE,
+        )
+        .expect("validated yield accrual start date should parse");
+        let requested_through = through_date_value.expect("validated throughDate");
+        let maturity = terms
+            .get("maturityDate")
+            .and_then(Value::as_str)
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+        let through = maturity.map_or(requested_through, |maturity| {
+            requested_through.min(maturity)
+        });
+        if through <= start {
+            return Err(LedgerError::Conflict(
+                "throughDate must be after the last accrued date".to_string(),
+            ));
+        }
+        let accrual = calculate_yield_accrual(terms, start, through)?;
+        if accrual.amount == DecimalAmount::ZERO {
+            return Err(LedgerError::Conflict(
+                "accrued interest is below ledger precision".to_string(),
+            ));
+        }
+        let payout_account_id = terms
+            .get("payoutAccountId")
+            .and_then(Value::as_str)
+            .expect("validated payoutAccountId");
+        let currency = terms
+            .get("principal")
+            .and_then(|principal| principal.get("currency"))
+            .and_then(Value::as_str)
+            .expect("validated principal currency");
+        let display_name = holding
+            .get("instrumentId")
+            .and_then(Value::as_str)
+            .and_then(|instrument_id| {
+                document["instruments"]
+                    .as_array()
+                    .expect("validated instruments")
+                    .iter()
+                    .find(|instrument| {
+                        instrument.get("id").and_then(Value::as_str) == Some(instrument_id)
+                    })
+            })
+            .and_then(|instrument| instrument.get("displayName"))
+            .and_then(Value::as_str)
+            .unwrap_or("投资产品");
+        let mut movement = json!({
+            "id": movement_id,
+            "atomicGroupId": atomic_group_id,
+            "type": "interest",
+            "occurredAt": format!("{through}T00:00:00Z"),
+            "recordedAt": now,
+            "status": "pending_review",
+            "title": format!("{display_name}利息"),
+            "entries": [{
+                "id": format!("entry_{movement_id}_interest"),
+                "accountId": payout_account_id,
+                "amount": accrual.amount.decimal_string(),
+                "currency": currency,
+                "direction": "in",
+                "role": "source"
+            }],
+            "yieldAccrual": {
+                "holdingId": holding_id,
+                "previousAccruedThrough": start.to_string(),
+                "throughDate": through.to_string(),
+                "principal": terms["principal"].clone(),
+                "annualRate": terms["annualRate"].clone(),
+                "interestMethod": terms["interestMethod"].clone(),
+                "dayCountBasis": terms["dayCountBasis"].clone(),
+                "compoundingFrequency": terms["compoundingFrequency"].clone(),
+                "accrualDays": accrual.days,
+                "fullCompoundingPeriods": accrual.full_periods,
+                "interestAmount": {"amount": accrual.amount.decimal_string(), "currency": currency}
+            },
+            "tags": ["yield_interest"],
+            "source": {"kind": "system", "sourceId": holding_id, "createdBy": "system"},
+            "createdAt": now,
+            "updatedAt": now
+        });
+        if let Some(note) = note {
+            movement["description"] = json!(note);
+        }
+
+        document["movements"]
+            .as_array_mut()
+            .expect("validated movements")
+            .push(movement.clone());
+        let mut indexed_entry = movement["entries"][0].clone();
+        indexed_entry["movementId"] = json!(movement_id);
+        indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+        document["movementEntries"]
+            .as_array_mut()
+            .expect("validated movement entries")
+            .push(indexed_entry);
+        let updated_holding = document["holdings"]
+            .as_array_mut()
+            .expect("validated holdings")
+            .iter_mut()
+            .find(|holding| holding.get("id").and_then(Value::as_str) == Some(holding_id))
+            .expect("holding should exist");
+        updated_holding["yieldTerms"]["pendingInterestMovementId"] = json!(movement_id);
+        updated_holding["yieldTerms"]["pendingInterestThroughDate"] = json!(through.to_string());
+
+        Ok(atomic_group_from_movement(&movement, "pending"))
+    })
+}
+
+pub fn list_liability_positions(
+    path: &Path,
+    through_date: Option<&str>,
+) -> Result<Value, LedgerError> {
+    let document = read_document(path)?;
+    let through_date = match through_date {
+        Some(value) => Date::parse(value, &Iso8601::DATE).map_err(|_| {
+            LedgerError::InvalidInput(vec!["throughDate must be an ISO date".to_string()])
+        })?,
+        None => OffsetDateTime::now_utc().date(),
+    };
+    Ok(json!(liability_positions_for_document(
+        &document,
+        through_date
+    )?))
+}
+
+pub fn loan_repayment_schedule(
+    path: &Path,
+    account_id: &str,
+    limit: Option<&str>,
+) -> Result<Value, LedgerError> {
+    let limit = match limit {
+        None => 24_usize,
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| (1..=360).contains(value))
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![
+                    "limit must be an integer from 1 through 360".to_string(),
+                ])
+            })?,
+    };
+    let document = read_document(path)?;
+    let account = document["accounts"]
+        .as_array()
+        .expect("validated accounts")
+        .iter()
+        .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+        .ok_or_else(|| LedgerError::NotFound(format!("account does not exist: {account_id}")))?;
+    let terms = account.get("liabilityTerms").ok_or_else(|| {
+        LedgerError::InvalidInput(vec!["account has no liability terms".to_string()])
+    })?;
+    let (outstanding, currency) = liability_outstanding(account)?;
+    projected_loan_repayment_schedule(account, terms, outstanding, currency, limit)
+}
+
+pub fn update_account_liability_terms(
+    path: &Path,
+    account_id: &str,
+    input: &Value,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let account = document["accounts"]
+            .as_array()
+            .expect("validated local ledger accounts should be an array")
+            .iter()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("account does not exist: {account_id}"))
+            })?;
+        if !is_liability_account(&account) {
+            return Err(LedgerError::InvalidInput(vec![
+                "liability terms require a liability account".to_string(),
+            ]));
+        }
+        if account.get("liabilityTerms").is_some_and(|terms| {
+            terms.get("pendingLoanInterestMovementId").is_some()
+                || terms.get("pendingLoanPaymentMovementId").is_some()
+        }) {
+            return Err(LedgerError::Conflict(
+                "account has a pending loan interest proposal".to_string(),
+            ));
+        }
+        let terms = liability_terms_from_input(document, &account, input, now)?;
+        let updated = document["accounts"]
+            .as_array_mut()
+            .expect("validated local ledger accounts should be an array")
+            .iter_mut()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+            .expect("account should still exist");
+        updated["liabilityTerms"] = terms;
+        updated["updatedAt"] = json!(now);
+        let payload = updated.clone();
+        append_sync_change(document, "account", account_id, "update", &payload, now);
+        Ok(project_account_for_api(&payload))
+    })
+}
+
+pub fn create_loan_interest_proposal(
+    path: &Path,
+    account_id: &str,
+    input: &Value,
+    movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let Some(object) = input.as_object() else {
+            return Err(LedgerError::InvalidInput(vec![
+                "loan interest proposal input must be a JSON object".to_string(),
+            ]));
+        };
+        let mut errors = Vec::new();
+        for key in object.keys() {
+            if !matches!(key.as_str(), "throughDate" | "note") {
+                errors.push(format!("unsupported loan interest proposal field: {key}"));
+            }
+        }
+        let through_date = required_string(object, "throughDate", &mut errors);
+        let note = optional_string(object, "note", &mut errors);
+        let through_date_value = through_date
+            .as_deref()
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+        if through_date.is_some() && through_date_value.is_none() {
+            errors.push("throughDate must be an ISO date".to_string());
+        }
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
+
+        let account = document["accounts"]
+            .as_array()
+            .expect("validated local ledger accounts should be an array")
+            .iter()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("account does not exist: {account_id}"))
+            })?;
+        let terms = account.get("liabilityTerms").ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["account has no liability terms".to_string()])
+        })?;
+        if terms.get("pendingLoanInterestMovementId").is_some()
+            || terms.get("pendingLoanPaymentMovementId").is_some()
+        {
+            return Err(LedgerError::Conflict(
+                "account already has a pending loan interest proposal".to_string(),
+            ));
+        }
+        let start = Date::parse(
+            terms
+                .get("lastInterestAccruedThrough")
+                .or_else(|| terms.get("interestStartDate"))
+                .and_then(Value::as_str)
+                .expect("validated loan interest start date"),
+            &Iso8601::DATE,
+        )
+        .expect("validated loan interest start date should parse");
+        let requested_through = through_date_value.expect("validated throughDate");
+        let maturity = Date::parse(
+            terms["maturityDate"]
+                .as_str()
+                .expect("validated maturityDate"),
+            &Iso8601::DATE,
+        )
+        .expect("validated maturityDate should parse");
+        let through = requested_through.min(maturity);
+        if through <= start {
+            return Err(LedgerError::Conflict(
+                "throughDate must be after the last accrued date".to_string(),
+            ));
+        }
+        let (outstanding, currency) = liability_outstanding(&account)?;
+        if outstanding == DecimalAmount::ZERO {
+            return Err(LedgerError::Conflict(
+                "loan account has no outstanding balance".to_string(),
+            ));
+        }
+        let annual_rate =
+            parse_decimal(terms["annualRate"].as_str().expect("validated annualRate"))?;
+        let basis = terms["dayCountBasis"]
+            .as_u64()
+            .expect("validated dayCountBasis");
+        let days = (through - start).whole_days();
+        let interest = prorated_interest(outstanding, annual_rate, days, basis)?;
+        if interest == DecimalAmount::ZERO {
+            return Err(LedgerError::Conflict(
+                "accrued loan interest is below ledger precision".to_string(),
+            ));
+        }
+        let occurred_at = format!("{through}T23:59:59Z");
+        let mut movement = json!({
+            "id": movement_id,
+            "type": "loan_interest",
+            "occurredAt": occurred_at,
+            "recordedAt": now,
+            "title": format!("{} 贷款利息", account["displayName"].as_str().unwrap_or(account_id)),
+            "entries": [{
+                "id": format!("entry_{movement_id}_loan_interest"),
+                "accountId": account_id,
+                "amount": interest.decimal_string(),
+                "currency": currency,
+                "direction": "out",
+                "role": "source"
+            }],
+            "status": "pending_review",
+            "atomicGroupId": atomic_group_id,
+            "loanInterestAccrual": {
+                "accountId": account_id,
+                "previousAccruedThrough": start.to_string(),
+                "throughDate": through.to_string(),
+                "outstandingPrincipal": {"amount": outstanding.decimal_string(), "currency": currency},
+                "annualRate": terms["annualRate"].clone(),
+                "rateType": terms["rateType"].clone(),
+                "dayCountBasis": basis,
+                "accrualDays": days,
+                "interestAmount": {"amount": interest.decimal_string(), "currency": currency}
+            },
+            "tags": ["loan_interest"],
+            "source": {"kind": "system", "sourceId": account_id, "createdBy": "system"},
+            "createdAt": now,
+            "updatedAt": now
+        });
+        if let Some(note) = note {
+            movement["description"] = json!(note);
+        }
+        document["movements"]
+            .as_array_mut()
+            .expect("validated movements")
+            .push(movement.clone());
+        let mut indexed_entry = movement["entries"][0].clone();
+        indexed_entry["movementId"] = json!(movement_id);
+        indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+        document["movementEntries"]
+            .as_array_mut()
+            .expect("validated movement entries")
+            .push(indexed_entry);
+        let updated_account = document["accounts"]
+            .as_array_mut()
+            .expect("validated accounts")
+            .iter_mut()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+            .expect("account should exist");
+        updated_account["liabilityTerms"]["pendingLoanInterestMovementId"] = json!(movement_id);
+        updated_account["liabilityTerms"]["pendingLoanInterestThroughDate"] =
+            json!(through.to_string());
+        updated_account["updatedAt"] = json!(now);
+        Ok(atomic_group_from_movement(&movement, "pending"))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_loan_payment_proposal(
+    path: &Path,
+    account_id: &str,
+    input: &Value,
+    interest_movement_id: &str,
+    payment_movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let Some(object) = input.as_object() else {
+            return Err(LedgerError::InvalidInput(vec![
+                "loan payment proposal input must be a JSON object".to_string(),
+            ]));
+        };
+        let mut errors = Vec::new();
+        for key in object.keys() {
+            if !matches!(key.as_str(), "paymentDate" | "amount" | "note") {
+                errors.push(format!("unsupported loan payment proposal field: {key}"));
+            }
+        }
+        let payment_date = required_string(object, "paymentDate", &mut errors);
+        let payment_date_value = payment_date
+            .as_deref()
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+        if payment_date.is_some() && payment_date_value.is_none() {
+            errors.push("paymentDate must be an ISO date".to_string());
+        }
+        let note = optional_string(object, "note", &mut errors);
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
+
+        let account = document["accounts"]
+            .as_array()
+            .expect("validated accounts")
+            .iter()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("account does not exist: {account_id}"))
+            })?;
+        let terms = account.get("liabilityTerms").ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["account has no liability terms".to_string()])
+        })?;
+        if terms.get("pendingLoanInterestMovementId").is_some()
+            || terms.get("pendingLoanPaymentMovementId").is_some()
+        {
+            return Err(LedgerError::Conflict(
+                "account already has a pending loan proposal".to_string(),
+            ));
+        }
+        let start = Date::parse(
+            terms["lastInterestAccruedThrough"]
+                .as_str()
+                .expect("validated lastInterestAccruedThrough"),
+            &Iso8601::DATE,
+        )
+        .expect("validated lastInterestAccruedThrough should parse");
+        let maturity = Date::parse(
+            terms["maturityDate"]
+                .as_str()
+                .expect("validated maturityDate"),
+            &Iso8601::DATE,
+        )
+        .expect("validated maturityDate should parse");
+        let payment_date = payment_date_value.expect("validated paymentDate");
+        if payment_date < start || payment_date > maturity {
+            return Err(LedgerError::InvalidInput(vec![
+                "paymentDate must be between the last accrued date and maturityDate".to_string(),
+            ]));
+        }
+        let (outstanding, currency) = liability_outstanding(&account)?;
+        if outstanding == DecimalAmount::ZERO {
+            return Err(LedgerError::Conflict(
+                "loan account has no outstanding balance".to_string(),
+            ));
+        }
+        let annual_rate =
+            parse_decimal(terms["annualRate"].as_str().expect("validated annualRate"))?;
+        let basis = terms["dayCountBasis"]
+            .as_u64()
+            .expect("validated dayCountBasis");
+        let days = (payment_date - start).whole_days();
+        let interest = if days > 0 {
+            prorated_interest(outstanding, annual_rate, days, basis)?
+        } else {
+            DecimalAmount::ZERO
+        };
+        let scheduled_payment = terms["scheduledPayment"].clone();
+        let requested_payment = match object.get("amount") {
+            None | Some(Value::Null) => scheduled_payment.clone(),
+            Some(value) => {
+                normalized_required_money(Some(value), "amount", &mut errors).unwrap_or(Value::Null)
+            }
+        };
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
+        let requested_currency = requested_payment
+            .get("currency")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let payment = requested_payment
+            .get("amount")
+            .and_then(Value::as_str)
+            .and_then(|value| parse_decimal(value).ok());
+        if requested_currency != currency {
+            return Err(LedgerError::InvalidInput(vec![
+                "amount.currency must match the loan currency".to_string(),
+            ]));
+        }
+        let Some(payment) = payment.filter(|value| *value > DecimalAmount::ZERO) else {
+            return Err(LedgerError::InvalidInput(vec![
+                "amount.amount must be positive".to_string(),
+            ]));
+        };
+        let total_due = outstanding + interest;
+        if payment > total_due {
+            return Err(LedgerError::InvalidInput(vec![
+                "payment amount cannot exceed the total loan balance and accrued interest"
+                    .to_string(),
+            ]));
+        }
+        let interest_portion = payment.min(interest);
+        let principal_portion = payment - interest_portion;
+        let previous_next_due = Date::parse(
+            terms["nextDueDate"]
+                .as_str()
+                .expect("validated nextDueDate"),
+            &Iso8601::DATE,
+        )
+        .expect("validated nextDueDate should parse");
+        let anchor_day = terms["repaymentAnchorDay"]
+            .as_u64()
+            .and_then(|value| u8::try_from(value).ok())
+            .expect("validated repaymentAnchorDay");
+        let next_due = add_calendar_months_with_anchor(previous_next_due, 1, anchor_day)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["next repayment date overflow".to_string()])
+            })?
+            .min(maturity);
+        let occurred_at = format!("{payment_date}T23:59:59Z");
+        let payment_account_id = terms["paymentAccountId"]
+            .as_str()
+            .expect("validated paymentAccountId");
+
+        let mut movements = Vec::new();
+        if interest > DecimalAmount::ZERO {
+            movements.push(json!({
+                "id": interest_movement_id,
+                "atomicGroupId": atomic_group_id,
+                "type": "loan_interest",
+                "occurredAt": occurred_at,
+                "recordedAt": now,
+                "status": "pending_review",
+                "title": format!("{} 贷款利息", account["displayName"].as_str().unwrap_or(account_id)),
+                "entries": [{
+                    "id": format!("entry_{interest_movement_id}_loan_interest"),
+                    "accountId": account_id,
+                    "amount": interest.decimal_string(),
+                    "currency": currency,
+                    "direction": "out",
+                    "role": "source"
+                }],
+                "loanInterestAccrual": {
+                    "accountId": account_id,
+                    "previousAccruedThrough": start.to_string(),
+                    "throughDate": payment_date.to_string(),
+                    "outstandingPrincipal": {"amount": outstanding.decimal_string(), "currency": currency},
+                    "annualRate": terms["annualRate"].clone(),
+                    "rateType": terms["rateType"].clone(),
+                    "dayCountBasis": basis,
+                    "accrualDays": days,
+                    "interestAmount": {"amount": interest.decimal_string(), "currency": currency}
+                },
+                "tags": ["loan_interest", "loan_payment"],
+                "source": {"kind": "system", "sourceId": account_id, "createdBy": "system"},
+                "createdAt": now,
+                "updatedAt": now
+            }));
+        }
+        let mut payment_movement = json!({
+            "id": payment_movement_id,
+            "atomicGroupId": atomic_group_id,
+            "type": "loan_repayment",
+            "occurredAt": occurred_at,
+            "recordedAt": now,
+            "status": "pending_review",
+            "title": format!("{} 还款", account["displayName"].as_str().unwrap_or(account_id)),
+            "entries": [
+                {
+                    "id": format!("entry_{payment_movement_id}_payment"),
+                    "accountId": payment_account_id,
+                    "amount": payment.decimal_string(),
+                    "currency": currency,
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "id": format!("entry_{payment_movement_id}_loan"),
+                    "accountId": account_id,
+                    "amount": payment.decimal_string(),
+                    "currency": currency,
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ],
+            "loanPayment": {
+                "accountId": account_id,
+                "paymentAccountId": payment_account_id,
+                "paymentDate": payment_date.to_string(),
+                "previousNextDueDate": previous_next_due.to_string(),
+                "nextDueDate": next_due.to_string(),
+                "paymentAmount": {"amount": payment.decimal_string(), "currency": currency},
+                "interestAmount": {"amount": interest_portion.decimal_string(), "currency": currency},
+                "principalAmount": {"amount": principal_portion.decimal_string(), "currency": currency},
+                "unpaidInterest": {"amount": (interest - interest_portion).decimal_string(), "currency": currency}
+            },
+            "tags": ["loan_payment"],
+            "source": {"kind": "manual", "createdBy": "user"},
+            "createdAt": now,
+            "updatedAt": now
+        });
+        if interest > DecimalAmount::ZERO {
+            payment_movement["loanPayment"]["linkedInterestMovementId"] =
+                json!(interest_movement_id);
+        }
+        if let Some(note) = note {
+            payment_movement["description"] = json!(note);
+        }
+        movements.push(payment_movement.clone());
+
+        for movement in &movements {
+            document["movements"]
+                .as_array_mut()
+                .expect("validated movements")
+                .push(movement.clone());
+            for entry in movement["entries"].as_array().expect("movement entries") {
+                let mut indexed_entry = entry.clone();
+                indexed_entry["movementId"] = movement["id"].clone();
+                indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+                document["movementEntries"]
+                    .as_array_mut()
+                    .expect("validated movement entries")
+                    .push(indexed_entry);
+            }
+        }
+        let updated_account = document["accounts"]
+            .as_array_mut()
+            .expect("validated accounts")
+            .iter_mut()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+            .expect("account should exist");
+        if interest > DecimalAmount::ZERO {
+            updated_account["liabilityTerms"]["pendingLoanInterestMovementId"] =
+                json!(interest_movement_id);
+            updated_account["liabilityTerms"]["pendingLoanInterestThroughDate"] =
+                json!(payment_date.to_string());
+        }
+        updated_account["liabilityTerms"]["pendingLoanPaymentMovementId"] =
+            json!(payment_movement_id);
+        updated_account["liabilityTerms"]["pendingLoanPaymentDate"] =
+            json!(payment_date.to_string());
+        updated_account["updatedAt"] = json!(now);
+
+        let mut group = atomic_group_from_movement(&payment_movement, "pending");
+        group["proposedMovements"] = json!(
+            movements
+                .iter()
+                .map(project_movement_for_api)
+                .collect::<Vec<_>>()
+        );
+        Ok(group)
+    })
+}
+
+pub fn create_holding_adjustment_proposal(
+    path: &Path,
+    account_id: &str,
+    input: &Value,
+    movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let Some(object) = input.as_object() else {
+            return Err(LedgerError::InvalidInput(vec![
+                "holding adjustment input must be a JSON object".to_string(),
+            ]));
+        };
+        let mut errors = Vec::new();
+        for key in object.keys() {
+            if !matches!(
+                key.as_str(),
+                "instrumentId" | "targetQuantity" | "asOf" | "note"
+            ) {
+                errors.push(format!("unsupported holding adjustment field: {key}"));
+            }
+        }
+        let instrument_id = required_string(object, "instrumentId", &mut errors);
+        let target_quantity = required_string(object, "targetQuantity", &mut errors);
+        let target = target_quantity
+            .as_deref()
+            .and_then(|value| parse_decimal(value).ok());
+        if target.is_none_or(|value| value < DecimalAmount::ZERO) {
+            errors.push("targetQuantity must be a non-negative decimal string".to_string());
+        }
+        let as_of = match object.get("asOf") {
+            None | Some(Value::Null) => Some(now.to_string()),
+            Some(Value::String(value)) if parse_rfc3339(value).is_some() => Some(value.to_string()),
+            _ => {
+                errors.push("asOf must be an RFC3339 timestamp".to_string());
+                None
+            }
+        };
+        let note = optional_string(object, "note", &mut errors);
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
+
+        let account = active_account(document, account_id).ok_or_else(|| {
+            LedgerError::NotFound(format!(
+                "holding account does not exist or is archived: {account_id}"
+            ))
+        })?;
+        if !matches!(
+            account.get("balanceMode").and_then(Value::as_str),
+            Some("holdings" | "mixed")
+        ) {
+            return Err(LedgerError::InvalidInput(vec![
+                "holding adjustment requires a holdings or mixed account".to_string(),
+            ]));
+        }
+        let instrument_id = instrument_id.expect("validated instrumentId");
+        let instrument = document["instruments"]
+            .as_array()
+            .expect("validated local ledger instruments should be an array")
+            .iter()
+            .find(|instrument| instrument.get("id").and_then(Value::as_str) == Some(&instrument_id))
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("instrument does not exist: {instrument_id}"))
+            })?;
+        let quote_currency = instrument
+            .get("quoteCurrency")
+            .and_then(Value::as_str)
+            .expect("validated instrument quoteCurrency")
+            .to_string();
+        if !account
+            .get("supportedCurrencies")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.as_str() == Some(quote_currency.as_str()))
+            })
+        {
+            return Err(LedgerError::InvalidInput(vec![format!(
+                "holding account does not support instrument quote currency: {quote_currency}"
+            )]));
+        }
+        if document["movements"]
+            .as_array()
+            .expect("validated local ledger movements should be an array")
+            .iter()
+            .any(|movement| {
+                movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                    && movement
+                        .get("holdingAdjustment")
+                        .and_then(|value| value.get("accountId"))
+                        .and_then(Value::as_str)
+                        == Some(account_id)
+                    && movement
+                        .get("holdingAdjustment")
+                        .and_then(|value| value.get("instrumentId"))
+                        .and_then(Value::as_str)
+                        == Some(instrument_id.as_str())
+            })
+        {
+            return Err(LedgerError::Conflict(
+                "holding already has a pending adjustment".to_string(),
+            ));
+        }
+
+        if document["holdings"]
+            .as_array()
+            .expect("validated holdings")
+            .iter()
+            .find(|holding| {
+                holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                    && holding.get("instrumentId").and_then(Value::as_str)
+                        == Some(instrument_id.as_str())
+            })
+            .and_then(|holding| holding.get("yieldTerms"))
+            .and_then(|terms| terms.get("pendingInterestMovementId"))
+            .is_some()
+        {
+            return Err(LedgerError::Conflict(
+                "holding has a pending interest proposal".to_string(),
+            ));
+        }
+
+        let previous = document["holdings"]
+            .as_array()
+            .expect("validated local ledger holdings should be an array")
+            .iter()
+            .find(|holding| {
+                holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                    && holding.get("instrumentId").and_then(Value::as_str)
+                        == Some(instrument_id.as_str())
+            })
+            .and_then(|holding| holding.get("quantity"))
+            .and_then(Value::as_str)
+            .and_then(|value| parse_decimal(value).ok())
+            .unwrap_or(DecimalAmount::ZERO);
+        let target = target.expect("validated targetQuantity");
+        if target == previous {
+            return Err(LedgerError::Conflict(
+                "holding already has the requested quantity".to_string(),
+            ));
+        }
+        let delta = target - previous;
+        let direction = if delta > DecimalAmount::ZERO {
+            "in"
+        } else {
+            "out"
+        };
+        let as_of = as_of.expect("validated asOf");
+        let display_name = instrument
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or(instrument_id.as_str());
+        let mut movement = json!({
+            "id": movement_id,
+            "atomicGroupId": atomic_group_id,
+            "type": "adjustment",
+            "occurredAt": as_of,
+            "recordedAt": now,
+            "status": "pending_review",
+            "title": format!("调整{display_name}持仓"),
+            "entries": [{
+                "id": format!("entry_{movement_id}_holding_adjustment"),
+                "accountId": account_id,
+                "instrumentId": instrument_id,
+                "amount": delta.abs().decimal_string(),
+                "currency": quote_currency,
+                "direction": direction,
+                "role": "adjustment"
+            }],
+            "holdingAdjustment": {
+                "accountId": account_id,
+                "instrumentId": instrument_id,
+                "previousQuantity": previous.decimal_string(),
+                "targetQuantity": target.decimal_string()
+            },
+            "tags": ["holding_adjustment"],
+            "source": {"kind": "manual", "createdBy": "user"},
+            "createdAt": now,
+            "updatedAt": now
+        });
+        if let Some(note) = note {
+            movement["description"] = json!(note);
+        }
+
+        document["movements"]
+            .as_array_mut()
+            .expect("validated local ledger movements should be an array")
+            .push(movement.clone());
+        let mut indexed_entry = movement["entries"][0].clone();
+        indexed_entry["movementId"] = json!(movement_id);
+        indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+        document["movementEntries"]
+            .as_array_mut()
+            .expect("validated local ledger movementEntries should be an array")
+            .push(indexed_entry);
+
+        Ok(atomic_group_from_movement(&movement, "pending"))
+    })
+}
+
 pub fn list_movements(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let movements = document["movements"]
         .as_array()
         .expect("validated local ledger movements should be an array")
@@ -1004,11 +2132,12 @@ pub fn create_correction_proposal(
         let mut errors = Vec::new();
         let target_movement_id = required_string(object, "targetMovementId", &mut errors);
         let reason = required_string(object, "reason", &mut errors);
-        let proposed_diffs = object
+        let mut proposed_diffs = object
             .get("proposedDiffs")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let replacement_entries = object.get("replacementEntries");
 
         if !errors.is_empty() {
             return Err(LedgerError::InvalidInput(errors));
@@ -1038,7 +2167,83 @@ pub fn create_correction_proposal(
             )));
         }
 
-        let correction_entry = correction_entry_from_diffs(&target, &proposed_diffs, movement_id)?;
+        let target_type = target.get("type").and_then(Value::as_str).ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["target movement.type is missing".to_string()])
+        })?;
+        let is_investment = matches!(target_type, "buy" | "sell");
+        let has_holding_entry =
+            target
+                .get("entries")
+                .and_then(Value::as_array)
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| entry.get("instrumentId").is_some())
+                });
+        if has_holding_entry && !is_investment {
+            return Err(LedgerError::InvalidInput(vec![
+                "holding-entry corrections may only target a confirmed buy or sell".to_string(),
+            ]));
+        }
+        if is_investment && replacement_entries.is_none() {
+            return Err(LedgerError::InvalidInput(vec![
+                "investment correction requires complete replacementEntries".to_string(),
+            ]));
+        }
+        if is_investment {
+            ensure_investment_correction_target_is_latest(document, &target)?;
+            ensure_investment_target_has_reversible_basis(&target)?;
+        }
+
+        if pending_correction_exists(document, &target_movement_id) {
+            return Err(LedgerError::Conflict(format!(
+                "target movement already has a pending correction: {target_movement_id}"
+            )));
+        }
+
+        let mut normalized_replacement = None;
+        let correction_entries = if let Some(replacement_entries) = replacement_entries {
+            let (entries, replacement) = correction_entries_for_replacement(
+                document,
+                &target,
+                replacement_entries,
+                movement_id,
+            )?;
+            if is_investment {
+                let mut replacement_errors = Vec::new();
+                validate_movement_semantics(
+                    document,
+                    target_type,
+                    &replacement,
+                    &mut replacement_errors,
+                );
+                if !replacement_errors.is_empty() {
+                    return Err(LedgerError::InvalidInput(
+                        replacement_errors
+                            .into_iter()
+                            .map(|error| format!("replacementEntries: {error}"))
+                            .collect(),
+                    ));
+                }
+                normalized_replacement = Some(replacement.clone());
+            }
+            if proposed_diffs.is_empty() {
+                proposed_diffs.push(json!({
+                    "fieldPath": "entries",
+                    "oldValue": target["entries"],
+                    "newValue": replacement,
+                    "severity": "danger",
+                    "reason": reason
+                }));
+            }
+            entries
+        } else {
+            vec![correction_entry_from_diffs(
+                &target,
+                &proposed_diffs,
+                movement_id,
+            )?]
+        };
         let target_title = target
             .get("title")
             .and_then(Value::as_str)
@@ -1052,7 +2257,7 @@ pub fn create_correction_proposal(
             "status": "pending_review",
             "title": format!("更正：{target_title}"),
             "description": reason,
-            "entries": [correction_entry],
+            "entries": correction_entries,
             "tags": ["correction"],
             "source": {
                 "kind": "manual",
@@ -1062,6 +2267,14 @@ pub fn create_correction_proposal(
             "createdAt": now,
             "updatedAt": now
         });
+        let mut movement = movement;
+        if let Some(replacement_entries) = normalized_replacement {
+            movement["investmentReplacement"] = json!({
+                "targetType": target_type,
+                "targetOccurredAt": target.get("occurredAt").cloned().unwrap_or(Value::Null),
+                "replacementEntries": replacement_entries
+            });
+        }
 
         document["movements"]
             .as_array_mut()
@@ -1163,12 +2376,7 @@ pub fn confirm_atomic_group(
         for movement in &candidate_movements {
             match movement.get("status").and_then(Value::as_str) {
                 Some("draft" | "pending_review") => {
-                    let entries = movement
-                        .get("entries")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    apply_movement_entries(document, &entries, now)?;
+                    apply_movement_effect(document, movement, now)?;
                     confirmed_movement_ids.push(
                         movement
                             .get("id")
@@ -1231,6 +2439,9 @@ pub fn confirm_atomic_group(
             }
             mark_dca_reminders_recorded_for_movements(document, &candidate_movements, now);
             mark_subscriptions_charged_for_movements(document, &candidate_movements, now)?;
+            mark_yield_interest_accrued_for_movements(document, &candidate_movements, now)?;
+            mark_loan_interest_accrued_for_movements(document, &candidate_movements, now)?;
+            mark_loan_payments_recorded_for_movements(document, &candidate_movements, now)?;
         }
 
         Ok(json!({
@@ -1295,13 +2506,16 @@ pub fn reject_atomic_group(
         }
 
         clear_rejected_subscription_charge_proposals(document, &candidate_movements, now);
+        clear_rejected_yield_interest_proposals(document, &candidate_movements, now);
+        clear_rejected_loan_interest_proposals(document, &candidate_movements, now);
+        clear_rejected_loan_payment_proposals(document, &candidate_movements, now);
 
         Ok(Value::Null)
     })
 }
 
 pub fn list_dca_plans(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(
         document["dcaPlans"]
             .as_array()
@@ -1372,7 +2586,7 @@ pub fn update_dca_plan(
 }
 
 pub fn list_due_dca_reminders(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let reminders = document["dcaReminders"]
         .as_array()
         .expect("validated local ledger dcaReminders should be an array")
@@ -1417,6 +2631,11 @@ pub fn snooze_dca_reminder(
         };
         let mut errors = Vec::new();
         let until = required_string(object, "until", &mut errors);
+        if let Some(until) = until.as_deref()
+            && parse_rfc3339(until).is_none()
+        {
+            errors.push("until must be an RFC3339 timestamp".to_string());
+        }
         if !errors.is_empty() {
             return Err(LedgerError::InvalidInput(errors));
         }
@@ -1430,10 +2649,68 @@ pub fn mark_dca_executed_as_proposal(
     reminder_id: &str,
     movement_id: &str,
     atomic_group_id: &str,
+    input: &Value,
     now: &str,
     idempotency: &IdempotencyRequest,
 ) -> Result<IdempotentResponse, LedgerError> {
     idempotent_ledger_write(path, idempotency, 200, |document| {
+        let Some(object) = input.as_object() else {
+            return Err(LedgerError::InvalidInput(vec![
+                "DCA execution input must be a JSON object".to_string(),
+            ]));
+        };
+        let mut errors = Vec::new();
+        for key in object.keys() {
+            if !matches!(
+                key.as_str(),
+                "holdingAccountId" | "quantity" | "totalCost" | "quoteCurrency" | "executedAt"
+            ) {
+                errors.push(format!("unsupported DCA execution field: {key}"));
+            }
+        }
+        let holding_account_id = required_string(object, "holdingAccountId", &mut errors);
+        let quantity = required_string(object, "quantity", &mut errors);
+        let total_cost =
+            normalized_required_money(object.get("totalCost"), "totalCost", &mut errors);
+        let quote_currency = required_string(object, "quoteCurrency", &mut errors);
+        let executed_at = match object.get("executedAt") {
+            None | Some(Value::Null) => Some(now.to_string()),
+            Some(Value::String(value)) if parse_rfc3339(value).is_some() => Some(value.to_string()),
+            _ => {
+                errors.push("executedAt must be an RFC3339 timestamp".to_string());
+                None
+            }
+        };
+        if let Some(quantity) = quantity.as_deref()
+            && !is_positive_decimal_string(quantity)
+        {
+            errors.push("quantity must be a positive decimal string".to_string());
+        }
+        if let Some(amount) = total_cost
+            .as_ref()
+            .and_then(|money| money.get("amount"))
+            .and_then(Value::as_str)
+            && !is_positive_decimal_string(amount)
+        {
+            errors.push("totalCost.amount must be a positive decimal string".to_string());
+        }
+        if !errors.is_empty() {
+            return Err(LedgerError::InvalidInput(errors));
+        }
+        let holding_account_id = holding_account_id.expect("validated holdingAccountId");
+        let quantity = quantity.expect("validated quantity");
+        let total_cost = total_cost.expect("validated totalCost");
+        let total_cost_amount = total_cost["amount"]
+            .as_str()
+            .expect("validated totalCost.amount")
+            .to_string();
+        let total_cost_currency = total_cost["currency"]
+            .as_str()
+            .expect("validated totalCost.currency")
+            .to_string();
+        let quote_currency = quote_currency.expect("validated quoteCurrency");
+        let executed_at = executed_at.expect("validated executedAt");
+
         let reminder = document["dcaReminders"]
             .as_array()
             .expect("validated local ledger dcaReminders should be an array")
@@ -1458,6 +2735,29 @@ pub fn mark_dca_executed_as_proposal(
             }
         }
 
+        if document["movements"]
+            .as_array()
+            .expect("validated local ledger movements should be an array")
+            .iter()
+            .any(|movement| {
+                movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                    && movement
+                        .get("source")
+                        .and_then(|source| source.get("kind"))
+                        .and_then(Value::as_str)
+                        == Some("system")
+                    && movement
+                        .get("source")
+                        .and_then(|source| source.get("sourceId"))
+                        .and_then(Value::as_str)
+                        == Some(reminder_id)
+            })
+        {
+            return Err(LedgerError::Conflict(format!(
+                "DCA reminder already has a pending execution proposal: {reminder_id}"
+            )));
+        }
+
         let plan_id = reminder
             .get("planId")
             .and_then(Value::as_str)
@@ -1479,10 +2779,49 @@ pub fn mark_dca_executed_as_proposal(
                     "DCA plan.fundingAccountId is required to record execution".to_string(),
                 ])
             })?;
-        if !active_account_exists(document, funding_account_id) {
-            return Err(LedgerError::NotFound(format!(
+        let funding_account = active_account(document, funding_account_id).ok_or_else(|| {
+            LedgerError::NotFound(format!(
                 "DCA funding account does not exist or is archived: {funding_account_id}"
-            )));
+            ))
+        })?;
+        if !funding_account
+            .get("supportedCurrencies")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.as_str() == Some(total_cost_currency.as_str()))
+            })
+        {
+            return Err(LedgerError::InvalidInput(vec![format!(
+                "DCA funding account does not support totalCost currency: {total_cost_currency}"
+            )]));
+        }
+        let holding_account = active_account(document, &holding_account_id).ok_or_else(|| {
+            LedgerError::NotFound(format!(
+                "DCA holding account does not exist or is archived: {holding_account_id}"
+            ))
+        })?;
+        if !matches!(
+            holding_account.get("balanceMode").and_then(Value::as_str),
+            Some("holdings" | "mixed")
+        ) {
+            return Err(LedgerError::InvalidInput(vec![format!(
+                "DCA holding account must use holdings or mixed balanceMode: {holding_account_id}"
+            )]));
+        }
+        if !holding_account
+            .get("supportedCurrencies")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.as_str() == Some(quote_currency.as_str()))
+            })
+        {
+            return Err(LedgerError::InvalidInput(vec![format!(
+                "DCA holding account does not support quoteCurrency: {quote_currency}"
+            )]));
         }
         let target_instrument_id = plan
             .get("targetInstrumentId")
@@ -1492,29 +2831,19 @@ pub fn mark_dca_executed_as_proposal(
                     "DCA plan.targetInstrumentId is required".to_string(),
                 ])
             })?;
-        let planned_amount = plan.get("plannedAmount").ok_or_else(|| {
-            LedgerError::InvalidInput(vec!["DCA plan.plannedAmount is required".to_string()])
-        })?;
-        let amount = planned_amount
-            .get("amount")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                LedgerError::InvalidInput(vec![
-                    "DCA plan.plannedAmount.amount is required".to_string(),
-                ])
-            })?;
-        let currency = planned_amount
-            .get("currency")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                LedgerError::InvalidInput(vec![
-                    "DCA plan.plannedAmount.currency is required".to_string(),
-                ])
-            })?;
-        if !is_positive_decimal_string(amount) {
-            return Err(LedgerError::InvalidInput(vec![
-                "DCA plan.plannedAmount.amount must be a positive decimal string".to_string(),
-            ]));
+        if let Some(instrument) = document["instruments"]
+            .as_array()
+            .expect("validated local ledger instruments should be an array")
+            .iter()
+            .find(|instrument| {
+                instrument.get("id").and_then(Value::as_str) == Some(target_instrument_id)
+            })
+            && instrument.get("quoteCurrency").and_then(Value::as_str)
+                != Some(quote_currency.as_str())
+        {
+            return Err(LedgerError::Conflict(format!(
+                "DCA target instrument quote currency does not match execution: {target_instrument_id}"
+            )));
         }
 
         let display_name = plan
@@ -1525,7 +2854,7 @@ pub fn mark_dca_executed_as_proposal(
             "id": movement_id,
             "atomicGroupId": atomic_group_id,
             "type": "buy",
-            "occurredAt": now,
+            "occurredAt": executed_at,
             "recordedAt": now,
             "status": "pending_review",
             "title": format!("记录{display_name}定投"),
@@ -1534,17 +2863,17 @@ pub fn mark_dca_executed_as_proposal(
                 {
                     "id": format!("entry_{movement_id}_cash_out"),
                     "accountId": funding_account_id,
-                    "amount": amount,
-                    "currency": currency,
+                    "amount": total_cost_amount,
+                    "currency": total_cost_currency,
                     "direction": "out",
                     "role": "source"
                 },
                 {
                     "id": format!("entry_{movement_id}_holding_in"),
-                    "accountId": funding_account_id,
+                    "accountId": holding_account_id,
                     "instrumentId": target_instrument_id,
-                    "amount": amount,
-                    "currency": currency,
+                    "amount": quantity,
+                    "currency": quote_currency,
                     "direction": "in",
                     "role": "destination"
                 }
@@ -1589,7 +2918,7 @@ pub fn mark_dca_executed_as_proposal(
 }
 
 pub fn list_subscriptions(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let mut items = document["subscriptions"]
         .as_array()
         .expect("validated local ledger subscriptions should be an array")
@@ -1620,7 +2949,7 @@ pub fn list_subscriptions(path: &Path) -> io::Result<Value> {
 }
 
 pub fn get_subscription(path: &Path, subscription_id: &str) -> io::Result<Option<Value>> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(document["subscriptions"]
         .as_array()
         .expect("validated local ledger subscriptions should be an array")
@@ -1630,7 +2959,7 @@ pub fn get_subscription(path: &Path, subscription_id: &str) -> io::Result<Option
 }
 
 pub fn list_upcoming_subscriptions(path: &Path, through_date: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let items = document["subscriptions"]
         .as_array()
         .expect("validated local ledger subscriptions should be an array")
@@ -1682,15 +3011,20 @@ pub fn update_subscription(
     idempotency: &IdempotencyRequest,
 ) -> Result<IdempotentResponse, LedgerError> {
     idempotent_ledger_write(path, idempotency, 200, |document| {
-        validate_subscription_payment_account_patch(document, &patch)?;
-        let updated = {
-            let subscription =
-                find_subscription_mut(document, subscription_id).ok_or_else(|| {
-                    LedgerError::NotFound(format!("subscription does not exist: {subscription_id}"))
-                })?;
-            apply_subscription_patch(subscription, &patch, now)?;
-            subscription.clone()
-        };
+        let subscription_index = document["subscriptions"]
+            .as_array()
+            .expect("validated local ledger subscriptions should be an array")
+            .iter()
+            .position(|subscription| {
+                subscription.get("id").and_then(Value::as_str) == Some(subscription_id)
+            })
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("subscription does not exist: {subscription_id}"))
+            })?;
+        let mut updated = document["subscriptions"][subscription_index].clone();
+        apply_subscription_patch(&mut updated, &patch, now)?;
+        validate_subscription_payment(document, &updated)?;
+        document["subscriptions"][subscription_index] = updated.clone();
         append_sync_change(
             document,
             "subscription",
@@ -1768,133 +3102,314 @@ pub fn create_subscription_charge_proposal(
     idempotency: &IdempotencyRequest,
 ) -> Result<IdempotentResponse, LedgerError> {
     idempotent_ledger_write(path, idempotency, 201, |document| {
-        let subscription = document["subscriptions"]
-            .as_array()
-            .expect("validated local ledger subscriptions should be an array")
-            .iter()
-            .find(|item| item.get("id").and_then(Value::as_str) == Some(subscription_id))
-            .cloned()
-            .ok_or_else(|| {
-                LedgerError::NotFound(format!("subscription does not exist: {subscription_id}"))
-            })?;
-        if !matches!(
-            subscription.get("status").and_then(Value::as_str),
-            Some("trial" | "active")
-        ) {
-            return Err(LedgerError::Conflict(
-                "subscription must be trial or active to generate a charge".to_string(),
-            ));
-        }
-        if subscription
-            .get("pendingChargeMovementId")
-            .and_then(Value::as_str)
-            .is_some()
-        {
-            return Err(LedgerError::Conflict(
-                "subscription already has a pending charge proposal".to_string(),
-            ));
-        }
-        let charge_date = subscription
-            .get("nextChargeDate")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                LedgerError::Conflict("subscription has no next charge date".to_string())
-            })?;
-        let payment_account_id = subscription
-            .get("paymentAccountId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                LedgerError::InvalidInput(vec![
-                    "subscription.paymentAccountId is missing".to_string(),
-                ])
-            })?;
-        if !active_account_exists(document, payment_account_id) {
-            return Err(LedgerError::NotFound(format!(
-                "subscription payment account does not exist or is archived: {payment_account_id}"
-            )));
-        }
-        let amount = subscription
-            .get("amount")
-            .and_then(|money| money.get("amount"))
-            .and_then(Value::as_str)
-            .expect("validated subscription amount should exist");
-        let currency = subscription
-            .get("amount")
-            .and_then(|money| money.get("currency"))
-            .and_then(Value::as_str)
-            .expect("validated subscription currency should exist");
-        let display_name = subscription
-            .get("displayName")
-            .and_then(Value::as_str)
-            .expect("validated subscription displayName should exist");
-        let provider = subscription
-            .get("provider")
-            .and_then(Value::as_str)
-            .expect("validated subscription provider should exist");
-        let mut movement = movement_from_create_input(
+        create_subscription_charge_proposal_in_document(
             document,
-            &json!({
-                "type": "expense",
-                "occurredAt": format!("{charge_date}T00:00:00Z"),
-                "title": format!("{display_name} 订阅扣款"),
-                "description": format!("{provider} 订阅的待确认计划扣款；确认前不影响正式账本。"),
-                "entries": [{
-                    "accountId": payment_account_id,
-                    "amount": amount,
-                    "currency": currency,
-                    "direction": "out",
-                    "role": "source"
-                }],
-                "tags": ["subscription"]
-            }),
+            subscription_id,
             movement_id,
             atomic_group_id,
             now,
-        )?;
-        movement["status"] = json!("pending_review");
-        movement["subscriptionId"] = json!(subscription_id);
-        movement["scheduledChargeDate"] = json!(charge_date);
-        movement["source"] = json!({
-            "kind": "system",
-            "sourceId": subscription_id,
-            "createdBy": "system"
-        });
-
-        document["movements"]
-            .as_array_mut()
-            .expect("validated local ledger movements should be an array")
-            .push(movement.clone());
-        if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
-            let movement_entries = document["movementEntries"]
-                .as_array_mut()
-                .expect("validated local ledger movementEntries should be an array");
-            for entry in entries {
-                let mut indexed_entry = entry.clone();
-                indexed_entry["movementId"] = json!(movement_id);
-                indexed_entry["atomicGroupId"] = json!(atomic_group_id);
-                movement_entries.push(indexed_entry);
-            }
-        }
-        let subscription_mut = find_subscription_mut(document, subscription_id)
-            .expect("subscription should still exist");
-        subscription_mut["pendingChargeMovementId"] = json!(movement_id);
-        subscription_mut["pendingChargeDate"] = json!(charge_date);
-        subscription_mut["updatedAt"] = json!(now);
-
-        let mut group = atomic_group_from_movement(&movement, "pending");
-        group["subscriptionId"] = json!(subscription_id);
-        group["scheduledChargeDate"] = json!(charge_date);
-        group["warnings"] = json!([{
-            "code": "subscription_charge_requires_confirmation",
-            "message": "该订阅扣款只是候选；用户确认后才写入正式账本。",
-            "severity": "info"
-        }]);
-        Ok(group)
+        )
     })
 }
 
+pub fn create_due_subscription_charge_proposals<F>(
+    path: &Path,
+    input: Value,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+    mut next_ids: F,
+) -> Result<IdempotentResponse, LedgerError>
+where
+    F: FnMut() -> (String, String),
+{
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let (through_date, limit) = parse_subscription_due_scan_input(&input)?;
+        let mut candidates = document["subscriptions"]
+            .as_array()
+            .expect("validated local ledger subscriptions should be an array")
+            .iter()
+            .filter(|subscription| {
+                matches!(
+                    subscription.get("status").and_then(Value::as_str),
+                    Some("trial" | "active")
+                ) && subscription
+                    .get("nextChargeDate")
+                    .and_then(Value::as_str)
+                    .is_some_and(|date| date <= through_date.as_str())
+            })
+            .map(|subscription| {
+                (
+                    subscription
+                        .get("nextChargeDate")
+                        .and_then(Value::as_str)
+                        .expect("eligible subscription nextChargeDate should exist")
+                        .to_string(),
+                    subscription
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .expect("validated subscription id should exist")
+                        .to_string(),
+                    subscription.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        });
+
+        let mut created = Vec::new();
+        let mut skipped = Vec::new();
+        let mut already_pending_count = 0_usize;
+        let mut blocked_count = 0_usize;
+        let mut remaining_eligible_count = 0_usize;
+
+        for (charge_date, subscription_id, subscription) in candidates {
+            if subscription
+                .get("pendingChargeMovementId")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                already_pending_count += 1;
+                skipped.push(subscription_due_scan_skip(
+                    &subscription_id,
+                    &charge_date,
+                    "already_pending",
+                ));
+                continue;
+            }
+
+            let payment_account_id = subscription
+                .get("paymentAccountId")
+                .and_then(Value::as_str)
+                .expect("validated subscription paymentAccountId should exist");
+            let currency = subscription
+                .get("amount")
+                .and_then(|money| money.get("currency"))
+                .and_then(Value::as_str)
+                .expect("validated subscription currency should exist");
+            if let Some(issue) = subscription_payment_issue(document, payment_account_id, currency)
+            {
+                blocked_count += 1;
+                let reason = match issue {
+                    SubscriptionPaymentIssue::AccountUnavailable => "payment_account_unavailable",
+                    SubscriptionPaymentIssue::CurrencyUnsupported => "payment_currency_unsupported",
+                };
+                skipped.push(subscription_due_scan_skip(
+                    &subscription_id,
+                    &charge_date,
+                    reason,
+                ));
+                continue;
+            }
+
+            if created.len() >= limit {
+                remaining_eligible_count += 1;
+                continue;
+            }
+
+            let (movement_id, atomic_group_id) = next_ids();
+            created.push(create_subscription_charge_proposal_in_document(
+                document,
+                &subscription_id,
+                &movement_id,
+                &atomic_group_id,
+                now,
+            )?);
+        }
+
+        Ok(json!({
+            "throughDate": through_date,
+            "createdCount": created.len(),
+            "alreadyPendingCount": already_pending_count,
+            "blockedCount": blocked_count,
+            "remainingEligibleCount": remaining_eligible_count,
+            "hasMore": remaining_eligible_count > 0,
+            "created": created,
+            "skipped": skipped
+        }))
+    })
+}
+
+fn parse_subscription_due_scan_input(input: &Value) -> Result<(String, usize), LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "subscription due scan input must be a JSON object".to_string(),
+        ]));
+    };
+    let mut errors = Vec::new();
+    let mut unknown = object
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "throughDate" | "limit"))
+        .cloned()
+        .collect::<Vec<_>>();
+    unknown.sort_unstable();
+    if !unknown.is_empty() {
+        errors.push(format!(
+            "unsupported subscription due scan fields: {}",
+            unknown.join(", ")
+        ));
+    }
+    let through_date = match object.get("throughDate").and_then(Value::as_str) {
+        Some(value) if Date::parse(value, &Iso8601::DATE).is_ok() => Some(value.to_string()),
+        _ => {
+            errors.push("throughDate must be an ISO date".to_string());
+            None
+        }
+    };
+    let limit = match object.get("limit") {
+        None => Some(100_usize),
+        Some(value) => match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
+            Some(value @ 1..=200) => Some(value),
+            _ => {
+                errors.push("limit must be an integer from 1 to 200".to_string());
+                None
+            }
+        },
+    };
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+    Ok((
+        through_date.expect("validated throughDate should exist"),
+        limit.expect("validated limit should exist"),
+    ))
+}
+
+fn subscription_due_scan_skip(
+    subscription_id: &str,
+    scheduled_charge_date: &str,
+    reason: &str,
+) -> Value {
+    json!({
+        "subscriptionId": subscription_id,
+        "scheduledChargeDate": scheduled_charge_date,
+        "reason": reason
+    })
+}
+
+fn create_subscription_charge_proposal_in_document(
+    document: &mut Value,
+    subscription_id: &str,
+    movement_id: &str,
+    atomic_group_id: &str,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let subscription = document["subscriptions"]
+        .as_array()
+        .expect("validated local ledger subscriptions should be an array")
+        .iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(subscription_id))
+        .cloned()
+        .ok_or_else(|| {
+            LedgerError::NotFound(format!("subscription does not exist: {subscription_id}"))
+        })?;
+    if !matches!(
+        subscription.get("status").and_then(Value::as_str),
+        Some("trial" | "active")
+    ) {
+        return Err(LedgerError::Conflict(
+            "subscription must be trial or active to generate a charge".to_string(),
+        ));
+    }
+    if subscription
+        .get("pendingChargeMovementId")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return Err(LedgerError::Conflict(
+            "subscription already has a pending charge proposal".to_string(),
+        ));
+    }
+    let charge_date = subscription
+        .get("nextChargeDate")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::Conflict("subscription has no next charge date".to_string()))?;
+    validate_subscription_payment(document, &subscription)?;
+    let payment_account_id = subscription
+        .get("paymentAccountId")
+        .and_then(Value::as_str)
+        .expect("validated subscription paymentAccountId should exist");
+    let amount = subscription
+        .get("amount")
+        .and_then(|money| money.get("amount"))
+        .and_then(Value::as_str)
+        .expect("validated subscription amount should exist");
+    let currency = subscription
+        .get("amount")
+        .and_then(|money| money.get("currency"))
+        .and_then(Value::as_str)
+        .expect("validated subscription currency should exist");
+    let display_name = subscription
+        .get("displayName")
+        .and_then(Value::as_str)
+        .expect("validated subscription displayName should exist");
+    let provider = subscription
+        .get("provider")
+        .and_then(Value::as_str)
+        .expect("validated subscription provider should exist");
+    let mut movement = movement_from_create_input(
+        document,
+        &json!({
+            "type": "expense",
+            "occurredAt": format!("{charge_date}T00:00:00Z"),
+            "title": format!("{display_name} 订阅扣款"),
+            "description": format!("{provider} 订阅的待确认计划扣款；确认前不影响正式账本。"),
+            "entries": [{
+                "accountId": payment_account_id,
+                "amount": amount,
+                "currency": currency,
+                "direction": "out",
+                "role": "source"
+            }],
+            "tags": ["subscription"]
+        }),
+        movement_id,
+        atomic_group_id,
+        now,
+    )?;
+    movement["status"] = json!("pending_review");
+    movement["subscriptionId"] = json!(subscription_id);
+    movement["scheduledChargeDate"] = json!(charge_date);
+    movement["source"] = json!({
+        "kind": "system",
+        "sourceId": subscription_id,
+        "createdBy": "system"
+    });
+
+    document["movements"]
+        .as_array_mut()
+        .expect("validated local ledger movements should be an array")
+        .push(movement.clone());
+    if let Some(entries) = movement.get("entries").and_then(Value::as_array) {
+        let movement_entries = document["movementEntries"]
+            .as_array_mut()
+            .expect("validated local ledger movementEntries should be an array");
+        for entry in entries {
+            let mut indexed_entry = entry.clone();
+            indexed_entry["movementId"] = json!(movement_id);
+            indexed_entry["atomicGroupId"] = json!(atomic_group_id);
+            movement_entries.push(indexed_entry);
+        }
+    }
+    let subscription_mut =
+        find_subscription_mut(document, subscription_id).expect("subscription should still exist");
+    subscription_mut["pendingChargeMovementId"] = json!(movement_id);
+    subscription_mut["pendingChargeDate"] = json!(charge_date);
+    subscription_mut["updatedAt"] = json!(now);
+
+    let mut group = atomic_group_from_movement(&movement, "pending");
+    group["subscriptionId"] = json!(subscription_id);
+    group["scheduledChargeDate"] = json!(charge_date);
+    group["warnings"] = json!([{
+        "code": "subscription_charge_requires_confirmation",
+        "message": "该订阅扣款只是候选；用户确认后才写入正式账本。",
+        "severity": "info"
+    }]);
+    Ok(group)
+}
+
 pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let summary = summarize_accounts(&document, now)?;
     let ai_pending_count = pending_ai_proposal_count(&document);
     let recent_movements = recent_movements_from_document(&document);
@@ -1925,7 +3440,10 @@ pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
             "accountAnomalyCount": summary.account_anomaly_count,
             "dcaDueCount": dca_due_count,
             "inTransitCount": in_transit_count,
-            "quoteProblemCount": summary.unpriceable_count,
+            "quoteProblemCount": summary.stale_count
+                + summary.offline_cached_count
+                + summary.unpriceable_count
+                + summary.error_count,
             "syncProblemCount": 0
         },
         "quoteStatusSummary": {
@@ -1941,7 +3459,7 @@ pub fn portfolio_overview(path: &Path, now: &str) -> io::Result<Value> {
 }
 
 pub fn asset_allocation(path: &Path, now: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     let summary = summarize_accounts(&document, now)?;
     Ok(json!({
         "slices": summary.allocation_slices,
@@ -1952,7 +3470,7 @@ pub fn asset_allocation(path: &Path, now: &str) -> io::Result<Value> {
 }
 
 pub fn latest_snapshot(path: &Path, now: &str) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     if let Some(snapshot) = latest_persisted_snapshot(&document) {
         return Ok(snapshot);
     }
@@ -1960,7 +3478,7 @@ pub fn latest_snapshot(path: &Path, now: &str) -> io::Result<Value> {
 }
 
 pub fn list_snapshots(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(
         document["snapshots"]
             .as_array()
@@ -2010,7 +3528,7 @@ pub fn create_manual_snapshot(
 }
 
 pub fn list_instruments(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(
         document["instruments"]
             .as_array()
@@ -2020,7 +3538,7 @@ pub fn list_instruments(path: &Path) -> io::Result<Value> {
 }
 
 pub fn get_instrument(path: &Path, instrument_id: &str) -> io::Result<Option<Value>> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(document["instruments"]
         .as_array()
         .expect("validated local ledger instruments should be an array")
@@ -2082,7 +3600,7 @@ pub fn update_instrument(
 }
 
 pub fn list_categories(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(
         document["categories"]
             .as_array()
@@ -2129,7 +3647,7 @@ pub fn update_category(
 }
 
 pub fn list_counterparties(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
+    let document = read_document(path)?;
     Ok(json!(
         document["counterparties"]
             .as_array()
@@ -2253,6 +3771,12 @@ pub fn edit_ai_atomic_group(
     idempotency: &IdempotencyRequest,
 ) -> Result<IdempotentResponse, LedgerError> {
     idempotent_ledger_write(path, idempotency, 200, |document| {
+        if standalone_pending_movement_for_group(document, atomic_group_id).is_some() {
+            return Err(LedgerError::Conflict(
+                "standalone ledger candidates cannot be edited; reject and regenerate the candidate"
+                    .to_string(),
+            ));
+        }
         let source_id =
             find_ai_proposal_id_for_group(document, atomic_group_id).ok_or_else(|| {
                 LedgerError::NotFound(format!("AI atomic group does not exist: {atomic_group_id}"))
@@ -2289,25 +3813,18 @@ pub fn edit_ai_atomic_group(
 }
 
 pub fn list_pending_ai_proposals(path: &Path) -> io::Result<Value> {
-    let document = load_or_initialize(path)?;
-    Ok(json!(
-        document["aiProposals"]
-            .as_array()
-            .expect("validated local ledger aiProposals should be an array")
-            .iter()
-            .filter(|proposal| is_pending_ai_proposal(proposal))
-            .cloned()
-            .collect::<Vec<_>>()
-    ))
+    let document = read_document(path)?;
+    Ok(json!(pending_ai_proposals_for_document(&document)))
 }
 
 fn pending_ai_proposal_count(document: &Value) -> usize {
-    document["aiProposals"]
+    let stored = document["aiProposals"]
         .as_array()
         .expect("validated local ledger aiProposals should be an array")
         .iter()
         .filter(|proposal| is_pending_ai_proposal(proposal))
-        .count()
+        .count();
+    stored + standalone_pending_movement_groups(document).len()
 }
 
 fn is_pending_ai_proposal(proposal: &Value) -> bool {
@@ -2318,13 +3835,193 @@ fn is_pending_ai_proposal(proposal: &Value) -> bool {
 }
 
 pub fn get_ai_proposal(path: &Path, proposal_id: &str) -> io::Result<Option<Value>> {
-    let document = load_or_initialize(path)?;
-    Ok(document["aiProposals"]
+    let document = read_document(path)?;
+    let stored = document["aiProposals"]
         .as_array()
         .expect("validated local ledger aiProposals should be an array")
         .iter()
         .find(|proposal| proposal.get("id").and_then(Value::as_str) == Some(proposal_id))
-        .cloned())
+        .cloned();
+    if stored.is_some() {
+        return Ok(stored);
+    }
+    Ok(standalone_pending_movement_groups(&document)
+        .into_iter()
+        .map(|movements| standalone_pending_movement_group_proposal(&movements))
+        .find(|proposal| proposal.get("id").and_then(Value::as_str) == Some(proposal_id)))
+}
+
+fn pending_ai_proposals_for_document(document: &Value) -> Vec<Value> {
+    let mut proposals = document["aiProposals"]
+        .as_array()
+        .expect("validated local ledger aiProposals should be an array")
+        .iter()
+        .filter(|proposal| is_pending_ai_proposal(proposal))
+        .cloned()
+        .collect::<Vec<_>>();
+    proposals.extend(
+        standalone_pending_movement_groups(document)
+            .into_iter()
+            .map(|movements| standalone_pending_movement_group_proposal(&movements)),
+    );
+    proposals.sort_by(|left, right| {
+        let left_key = (
+            left.get("createdAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            left.get("id").and_then(Value::as_str).unwrap_or_default(),
+        );
+        let right_key = (
+            right
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            right.get("id").and_then(Value::as_str).unwrap_or_default(),
+        );
+        left_key.cmp(&right_key)
+    });
+    proposals
+}
+
+fn standalone_pending_movements(document: &Value) -> impl Iterator<Item = &Value> {
+    document["movements"]
+        .as_array()
+        .expect("validated local ledger movements should be an array")
+        .iter()
+        .filter(|movement| movement.get("status").and_then(Value::as_str) == Some("pending_review"))
+}
+
+fn standalone_pending_movement_groups(document: &Value) -> Vec<Vec<&Value>> {
+    let mut groups = BTreeMap::<String, Vec<&Value>>::new();
+    for movement in standalone_pending_movements(document) {
+        let Some(atomic_group_id) = movement.get("atomicGroupId").and_then(Value::as_str) else {
+            continue;
+        };
+        groups
+            .entry(atomic_group_id.to_string())
+            .or_default()
+            .push(movement);
+    }
+    for movements in groups.values_mut() {
+        movements.sort_unstable_by_key(|movement| {
+            movement
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        });
+    }
+    groups.into_values().collect()
+}
+
+fn standalone_pending_movement_for_group<'a>(
+    document: &'a Value,
+    atomic_group_id: &str,
+) -> Option<&'a Value> {
+    standalone_pending_movements(document).find(|movement| {
+        movement.get("atomicGroupId").and_then(Value::as_str) == Some(atomic_group_id)
+    })
+}
+
+fn standalone_pending_movement_group_proposal(movements: &[&Value]) -> Value {
+    let movement = movements
+        .first()
+        .copied()
+        .expect("standalone pending movement group should not be empty");
+    let movement_id = movement
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("validated pending movement id should be a string");
+    let title = movement
+        .get("title")
+        .and_then(Value::as_str)
+        .expect("validated pending movement title should be a string");
+    let created_at = movements
+        .iter()
+        .filter_map(|movement| {
+            movement
+                .get("createdAt")
+                .or_else(|| movement.get("recordedAt"))
+                .and_then(Value::as_str)
+        })
+        .min()
+        .expect("validated pending movement timestamp should be a string");
+    let is_subscription = movements.iter().any(|movement| {
+        movement
+            .get("subscriptionId")
+            .and_then(Value::as_str)
+            .is_some()
+    });
+    let is_dca = movements.iter().any(|movement| {
+        movement
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some("dca")))
+    });
+    let (source_label, warnings) = if is_subscription {
+        (
+            "订阅计划",
+            json!([{
+                "code": "subscription_charge_requires_confirmation",
+                "message": "该订阅扣费只是候选；用户确认后才写入正式账本。",
+                "severity": "info"
+            }]),
+        )
+    } else if is_dca {
+        (
+            "定投提醒",
+            json!([{
+                "code": "record_only_no_order",
+                "message": "该候选只记录用户已执行的定投，不连接券商、不下单、不转账。",
+                "severity": "info"
+            }]),
+        )
+    } else {
+        (
+            "手动记录",
+            json!([{
+                "code": "manual_candidate_requires_confirmation",
+                "message": "该记录仍是候选；用户确认后才写入正式账本。",
+                "severity": "info"
+            }]),
+        )
+    };
+    let mut group = atomic_group_from_movement(movement, "pending");
+    group["proposedMovements"] = json!(
+        movements
+            .iter()
+            .map(|movement| project_movement_for_api(movement))
+            .collect::<Vec<_>>()
+    );
+    group["warnings"] = warnings.clone();
+    if let Some(subscription_id) = movement.get("subscriptionId").and_then(Value::as_str) {
+        group["subscriptionId"] = json!(subscription_id);
+    }
+    if let Some(charge_date) = movement.get("scheduledChargeDate").and_then(Value::as_str) {
+        group["scheduledChargeDate"] = json!(charge_date);
+    }
+    let evidence_refs = movements
+        .iter()
+        .filter_map(|movement| movement.get("id").and_then(Value::as_str))
+        .map(|movement_id| {
+            json!({
+                "id": format!("evidence_movement_{movement_id}"),
+                "type": "text",
+                "label": source_label
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "id": format!("proposal_movement_{movement_id}"),
+        "status": "pending",
+        "source": {
+            "kind": "manual_import",
+            "evidenceRefs": evidence_refs
+        },
+        "summary": title,
+        "atomicGroups": [group],
+        "warnings": warnings,
+        "createdAt": created_at
+    })
 }
 
 pub fn ensure_real_and_fixture_paths_separate(
@@ -2350,14 +4047,21 @@ pub fn ensure_real_and_fixture_paths_separate(
 }
 
 pub fn validate_document(document: &Value) -> Result<(), Vec<String>> {
+    validate_document_for_version(document, LEDGER_VERSION)
+}
+
+fn validate_document_for_version(
+    document: &Value,
+    expected_version: i64,
+) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
 
     let Some(object) = document.as_object() else {
         return Err(vec!["ledger document must be a JSON object".to_string()]);
     };
 
-    if object.get("ledgerVersion").and_then(Value::as_i64) != Some(LEDGER_VERSION) {
-        errors.push(format!("ledgerVersion must be {LEDGER_VERSION}"));
+    if object.get("ledgerVersion").and_then(Value::as_i64) != Some(expected_version) {
+        errors.push(format!("ledgerVersion must be {expected_version}"));
     }
 
     match object.get("baseCurrency").and_then(Value::as_str) {
@@ -2388,6 +4092,10 @@ pub fn validate_document(document: &Value) -> Result<(), Vec<String>> {
         require_array(object, key, &mut errors);
     }
 
+    if let Err(error) = validate_history(document, MIGRATION_REGISTRY) {
+        errors.push(error);
+    }
+
     validate_sync_state_and_changes(
         object.get("syncState"),
         object.get("syncChanges"),
@@ -2401,9 +4109,14 @@ pub fn validate_document(document: &Value) -> Result<(), Vec<String>> {
     }
 
     validate_accounts(object.get("accounts"), &mut errors);
+    validate_core_ledger_entities(document, &mut errors);
+    validate_taxonomy_entities(document, &mut errors);
+    validate_quote_entities(document, &mut errors);
+    validate_dca_entities(document, &mut errors);
     validate_subscriptions(
         object.get("subscriptions"),
         object.get("accounts"),
+        object.get("movements"),
         &mut errors,
     );
 
@@ -2411,6 +4124,307 @@ pub fn validate_document(document: &Value) -> Result<(), Vec<String>> {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+fn validate_dca_entities(document: &Value, errors: &mut Vec<String>) {
+    let Some(plans) = document.get("dcaPlans").and_then(Value::as_array) else {
+        return;
+    };
+    let Some(reminders) = document.get("dcaReminders").and_then(Value::as_array) else {
+        return;
+    };
+
+    let account_ids = document["accounts"]
+        .as_array()
+        .map(|accounts| {
+            accounts
+                .iter()
+                .filter_map(|account| account.get("id").and_then(Value::as_str))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut plan_ids = BTreeSet::new();
+    let mut plan_index = BTreeMap::new();
+
+    for (index, plan) in plans.iter().enumerate() {
+        let Some(plan) = plan.as_object() else {
+            errors.push(format!("dcaPlans[{index}] must be an object"));
+            continue;
+        };
+        let id = plan.get("id").and_then(Value::as_str);
+        match id {
+            Some(id) if !id.is_empty() => {
+                if !plan_ids.insert(id) {
+                    errors.push(format!("duplicate DCA plan id: {id}"));
+                }
+                plan_index.entry(id).or_insert(plan);
+            }
+            _ => errors.push(format!("dcaPlans[{index}].id must be a non-empty string")),
+        }
+        for key in ["displayName", "targetInstrumentId"] {
+            if plan
+                .get(key)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                errors.push(format!(
+                    "dcaPlans[{index}].{key} must be a non-empty string"
+                ));
+            }
+        }
+        if let Some(funding_account_id) = plan.get("fundingAccountId") {
+            match funding_account_id.as_str() {
+                Some(id) if account_ids.contains(id) => {}
+                _ => errors.push(format!(
+                    "dcaPlans[{index}].fundingAccountId must reference an existing account"
+                )),
+            }
+        }
+        validate_positive_money(
+            plan.get("plannedAmount"),
+            &format!("dcaPlans[{index}].plannedAmount"),
+            errors,
+        );
+        if !matches!(
+            plan.get("frequency").and_then(Value::as_str),
+            Some("weekly" | "monthly" | "custom")
+        ) {
+            errors.push(format!("dcaPlans[{index}].frequency is invalid"));
+        }
+        if plan
+            .get("nextDueDate")
+            .and_then(Value::as_str)
+            .is_none_or(|value| Date::parse(value, &Iso8601::DATE).is_err())
+        {
+            errors.push(format!("dcaPlans[{index}].nextDueDate must be an ISO date"));
+        }
+        if !matches!(
+            plan.get("reminderStatus").and_then(Value::as_str),
+            Some("active" | "snoozed" | "paused" | "completed")
+        ) {
+            errors.push(format!("dcaPlans[{index}].reminderStatus is invalid"));
+        }
+        validate_optional_timestamp(
+            plan.get("lastActionAt"),
+            &format!("dcaPlans[{index}].lastActionAt"),
+            errors,
+        );
+        validate_optional_timestamp(
+            plan.get("createdAt"),
+            &format!("dcaPlans[{index}].createdAt"),
+            errors,
+        );
+        validate_optional_timestamp(
+            plan.get("updatedAt"),
+            &format!("dcaPlans[{index}].updatedAt"),
+            errors,
+        );
+        if plan.contains_key("note") && !plan.get("note").is_some_and(Value::is_string) {
+            errors.push(format!("dcaPlans[{index}].note must be a string"));
+        }
+    }
+
+    let mut reminder_ids = BTreeSet::new();
+    let mut open_by_plan = BTreeMap::<&str, usize>::new();
+    let mut reminder_index = BTreeMap::new();
+    for (index, reminder) in reminders.iter().enumerate() {
+        let Some(reminder) = reminder.as_object() else {
+            errors.push(format!("dcaReminders[{index}] must be an object"));
+            continue;
+        };
+        let id = reminder.get("id").and_then(Value::as_str);
+        match id {
+            Some(id) if !id.is_empty() => {
+                if !reminder_ids.insert(id) {
+                    errors.push(format!("duplicate DCA reminder id: {id}"));
+                }
+                reminder_index.entry(id).or_insert(reminder);
+            }
+            _ => errors.push(format!(
+                "dcaReminders[{index}].id must be a non-empty string"
+            )),
+        }
+        let plan_id = reminder.get("planId").and_then(Value::as_str);
+        let plan = match plan_id {
+            Some(plan_id) => match plan_index.get(plan_id) {
+                Some(plan) => Some(*plan),
+                None => {
+                    errors.push(format!(
+                        "dcaReminders[{index}].planId must reference an existing DCA plan"
+                    ));
+                    None
+                }
+            },
+            None => {
+                errors.push(format!(
+                    "dcaReminders[{index}].planId must be a non-empty string"
+                ));
+                None
+            }
+        };
+        if reminder
+            .get("displayName")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!(
+                "dcaReminders[{index}].displayName must be a non-empty string"
+            ));
+        }
+        validate_positive_money(
+            reminder.get("plannedAmount"),
+            &format!("dcaReminders[{index}].plannedAmount"),
+            errors,
+        );
+        if reminder
+            .get("dueDate")
+            .and_then(Value::as_str)
+            .is_none_or(|value| Date::parse(value, &Iso8601::DATE).is_err())
+        {
+            errors.push(format!("dcaReminders[{index}].dueDate must be an ISO date"));
+        }
+        let status = reminder.get("status").and_then(Value::as_str);
+        if !matches!(
+            status,
+            Some("due" | "overdue" | "snoozed" | "recorded" | "skipped")
+        ) {
+            errors.push(format!("dcaReminders[{index}].status is invalid"));
+        }
+        if status == Some("snoozed") {
+            if reminder
+                .get("snoozedUntil")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339)
+                .is_none()
+            {
+                errors.push(format!(
+                    "dcaReminders[{index}].snoozedUntil must be an RFC3339 timestamp when snoozed"
+                ));
+            }
+        } else if reminder.contains_key("snoozedUntil") {
+            errors.push(format!(
+                "dcaReminders[{index}].snoozedUntil is only valid for snoozed reminders"
+            ));
+        }
+        validate_optional_timestamp(
+            reminder.get("updatedAt"),
+            &format!("dcaReminders[{index}].updatedAt"),
+            errors,
+        );
+
+        if matches!(status, Some("due" | "overdue" | "snoozed"))
+            && let Some(plan_id) = plan_id
+        {
+            let count = open_by_plan.entry(plan_id).or_default();
+            *count += 1;
+            if *count > 1 {
+                errors.push(format!(
+                    "DCA plan has more than one open reminder: {plan_id}"
+                ));
+            }
+            if let Some(plan) = plan {
+                for (reminder_key, plan_key) in [
+                    ("displayName", "displayName"),
+                    ("plannedAmount", "plannedAmount"),
+                    ("dueDate", "nextDueDate"),
+                ] {
+                    if reminder.get(reminder_key) != plan.get(plan_key) {
+                        errors.push(format!(
+                            "dcaReminders[{index}].{reminder_key} must match its open DCA plan"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut pending_counts = BTreeMap::<&str, usize>::new();
+    let mut confirmed_counts = BTreeMap::<&str, usize>::new();
+    if let Some(movements) = document.get("movements").and_then(Value::as_array) {
+        for (index, movement) in movements.iter().enumerate() {
+            let is_dca = movement
+                .get("tags")
+                .and_then(Value::as_array)
+                .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some("dca")))
+                && movement
+                    .get("source")
+                    .and_then(|source| source.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("system");
+            if !is_dca {
+                continue;
+            }
+            let Some(reminder_id) = movement
+                .get("source")
+                .and_then(|source| source.get("sourceId"))
+                .and_then(Value::as_str)
+            else {
+                errors.push(format!(
+                    "movements[{index}] DCA source.sourceId must reference a reminder"
+                ));
+                continue;
+            };
+            if !reminder_index.contains_key(reminder_id) {
+                errors.push(format!(
+                    "movements[{index}] DCA source.sourceId must reference an existing reminder"
+                ));
+                continue;
+            }
+            match movement.get("status").and_then(Value::as_str) {
+                Some("pending_review") => *pending_counts.entry(reminder_id).or_default() += 1,
+                Some("confirmed") => *confirmed_counts.entry(reminder_id).or_default() += 1,
+                _ => {}
+            }
+        }
+    }
+    for (reminder_id, count) in pending_counts {
+        if count > 1 {
+            errors.push(format!(
+                "DCA reminder has more than one pending proposal: {reminder_id}"
+            ));
+        }
+    }
+    for (reminder_id, reminder) in reminder_index {
+        let confirmed = confirmed_counts.get(reminder_id).copied().unwrap_or(0);
+        if reminder.get("status").and_then(Value::as_str) == Some("recorded") && confirmed != 1 {
+            errors.push(format!(
+                "recorded DCA reminder must reference exactly one confirmed movement: {reminder_id}"
+            ));
+        }
+    }
+}
+
+fn validate_positive_money(value: Option<&Value>, label: &str, errors: &mut Vec<String>) {
+    let Some(value) = value else {
+        errors.push(format!("{label} is required"));
+        return;
+    };
+    let Some(object) = value.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    if object
+        .get("amount")
+        .and_then(Value::as_str)
+        .is_none_or(|amount| !is_positive_decimal_string(amount))
+    {
+        errors.push(format!("{label}.amount must be a positive decimal string"));
+    }
+    if object
+        .get("currency")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        errors.push(format!("{label}.currency must be a non-empty string"));
+    }
+}
+
+fn validate_optional_timestamp(value: Option<&Value>, label: &str, errors: &mut Vec<String>) {
+    match value {
+        None | Some(Value::Null) => {}
+        Some(Value::String(value)) if parse_rfc3339(value).is_some() => {}
+        _ => errors.push(format!("{label} must be an RFC3339 timestamp")),
     }
 }
 
@@ -2536,12 +4550,2167 @@ fn validate_accounts(accounts: Option<&Value>, errors: &mut Vec<String>) {
                 ));
             }
         }
+        if let Some(terms) = account.get("liabilityTerms") {
+            validate_liability_terms(terms, index, errors);
+        }
+    }
+}
+
+fn validate_liability_terms(value: &Value, account_index: usize, errors: &mut Vec<String>) {
+    let label = format!("accounts[{account_index}].liabilityTerms");
+    let Some(terms) = value.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    if !matches!(
+        terms.get("liabilityType").and_then(Value::as_str),
+        Some("student_loan" | "mortgage" | "consumer_loan" | "credit_card" | "other")
+    ) {
+        errors.push(format!("{label}.liabilityType is invalid"));
+    }
+    if terms
+        .get("annualRate")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok())
+        .is_none_or(|value| value <= DecimalAmount::ZERO)
+    {
+        errors.push(format!("{label}.annualRate must be positive"));
+    }
+    if !matches!(
+        terms.get("rateType").and_then(Value::as_str),
+        Some("fixed" | "floating")
+    ) {
+        errors.push(format!("{label}.rateType is invalid"));
+    }
+    if !matches!(
+        terms.get("dayCountBasis").and_then(Value::as_u64),
+        Some(360 | 365)
+    ) {
+        errors.push(format!("{label}.dayCountBasis must be 360 or 365"));
+    }
+    if terms.get("repaymentFrequency").and_then(Value::as_str) != Some("monthly") {
+        errors.push(format!("{label}.repaymentFrequency must be monthly"));
+    }
+    if !matches!(
+        terms.get("repaymentAnchorDay").and_then(Value::as_u64),
+        Some(1..=31)
+    ) {
+        errors.push(format!(
+            "{label}.repaymentAnchorDay must be from 1 through 31"
+        ));
+    }
+    validate_positive_money(
+        terms.get("scheduledPayment"),
+        &format!("{label}.scheduledPayment"),
+        errors,
+    );
+    for key in ["paymentAccountId", "updatedAt"] {
+        if terms
+            .get(key)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.{key} must be a non-empty string"));
+        }
+    }
+    let interest_start = terms
+        .get("interestStartDate")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let maturity = terms
+        .get("maturityDate")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let repayment_start = terms
+        .get("repaymentStartDate")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let next_due = terms
+        .get("nextDueDate")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let last = terms
+        .get("lastInterestAccruedThrough")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    if interest_start.is_none()
+        || maturity.is_none()
+        || repayment_start.is_none()
+        || next_due.is_none()
+        || last.is_none()
+    {
+        errors.push(format!("{label} dates must be valid ISO dates"));
+    } else if let (
+        Some(interest_start),
+        Some(maturity),
+        Some(repayment_start),
+        Some(next_due),
+        Some(last),
+    ) = (interest_start, maturity, repayment_start, next_due, last)
+    {
+        if maturity <= interest_start {
+            errors.push(format!(
+                "{label}.maturityDate must follow interestStartDate"
+            ));
+        }
+        if repayment_start < interest_start || repayment_start > maturity {
+            errors.push(format!(
+                "{label}.repaymentStartDate must be within the loan term"
+            ));
+        }
+        if next_due < repayment_start || next_due > maturity {
+            errors.push(format!(
+                "{label}.nextDueDate must be within the repayment term"
+            ));
+        }
+        if last < interest_start || last > maturity {
+            errors.push(format!(
+                "{label}.lastInterestAccruedThrough must be within the loan term"
+            ));
+        }
+    }
+    for key in [
+        "pendingLoanInterestMovementId",
+        "lastLoanInterestMovementId",
+        "pendingLoanPaymentMovementId",
+        "lastLoanPaymentMovementId",
+    ] {
+        if let Some(value) = terms.get(key)
+            && value.as_str().is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.{key} must be a non-empty string"));
+        }
+    }
+    if let Some(value) = terms.get("pendingLoanInterestThroughDate")
+        && value
+            .as_str()
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok())
+            .is_none()
+    {
+        errors.push(format!(
+            "{label}.pendingLoanInterestThroughDate must be an ISO date"
+        ));
+    }
+    for key in ["pendingLoanPaymentDate", "lastPaymentDate"] {
+        if let Some(value) = terms.get(key)
+            && value
+                .as_str()
+                .and_then(|value| Date::parse(value, &Iso8601::DATE).ok())
+                .is_none()
+        {
+            errors.push(format!("{label}.{key} must be an ISO date"));
+        }
+    }
+}
+
+fn validate_core_ledger_entities(document: &Value, errors: &mut Vec<String>) {
+    let account_ids = document["accounts"]
+        .as_array()
+        .map(|accounts| {
+            accounts
+                .iter()
+                .filter_map(|account| account.get("id").and_then(Value::as_str))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let instrument_ids = validate_instruments(document.get("instruments"), errors);
+    validate_fx_rates(document.get("fxRates"), errors);
+    validate_holdings(
+        document.get("holdings"),
+        &account_ids,
+        &instrument_ids,
+        errors,
+    );
+    let movement_index = validate_movements(document, &account_ids, &instrument_ids, errors);
+    validate_yield_pending_links(document, errors);
+    validate_liability_term_links(document, errors);
+    validate_movement_entry_index(document.get("movementEntries"), &movement_index, errors);
+}
+
+fn validate_yield_pending_links(document: &Value, errors: &mut Vec<String>) {
+    let movements = document["movements"]
+        .as_array()
+        .expect("validated movements should be an array");
+    for (index, holding) in document["holdings"]
+        .as_array()
+        .expect("validated holdings should be an array")
+        .iter()
+        .enumerate()
+    {
+        let Some(terms) = holding.get("yieldTerms") else {
+            continue;
+        };
+        let Some(pending_id) = terms
+            .get("pendingInterestMovementId")
+            .and_then(Value::as_str)
+        else {
+            if terms.get("pendingInterestThroughDate").is_some() {
+                errors.push(format!(
+                    "holdings[{index}].yieldTerms.pendingInterestThroughDate requires a pending movement"
+                ));
+            }
+            continue;
+        };
+        let holding_id = holding.get("id").and_then(Value::as_str);
+        let pending = movements
+            .iter()
+            .find(|movement| movement.get("id").and_then(Value::as_str) == Some(pending_id));
+        let valid = pending.is_some_and(|movement| {
+            movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                && movement
+                    .get("yieldAccrual")
+                    .and_then(|accrual| accrual.get("holdingId"))
+                    .and_then(Value::as_str)
+                    == holding_id
+                && movement
+                    .get("yieldAccrual")
+                    .and_then(|accrual| accrual.get("throughDate"))
+                    == terms.get("pendingInterestThroughDate")
+        });
+        if !valid {
+            errors.push(format!(
+                "holdings[{index}].yieldTerms pending interest link is invalid"
+            ));
+        }
+    }
+}
+
+fn validate_liability_term_links(document: &Value, errors: &mut Vec<String>) {
+    let movements = document["movements"]
+        .as_array()
+        .expect("validated movements should be an array");
+    for (index, account) in document["accounts"]
+        .as_array()
+        .expect("validated accounts should be an array")
+        .iter()
+        .enumerate()
+    {
+        let Some(terms) = account.get("liabilityTerms") else {
+            continue;
+        };
+        if !is_liability_account(account) {
+            errors.push(format!(
+                "accounts[{index}].liabilityTerms require a liability account"
+            ));
+        }
+        let loan_currency = account.get("defaultCurrency").and_then(Value::as_str);
+        if terms["scheduledPayment"]["currency"].as_str() != loan_currency {
+            errors.push(format!(
+                "accounts[{index}].liabilityTerms scheduled payment currency must match the account"
+            ));
+        }
+        let payment_account_id = terms.get("paymentAccountId").and_then(Value::as_str);
+        let payment_account = payment_account_id.and_then(|id| active_account(document, id));
+        if payment_account.is_none_or(is_liability_account) {
+            errors.push(format!(
+                "accounts[{index}].liabilityTerms paymentAccountId must reference an active non-liability account"
+            ));
+        } else if let (Some(payment_account), Some(currency)) = (payment_account, loan_currency)
+            && !payment_account["supportedCurrencies"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(currency)))
+        {
+            errors.push(format!(
+                "accounts[{index}].liabilityTerms payment account must support the loan currency"
+            ));
+        }
+        let account_id = account.get("id").and_then(Value::as_str);
+        if let Some(pending_id) = terms
+            .get("pendingLoanInterestMovementId")
+            .and_then(Value::as_str)
+        {
+            let pending = movements
+                .iter()
+                .find(|movement| movement.get("id").and_then(Value::as_str) == Some(pending_id));
+            let valid = pending.is_some_and(|movement| {
+                movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                    && movement
+                        .get("loanInterestAccrual")
+                        .and_then(|accrual| accrual.get("accountId"))
+                        .and_then(Value::as_str)
+                        == account_id
+                    && movement
+                        .get("loanInterestAccrual")
+                        .and_then(|accrual| accrual.get("throughDate"))
+                        == terms.get("pendingLoanInterestThroughDate")
+            });
+            if !valid {
+                errors.push(format!(
+                    "accounts[{index}].liabilityTerms pending loan interest link is invalid"
+                ));
+            }
+        } else {
+            if terms.get("pendingLoanInterestThroughDate").is_some() {
+                errors.push(format!(
+                    "accounts[{index}].liabilityTerms.pendingLoanInterestThroughDate requires a pending movement"
+                ));
+            }
+        }
+        if let Some(pending_id) = terms
+            .get("pendingLoanPaymentMovementId")
+            .and_then(Value::as_str)
+        {
+            let pending = movements
+                .iter()
+                .find(|movement| movement.get("id").and_then(Value::as_str) == Some(pending_id));
+            let valid = pending.is_some_and(|movement| {
+                movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                    && movement
+                        .get("loanPayment")
+                        .and_then(|payment| payment.get("accountId"))
+                        .and_then(Value::as_str)
+                        == account_id
+                    && movement
+                        .get("loanPayment")
+                        .and_then(|payment| payment.get("paymentDate"))
+                        == terms.get("pendingLoanPaymentDate")
+            });
+            if !valid {
+                errors.push(format!(
+                    "accounts[{index}].liabilityTerms pending loan payment link is invalid"
+                ));
+            }
+        } else if terms.get("pendingLoanPaymentDate").is_some() {
+            errors.push(format!(
+                "accounts[{index}].liabilityTerms.pendingLoanPaymentDate requires a pending movement"
+            ));
+        }
+    }
+}
+
+fn validate_fx_rates(value: Option<&Value>, errors: &mut Vec<String>) {
+    let Some(rates) = value.and_then(Value::as_array) else {
+        return;
+    };
+    let mut ids = BTreeSet::new();
+    let mut time_points = BTreeSet::new();
+    for (index, rate) in rates.iter().enumerate() {
+        let label = format!("fxRates[{index}]");
+        let Some(rate) = rate.as_object() else {
+            errors.push(format!("{label} must be an object"));
+            continue;
+        };
+        match rate.get("id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => {
+                if !ids.insert(id) {
+                    errors.push(format!("duplicate FX rate id: {id}"));
+                }
+            }
+            _ => errors.push(format!("{label}.id must be a non-empty string")),
+        }
+        let base = rate.get("baseCurrency").and_then(Value::as_str);
+        let quote = rate.get("quoteCurrency").and_then(Value::as_str);
+        if base.is_none_or(str::is_empty) {
+            errors.push(format!("{label}.baseCurrency must be a non-empty string"));
+        }
+        if quote.is_none_or(str::is_empty) {
+            errors.push(format!("{label}.quoteCurrency must be a non-empty string"));
+        }
+        if base.is_some() && base == quote {
+            errors.push(format!("{label} must use two different currencies"));
+        }
+        let as_of_text = rate.get("asOf").and_then(Value::as_str);
+        if let (Some(base), Some(quote), Some(as_of)) = (base, quote, as_of_text)
+            && !time_points.insert((base, quote, as_of))
+        {
+            errors.push(format!(
+                "duplicate FX rate time point: {base}/{quote} at {as_of}"
+            ));
+        }
+        if rate
+            .get("rate")
+            .and_then(Value::as_str)
+            .is_none_or(|rate| !is_positive_decimal_string(rate))
+        {
+            errors.push(format!("{label}.rate must be a positive decimal string"));
+        }
+        if as_of_text.and_then(parse_rfc3339).is_none() {
+            errors.push(format!("{label}.asOf must be an RFC3339 timestamp"));
+        }
+        if rate
+            .get("source")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.source must be a non-empty string"));
+        }
+        if !matches!(
+            rate.get("status").and_then(Value::as_str),
+            Some("fresh" | "stale" | "offline_cached" | "incomplete" | "unpriceable" | "error")
+        ) {
+            errors.push(format!("{label}.status is invalid"));
+        }
+        if let Some(expires_at) = rate.get("expiresAt")
+            && expires_at.as_str().and_then(parse_rfc3339).is_none()
+        {
+            errors.push(format!("{label}.expiresAt must be an RFC3339 timestamp"));
+        }
+        if let Some(source_url) = rate.get("sourceUrl")
+            && source_url.as_str().is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.sourceUrl must be a non-empty string"));
+        }
+    }
+}
+
+fn validate_instruments<'a>(
+    instruments: Option<&'a Value>,
+    errors: &mut Vec<String>,
+) -> BTreeSet<&'a str> {
+    let Some(instruments) = instruments.and_then(Value::as_array) else {
+        return BTreeSet::new();
+    };
+    let mut ids = BTreeSet::new();
+    for (index, instrument) in instruments.iter().enumerate() {
+        let Some(instrument) = instrument.as_object() else {
+            errors.push(format!("instruments[{index}] must be an object"));
+            continue;
+        };
+        let id = instrument.get("id").and_then(Value::as_str);
+        match id {
+            Some(id) if !id.is_empty() => {
+                if !ids.insert(id) {
+                    errors.push(format!("duplicate instrument id: {id}"));
+                }
+            }
+            _ => errors.push(format!(
+                "instruments[{index}].id must be a non-empty string"
+            )),
+        }
+        for key in ["displayName", "quoteCurrency"] {
+            if instrument
+                .get(key)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                errors.push(format!(
+                    "instruments[{index}].{key} must be a non-empty string"
+                ));
+            }
+        }
+        if !matches!(
+            instrument.get("type").and_then(Value::as_str),
+            Some("cash" | "equity" | "fund" | "crypto" | "fx_cash" | "receivable" | "other")
+        ) {
+            errors.push(format!("instruments[{index}].type is invalid"));
+        }
+        for key in ["symbol", "market", "sourceRef"] {
+            if let Some(value) = instrument.get(key)
+                && value.as_str().is_none_or(|value| value.trim().is_empty())
+            {
+                errors.push(format!(
+                    "instruments[{index}].{key} must be a non-empty string when present"
+                ));
+            }
+        }
+    }
+    ids
+}
+
+fn validate_taxonomy_entities(document: &Value, errors: &mut Vec<String>) {
+    let Some(categories) = document.get("categories").and_then(Value::as_array) else {
+        return;
+    };
+    let mut category_ids = BTreeSet::new();
+    let mut parent_by_id = BTreeMap::new();
+    for (index, category) in categories.iter().enumerate() {
+        let label = format!("categories[{index}]");
+        let Some(category) = category.as_object() else {
+            errors.push(format!("{label} must be an object"));
+            continue;
+        };
+        let id = category.get("id").and_then(Value::as_str);
+        match id {
+            Some(id) if !id.is_empty() => {
+                if !category_ids.insert(id) {
+                    errors.push(format!("duplicate category id: {id}"));
+                }
+                if let Some(parent_id) = category.get("parentId").and_then(Value::as_str) {
+                    parent_by_id.insert(id, parent_id);
+                }
+            }
+            _ => errors.push(format!("{label}.id must be a non-empty string")),
+        }
+        if category
+            .get("displayName")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            errors.push(format!("{label}.displayName must be a non-empty string"));
+        }
+        if !matches!(
+            category.get("kind").and_then(Value::as_str),
+            Some("income" | "expense" | "transfer" | "investment" | "liability" | "system")
+        ) {
+            errors.push(format!("{label}.kind is invalid"));
+        }
+        if category.get("isSystem").and_then(Value::as_bool).is_none() {
+            errors.push(format!("{label}.isSystem must be a boolean"));
+        }
+        if let Some(parent_id) = category.get("parentId")
+            && parent_id
+                .as_str()
+                .is_none_or(|parent_id| parent_id.trim().is_empty())
+        {
+            errors.push(format!(
+                "{label}.parentId must be a non-empty string when present"
+            ));
+        }
+        if let Some(description) = category.get("aiDescription")
+            && description
+                .as_str()
+                .is_none_or(|description| description.trim().is_empty())
+        {
+            errors.push(format!(
+                "{label}.aiDescription must be a non-empty string when present"
+            ));
+        }
+    }
+
+    for (id, parent_id) in &parent_by_id {
+        if id == parent_id {
+            errors.push(format!("category parent must not reference itself: {id}"));
+        } else if !category_ids.contains(parent_id) {
+            errors.push(format!(
+                "category parentId must reference an existing category: {id} -> {parent_id}"
+            ));
+        }
+        let mut visited = BTreeSet::new();
+        let mut cursor = *id;
+        while let Some(parent) = parent_by_id.get(cursor) {
+            if !visited.insert(cursor) {
+                errors.push(format!("category parent cycle detected at: {cursor}"));
+                break;
+            }
+            cursor = parent;
+        }
+    }
+
+    let Some(counterparties) = document.get("counterparties").and_then(Value::as_array) else {
+        return;
+    };
+    let mut counterparty_ids = BTreeSet::new();
+    for (index, counterparty) in counterparties.iter().enumerate() {
+        let label = format!("counterparties[{index}]");
+        let Some(counterparty) = counterparty.as_object() else {
+            errors.push(format!("{label} must be an object"));
+            continue;
+        };
+        match counterparty.get("id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => {
+                if !counterparty_ids.insert(id) {
+                    errors.push(format!("duplicate counterparty id: {id}"));
+                }
+            }
+            _ => errors.push(format!("{label}.id must be a non-empty string")),
+        }
+        if counterparty
+            .get("displayName")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            errors.push(format!("{label}.displayName must be a non-empty string"));
+        }
+        if let Some(normalized_name) = counterparty.get("normalizedName")
+            && normalized_name
+                .as_str()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            errors.push(format!(
+                "{label}.normalizedName must be a non-empty string when present"
+            ));
+        }
+        let Some(aliases) = counterparty.get("aliases").and_then(Value::as_array) else {
+            errors.push(format!("{label}.aliases must be a string array"));
+            continue;
+        };
+        let mut unique_aliases = BTreeSet::new();
+        for (alias_index, alias) in aliases.iter().enumerate() {
+            match alias.as_str().filter(|alias| !alias.trim().is_empty()) {
+                Some(alias) => {
+                    if !unique_aliases.insert(alias) {
+                        errors.push(format!("{label}.aliases contains duplicate: {alias}"));
+                    }
+                }
+                None => errors.push(format!(
+                    "{label}.aliases[{alias_index}] must be a non-empty string"
+                )),
+            }
+        }
+        if counterparty
+            .get("isUserMerged")
+            .and_then(Value::as_bool)
+            .is_none()
+        {
+            errors.push(format!("{label}.isUserMerged must be a boolean"));
+        }
+        if let Some(category_id) = counterparty.get("categoryHintId") {
+            match category_id.as_str() {
+                Some(category_id) if category_ids.contains(category_id) => {}
+                _ => errors.push(format!(
+                    "{label}.categoryHintId must reference an existing category"
+                )),
+            }
+        }
+    }
+}
+
+fn validate_quote_entities(document: &Value, errors: &mut Vec<String>) {
+    let instrument_currency = document["instruments"]
+        .as_array()
+        .map(|instruments| {
+            instruments
+                .iter()
+                .filter_map(|instrument| {
+                    Some((
+                        instrument.get("id")?.as_str()?,
+                        instrument.get("quoteCurrency")?.as_str()?,
+                    ))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let Some(quotes) = document.get("quotes").and_then(Value::as_array) else {
+        return;
+    };
+    let mut ids = BTreeSet::new();
+    let mut quoted_instruments = BTreeSet::new();
+    for (index, quote) in quotes.iter().enumerate() {
+        let label = format!("quotes[{index}]");
+        let Some(quote) = quote.as_object() else {
+            errors.push(format!("{label} must be an object"));
+            continue;
+        };
+        match quote.get("id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => {
+                if !ids.insert(id) {
+                    errors.push(format!("duplicate quote id: {id}"));
+                }
+            }
+            _ => errors.push(format!("{label}.id must be a non-empty string")),
+        }
+        let instrument_id = quote.get("instrumentId").and_then(Value::as_str);
+        match instrument_id {
+            Some(instrument_id) if instrument_currency.contains_key(instrument_id) => {
+                if !quoted_instruments.insert(instrument_id) {
+                    errors.push(format!(
+                        "duplicate current quote for instrument: {instrument_id}"
+                    ));
+                }
+                if quote.get("currency").and_then(Value::as_str)
+                    != instrument_currency.get(instrument_id).copied()
+                {
+                    errors.push(format!(
+                        "{label}.currency must match the instrument quoteCurrency"
+                    ));
+                }
+            }
+            _ => errors.push(format!(
+                "{label}.instrumentId must reference an existing instrument"
+            )),
+        }
+        if quote
+            .get("price")
+            .and_then(Value::as_str)
+            .is_none_or(|price| !is_positive_decimal_string(price))
+        {
+            errors.push(format!("{label}.price must be a positive decimal string"));
+        }
+        if quote
+            .get("currency")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.currency must be a non-empty string"));
+        }
+        if quote
+            .get("asOf")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339)
+            .is_none()
+        {
+            errors.push(format!("{label}.asOf must be an RFC3339 timestamp"));
+        }
+        if let Some(expires_at) = quote.get("expiresAt")
+            && expires_at.as_str().and_then(parse_rfc3339).is_none()
+        {
+            errors.push(format!("{label}.expiresAt must be an RFC3339 timestamp"));
+        }
+        if quote
+            .get("source")
+            .and_then(Value::as_str)
+            .is_none_or(|source| source.trim().is_empty())
+        {
+            errors.push(format!("{label}.source must be a non-empty string"));
+        }
+        if !matches!(
+            quote.get("status").and_then(Value::as_str),
+            Some("fresh" | "stale" | "offline_cached" | "incomplete" | "unpriceable" | "error")
+        ) {
+            errors.push(format!("{label}.status is invalid"));
+        }
+        if let Some(source_url) = quote.get("sourceUrl")
+            && source_url.as_str().is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.sourceUrl must be a non-empty string"));
+        }
+    }
+
+    for (movement_index, movement) in document["movements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for (entry_index, entry) in movement
+            .get("entries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let Some(instrument_id) = entry.get("instrumentId").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(expected_currency) = instrument_currency.get(instrument_id)
+                && entry.get("currency").and_then(Value::as_str) != Some(*expected_currency)
+            {
+                errors.push(format!(
+                    "movements[{movement_index}].entries[{entry_index}].currency must match the instrument quoteCurrency"
+                ));
+            }
+        }
+    }
+}
+
+fn validate_holdings(
+    holdings: Option<&Value>,
+    account_ids: &BTreeSet<&str>,
+    instrument_ids: &BTreeSet<&str>,
+    errors: &mut Vec<String>,
+) {
+    let Some(holdings) = holdings.and_then(Value::as_array) else {
+        return;
+    };
+    let mut ids = BTreeSet::new();
+    let mut account_instruments = BTreeSet::new();
+    for (index, holding) in holdings.iter().enumerate() {
+        let Some(holding) = holding.as_object() else {
+            errors.push(format!("holdings[{index}] must be an object"));
+            continue;
+        };
+        let id = holding.get("id").and_then(Value::as_str);
+        match id {
+            Some(id) if !id.is_empty() => {
+                if !ids.insert(id) {
+                    errors.push(format!("duplicate holding id: {id}"));
+                }
+            }
+            _ => errors.push(format!("holdings[{index}].id must be a non-empty string")),
+        }
+        let account_id = holding.get("accountId").and_then(Value::as_str);
+        match account_id {
+            Some(account_id) if account_ids.contains(account_id) => {}
+            _ => errors.push(format!(
+                "holdings[{index}].accountId must reference an existing account"
+            )),
+        }
+        let instrument_id = holding.get("instrumentId").and_then(Value::as_str);
+        match instrument_id {
+            Some(instrument_id) if instrument_ids.contains(instrument_id) => {}
+            _ => errors.push(format!(
+                "holdings[{index}].instrumentId must reference an existing instrument"
+            )),
+        }
+        if let (Some(account_id), Some(instrument_id)) = (account_id, instrument_id)
+            && !account_instruments.insert((account_id, instrument_id))
+        {
+            errors.push(format!(
+                "duplicate holding for account/instrument: {account_id}/{instrument_id}"
+            ));
+        }
+        match holding.get("quantity").and_then(Value::as_str) {
+            Some(quantity)
+                if is_decimal_string(quantity)
+                    && parse_decimal(quantity)
+                        .is_ok_and(|quantity| quantity >= DecimalAmount::ZERO) => {}
+            _ => errors.push(format!(
+                "holdings[{index}].quantity must be a non-negative decimal string"
+            )),
+        }
+        if let Some(cost_basis) = holding.get("costBasisTotal") {
+            validate_non_negative_money(
+                cost_basis,
+                &format!("holdings[{index}].costBasisTotal"),
+                errors,
+            );
+        }
+        if let Some(market_value) = holding.get("marketValue") {
+            validate_non_negative_money(
+                market_value,
+                &format!("holdings[{index}].marketValue"),
+                errors,
+            );
+            if market_value
+                .get("asOf")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                errors.push(format!(
+                    "holdings[{index}].marketValue.asOf must be a non-empty string"
+                ));
+            }
+            if !matches!(
+                market_value.get("quality").and_then(Value::as_str),
+                Some("exact" | "estimated" | "incomplete" | "unpriceable" | "anomaly")
+            ) {
+                errors.push(format!("holdings[{index}].marketValue.quality is invalid"));
+            }
+        }
+        if !matches!(
+            holding.get("quoteStatus").and_then(Value::as_str),
+            Some("fresh" | "stale" | "offline_cached" | "incomplete" | "unpriceable" | "error")
+        ) {
+            errors.push(format!("holdings[{index}].quoteStatus is invalid"));
+        }
+        if holding
+            .get("asOf")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("holdings[{index}].asOf must be a non-empty string"));
+        }
+        if let Some(terms) = holding.get("yieldTerms") {
+            validate_yield_terms(terms, index, account_ids, errors);
+        }
+    }
+}
+
+fn validate_yield_terms(
+    value: &Value,
+    holding_index: usize,
+    account_ids: &BTreeSet<&str>,
+    errors: &mut Vec<String>,
+) {
+    let label = format!("holdings[{holding_index}].yieldTerms");
+    let Some(terms) = value.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    validate_positive_money(
+        terms.get("principal"),
+        &format!("{label}.principal"),
+        errors,
+    );
+    if terms
+        .get("annualRate")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok())
+        .is_none_or(|value| value <= DecimalAmount::ZERO)
+    {
+        errors.push(format!(
+            "{label}.annualRate must be a positive decimal string"
+        ));
+    }
+    if !matches!(
+        terms.get("rateType").and_then(Value::as_str),
+        Some("fixed" | "floating")
+    ) {
+        errors.push(format!("{label}.rateType is invalid"));
+    }
+    let method = terms.get("interestMethod").and_then(Value::as_str);
+    let frequency = terms.get("compoundingFrequency").and_then(Value::as_str);
+    if !matches!(method, Some("simple" | "compound")) {
+        errors.push(format!("{label}.interestMethod is invalid"));
+    }
+    if !matches!(frequency, Some("none" | "monthly" | "quarterly" | "annual")) {
+        errors.push(format!("{label}.compoundingFrequency is invalid"));
+    }
+    if method == Some("simple") && frequency != Some("none") {
+        errors.push(format!(
+            "{label} simple interest requires compoundingFrequency=none"
+        ));
+    }
+    if method == Some("compound") && frequency == Some("none") {
+        errors.push(format!(
+            "{label} compound interest requires a compounding frequency"
+        ));
+    }
+    if !matches!(
+        terms.get("dayCountBasis").and_then(Value::as_u64),
+        Some(360 | 365)
+    ) {
+        errors.push(format!("{label}.dayCountBasis must be 360 or 365"));
+    }
+    let start = terms
+        .get("interestStartDate")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let maturity = terms
+        .get("maturityDate")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let last = terms
+        .get("lastAccruedThrough")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    if start.is_none() {
+        errors.push(format!("{label}.interestStartDate must be an ISO date"));
+    }
+    if maturity.is_none() {
+        errors.push(format!("{label}.maturityDate must be an ISO date"));
+    }
+    if last.is_none() {
+        errors.push(format!("{label}.lastAccruedThrough must be an ISO date"));
+    }
+    if let (Some(start), Some(last), Some(maturity)) = (start, last, maturity)
+        && (last < start || last > maturity)
+    {
+        errors.push(format!(
+            "{label}.lastAccruedThrough must be within the interest term"
+        ));
+    }
+    if terms
+        .get("payoutAccountId")
+        .and_then(Value::as_str)
+        .is_none_or(|account_id| !account_ids.contains(account_id))
+    {
+        errors.push(format!(
+            "{label}.payoutAccountId must reference an existing account"
+        ));
+    }
+    if terms
+        .get("updatedAt")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339)
+        .is_none()
+    {
+        errors.push(format!("{label}.updatedAt must be an RFC3339 timestamp"));
+    }
+    for key in ["pendingInterestMovementId", "lastInterestMovementId"] {
+        if let Some(value) = terms.get(key)
+            && value.as_str().is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.{key} must be a non-empty string"));
+        }
+    }
+    if let Some(value) = terms.get("pendingInterestThroughDate")
+        && value
+            .as_str()
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok())
+            .is_none()
+    {
+        errors.push(format!(
+            "{label}.pendingInterestThroughDate must be an ISO date"
+        ));
+    }
+}
+
+#[derive(Default)]
+struct StoredMovementIndex<'a> {
+    groups: BTreeMap<&'a str, &'a str>,
+    entry_ids: BTreeMap<&'a str, BTreeSet<&'a str>>,
+}
+
+fn validate_movements<'a>(
+    document: &'a Value,
+    account_ids: &BTreeSet<&str>,
+    instrument_ids: &BTreeSet<&str>,
+    errors: &mut Vec<String>,
+) -> StoredMovementIndex<'a> {
+    let Some(movements) = document["movements"].as_array() else {
+        return StoredMovementIndex::default();
+    };
+    let mut index_by_id = StoredMovementIndex::default();
+    for (index, movement) in movements.iter().enumerate() {
+        let Some(movement) = movement.as_object() else {
+            errors.push(format!("movements[{index}] must be an object"));
+            continue;
+        };
+        let movement_id = movement.get("id").and_then(Value::as_str);
+        let atomic_group_id = movement.get("atomicGroupId").and_then(Value::as_str);
+        match (movement_id, atomic_group_id) {
+            (Some(movement_id), Some(group_id))
+                if !movement_id.is_empty() && !group_id.is_empty() =>
+            {
+                if index_by_id.groups.insert(movement_id, group_id).is_some() {
+                    errors.push(format!("duplicate movement id: {movement_id}"));
+                }
+            }
+            _ => {
+                if movement_id.is_none_or(str::is_empty) {
+                    errors.push(format!("movements[{index}].id must be a non-empty string"));
+                }
+                if atomic_group_id.is_none_or(str::is_empty) {
+                    errors.push(format!(
+                        "movements[{index}].atomicGroupId must be a non-empty string"
+                    ));
+                }
+            }
+        }
+        for key in [
+            "occurredAt",
+            "recordedAt",
+            "title",
+            "createdAt",
+            "updatedAt",
+        ] {
+            if movement
+                .get(key)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                errors.push(format!(
+                    "movements[{index}].{key} must be a non-empty string"
+                ));
+            }
+        }
+        let movement_type = movement.get("type").and_then(Value::as_str);
+        if !matches!(
+            movement_type,
+            Some(
+                "income"
+                    | "expense"
+                    | "transfer"
+                    | "buy"
+                    | "sell"
+                    | "dividend"
+                    | "interest"
+                    | "fee"
+                    | "adjustment"
+                    | "loan_disbursement"
+                    | "loan_repayment"
+                    | "loan_interest"
+                    | "correction"
+            )
+        ) {
+            errors.push(format!("movements[{index}].type is invalid"));
+        }
+        if !matches!(
+            movement.get("status").and_then(Value::as_str),
+            Some(
+                "draft" | "pending_review" | "confirmed" | "in_transit" | "cancelled" | "reversed"
+            )
+        ) {
+            errors.push(format!("movements[{index}].status is invalid"));
+        }
+        validate_string_array(
+            movement.get("tags"),
+            &format!("movements[{index}].tags"),
+            errors,
+        );
+        let entry_ids = validate_stored_movement_entries(
+            movement.get("entries"),
+            index,
+            account_ids,
+            instrument_ids,
+            matches!(
+                movement.get("status").and_then(Value::as_str),
+                Some("confirmed" | "in_transit" | "reversed")
+            ),
+            errors,
+        );
+        if let Some(movement_id) = movement_id {
+            index_by_id.entry_ids.insert(movement_id, entry_ids);
+        }
+        if let (Some(movement_type), Some(entries)) = (
+            movement_type,
+            movement.get("entries").and_then(Value::as_array),
+        ) {
+            if movement_type == "transfer" {
+                validate_simple_transfer(Some(entries), movement.get("transferMeta"), errors);
+            } else if movement_type != "correction" {
+                validate_movement_semantics(document, movement_type, entries, errors);
+            }
+            validate_holding_adjustment_metadata(movement, movement_type, entries, index, errors);
+            validate_yield_accrual_metadata(
+                document,
+                movement,
+                movement_type,
+                entries,
+                index,
+                errors,
+            );
+            validate_loan_interest_accrual_metadata(
+                document,
+                movement,
+                movement_type,
+                entries,
+                index,
+                errors,
+            );
+            validate_loan_payment_metadata(
+                document,
+                movement,
+                movement_type,
+                entries,
+                index,
+                errors,
+            );
+        }
+        validate_investment_sale_result(movement, index, errors);
+        validate_movement_cost_basis_fx(movement, index, errors);
+        validate_investment_replacement(movement, document, index, errors);
+    }
+    index_by_id
+}
+
+fn validate_holding_adjustment_metadata(
+    movement: &serde_json::Map<String, Value>,
+    movement_type: &str,
+    entries: &[Value],
+    movement_index: usize,
+    errors: &mut Vec<String>,
+) {
+    let instrument_adjustment = movement_type == "adjustment"
+        && entries
+            .iter()
+            .any(|entry| entry.get("instrumentId").is_some());
+    let Some(metadata) = movement.get("holdingAdjustment") else {
+        if instrument_adjustment {
+            errors.push(format!(
+                "movements[{movement_index}].holdingAdjustment is required for an instrument adjustment"
+            ));
+        }
+        return;
+    };
+    if !instrument_adjustment {
+        errors.push(format!(
+            "movements[{movement_index}].holdingAdjustment is only valid for an instrument adjustment"
+        ));
+        return;
+    }
+    let Some(metadata) = metadata.as_object() else {
+        errors.push(format!(
+            "movements[{movement_index}].holdingAdjustment must be an object"
+        ));
+        return;
+    };
+    let entry = &entries[0];
+    for key in ["accountId", "instrumentId"] {
+        if metadata.get(key).and_then(Value::as_str) != entry.get(key).and_then(Value::as_str) {
+            errors.push(format!(
+                "movements[{movement_index}].holdingAdjustment.{key} must match the entry"
+            ));
+        }
+    }
+    let previous = metadata
+        .get("previousQuantity")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    let target = metadata
+        .get("targetQuantity")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    if previous.is_none_or(|value| value < DecimalAmount::ZERO) {
+        errors.push(format!(
+            "movements[{movement_index}].holdingAdjustment.previousQuantity must be a non-negative decimal string"
+        ));
+    }
+    if target.is_none_or(|value| value < DecimalAmount::ZERO) {
+        errors.push(format!(
+            "movements[{movement_index}].holdingAdjustment.targetQuantity must be a non-negative decimal string"
+        ));
+    }
+    let entry_amount = entry
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    if let (Some(previous), Some(target), Some(entry_amount)) = (previous, target, entry_amount) {
+        let delta = target - previous;
+        let expected_direction = if delta > DecimalAmount::ZERO {
+            "in"
+        } else if delta < DecimalAmount::ZERO {
+            "out"
+        } else {
+            errors.push(format!(
+                "movements[{movement_index}].holdingAdjustment must change the quantity"
+            ));
+            return;
+        };
+        if entry_amount != delta.abs()
+            || entry.get("direction").and_then(Value::as_str) != Some(expected_direction)
+        {
+            errors.push(format!(
+                "movements[{movement_index}].holdingAdjustment delta must match the entry"
+            ));
+        }
+    }
+}
+
+fn validate_yield_accrual_metadata(
+    document: &Value,
+    movement: &serde_json::Map<String, Value>,
+    movement_type: &str,
+    entries: &[Value],
+    movement_index: usize,
+    errors: &mut Vec<String>,
+) {
+    let Some(accrual) = movement.get("yieldAccrual") else {
+        return;
+    };
+    let label = format!("movements[{movement_index}].yieldAccrual");
+    if movement_type != "interest" || entries.len() != 1 {
+        errors.push(format!(
+            "{label} is only valid on a single-entry interest movement"
+        ));
+        return;
+    }
+    let Some(accrual) = accrual.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    let holding_id = accrual.get("holdingId").and_then(Value::as_str);
+    let holding = holding_id.and_then(|holding_id| {
+        document["holdings"]
+            .as_array()
+            .expect("validated holdings")
+            .iter()
+            .find(|holding| holding.get("id").and_then(Value::as_str) == Some(holding_id))
+    });
+    if holding.is_none() {
+        errors.push(format!(
+            "{label}.holdingId must reference an existing holding"
+        ));
+    }
+    let previous = accrual
+        .get("previousAccruedThrough")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let through = accrual
+        .get("throughDate")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    if previous.is_none() || through.is_none() || previous >= through {
+        errors.push(format!("{label} must use valid increasing accrual dates"));
+    }
+    validate_positive_money(
+        accrual.get("principal"),
+        &format!("{label}.principal"),
+        errors,
+    );
+    validate_positive_money(
+        accrual.get("interestAmount"),
+        &format!("{label}.interestAmount"),
+        errors,
+    );
+    if accrual
+        .get("annualRate")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok())
+        .is_none_or(|value| value <= DecimalAmount::ZERO)
+    {
+        errors.push(format!("{label}.annualRate must be positive"));
+    }
+    let entry_amount = entries[0].get("amount").and_then(Value::as_str);
+    let entry_currency = entries[0].get("currency").and_then(Value::as_str);
+    if accrual
+        .get("interestAmount")
+        .and_then(|value| value.get("amount"))
+        .and_then(Value::as_str)
+        != entry_amount
+        || accrual
+            .get("interestAmount")
+            .and_then(|value| value.get("currency"))
+            .and_then(Value::as_str)
+            != entry_currency
+    {
+        errors.push(format!("{label}.interestAmount must match the entry"));
+    }
+    if let Some(holding) = holding {
+        let terms = holding.get("yieldTerms");
+        if terms.is_none() {
+            errors.push(format!("{label} holding must have yieldTerms"));
+        } else if movement.get("status").and_then(Value::as_str) == Some("pending_review") {
+            let movement_id = movement.get("id").and_then(Value::as_str);
+            if terms
+                .and_then(|terms| terms.get("pendingInterestMovementId"))
+                .and_then(Value::as_str)
+                != movement_id
+            {
+                errors.push(format!(
+                    "{label} pending movement must match the holding pending pointer"
+                ));
+            }
+        }
+    }
+}
+
+fn validate_loan_interest_accrual_metadata(
+    document: &Value,
+    movement: &serde_json::Map<String, Value>,
+    movement_type: &str,
+    entries: &[Value],
+    movement_index: usize,
+    errors: &mut Vec<String>,
+) {
+    let Some(accrual) = movement.get("loanInterestAccrual") else {
+        return;
+    };
+    let label = format!("movements[{movement_index}].loanInterestAccrual");
+    if movement_type != "loan_interest" || entries.len() != 1 {
+        errors.push(format!(
+            "{label} is only valid on a single-entry loan_interest movement"
+        ));
+        return;
+    }
+    let Some(accrual) = accrual.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    let account_id = accrual.get("accountId").and_then(Value::as_str);
+    let account = account_id.and_then(|account_id| active_account(document, account_id));
+    if account.is_none_or(|account| !is_liability_account(account)) {
+        errors.push(format!(
+            "{label}.accountId must reference an active liability account"
+        ));
+    }
+    let previous = accrual
+        .get("previousAccruedThrough")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let through = accrual
+        .get("throughDate")
+        .and_then(Value::as_str)
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    if previous.is_none() || through.is_none() || previous >= through {
+        errors.push(format!("{label} must use valid increasing accrual dates"));
+    }
+    validate_positive_money(
+        accrual.get("outstandingPrincipal"),
+        &format!("{label}.outstandingPrincipal"),
+        errors,
+    );
+    validate_positive_money(
+        accrual.get("interestAmount"),
+        &format!("{label}.interestAmount"),
+        errors,
+    );
+    if accrual
+        .get("annualRate")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok())
+        .is_none_or(|value| value <= DecimalAmount::ZERO)
+    {
+        errors.push(format!("{label}.annualRate must be positive"));
+    }
+    if !matches!(
+        accrual.get("dayCountBasis").and_then(Value::as_u64),
+        Some(360 | 365)
+    ) {
+        errors.push(format!("{label}.dayCountBasis must be 360 or 365"));
+    }
+    if accrual
+        .get("accrualDays")
+        .and_then(Value::as_i64)
+        .is_none_or(|days| days <= 0)
+    {
+        errors.push(format!("{label}.accrualDays must be positive"));
+    }
+    let entry = &entries[0];
+    if accrual
+        .get("interestAmount")
+        .and_then(|value| value.get("amount"))
+        .and_then(Value::as_str)
+        != entry.get("amount").and_then(Value::as_str)
+        || accrual
+            .get("interestAmount")
+            .and_then(|value| value.get("currency"))
+            .and_then(Value::as_str)
+            != entry.get("currency").and_then(Value::as_str)
+        || account_id != entry.get("accountId").and_then(Value::as_str)
+    {
+        errors.push(format!("{label} must match the loan interest entry"));
+    }
+    if let Some(account) = account {
+        let terms = account.get("liabilityTerms");
+        if terms.is_none() {
+            errors.push(format!("{label} account must have liabilityTerms"));
+        } else if movement.get("status").and_then(Value::as_str) == Some("pending_review")
+            && terms
+                .and_then(|terms| terms.get("pendingLoanInterestMovementId"))
+                .and_then(Value::as_str)
+                != movement.get("id").and_then(Value::as_str)
+        {
+            errors.push(format!(
+                "{label} pending movement must match the account pending pointer"
+            ));
+        }
+    }
+}
+
+fn validate_loan_payment_metadata(
+    document: &Value,
+    movement: &serde_json::Map<String, Value>,
+    movement_type: &str,
+    entries: &[Value],
+    movement_index: usize,
+    errors: &mut Vec<String>,
+) {
+    let Some(payment) = movement.get("loanPayment") else {
+        return;
+    };
+    let label = format!("movements[{movement_index}].loanPayment");
+    if movement_type != "loan_repayment" || entries.len() != 2 {
+        errors.push(format!(
+            "{label} is only valid on a two-entry loan_repayment movement"
+        ));
+        return;
+    }
+    let Some(payment) = payment.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    let account_id = payment.get("accountId").and_then(Value::as_str);
+    let payment_account_id = payment.get("paymentAccountId").and_then(Value::as_str);
+    let account = account_id.and_then(|id| active_account(document, id));
+    if account.is_none_or(|account| !is_liability_account(account)) {
+        errors.push(format!(
+            "{label}.accountId must reference a liability account"
+        ));
+    }
+    if payment_account_id
+        .and_then(|id| active_account(document, id))
+        .is_none_or(is_liability_account)
+    {
+        errors.push(format!(
+            "{label}.paymentAccountId must reference a non-liability account"
+        ));
+    }
+    for key in ["paymentDate", "previousNextDueDate", "nextDueDate"] {
+        if payment
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|value| Date::parse(value, &Iso8601::DATE).ok())
+            .is_none()
+        {
+            errors.push(format!("{label}.{key} must be an ISO date"));
+        }
+    }
+    validate_positive_money(
+        payment.get("paymentAmount"),
+        &format!("{label}.paymentAmount"),
+        errors,
+    );
+    for key in ["interestAmount", "principalAmount", "unpaidInterest"] {
+        validate_non_negative_money(
+            payment.get(key).unwrap_or(&Value::Null),
+            &format!("{label}.{key}"),
+            errors,
+        );
+    }
+    let payment_amount = payment
+        .get("paymentAmount")
+        .and_then(|money| money.get("amount"))
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    let interest_amount = payment
+        .get("interestAmount")
+        .and_then(|money| money.get("amount"))
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    let principal_amount = payment
+        .get("principalAmount")
+        .and_then(|money| money.get("amount"))
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    if let (Some(payment_amount), Some(interest_amount), Some(principal_amount)) =
+        (payment_amount, interest_amount, principal_amount)
+        && payment_amount != interest_amount + principal_amount
+    {
+        errors.push(format!(
+            "{label}.paymentAmount must equal interestAmount plus principalAmount"
+        ));
+    }
+    let source = entries
+        .iter()
+        .find(|entry| entry.get("role").and_then(Value::as_str) == Some("source"));
+    let destination = entries
+        .iter()
+        .find(|entry| entry.get("role").and_then(Value::as_str) == Some("destination"));
+    if source
+        .and_then(|entry| entry.get("accountId"))
+        .and_then(Value::as_str)
+        != payment_account_id
+        || destination
+            .and_then(|entry| entry.get("accountId"))
+            .and_then(Value::as_str)
+            != account_id
+        || source
+            .and_then(|entry| entry.get("amount"))
+            .and_then(Value::as_str)
+            != payment
+                .get("paymentAmount")
+                .and_then(|money| money.get("amount"))
+                .and_then(Value::as_str)
+    {
+        errors.push(format!("{label} must match the repayment entries"));
+    }
+    if let Some(linked_id) = payment
+        .get("linkedInterestMovementId")
+        .and_then(Value::as_str)
+    {
+        let linked = document["movements"]
+            .as_array()
+            .expect("validated movements")
+            .iter()
+            .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(linked_id));
+        if linked.is_none_or(|linked| {
+            linked.get("atomicGroupId") != movement.get("atomicGroupId")
+                || linked.get("loanInterestAccrual").is_none()
+        }) {
+            errors.push(format!(
+                "{label}.linkedInterestMovementId must reference loan interest in the same group"
+            ));
+        }
+    }
+    if let Some(account) = account
+        && movement.get("status").and_then(Value::as_str) == Some("pending_review")
+        && account["liabilityTerms"]["pendingLoanPaymentMovementId"].as_str()
+            != movement.get("id").and_then(Value::as_str)
+    {
+        errors.push(format!(
+            "{label} pending movement must match the account pending pointer"
+        ));
+    }
+}
+
+fn validate_investment_replacement(
+    movement: &serde_json::Map<String, Value>,
+    document: &Value,
+    movement_index: usize,
+    errors: &mut Vec<String>,
+) {
+    let Some(replacement) = movement.get("investmentReplacement") else {
+        return;
+    };
+    let label = format!("movements[{movement_index}].investmentReplacement");
+    if movement.get("type").and_then(Value::as_str) != Some("correction") {
+        errors.push(format!("{label} is only valid for correction movements"));
+    }
+    let Some(replacement) = replacement.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    let target_type = replacement.get("targetType").and_then(Value::as_str);
+    if !matches!(target_type, Some("buy" | "sell")) {
+        errors.push(format!("{label}.targetType must be buy or sell"));
+    }
+    if replacement
+        .get("targetOccurredAt")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339)
+        .is_none()
+    {
+        errors.push(format!(
+            "{label}.targetOccurredAt must be an RFC3339 timestamp"
+        ));
+    }
+    let Some(entries) = replacement
+        .get("replacementEntries")
+        .and_then(Value::as_array)
+        .filter(|entries| !entries.is_empty())
+    else {
+        errors.push(format!(
+            "{label}.replacementEntries must be a non-empty array"
+        ));
+        return;
+    };
+    if let Some(target_type) = target_type {
+        let before = errors.len();
+        validate_movement_semantics(document, target_type, entries, errors);
+        for error in errors.iter_mut().skip(before) {
+            *error = format!("{label}: {error}");
+        }
+    }
+
+    let target_id = movement
+        .get("source")
+        .and_then(|source| source.get("sourceId"))
+        .and_then(Value::as_str);
+    let target = target_id.and_then(|target_id| {
+        document["movements"].as_array().and_then(|movements| {
+            movements
+                .iter()
+                .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(target_id))
+        })
+    });
+    match target {
+        Some(target) => {
+            if target.get("type").and_then(Value::as_str) != target_type {
+                errors.push(format!("{label}.targetType must match the target movement"));
+            }
+            if target.get("occurredAt").and_then(Value::as_str)
+                != replacement.get("targetOccurredAt").and_then(Value::as_str)
+            {
+                errors.push(format!(
+                    "{label}.targetOccurredAt must match the target movement"
+                ));
+            }
+            if !matches!(
+                target.get("status").and_then(Value::as_str),
+                Some("confirmed" | "in_transit")
+            ) {
+                errors.push(format!(
+                    "{label} must reference a confirmed target movement"
+                ));
+            }
+        }
+        None => errors.push(format!(
+            "{label} must reference its target through source.sourceId"
+        )),
+    }
+    if let Some(target_id) = target_id {
+        let confirmed_replacements = document["movements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|candidate| {
+                candidate.get("type").and_then(Value::as_str) == Some("correction")
+                    && candidate.get("investmentReplacement").is_some()
+                    && matches!(
+                        candidate.get("status").and_then(Value::as_str),
+                        Some("confirmed" | "in_transit")
+                    )
+                    && candidate
+                        .get("source")
+                        .and_then(|source| source.get("sourceId"))
+                        .and_then(Value::as_str)
+                        == Some(target_id)
+            })
+            .count();
+        if confirmed_replacements > 1 {
+            errors.push(format!(
+                "{label} target must not have multiple confirmed investment replacements"
+            ));
+        }
+    }
+
+    let mut derived = serde_json::Map::new();
+    derived.insert("type".to_string(), json!(target_type));
+    derived.insert(
+        "status".to_string(),
+        movement.get("status").cloned().unwrap_or(Value::Null),
+    );
+    derived.insert("entries".to_string(), json!(entries));
+    if let Some(value) = replacement.get("saleResult") {
+        derived.insert("saleResult".to_string(), value.clone());
+    }
+    if let Some(value) = replacement.get("costBasisFx") {
+        derived.insert("costBasisFx".to_string(), value.clone());
+    }
+    validate_investment_sale_result(&derived, movement_index, errors);
+    validate_movement_cost_basis_fx(&derived, movement_index, errors);
+    if matches!(
+        movement.get("status").and_then(Value::as_str),
+        Some("confirmed" | "in_transit")
+    ) && target_type == Some("sell")
+        && replacement.get("saleResult").is_none()
+    {
+        errors.push(format!(
+            "{label}.saleResult is required after a replacement sell is confirmed"
+        ));
+    }
+}
+
+fn validate_stored_movement_entries<'a>(
+    entries: Option<&'a Value>,
+    movement_index: usize,
+    account_ids: &BTreeSet<&str>,
+    instrument_ids: &BTreeSet<&str>,
+    require_instrument_exists: bool,
+    errors: &mut Vec<String>,
+) -> BTreeSet<&'a str> {
+    let Some(entries) = entries.and_then(Value::as_array) else {
+        errors.push(format!(
+            "movements[{movement_index}].entries must be a non-empty array"
+        ));
+        return BTreeSet::new();
+    };
+    if entries.is_empty() {
+        errors.push(format!(
+            "movements[{movement_index}].entries must be a non-empty array"
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    for (entry_index, entry) in entries.iter().enumerate() {
+        let label = format!("movements[{movement_index}].entries[{entry_index}]");
+        let Some(entry) = entry.as_object() else {
+            errors.push(format!("{label} must be an object"));
+            continue;
+        };
+        let id = entry.get("id").and_then(Value::as_str);
+        match id {
+            Some(id) if !id.is_empty() => {
+                if !ids.insert(id) {
+                    errors.push(format!("duplicate movement entry id: {id}"));
+                }
+            }
+            _ => errors.push(format!("{label}.id must be a non-empty string")),
+        }
+        let account_id = entry.get("accountId").and_then(Value::as_str);
+        if account_id.is_none_or(|account_id| !account_ids.contains(account_id)) {
+            errors.push(format!(
+                "{label}.accountId must reference an existing account"
+            ));
+        }
+        if !entry
+            .get("amount")
+            .and_then(Value::as_str)
+            .is_some_and(is_positive_decimal_string)
+        {
+            errors.push(format!("{label}.amount must be a positive decimal string"));
+        }
+        if entry
+            .get("currency")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.currency must be a non-empty string"));
+        }
+        if !matches!(
+            entry.get("direction").and_then(Value::as_str),
+            Some("in" | "out")
+        ) {
+            errors.push(format!("{label}.direction must be in or out"));
+        }
+        if !matches!(
+            entry.get("role").and_then(Value::as_str),
+            Some("source" | "destination" | "fee" | "discount" | "pnl" | "tax" | "adjustment")
+        ) {
+            errors.push(format!("{label}.role is invalid"));
+        }
+        if let Some(instrument_id) = entry.get("instrumentId").and_then(Value::as_str)
+            && require_instrument_exists
+            && !instrument_ids.contains(instrument_id)
+        {
+            errors.push(format!(
+                "{label}.instrumentId must reference an existing instrument"
+            ));
+        }
+    }
+    ids
+}
+
+fn validate_movement_entry_index(
+    entries: Option<&Value>,
+    movements: &StoredMovementIndex<'_>,
+    errors: &mut Vec<String>,
+) {
+    let Some(entries) = entries.and_then(Value::as_array) else {
+        return;
+    };
+    let mut indexed = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut global_entry_ids = BTreeSet::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(entry) = entry.as_object() else {
+            errors.push(format!("movementEntries[{index}] must be an object"));
+            continue;
+        };
+        let movement_id = entry.get("movementId").and_then(Value::as_str);
+        let atomic_group_id = entry.get("atomicGroupId").and_then(Value::as_str);
+        let entry_id = entry.get("id").and_then(Value::as_str);
+        match movement_id {
+            Some(movement_id) if movements.groups.contains_key(movement_id) => {
+                if atomic_group_id != movements.groups.get(movement_id).copied() {
+                    errors.push(format!(
+                        "movementEntries[{index}].atomicGroupId must match its movement"
+                    ));
+                }
+                if let Some(entry_id) = entry_id {
+                    indexed.entry(movement_id).or_default().insert(entry_id);
+                }
+            }
+            _ => errors.push(format!(
+                "movementEntries[{index}].movementId must reference an existing movement"
+            )),
+        }
+        match entry_id {
+            Some(entry_id) if !entry_id.is_empty() => {
+                if !global_entry_ids.insert(entry_id) {
+                    errors.push(format!("duplicate indexed movement entry id: {entry_id}"));
+                }
+            }
+            _ => errors.push(format!(
+                "movementEntries[{index}].id must be a non-empty string"
+            )),
+        }
+    }
+    for (movement_id, expected_ids) in &movements.entry_ids {
+        let actual_ids = indexed.get(movement_id).cloned().unwrap_or_default();
+        if &actual_ids != expected_ids {
+            errors.push(format!(
+                "movementEntries index does not match movement.entries for {movement_id}"
+            ));
+        }
+    }
+}
+
+fn validate_non_negative_money(value: &Value, label: &str, errors: &mut Vec<String>) {
+    let Some(value) = value.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    match value.get("amount").and_then(Value::as_str) {
+        Some(amount)
+            if is_decimal_string(amount)
+                && parse_decimal(amount).is_ok_and(|amount| amount >= DecimalAmount::ZERO) => {}
+        _ => errors.push(format!(
+            "{label}.amount must be a non-negative decimal string"
+        )),
+    }
+    if value
+        .get("currency")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        errors.push(format!("{label}.currency must be a non-empty string"));
+    }
+}
+
+fn parsed_money_parts<'a>(
+    value: Option<&'a Value>,
+    label: &str,
+    errors: &mut Vec<String>,
+) -> Option<(DecimalAmount, &'a str)> {
+    let Some(value) = value else {
+        errors.push(format!("{label} is required"));
+        return None;
+    };
+    let Some(object) = value.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return None;
+    };
+    let amount = match object.get("amount").and_then(Value::as_str) {
+        Some(amount) => match parse_decimal(amount) {
+            Ok(amount) => Some(amount),
+            Err(_) => {
+                errors.push(format!("{label}.amount must be a decimal string"));
+                None
+            }
+        },
+        None => {
+            errors.push(format!("{label}.amount must be a decimal string"));
+            None
+        }
+    };
+    let currency = match object.get("currency").and_then(Value::as_str) {
+        Some(currency) if !currency.is_empty() => Some(currency),
+        _ => {
+            errors.push(format!("{label}.currency must be a non-empty string"));
+            None
+        }
+    };
+    amount.zip(currency)
+}
+
+#[derive(Clone, Copy)]
+struct ParsedExecutionFxBasis<'a> {
+    base_currency: &'a str,
+    quote_currency: &'a str,
+    rate: DecimalAmount,
+}
+
+fn validate_execution_fx_basis<'a>(
+    value: Option<&'a Value>,
+    label: &str,
+    errors: &mut Vec<String>,
+) -> Option<ParsedExecutionFxBasis<'a>> {
+    let Some(value) = value else {
+        errors.push(format!("{label} is required"));
+        return None;
+    };
+    let Some(object) = value.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return None;
+    };
+    let base_currency = object
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let quote_currency = object
+        .get("quoteCurrency")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let rate = object
+        .get("rate")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok())
+        .filter(|value| *value > DecimalAmount::ZERO);
+    if base_currency.is_none() {
+        errors.push(format!("{label}.baseCurrency must be a non-empty string"));
+    }
+    if quote_currency.is_none() {
+        errors.push(format!("{label}.quoteCurrency must be a non-empty string"));
+    }
+    if rate.is_none() {
+        errors.push(format!("{label}.rate must be a positive decimal string"));
+    }
+    if object
+        .get("asOf")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339)
+        .is_none()
+    {
+        errors.push(format!("{label}.asOf must be an RFC3339 timestamp"));
+    }
+    for field in ["sourceRateId", "source"] {
+        if object
+            .get(field)
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            errors.push(format!("{label}.{field} must be a non-empty string"));
+        }
+    }
+    if !matches!(object.get("inverted"), Some(Value::Bool(_))) {
+        errors.push(format!("{label}.inverted must be a boolean"));
+    }
+    match (base_currency, quote_currency, rate) {
+        (Some(base_currency), Some(quote_currency), Some(rate)) => Some(ParsedExecutionFxBasis {
+            base_currency,
+            quote_currency,
+            rate,
+        }),
+        _ => None,
+    }
+}
+
+fn validate_investment_sale_result(
+    movement: &serde_json::Map<String, Value>,
+    movement_index: usize,
+    errors: &mut Vec<String>,
+) {
+    let Some(result) = movement.get("saleResult") else {
+        return;
+    };
+    let label = format!("movements[{movement_index}].saleResult");
+    if movement.get("type").and_then(Value::as_str) != Some("sell") {
+        errors.push(format!("{label} is only valid for sell movements"));
+    }
+    if !matches!(
+        movement.get("status").and_then(Value::as_str),
+        Some("confirmed" | "in_transit" | "reversed")
+    ) {
+        errors.push(format!(
+            "{label} is only valid after a sell movement is confirmed"
+        ));
+    }
+    let Some(result) = result.as_object() else {
+        errors.push(format!("{label} must be an object"));
+        return;
+    };
+    if result.get("costBasisMethod").and_then(Value::as_str) != Some("average_cost") {
+        errors.push(format!("{label}.costBasisMethod must be average_cost"));
+    }
+    let status = result.get("realizedPnlStatus").and_then(Value::as_str);
+    if !matches!(
+        status,
+        Some("calculated" | "calculated_with_fx" | "cost_basis_unavailable" | "currency_mismatch")
+    ) {
+        errors.push(format!("{label}.realizedPnlStatus is invalid"));
+    }
+
+    let gross = parsed_money_parts(
+        result.get("grossProceeds"),
+        &format!("{label}.grossProceeds"),
+        errors,
+    );
+    let fees = parsed_money_parts(
+        result.get("feeAndTaxTotal"),
+        &format!("{label}.feeAndTaxTotal"),
+        errors,
+    );
+    let net = parsed_money_parts(
+        result.get("netProceeds"),
+        &format!("{label}.netProceeds"),
+        errors,
+    );
+    for (field, value) in [
+        ("grossProceeds", gross),
+        ("feeAndTaxTotal", fees),
+        ("netProceeds", net),
+    ] {
+        if value.is_some_and(|(amount, _)| amount < DecimalAmount::ZERO) {
+            errors.push(format!("{label}.{field}.amount must be non-negative"));
+        }
+    }
+    if let (
+        Some((gross_amount, gross_currency)),
+        Some((fee_amount, fee_currency)),
+        Some((net_amount, net_currency)),
+    ) = (gross, fees, net)
+    {
+        if gross_currency != fee_currency || gross_currency != net_currency {
+            errors.push(format!(
+                "{label} gross proceeds, fees, and net proceeds must use one currency"
+            ));
+        }
+        if gross_amount - fee_amount != net_amount {
+            errors.push(format!("{label}.netProceeds must equal gross minus fees"));
+        }
+    }
+
+    let released = result.get("costBasisReleased").and_then(|value| {
+        parsed_money_parts(Some(value), &format!("{label}.costBasisReleased"), errors)
+    });
+    if released.is_some_and(|(amount, _)| amount < DecimalAmount::ZERO) {
+        errors.push(format!(
+            "{label}.costBasisReleased.amount must be non-negative"
+        ));
+    }
+    let pnl = result
+        .get("realizedPnl")
+        .and_then(|value| parsed_money_parts(Some(value), &format!("{label}.realizedPnl"), errors));
+    let converted_net = result
+        .get("netProceedsInCostBasisCurrency")
+        .and_then(|value| {
+            parsed_money_parts(
+                Some(value),
+                &format!("{label}.netProceedsInCostBasisCurrency"),
+                errors,
+            )
+        });
+    let fx_basis = result.get("fxBasis").and_then(|value| {
+        validate_execution_fx_basis(Some(value), &format!("{label}.fxBasis"), errors)
+    });
+
+    match status {
+        Some("calculated") => {
+            let (
+                Some((net_amount, net_currency)),
+                Some((released_amount, released_currency)),
+                Some((pnl_amount, pnl_currency)),
+            ) = (net, released, pnl)
+            else {
+                errors.push(format!(
+                    "{label} calculated status requires costBasisReleased and realizedPnl"
+                ));
+                return;
+            };
+            if net_currency != released_currency || net_currency != pnl_currency {
+                errors.push(format!("{label} calculated amounts must use one currency"));
+            }
+            if net_amount - released_amount != pnl_amount {
+                errors.push(format!(
+                    "{label}.realizedPnl must equal net proceeds minus released cost basis"
+                ));
+            }
+            if converted_net.is_some() || fx_basis.is_some() {
+                errors.push(format!(
+                    "{label} same-currency calculation must not include an FX basis"
+                ));
+            }
+        }
+        Some("calculated_with_fx") => {
+            let (
+                Some((net_amount, net_currency)),
+                Some((released_amount, released_currency)),
+                Some((converted_amount, converted_currency)),
+                Some((pnl_amount, pnl_currency)),
+                Some(fx_basis),
+            ) = (net, released, converted_net, pnl, fx_basis)
+            else {
+                errors.push(format!(
+                    "{label} FX calculation requires net conversion, released cost, realized PnL, and FX basis"
+                ));
+                return;
+            };
+            if net_currency != fx_basis.base_currency
+                || released_currency != fx_basis.quote_currency
+                || converted_currency != released_currency
+                || pnl_currency != released_currency
+            {
+                errors.push(format!(
+                    "{label} FX currencies must connect net proceeds to released cost basis"
+                ));
+            }
+            if multiply_decimal(net_amount, fx_basis.rate) != converted_amount {
+                errors.push(format!(
+                    "{label}.netProceedsInCostBasisCurrency must equal net proceeds times FX rate"
+                ));
+            }
+            if converted_amount - released_amount != pnl_amount {
+                errors.push(format!(
+                    "{label}.realizedPnl must equal converted net proceeds minus released cost basis"
+                ));
+            }
+        }
+        Some("cost_basis_unavailable") => {
+            if released.is_some() || pnl.is_some() || converted_net.is_some() || fx_basis.is_some()
+            {
+                errors.push(format!(
+                    "{label} unavailable cost basis must not include released cost or realized PnL"
+                ));
+            }
+        }
+        Some("currency_mismatch") => {
+            if released.is_none() || pnl.is_some() || converted_net.is_some() || fx_basis.is_some()
+            {
+                errors.push(format!(
+                    "{label} currency mismatch requires released cost and no realized PnL"
+                ));
+            }
+            if let (Some((_, net_currency)), Some((_, released_currency))) = (net, released)
+                && net_currency == released_currency
+            {
+                errors.push(format!(
+                    "{label} currency mismatch requires different proceeds and cost currencies"
+                ));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_movement_cost_basis_fx(
+    movement: &serde_json::Map<String, Value>,
+    movement_index: usize,
+    errors: &mut Vec<String>,
+) {
+    let Some(value) = movement.get("costBasisFx") else {
+        return;
+    };
+    let label = format!("movements[{movement_index}].costBasisFx");
+    if movement.get("type").and_then(Value::as_str) != Some("buy") {
+        errors.push(format!("{label} is only valid for buy movements"));
+    }
+    if !matches!(
+        movement.get("status").and_then(Value::as_str),
+        Some("confirmed" | "in_transit" | "reversed")
+    ) {
+        errors.push(format!(
+            "{label} is only valid after a buy movement is confirmed"
+        ));
+    }
+    let parsed = validate_execution_fx_basis(Some(value), &label, errors);
+    let principal_currency = movement
+        .get("entries")
+        .and_then(Value::as_array)
+        .and_then(|entries| {
+            entries.iter().find(|entry| {
+                entry.get("instrumentId").is_none()
+                    && entry.get("role").and_then(Value::as_str) == Some("source")
+            })
+        })
+        .and_then(|entry| entry.get("currency"))
+        .and_then(Value::as_str);
+    if let (Some(parsed), Some(principal_currency)) = (parsed, principal_currency) {
+        if parsed.base_currency != principal_currency {
+            errors.push(format!(
+                "{label}.baseCurrency must match the buy principal currency"
+            ));
+        }
+        if parsed.base_currency == parsed.quote_currency {
+            errors.push(format!("{label} must convert between different currencies"));
+        }
     }
 }
 
 fn validate_subscriptions(
     subscriptions: Option<&Value>,
     accounts: Option<&Value>,
+    movements: Option<&Value>,
     errors: &mut Vec<String>,
 ) {
     let Some(subscriptions) = subscriptions.and_then(Value::as_array) else {
@@ -2556,7 +6725,20 @@ fn validate_subscriptions(
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
+    let movement_by_id = movements
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|movement| {
+                    Some((movement.get("id")?.as_str()?.to_string(), movement.clone()))
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let mut ids = BTreeSet::new();
+    let mut pending_keys = BTreeSet::new();
+    let mut pending_links = BTreeMap::new();
 
     for (index, subscription) in subscriptions.iter().enumerate() {
         let path = format!("subscriptions[{index}]");
@@ -2663,10 +6845,26 @@ fn validate_subscriptions(
                 "{path}.reminderDaysBefore must be an integer from 0 to 365"
             ));
         }
-        let pending_movement = object
-            .get("pendingChargeMovementId")
-            .and_then(Value::as_str);
-        let pending_date = object.get("pendingChargeDate").and_then(Value::as_str);
+        let pending_movement = match object.get("pendingChargeMovementId") {
+            None => None,
+            Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+            Some(_) => {
+                errors.push(format!(
+                    "{path}.pendingChargeMovementId must be a non-empty string"
+                ));
+                None
+            }
+        };
+        let pending_date = match object.get("pendingChargeDate") {
+            None => None,
+            Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+            Some(_) => {
+                errors.push(format!(
+                    "{path}.pendingChargeDate must be a non-empty string"
+                ));
+                None
+            }
+        };
         if pending_movement.is_some() != pending_date.is_some() {
             errors.push(format!(
                 "{path}.pendingChargeMovementId and pendingChargeDate must appear together"
@@ -2676,6 +6874,105 @@ fn validate_subscriptions(
             && Date::parse(date, &Iso8601::DATE).is_err()
         {
             errors.push(format!("{path}.pendingChargeDate must be an ISO date"));
+        }
+        if let (Some(subscription_id), Some(movement_id), Some(charge_date)) = (
+            object.get("id").and_then(Value::as_str),
+            pending_movement,
+            pending_date,
+        ) {
+            if !pending_keys.insert((subscription_id.to_string(), charge_date.to_string())) {
+                errors.push(format!(
+                    "duplicate pending subscription charge for {subscription_id} on {charge_date}"
+                ));
+            }
+            pending_links.insert(
+                subscription_id.to_string(),
+                (movement_id.to_string(), charge_date.to_string()),
+            );
+            match movement_by_id.get(movement_id) {
+                Some(movement) => {
+                    if movement.get("status").and_then(Value::as_str) != Some("pending_review") {
+                        errors.push(format!(
+                            "{path}.pendingChargeMovementId must reference a pending_review movement"
+                        ));
+                    }
+                    if movement.get("subscriptionId").and_then(Value::as_str)
+                        != Some(subscription_id)
+                    {
+                        errors.push(format!(
+                            "{path}.pendingChargeMovementId must reference the same subscription"
+                        ));
+                    }
+                    if movement.get("scheduledChargeDate").and_then(Value::as_str)
+                        != Some(charge_date)
+                    {
+                        errors.push(format!(
+                            "{path}.pendingChargeDate must match movement.scheduledChargeDate"
+                        ));
+                    }
+                }
+                None => errors.push(format!(
+                    "{path}.pendingChargeMovementId must reference an existing movement"
+                )),
+            }
+        }
+    }
+
+    if let Some(movements) = movements.and_then(Value::as_array) {
+        for (index, movement) in movements.iter().enumerate() {
+            if movement.get("status").and_then(Value::as_str) != Some("pending_review") {
+                continue;
+            }
+            let Some(subscription_id_value) = movement.get("subscriptionId") else {
+                continue;
+            };
+            let Some(subscription_id) = subscription_id_value
+                .as_str()
+                .filter(|subscription_id| !subscription_id.is_empty())
+            else {
+                errors.push(format!(
+                    "movements[{index}].subscriptionId must be a non-empty string"
+                ));
+                continue;
+            };
+            let movement_id = movement
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|movement_id| !movement_id.is_empty());
+            if movement_id.is_none() {
+                errors.push(format!(
+                    "movements[{index}].id must be a non-empty string for a pending subscription charge"
+                ));
+            }
+            if movement
+                .get("atomicGroupId")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                errors.push(format!(
+                    "movements[{index}].atomicGroupId must be a non-empty string for a pending subscription charge"
+                ));
+            }
+            let charge_date = movement
+                .get("scheduledChargeDate")
+                .and_then(Value::as_str)
+                .filter(|charge_date| !charge_date.is_empty());
+            if charge_date.is_none() {
+                errors.push(format!(
+                    "movements[{index}].scheduledChargeDate must be a non-empty ISO date"
+                ));
+            } else if charge_date.is_some_and(|date| Date::parse(date, &Iso8601::DATE).is_err()) {
+                errors.push(format!(
+                    "movements[{index}].scheduledChargeDate must be an ISO date"
+                ));
+            }
+            match (movement_id, charge_date, pending_links.get(subscription_id)) {
+                (Some(movement_id), Some(charge_date), Some((linked_id, linked_date)))
+                    if linked_id == movement_id && linked_date == charge_date => {}
+                _ => errors.push(format!(
+                    "movements[{index}] pending subscription charge must match the subscription pending pointer"
+                )),
+            }
         }
     }
 }
@@ -3392,13 +7689,13 @@ fn summarize_accounts(document: &Value, now: &str) -> io::Result<AccountSummary>
             }
         }));
 
-        if is_liability {
+        if account_total.is_negative() {
             total_liabilities += absolute_decimal(account_total);
-        } else if account_total.is_negative() {
-            account_anomaly_count += 1;
-            total_liabilities += absolute_decimal(account_total);
-            quality = combine_quality(quality, "anomaly");
-        } else {
+            if !is_liability {
+                account_anomaly_count += 1;
+                quality = combine_quality(quality, "anomaly");
+            }
+        } else if account_total > DecimalAmount::ZERO {
             gross_assets += account_total;
             let category = allocation_category(account).to_string();
             *allocation_by_category
@@ -3547,6 +7844,197 @@ fn account_anomalies_for_document(document: &Value, now: &str) -> io::Result<Vec
     Ok(anomalies)
 }
 
+fn valuation_issues_for_document(document: &Value, now: &str) -> io::Result<Vec<Value>> {
+    let base_currency = document
+        .get("baseCurrency")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_BASE_CURRENCY);
+    let accounts = document["accounts"]
+        .as_array()
+        .expect("validated local ledger accounts should be an array");
+    let holdings = document["holdings"]
+        .as_array()
+        .expect("validated local ledger holdings should be an array");
+    let instruments = document["instruments"]
+        .as_array()
+        .expect("validated local ledger instruments should be an array");
+    let mut issues = Vec::new();
+
+    for account in accounts {
+        if account.get("status").and_then(Value::as_str) == Some("archived")
+            || !account
+                .get("includeInNetWorth")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        let account_id = account
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("validated account id should be a string");
+        let account_name = account
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or(account_id);
+
+        for balance in account
+            .get("cashBalances")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let currency = balance
+                .get("currency")
+                .and_then(Value::as_str)
+                .expect("validated cash balance currency should be a string");
+            let quantity = balance
+                .get("amount")
+                .and_then(Value::as_str)
+                .expect("validated cash balance amount should be a string");
+            if currency == base_currency || parse_decimal(quantity)? == DecimalAmount::ZERO {
+                continue;
+            }
+            let issue = match fx_rate_between(document, currency, base_currency, now) {
+                None => Some(("unpriceable", "missing_fx_path")),
+                Some((_, "stale")) => Some(("stale", "stale_fx")),
+                Some((_, "offline_cached")) => Some(("offline_cached", "offline_cached_fx")),
+                Some((_, _)) => None,
+            };
+            if let Some((status, reason)) = issue {
+                issues.push(json!({
+                    "id": format!("valuation_cash_{account_id}_{currency}"),
+                    "accountId": account_id,
+                    "accountName": account_name,
+                    "assetKind": "cash",
+                    "assetId": currency,
+                    "assetLabel": currency,
+                    "quantity": quantity,
+                    "quantityUnit": currency,
+                    "status": status,
+                    "reason": reason,
+                    "sourceCurrency": currency,
+                    "targetCurrency": base_currency
+                }));
+            }
+        }
+
+        for holding in holdings
+            .iter()
+            .filter(|holding| holding.get("accountId").and_then(Value::as_str) == Some(account_id))
+        {
+            let quantity = holding
+                .get("quantity")
+                .and_then(Value::as_str)
+                .expect("validated holding quantity should be a string");
+            if parse_decimal(quantity)? <= DecimalAmount::ZERO {
+                continue;
+            }
+            let instrument_id = holding
+                .get("instrumentId")
+                .and_then(Value::as_str)
+                .expect("validated holding instrumentId should be a string");
+            let instrument = instruments
+                .iter()
+                .find(|instrument| {
+                    instrument.get("id").and_then(Value::as_str) == Some(instrument_id)
+                })
+                .expect("validated holding should reference an instrument");
+            let provider_symbol = instrument
+                .get("symbol")
+                .and_then(Value::as_str)
+                .filter(|symbol| !symbol.trim().is_empty())
+                .or_else(|| instrument.get("displayName").and_then(Value::as_str))
+                .unwrap_or(instrument_id);
+            let quote_currency = instrument
+                .get("quoteCurrency")
+                .and_then(Value::as_str)
+                .expect("validated instrument quoteCurrency should be a string");
+            let asset_label = concise_asset_label(provider_symbol, quote_currency);
+
+            let quote = latest_quote_for_instrument(document, instrument_id);
+            let (status, reason, as_of) = match quote {
+                None => ("unpriceable", "missing_quote", None),
+                Some(quote) => {
+                    let quote_status = effective_quote_status(quote, now);
+                    let quote_as_of = quote.get("asOf").and_then(Value::as_str);
+                    match quote_status {
+                        "error" => ("error", "quote_error", quote_as_of),
+                        "incomplete" | "unpriceable" => {
+                            ("unpriceable", "missing_quote", quote_as_of)
+                        }
+                        _ => {
+                            let fx_status = if quote_currency == base_currency {
+                                Some("fresh")
+                            } else {
+                                fx_rate_between(document, quote_currency, base_currency, now)
+                                    .map(|(_, status)| status)
+                            };
+                            match fx_status {
+                                None => ("unpriceable", "missing_fx_path", quote_as_of),
+                                Some(fx_status) => {
+                                    let combined = combine_quote_status(quote_status, fx_status);
+                                    match combined {
+                                        "stale" if quote_status == "stale" => {
+                                            ("stale", "stale_quote", quote_as_of)
+                                        }
+                                        "stale" => ("stale", "stale_fx", quote_as_of),
+                                        "offline_cached" if quote_status == "offline_cached" => {
+                                            ("offline_cached", "offline_cached_quote", quote_as_of)
+                                        }
+                                        "offline_cached" => {
+                                            ("offline_cached", "offline_cached_fx", quote_as_of)
+                                        }
+                                        _ => continue,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            let mut issue = json!({
+                "id": format!("valuation_holding_{account_id}_{instrument_id}"),
+                "accountId": account_id,
+                "accountName": account_name,
+                "assetKind": "holding",
+                "assetId": instrument_id,
+                "assetLabel": asset_label,
+                "quantity": quantity,
+                "quantityUnit": asset_label,
+                "status": status,
+                "reason": reason,
+                "sourceCurrency": quote_currency,
+                "targetCurrency": base_currency
+            });
+            if let Some(as_of) = as_of {
+                issue["asOf"] = json!(as_of);
+            }
+            issues.push(issue);
+        }
+    }
+
+    issues.sort_by(|left, right| {
+        left.get("accountName")
+            .and_then(Value::as_str)
+            .cmp(&right.get("accountName").and_then(Value::as_str))
+            .then_with(|| {
+                left.get("assetLabel")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("assetLabel").and_then(Value::as_str))
+            })
+    });
+    Ok(issues)
+}
+
+fn concise_asset_label<'a>(symbol: &'a str, quote_currency: &str) -> &'a str {
+    symbol
+        .strip_suffix(quote_currency)
+        .and_then(|prefix| prefix.strip_suffix(['-', '/', '_']))
+        .filter(|prefix| !prefix.is_empty())
+        .unwrap_or(symbol)
+}
+
 fn sync_changes_for_document(document: &Value, since: Option<&str>) -> Result<Value, LedgerError> {
     let changes = document["syncChanges"]
         .as_array()
@@ -3657,6 +8145,7 @@ fn sync_ack_change_ids_for_input(
 
 fn sync_push_changes_for_input(
     input: &Value,
+    authenticated_device_id: &str,
     now: &str,
 ) -> Result<(String, Vec<Value>), LedgerError> {
     let Some(object) = input.as_object() else {
@@ -3682,6 +8171,9 @@ fn sync_push_changes_for_input(
             String::new()
         }
     };
+    if device_id != authenticated_device_id {
+        errors.push("deviceId must match the authenticated device".to_string());
+    }
     if device_id == LOCAL_SYNC_DEVICE_ID {
         errors.push(format!(
             "deviceId must not use reserved id {LOCAL_SYNC_DEVICE_ID}"
@@ -3697,7 +8189,7 @@ fn sync_push_changes_for_input(
 
     let mut normalized_changes = Vec::new();
     for (index, change) in changes.iter().enumerate() {
-        match sync_change_from_push_input(change, &device_id, now) {
+        match sync_change_from_push_input(change, authenticated_device_id, now) {
             Ok(change) => normalized_changes.push(change),
             Err(mut change_errors) => {
                 errors.extend(
@@ -3728,32 +8220,13 @@ fn sync_change_from_push_input(
     let mut errors = Vec::new();
     let source_change_id = required_sync_string(object, "id", &mut errors);
     let change_device_id = required_sync_string(object, "deviceId", &mut errors);
-    let entity_type = required_sync_enum(
-        object,
-        "entityType",
-        &[
-            "account",
-            "instrument",
-            "holding",
-            "movement",
-            "dca_plan",
-            "subscription",
-            "category",
-            "counterparty",
-            "quote",
-            "fx_rate",
-            "snapshot",
-            "ai_proposal",
-        ],
-        &mut errors,
-    );
+    let entity_type = required_sync_enum(object, "entityType", &["account"], &mut errors);
     let entity_id = required_sync_string(object, "entityId", &mut errors);
-    let operation = required_sync_enum(
-        object,
-        "operation",
-        &["create", "update", "delete", "correction"],
-        &mut errors,
-    );
+    let operation = required_sync_enum(object, "operation", &["create"], &mut errors);
+    match object.get("baseVersion").and_then(Value::as_u64) {
+        Some(0) => {}
+        _ => errors.push("baseVersion must be 0 for account create".to_string()),
+    }
     let created_at = required_sync_string(object, "createdAt", &mut errors);
     let payload = match object.get("payload") {
         Some(payload) => payload.clone(),
@@ -3771,6 +8244,9 @@ fn sync_change_from_push_input(
     if created_at.as_deref().and_then(parse_rfc3339).is_none() {
         errors.push("createdAt must be an RFC3339 timestamp".to_string());
     }
+    if let Some(entity_id) = entity_id.as_deref() {
+        validate_inbound_account_payload(&payload, entity_id, &mut errors);
+    }
 
     if !errors.is_empty() {
         return Err(errors);
@@ -3786,9 +8262,125 @@ fn sync_change_from_push_input(
         "entityId": entity_id.expect("validated entityId"),
         "operation": operation.expect("validated operation"),
         "payload": payload,
+        "baseVersion": 0,
         "createdAt": created_at.expect("validated createdAt"),
         "receivedAt": now
     }))
+}
+
+fn validate_inbound_account_payload(payload: &Value, entity_id: &str, errors: &mut Vec<String>) {
+    let Some(account) = payload.as_object() else {
+        errors.push("payload must be a complete Account object".to_string());
+        return;
+    };
+
+    if account.get("id").and_then(Value::as_str) != Some(entity_id) {
+        errors.push("payload.id must equal entityId".to_string());
+    }
+    if !matches!(
+        account.get("accountType").and_then(Value::as_str),
+        Some(
+            "bank"
+                | "brokerage"
+                | "exchange"
+                | "wallet"
+                | "platform_wallet"
+                | "virtual_card"
+                | "social_security"
+                | "credit_card"
+                | "loan"
+                | "cash"
+                | "other"
+        )
+    ) {
+        errors.push("payload.accountType is invalid".to_string());
+    }
+    if !matches!(
+        account.get("visibility").and_then(Value::as_str),
+        Some("normal" | "hidden_amount" | "archived")
+    ) {
+        errors.push("payload.visibility is invalid".to_string());
+    }
+    if !matches!(
+        account.get("status").and_then(Value::as_str),
+        Some("active" | "inactive" | "archived")
+    ) {
+        errors.push("payload.status is invalid".to_string());
+    }
+    if !matches!(
+        account.get("balanceMode").and_then(Value::as_str),
+        Some("cash_balance" | "holdings" | "liability" | "mixed")
+    ) {
+        errors.push("payload.balanceMode is invalid".to_string());
+    }
+    for key in ["createdAt", "updatedAt"] {
+        if account
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339)
+            .is_none()
+        {
+            errors.push(format!("payload.{key} must be an RFC3339 timestamp"));
+        }
+    }
+    for key in ["institutionName", "note"] {
+        if account.contains_key(key) && !account.get(key).is_some_and(Value::is_string) {
+            errors.push(format!("payload.{key} must be a string"));
+        }
+    }
+    if let Some(cash_balances) = account.get("cashBalances").and_then(Value::as_array) {
+        for (index, balance) in cash_balances.iter().enumerate() {
+            if balance
+                .get("asOf")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339)
+                .is_none()
+            {
+                errors.push(format!(
+                    "payload.cashBalances[{index}].asOf must be an RFC3339 timestamp"
+                ));
+            }
+        }
+    }
+
+    let candidate = json!([payload.clone()]);
+    let mut account_errors = Vec::new();
+    validate_accounts(Some(&candidate), &mut account_errors);
+    errors.extend(
+        account_errors
+            .into_iter()
+            .map(|error| error.replacen("accounts[0]", "payload", 1)),
+    );
+}
+
+fn account_create_sync_conflict(
+    device_id: &str,
+    source_change_id: &str,
+    entity_id: &str,
+    existing_account: &Value,
+    incoming_change: &Value,
+    now: &str,
+) -> Value {
+    let mut remote_change = incoming_change.clone();
+    remote_change["id"] = json!(source_change_id);
+    json!({
+        "id": format!("account_exists:{device_id}:{source_change_id}"),
+        "kind": "entity_already_exists",
+        "entityType": "account",
+        "entityId": entity_id,
+        "localChange": {
+            "id": format!("existing:{entity_id}"),
+            "deviceId": LOCAL_SYNC_DEVICE_ID,
+            "entityType": "account",
+            "entityId": entity_id,
+            "operation": "create",
+            "payload": existing_account,
+            "baseVersion": 0,
+            "createdAt": now
+        },
+        "remoteChange": remote_change,
+        "resolution": "manual"
+    })
 }
 
 fn required_sync_string(
@@ -4054,6 +8646,25 @@ fn movement_from_create_input(
     let settlement = normalized_settlement(object.get("settlement"), &mut errors);
     let transfer_meta = normalized_transfer_meta(object.get("transferMeta"), &mut errors);
 
+    if movement_type.as_deref() == Some("transfer") {
+        validate_simple_transfer(entries.as_deref(), transfer_meta.as_ref(), &mut errors);
+    } else if transfer_meta.is_some() {
+        errors.push("transferMeta is only valid for transfer movements".to_string());
+    }
+    if let (Some(movement_type), Some(entries)) = (movement_type.as_deref(), entries.as_deref()) {
+        validate_movement_semantics(document, movement_type, entries, &mut errors);
+        if movement_type == "adjustment"
+            && entries
+                .iter()
+                .any(|entry| entry.get("instrumentId").is_some())
+        {
+            errors.push(
+                "holding adjustments must use the account holding-adjustment proposal endpoint"
+                    .to_string(),
+            );
+        }
+    }
+
     if !errors.is_empty() {
         return Err(LedgerError::InvalidInput(errors));
     }
@@ -4192,6 +8803,288 @@ fn correction_entry_from_diffs(
     Ok(entry)
 }
 
+fn correction_entries_for_replacement(
+    document: &Value,
+    target: &Value,
+    replacement_input: &Value,
+    movement_id: &str,
+) -> Result<(Vec<Value>, Vec<Value>), LedgerError> {
+    let Some(replacement_items) = replacement_input.as_array() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "replacementEntries must be a non-empty array".to_string(),
+        ]));
+    };
+    let sanitized_items = replacement_items
+        .iter()
+        .map(|item| {
+            let mut item = item.clone();
+            if let Some(object) = item.as_object_mut() {
+                object.remove("id");
+            }
+            item
+        })
+        .collect::<Vec<_>>();
+    let mut errors = Vec::new();
+    let replacement_value = json!(sanitized_items);
+    let replacement_entries =
+        normalized_movement_entries(document, Some(&replacement_value), movement_id, &mut errors)
+            .unwrap_or_default();
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(
+            errors
+                .into_iter()
+                .map(|error| {
+                    error
+                        .replacen("entries[", "replacementEntries[", 1)
+                        .replacen("entries must", "replacementEntries must", 1)
+                })
+                .collect(),
+        ));
+    }
+
+    let target_entries = target
+        .get("entries")
+        .and_then(Value::as_array)
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "target movement must have entries for replacement correction".to_string(),
+            ])
+        })?;
+    let target_type = target.get("type").and_then(Value::as_str);
+    let is_noop = if matches!(target_type, Some("buy" | "sell")) {
+        movement_entry_semantics(target_entries)? == movement_entry_semantics(&replacement_entries)?
+    } else {
+        movement_entry_effects(target_entries)? == movement_entry_effects(&replacement_entries)?
+    };
+    if is_noop {
+        return Err(LedgerError::InvalidInput(vec![
+            "replacementEntries must change the target movement semantics or ledger effect"
+                .to_string(),
+        ]));
+    }
+
+    let mut correction_entries =
+        Vec::with_capacity(target_entries.len() + replacement_entries.len());
+    for (index, target_entry) in target_entries.iter().enumerate() {
+        let account_id = target_entry
+            .get("accountId")
+            .and_then(Value::as_str)
+            .expect("validated target entry accountId should exist");
+        let amount = target_entry
+            .get("amount")
+            .and_then(Value::as_str)
+            .expect("validated target entry amount should exist");
+        let currency = target_entry
+            .get("currency")
+            .and_then(Value::as_str)
+            .expect("validated target entry currency should exist");
+        let direction = match target_entry.get("direction").and_then(Value::as_str) {
+            Some("in") => "out",
+            Some("out") => "in",
+            _ => unreachable!("validated target entry direction should be in or out"),
+        };
+        let mut reversal = json!({
+            "id": format!("entry_{movement_id}_reversal_{index}"),
+            "accountId": account_id,
+            "amount": amount,
+            "currency": currency,
+            "direction": direction,
+            "role": "adjustment"
+        });
+        if let Some(instrument_id) = target_entry.get("instrumentId").and_then(Value::as_str) {
+            reversal["instrumentId"] = json!(instrument_id);
+        }
+        correction_entries.push(reversal);
+    }
+    correction_entries.extend(replacement_entries.clone());
+    Ok((correction_entries, replacement_entries))
+}
+
+fn movement_entry_effects(
+    entries: &[Value],
+) -> Result<BTreeMap<String, DecimalAmount>, LedgerError> {
+    let mut effects = BTreeMap::new();
+    for entry in entries {
+        let account_id = entry
+            .get("accountId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["entry.accountId is required".to_string()])
+            })?;
+        let currency = entry
+            .get("currency")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["entry.currency is required".to_string()])
+            })?;
+        let instrument_id = entry
+            .get("instrumentId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let amount =
+            parse_decimal(entry.get("amount").and_then(Value::as_str).ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["entry.amount is required".to_string()])
+            })?)
+            .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+        let signed = match entry.get("direction").and_then(Value::as_str) {
+            Some("in") => amount,
+            Some("out") => -amount,
+            _ => {
+                return Err(LedgerError::InvalidInput(vec![
+                    "entry.direction must be in or out".to_string(),
+                ]));
+            }
+        };
+        let key = format!("{account_id}\u{1f}{currency}\u{1f}{instrument_id}");
+        *effects.entry(key).or_insert(DecimalAmount::ZERO) += signed;
+    }
+    effects.retain(|_, amount| *amount != DecimalAmount::ZERO);
+    Ok(effects)
+}
+
+fn movement_entry_semantics(
+    entries: &[Value],
+) -> Result<BTreeMap<String, DecimalAmount>, LedgerError> {
+    let mut semantics = BTreeMap::new();
+    for entry in entries {
+        let account_id = required_entry_string(entry, "accountId")?;
+        let currency = required_entry_string(entry, "currency")?;
+        let direction = required_entry_string(entry, "direction")?;
+        let role = required_entry_string(entry, "role")?;
+        let instrument_id = entry
+            .get("instrumentId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let amount = parse_entry_amount(entry)?;
+        let key = format!(
+            "{account_id}\u{1f}{currency}\u{1f}{instrument_id}\u{1f}{direction}\u{1f}{role}"
+        );
+        *semantics.entry(key).or_insert(DecimalAmount::ZERO) += amount;
+    }
+    semantics.retain(|_, amount| *amount != DecimalAmount::ZERO);
+    Ok(semantics)
+}
+
+fn pending_correction_exists(document: &Value, target_movement_id: &str) -> bool {
+    document["movements"]
+        .as_array()
+        .expect("validated movements should be an array")
+        .iter()
+        .any(|movement| {
+            movement.get("type").and_then(Value::as_str) == Some("correction")
+                && movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                && movement
+                    .get("source")
+                    .and_then(|source| source.get("sourceId"))
+                    .and_then(Value::as_str)
+                    == Some(target_movement_id)
+        })
+}
+
+fn investment_holding_key(movement: &Value) -> Option<(&str, &str)> {
+    movement
+        .get("entries")?
+        .as_array()?
+        .iter()
+        .find_map(|entry| {
+            Some((
+                entry.get("accountId")?.as_str()?,
+                entry.get("instrumentId")?.as_str()?,
+            ))
+        })
+}
+
+fn ensure_investment_correction_target_is_latest(
+    document: &Value,
+    target: &Value,
+) -> Result<(), LedgerError> {
+    let target_id = target.get("id").and_then(Value::as_str).ok_or_else(|| {
+        LedgerError::InvalidInput(vec!["target movement.id is missing".to_string()])
+    })?;
+    let (account_id, instrument_id) = investment_holding_key(target).ok_or_else(|| {
+        LedgerError::InvalidInput(vec![
+            "investment target must contain one holding entry".to_string(),
+        ])
+    })?;
+    let movements = document["movements"]
+        .as_array()
+        .expect("validated local ledger movements should be an array");
+    let target_confirm_order =
+        movement_confirmation_order(document, target_id).ok_or_else(|| {
+            LedgerError::Conflict(format!(
+                "cannot establish confirmation order for investment movement: {target_id}"
+            ))
+        })?;
+
+    if movements.iter().any(|movement| {
+        movement.get("type").and_then(Value::as_str) == Some("correction")
+            && matches!(
+                movement.get("status").and_then(Value::as_str),
+                Some("confirmed" | "in_transit")
+            )
+            && movement
+                .get("source")
+                .and_then(|source| source.get("sourceId"))
+                .and_then(Value::as_str)
+                == Some(target_id)
+    }) {
+        return Err(LedgerError::Conflict(format!(
+            "investment movement already has a confirmed correction: {target_id}"
+        )));
+    }
+
+    let later_exists = movements.iter().any(|movement| {
+        let candidate_id = movement.get("id").and_then(Value::as_str);
+        let applied_later = candidate_id
+            .and_then(|candidate_id| movement_confirmation_order(document, candidate_id))
+            .is_some_and(|order| order > target_confirm_order);
+        applied_later
+            && matches!(
+                movement.get("status").and_then(Value::as_str),
+                Some("confirmed" | "in_transit")
+            )
+            && matches!(
+                movement.get("type").and_then(Value::as_str),
+                Some("buy" | "sell")
+            )
+            && investment_holding_key(movement) == Some((account_id, instrument_id))
+    });
+    if later_exists {
+        return Err(LedgerError::Conflict(format!(
+            "investment movement is not the latest confirmed trade for holding {account_id}/{instrument_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn movement_confirmation_order(document: &Value, movement_id: &str) -> Option<usize> {
+    document["syncChanges"]
+        .as_array()?
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, change)| {
+            (change.get("entityType").and_then(Value::as_str) == Some("movement")
+                && change.get("entityId").and_then(Value::as_str) == Some(movement_id))
+            .then_some(index)
+        })
+}
+
+fn ensure_investment_target_has_reversible_basis(target: &Value) -> Result<(), LedgerError> {
+    if target.get("type").and_then(Value::as_str) == Some("sell")
+        && target
+            .get("saleResult")
+            .and_then(|result| result.get("costBasisReleased"))
+            .is_none()
+    {
+        return Err(LedgerError::Conflict(
+            "sell correction requires a persisted costBasisReleased result".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn diff_value_as_decimal(value: Option<&Value>) -> Option<DecimalAmount> {
     match value? {
         Value::String(value) => parse_decimal(value).ok(),
@@ -4227,6 +9120,14 @@ fn dca_plan_from_create_input(
     }
     let planned_amount =
         normalized_required_money(object.get("plannedAmount"), "plannedAmount", &mut errors);
+    if let Some(amount) = planned_amount
+        .as_ref()
+        .and_then(|money| money.get("amount"))
+        .and_then(Value::as_str)
+        && !is_positive_decimal_string(amount)
+    {
+        errors.push("plannedAmount.amount must be a positive decimal string".to_string());
+    }
     let frequency = required_enum(
         object,
         "frequency",
@@ -4234,6 +9135,11 @@ fn dca_plan_from_create_input(
         &mut errors,
     );
     let next_due_date = required_string(object, "nextDueDate", &mut errors);
+    if let Some(next_due_date) = next_due_date.as_deref()
+        && Date::parse(next_due_date, &Iso8601::DATE).is_err()
+    {
+        errors.push("nextDueDate must be an ISO date".to_string());
+    }
     let note = optional_string(object, "note", &mut errors);
 
     if !errors.is_empty() {
@@ -4309,7 +9215,15 @@ fn apply_dca_plan_patch(plan: &mut Value, patch: &Value, now: &str) -> Result<()
         && let Some(planned_amount) =
             normalized_required_money(Some(value), "plannedAmount", &mut errors)
     {
-        plan["plannedAmount"] = planned_amount;
+        if planned_amount
+            .get("amount")
+            .and_then(Value::as_str)
+            .is_some_and(is_positive_decimal_string)
+        {
+            plan["plannedAmount"] = planned_amount;
+        } else {
+            errors.push("plannedAmount.amount must be a positive decimal string".to_string());
+        }
     }
 
     if let Some(value) = object.get("frequency") {
@@ -4320,7 +9234,10 @@ fn apply_dca_plan_patch(plan: &mut Value, patch: &Value, now: &str) -> Result<()
     }
 
     if let Some(value) = object.get("nextDueDate") {
-        match value.as_str().filter(|value| !value.trim().is_empty()) {
+        match value
+            .as_str()
+            .filter(|value| !value.trim().is_empty() && Date::parse(value, &Iso8601::DATE).is_ok())
+        {
             Some(value) => plan["nextDueDate"] = json!(value),
             None => errors.push("nextDueDate must be a non-empty ISO date".to_string()),
         }
@@ -4978,6 +9895,14 @@ fn project_holding_for_api(document: &Value, holding: &Value) -> Value {
         )
         && let (Ok(market_value), Ok(cost_basis)) =
             (parse_decimal(market_value), parse_decimal(cost_basis))
+        && projected
+            .get("marketValue")
+            .and_then(|value| value.get("currency"))
+            .and_then(Value::as_str)
+            == projected
+                .get("costBasisTotal")
+                .and_then(|value| value.get("currency"))
+                .and_then(Value::as_str)
     {
         let currency = projected
             .get("costBasisTotal")
@@ -5010,6 +9935,9 @@ fn quote_from_refresh_input(input: &Value, now: &str) -> Result<Value, String> {
     let price = required_positive_decimal_field(object, "price")?;
     let currency = required_non_empty_field(object, "currency")?;
     let as_of = optional_non_empty_field(object, "asOf")?.unwrap_or_else(|| now.to_string());
+    if parse_rfc3339(&as_of).is_none() {
+        return Err("quote.asOf must be an RFC3339 timestamp".to_string());
+    }
     let source =
         optional_non_empty_field(object, "source")?.unwrap_or_else(|| "manual_refresh".to_string());
     let status = optional_status_field(object, "status")?.unwrap_or("fresh");
@@ -5042,6 +9970,9 @@ fn fx_rate_from_refresh_input(input: &Value, now: &str) -> Result<Value, String>
     let quote_currency = required_non_empty_field(object, "quoteCurrency")?;
     let rate = required_positive_decimal_field(object, "rate")?;
     let as_of = optional_non_empty_field(object, "asOf")?.unwrap_or_else(|| now.to_string());
+    if parse_rfc3339(&as_of).is_none() {
+        return Err("FX rate.asOf must be an RFC3339 timestamp".to_string());
+    }
     let source =
         optional_non_empty_field(object, "source")?.unwrap_or_else(|| "manual_refresh".to_string());
     let status = optional_status_field(object, "status")?.unwrap_or("fresh");
@@ -5084,28 +10015,41 @@ fn upsert_quote(document: &mut Value, quote: Value) {
     }
 }
 
-fn upsert_fx_rate(document: &mut Value, rate: Value) {
-    let base_currency = rate
-        .get("baseCurrency")
+fn upsert_fx_rate(document: &mut Value, rate: Value) -> Result<(), String> {
+    let rate_id = rate
+        .get("id")
         .and_then(Value::as_str)
-        .expect("validated FX baseCurrency should be a string")
-        .to_string();
-    let quote_currency = rate
-        .get("quoteCurrency")
-        .and_then(Value::as_str)
-        .expect("validated FX quoteCurrency should be a string")
+        .expect("validated FX rate id should be a string")
         .to_string();
     let rates = document["fxRates"]
         .as_array_mut()
         .expect("validated local ledger fxRates should be an array");
-    if let Some(existing) = rates.iter_mut().find(|item| {
-        item.get("baseCurrency").and_then(Value::as_str) == Some(base_currency.as_str())
-            && item.get("quoteCurrency").and_then(Value::as_str) == Some(quote_currency.as_str())
-    }) {
+    if let Some(existing) = rates
+        .iter_mut()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(rate_id.as_str()))
+    {
+        for field in ["baseCurrency", "quoteCurrency", "asOf"] {
+            if existing.get(field) != rate.get(field) {
+                return Err(format!("FX rate id cannot change {field}: {rate_id}"));
+            }
+        }
         *existing = rate;
     } else {
+        let base_currency = rate.get("baseCurrency");
+        let quote_currency = rate.get("quoteCurrency");
+        let as_of = rate.get("asOf");
+        if rates.iter().any(|existing| {
+            existing.get("baseCurrency") == base_currency
+                && existing.get("quoteCurrency") == quote_currency
+                && existing.get("asOf") == as_of
+        }) {
+            return Err(format!(
+                "FX rate pair/asOf already exists with a different id: {rate_id}"
+            ));
+        }
         rates.push(rate);
     }
+    Ok(())
 }
 
 fn quoted_holding_market_value(document: &Value, holding: &Value) -> Option<(Value, &'static str)> {
@@ -5169,24 +10113,159 @@ fn fx_rate_between(
     to_currency: &str,
     now: &str,
 ) -> Option<(DecimalAmount, &'static str)> {
+    if let Some(direct) = direct_fx_rate_between(document, from_currency, to_currency, now) {
+        return Some(direct);
+    }
+
+    let mut currencies = BTreeSet::new();
     for rate in document["fxRates"]
         .as_array()
         .expect("validated local ledger fxRates should be an array")
-        .iter()
-        .rev()
     {
-        let base = rate.get("baseCurrency").and_then(Value::as_str)?;
-        let quote = rate.get("quoteCurrency").and_then(Value::as_str)?;
-        let parsed = parse_decimal(rate.get("rate")?.as_str()?).ok()?;
-        let status = effective_quote_status(rate, now);
-        if base == from_currency && quote == to_currency {
-            return Some((parsed, status));
+        if let Some(currency) = rate.get("baseCurrency").and_then(Value::as_str) {
+            currencies.insert(currency.to_string());
         }
-        if base == to_currency && quote == from_currency {
-            return divide_decimal(DecimalAmount::ONE, parsed).map(|inverse| (inverse, status));
+        if let Some(currency) = rate.get("quoteCurrency").and_then(Value::as_str) {
+            currencies.insert(currency.to_string());
         }
     }
+
+    let mut frontier = vec![(
+        from_currency.to_string(),
+        DecimalAmount::ONE,
+        "fresh",
+        BTreeSet::from([from_currency.to_string()]),
+    )];
+    for _ in 0..3 {
+        let mut next_frontier = Vec::new();
+        let mut completed = Vec::new();
+        for (currency, accumulated_rate, accumulated_status, visited) in frontier {
+            for next_currency in &currencies {
+                if visited.contains(next_currency) {
+                    continue;
+                }
+                let Some((edge_rate, edge_status)) =
+                    direct_fx_rate_between(document, &currency, next_currency, now)
+                else {
+                    continue;
+                };
+                let next_rate = multiply_decimal(accumulated_rate, edge_rate);
+                let next_status = combine_quote_status(accumulated_status, edge_status);
+                if next_currency == to_currency {
+                    completed.push((next_rate, next_status));
+                    continue;
+                }
+                let mut next_visited = visited.clone();
+                next_visited.insert(next_currency.clone());
+                next_frontier.push((next_currency.clone(), next_rate, next_status, next_visited));
+            }
+        }
+        if let Some(best) = completed
+            .into_iter()
+            .min_by_key(|(_, status)| quote_status_rank(status))
+        {
+            return Some(best);
+        }
+        frontier = next_frontier;
+    }
     None
+}
+
+fn direct_fx_rate_between(
+    document: &Value,
+    from_currency: &str,
+    to_currency: &str,
+    now: &str,
+) -> Option<(DecimalAmount, &'static str)> {
+    let (rate, inverted) = fx_rate_at_or_before(document, from_currency, to_currency, now)?;
+    let status = effective_quote_status(rate, now);
+    if matches!(status, "incomplete" | "unpriceable" | "error") {
+        return None;
+    }
+    let parsed = parse_decimal(rate.get("rate")?.as_str()?).ok()?;
+    if inverted {
+        divide_decimal(DecimalAmount::ONE, parsed).map(|inverse| (inverse, status))
+    } else {
+        Some((parsed, status))
+    }
+}
+
+fn fx_rate_at_or_before<'a>(
+    document: &'a Value,
+    from_currency: &str,
+    to_currency: &str,
+    at: &str,
+) -> Option<(&'a Value, bool)> {
+    let cutoff = parse_rfc3339(at)?;
+    document["fxRates"]
+        .as_array()
+        .expect("validated local ledger fxRates should be an array")
+        .iter()
+        .filter_map(|rate| {
+            let base = rate.get("baseCurrency").and_then(Value::as_str)?;
+            let quote = rate.get("quoteCurrency").and_then(Value::as_str)?;
+            let inverted = if base == from_currency && quote == to_currency {
+                false
+            } else if base == to_currency && quote == from_currency {
+                true
+            } else {
+                return None;
+            };
+            let as_of = parse_rfc3339(rate.get("asOf")?.as_str()?)?;
+            (as_of <= cutoff).then_some((as_of, rate, inverted))
+        })
+        .max_by_key(|(as_of, _, _)| *as_of)
+        .map(|(_, rate, inverted)| (rate, inverted))
+}
+
+struct ExecutionFxConversion {
+    amount: DecimalAmount,
+    basis: Value,
+}
+
+fn convert_execution_amount(
+    document: &Value,
+    amount: DecimalAmount,
+    from_currency: &str,
+    to_currency: &str,
+    occurred_at: &str,
+) -> Option<ExecutionFxConversion> {
+    if from_currency == to_currency {
+        return Some(ExecutionFxConversion {
+            amount,
+            basis: Value::Null,
+        });
+    }
+    let (source_rate, inverted) =
+        fx_rate_at_or_before(document, from_currency, to_currency, occurred_at)?;
+    if matches!(
+        source_rate.get("status").and_then(Value::as_str),
+        Some("incomplete" | "unpriceable" | "error")
+    ) {
+        return None;
+    }
+    let stored_rate = parse_decimal(source_rate.get("rate")?.as_str()?).ok()?;
+    let applied_rate = if inverted {
+        divide_decimal(DecimalAmount::ONE, stored_rate)?
+    } else {
+        stored_rate
+    };
+    let mut basis = json!({
+        "baseCurrency": from_currency,
+        "quoteCurrency": to_currency,
+        "rate": applied_rate.decimal_string(),
+        "asOf": source_rate.get("asOf")?.clone(),
+        "sourceRateId": source_rate.get("id")?.clone(),
+        "source": source_rate.get("source")?.clone(),
+        "inverted": inverted
+    });
+    if let Some(source_url) = source_rate.get("sourceUrl") {
+        basis["sourceUrl"] = source_url.clone();
+    }
+    Some(ExecutionFxConversion {
+        amount: multiply_decimal(amount, applied_rate),
+        basis,
+    })
 }
 
 fn effective_quote_status(item: &Value, now: &str) -> &'static str {
@@ -5221,20 +10300,21 @@ fn is_expired(expires_at: Option<&str>, now: &str) -> bool {
 }
 
 fn combine_quote_status(left: &'static str, right: &'static str) -> &'static str {
-    fn rank(status: &str) -> u8 {
-        match status {
-            "fresh" => 0,
-            "stale" => 1,
-            "offline_cached" => 2,
-            "incomplete" | "unpriceable" => 3,
-            "error" => 4,
-            _ => 4,
-        }
-    }
-    if rank(right) > rank(left) {
+    if quote_status_rank(right) > quote_status_rank(left) {
         right
     } else {
         left
+    }
+}
+
+fn quote_status_rank(status: &str) -> u8 {
+    match status {
+        "fresh" => 0,
+        "stale" => 1,
+        "offline_cached" => 2,
+        "incomplete" | "unpriceable" => 3,
+        "error" => 4,
+        _ => 4,
     }
 }
 
@@ -5660,8 +10740,15 @@ impl DecimalAmount {
     }
 
     fn money_string(self) -> String {
-        let cents = round_div(self.0, Self::SCALE / 100);
-        signed_fixed_string(cents, 2)
+        let raw = signed_fixed_string(self.0, 8);
+        let Some((integer, fraction)) = raw.split_once('.') else {
+            return format!("{raw}.00");
+        };
+        let mut keep = fraction.len();
+        while keep > 2 && fraction.as_bytes()[keep - 1] == b'0' {
+            keep -= 1;
+        }
+        format!("{integer}.{}", &fraction[..keep])
     }
 
     fn decimal_string(self) -> String {
@@ -5846,10 +10933,22 @@ fn subscription_from_create_input(
     };
     let note = optional_string(object, "note", &mut errors);
 
-    if let Some(account_id) = payment_account_id.as_deref()
-        && !active_account_exists(document, account_id)
-    {
-        errors.push("paymentAccountId does not exist or is archived".to_string());
+    if let (Some(account_id), Some(currency)) = (
+        payment_account_id.as_deref(),
+        amount
+            .as_ref()
+            .and_then(|money| money.get("currency"))
+            .and_then(Value::as_str),
+    ) {
+        match subscription_payment_issue(document, account_id, currency) {
+            Some(SubscriptionPaymentIssue::AccountUnavailable) => {
+                errors.push("paymentAccountId does not exist or is archived".to_string());
+            }
+            Some(SubscriptionPaymentIssue::CurrencyUnsupported) => {
+                errors.push("amount.currency must be supported by the payment account".to_string());
+            }
+            None => {}
+        }
     }
     if let (Some(start), Some(next)) = (start_date, next_charge_date)
         && next < start
@@ -5905,28 +11004,38 @@ fn subscription_from_create_input(
     Ok(subscription)
 }
 
-fn validate_subscription_payment_account_patch(
+fn validate_subscription_payment(
     document: &Value,
-    patch: &Value,
+    subscription: &Value,
 ) -> Result<(), LedgerError> {
-    let Some(object) = patch.as_object() else {
-        return Err(LedgerError::InvalidInput(vec![
-            "subscription patch must be a JSON object".to_string(),
-        ]));
-    };
-    if let Some(value) = object.get("paymentAccountId") {
-        let Some(account_id) = value.as_str().filter(|value| !value.is_empty()) else {
-            return Err(LedgerError::InvalidInput(vec![
+    let account_id = subscription
+        .get("paymentAccountId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
                 "paymentAccountId must be a non-empty string".to_string(),
-            ]));
-        };
-        if !active_account_exists(document, account_id) {
-            return Err(LedgerError::InvalidInput(vec![
-                "paymentAccountId does not exist or is archived".to_string(),
-            ]));
+            ])
+        })?;
+    let currency = subscription
+        .get("amount")
+        .and_then(|money| money.get("currency"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "amount.currency must be a non-empty string".to_string(),
+            ])
+        })?;
+    match subscription_payment_issue(document, account_id, currency) {
+        Some(SubscriptionPaymentIssue::AccountUnavailable) => Err(LedgerError::InvalidInput(vec![
+            "paymentAccountId does not exist or is archived".to_string(),
+        ])),
+        Some(SubscriptionPaymentIssue::CurrencyUnsupported) => {
+            Err(LedgerError::InvalidInput(vec![
+                "amount.currency must be supported by the payment account".to_string(),
+            ]))
         }
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn apply_subscription_patch(
@@ -6013,6 +11122,15 @@ fn apply_subscription_patch(
             normalized_subscription_date(candidate.get("startDate"), "startDate", &mut date_errors)
         {
             candidate["billingAnchorDay"] = json!(start.day());
+            if !object.contains_key("nextChargeDate")
+                && candidate
+                    .get("nextChargeDate")
+                    .and_then(Value::as_str)
+                    .and_then(|value| Date::parse(value, &Iso8601::DATE).ok())
+                    .is_some_and(|next| next < start)
+            {
+                candidate["nextChargeDate"] = json!(start.to_string());
+            }
         }
         if !date_errors.is_empty() {
             return Err(LedgerError::InvalidInput(date_errors));
@@ -6077,7 +11195,12 @@ fn apply_subscription_patch(
     let fake_accounts = json!([{ "id": payment_id }]);
     let candidate_array = json!([candidate.clone()]);
     let mut errors = Vec::new();
-    validate_subscriptions(Some(&candidate_array), Some(&fake_accounts), &mut errors);
+    validate_subscriptions(
+        Some(&candidate_array),
+        Some(&fake_accounts),
+        None,
+        &mut errors,
+    );
     if let (Some(next), Some(end)) = (
         candidate
             .get("nextChargeDate")
@@ -6213,6 +11336,800 @@ fn advance_subscription_date(date: Date, unit: &str, count: u64) -> Option<Date>
         "year" => add_calendar_months(date, i32::try_from(count.checked_mul(12)?).ok()?),
         _ => None,
     }
+}
+
+struct YieldAccrual {
+    amount: DecimalAmount,
+    days: i64,
+    full_periods: u64,
+}
+
+fn yield_terms_from_input(
+    document: &Value,
+    holding: &Value,
+    input: &Value,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "yield terms input must be a JSON object".to_string(),
+        ]));
+    };
+    let mut errors = Vec::new();
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "principal"
+                | "annualRate"
+                | "rateType"
+                | "interestMethod"
+                | "dayCountBasis"
+                | "compoundingFrequency"
+                | "interestStartDate"
+                | "maturityDate"
+                | "payoutAccountId"
+        ) {
+            errors.push(format!("unsupported yield terms field: {key}"));
+        }
+    }
+    let principal = normalized_required_money(object.get("principal"), "principal", &mut errors);
+    if principal
+        .as_ref()
+        .and_then(|value| value.get("amount"))
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok())
+        .is_none_or(|value| value <= DecimalAmount::ZERO)
+    {
+        errors.push("principal.amount must be positive".to_string());
+    }
+    let annual_rate = required_string(object, "annualRate", &mut errors);
+    if annual_rate
+        .as_deref()
+        .and_then(|value| parse_decimal(value).ok())
+        .is_none_or(|value| value <= DecimalAmount::ZERO)
+    {
+        errors.push("annualRate must be a positive decimal string".to_string());
+    }
+    let rate_type = required_enum(object, "rateType", &["fixed", "floating"], &mut errors);
+    let interest_method = required_enum(
+        object,
+        "interestMethod",
+        &["simple", "compound"],
+        &mut errors,
+    );
+    let day_count_basis = object.get("dayCountBasis").and_then(Value::as_u64);
+    if !matches!(day_count_basis, Some(360 | 365)) {
+        errors.push("dayCountBasis must be 360 or 365".to_string());
+    }
+    let compounding_frequency = required_enum(
+        object,
+        "compoundingFrequency",
+        &["none", "monthly", "quarterly", "annual"],
+        &mut errors,
+    );
+    if matches!(interest_method.as_deref(), Some("simple"))
+        && !matches!(compounding_frequency.as_deref(), Some("none"))
+    {
+        errors.push("simple interest requires compoundingFrequency=none".to_string());
+    }
+    if matches!(interest_method.as_deref(), Some("compound"))
+        && matches!(compounding_frequency.as_deref(), Some("none"))
+    {
+        errors.push("compound interest requires a compounding frequency".to_string());
+    }
+    let interest_start_date = required_string(object, "interestStartDate", &mut errors);
+    let interest_start = interest_start_date
+        .as_deref()
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    if interest_start_date.is_some() && interest_start.is_none() {
+        errors.push("interestStartDate must be an ISO date".to_string());
+    }
+    let maturity_date = required_string(object, "maturityDate", &mut errors);
+    let maturity = maturity_date
+        .as_deref()
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    if maturity_date.is_some() && maturity.is_none() {
+        errors.push("maturityDate must be an ISO date".to_string());
+    }
+    if let (Some(start), Some(maturity)) = (interest_start, maturity)
+        && maturity <= start
+    {
+        errors.push("maturityDate must be after interestStartDate".to_string());
+    }
+    let payout_account_id = required_string(object, "payoutAccountId", &mut errors);
+
+    let instrument_currency = holding
+        .get("instrumentId")
+        .and_then(Value::as_str)
+        .and_then(|instrument_id| {
+            document["instruments"]
+                .as_array()
+                .expect("validated instruments")
+                .iter()
+                .find(|instrument| {
+                    instrument.get("id").and_then(Value::as_str) == Some(instrument_id)
+                })
+        })
+        .and_then(|instrument| instrument.get("quoteCurrency"))
+        .and_then(Value::as_str);
+    let principal_currency = principal
+        .as_ref()
+        .and_then(|principal| principal.get("currency"))
+        .and_then(Value::as_str);
+    if principal_currency.is_some() && principal_currency != instrument_currency {
+        errors.push("principal.currency must match instrument quoteCurrency".to_string());
+    }
+    if let (Some(account_id), Some(currency)) = (payout_account_id.as_deref(), principal_currency) {
+        match active_account(document, account_id) {
+            None => errors.push("payoutAccountId must reference an active account".to_string()),
+            Some(account)
+                if !account
+                    .get("supportedCurrencies")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| item.as_str() == Some(currency))
+                    }) =>
+            {
+                errors.push("payout account does not support principal currency".to_string())
+            }
+            Some(_) => {}
+        }
+    }
+
+    let existing = holding.get("yieldTerms");
+    let existing_start = existing
+        .and_then(|terms| terms.get("interestStartDate"))
+        .and_then(Value::as_str);
+    let existing_last = existing
+        .and_then(|terms| terms.get("lastAccruedThrough"))
+        .and_then(Value::as_str);
+    if let (Some(existing_start), Some(existing_last), Some(next_start)) = (
+        existing_start,
+        existing_last,
+        interest_start_date.as_deref(),
+    ) && existing_last != existing_start
+        && next_start != existing_start
+    {
+        errors.push("interestStartDate cannot change after interest was accrued".to_string());
+    }
+    if let (Some(last), Some(maturity)) = (
+        existing_last.and_then(|value| Date::parse(value, &Iso8601::DATE).ok()),
+        maturity,
+    ) && maturity < last
+    {
+        errors.push("maturityDate cannot precede the last accrued date".to_string());
+    }
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+
+    let start = interest_start_date.expect("validated interestStartDate");
+    Ok(json!({
+        "principal": principal.expect("validated principal"),
+        "annualRate": annual_rate.expect("validated annualRate"),
+        "rateType": rate_type.expect("validated rateType"),
+        "interestMethod": interest_method.expect("validated interestMethod"),
+        "dayCountBasis": day_count_basis.expect("validated dayCountBasis"),
+        "compoundingFrequency": compounding_frequency.expect("validated compoundingFrequency"),
+        "interestStartDate": start,
+        "maturityDate": maturity_date.expect("validated maturityDate"),
+        "payoutAccountId": payout_account_id.expect("validated payoutAccountId"),
+        "lastAccruedThrough": existing_last.unwrap_or(start.as_str()),
+        "updatedAt": now
+    }))
+}
+
+fn yield_positions_for_document(
+    document: &Value,
+    through_date: Date,
+) -> Result<Vec<Value>, LedgerError> {
+    let mut positions = Vec::new();
+    for holding in document["holdings"]
+        .as_array()
+        .expect("validated holdings")
+        .iter()
+        .filter(|holding| holding.get("yieldTerms").is_some())
+    {
+        let terms = holding.get("yieldTerms").expect("yieldTerms should exist");
+        let start = Date::parse(
+            terms
+                .get("lastAccruedThrough")
+                .and_then(Value::as_str)
+                .expect("validated lastAccruedThrough"),
+            &Iso8601::DATE,
+        )
+        .expect("validated lastAccruedThrough should parse");
+        let maturity = Date::parse(
+            terms
+                .get("maturityDate")
+                .and_then(Value::as_str)
+                .expect("validated maturityDate"),
+            &Iso8601::DATE,
+        )
+        .expect("validated maturityDate should parse");
+        let effective_through = through_date.min(maturity);
+        let accrual = if effective_through > start {
+            calculate_yield_accrual(terms, start, effective_through)?
+        } else {
+            YieldAccrual {
+                amount: DecimalAmount::ZERO,
+                days: 0,
+                full_periods: 0,
+            }
+        };
+        let instrument_id = holding
+            .get("instrumentId")
+            .and_then(Value::as_str)
+            .expect("validated instrumentId");
+        let instrument_name = document["instruments"]
+            .as_array()
+            .expect("validated instruments")
+            .iter()
+            .find(|instrument| instrument.get("id").and_then(Value::as_str) == Some(instrument_id))
+            .and_then(|instrument| instrument.get("displayName"))
+            .and_then(Value::as_str)
+            .unwrap_or(instrument_id);
+        let currency = terms["principal"]["currency"]
+            .as_str()
+            .expect("validated principal currency");
+        positions.push(json!({
+            "holdingId": holding["id"],
+            "accountId": holding["accountId"],
+            "instrumentId": instrument_id,
+            "instrumentName": instrument_name,
+            "terms": terms,
+            "accruedThrough": effective_through.to_string(),
+            "accrualDays": accrual.days,
+            "fullCompoundingPeriods": accrual.full_periods,
+            "accruedInterest": {"amount": accrual.amount.decimal_string(), "currency": currency},
+            "status": if through_date >= maturity {"matured"} else {"active"}
+        }));
+    }
+    Ok(positions)
+}
+
+fn liability_terms_from_input(
+    document: &Value,
+    account: &Value,
+    input: &Value,
+    now: &str,
+) -> Result<Value, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "liability terms input must be a JSON object".to_string(),
+        ]));
+    };
+    let mut errors = Vec::new();
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "liabilityType"
+                | "annualRate"
+                | "rateType"
+                | "dayCountBasis"
+                | "interestStartDate"
+                | "maturityDate"
+                | "repaymentStartDate"
+                | "nextDueDate"
+                | "repaymentFrequency"
+                | "scheduledPayment"
+                | "paymentAccountId"
+        ) {
+            errors.push(format!("unsupported liability terms field: {key}"));
+        }
+    }
+    let liability_type = required_enum(
+        object,
+        "liabilityType",
+        &[
+            "student_loan",
+            "mortgage",
+            "consumer_loan",
+            "credit_card",
+            "other",
+        ],
+        &mut errors,
+    );
+    let annual_rate = required_string(object, "annualRate", &mut errors);
+    if annual_rate
+        .as_deref()
+        .and_then(|value| parse_decimal(value).ok())
+        .is_none_or(|value| value <= DecimalAmount::ZERO)
+    {
+        errors.push("annualRate must be a positive decimal string".to_string());
+    }
+    let rate_type = required_enum(object, "rateType", &["fixed", "floating"], &mut errors);
+    let day_count_basis = object.get("dayCountBasis").and_then(Value::as_u64);
+    if !matches!(day_count_basis, Some(360 | 365)) {
+        errors.push("dayCountBasis must be 360 or 365".to_string());
+    }
+    let interest_start_date = required_string(object, "interestStartDate", &mut errors);
+    let maturity_date = required_string(object, "maturityDate", &mut errors);
+    let repayment_start_date = required_string(object, "repaymentStartDate", &mut errors);
+    let next_due_date = required_string(object, "nextDueDate", &mut errors);
+    let interest_start = interest_start_date
+        .as_deref()
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let maturity = maturity_date
+        .as_deref()
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let repayment_start = repayment_start_date
+        .as_deref()
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    let next_due = next_due_date
+        .as_deref()
+        .and_then(|value| Date::parse(value, &Iso8601::DATE).ok());
+    for (name, present, parsed) in [
+        (
+            "interestStartDate",
+            interest_start_date.is_some(),
+            interest_start,
+        ),
+        ("maturityDate", maturity_date.is_some(), maturity),
+        (
+            "repaymentStartDate",
+            repayment_start_date.is_some(),
+            repayment_start,
+        ),
+        ("nextDueDate", next_due_date.is_some(), next_due),
+    ] {
+        if present && parsed.is_none() {
+            errors.push(format!("{name} must be an ISO date"));
+        }
+    }
+    if let (Some(start), Some(end)) = (interest_start, maturity)
+        && end <= start
+    {
+        errors.push("maturityDate must be after interestStartDate".to_string());
+    }
+    if let (Some(start), Some(end)) = (repayment_start, maturity)
+        && (start < interest_start.unwrap_or(start) || start > end)
+    {
+        errors.push("repaymentStartDate must be within the loan term".to_string());
+    }
+    if let (Some(due), Some(start), Some(end)) = (next_due, repayment_start, maturity)
+        && (due < start || due > end)
+    {
+        errors.push("nextDueDate must be within the repayment term".to_string());
+    }
+    let repayment_frequency =
+        required_enum(object, "repaymentFrequency", &["monthly"], &mut errors);
+    let scheduled_payment = normalized_required_money(
+        object.get("scheduledPayment"),
+        "scheduledPayment",
+        &mut errors,
+    );
+    if scheduled_payment
+        .as_ref()
+        .and_then(|value| value.get("amount"))
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok())
+        .is_none_or(|value| value <= DecimalAmount::ZERO)
+    {
+        errors.push("scheduledPayment.amount must be positive".to_string());
+    }
+    let payment_account_id = required_string(object, "paymentAccountId", &mut errors);
+    let loan_currency = account.get("defaultCurrency").and_then(Value::as_str);
+    let payment_currency = scheduled_payment
+        .as_ref()
+        .and_then(|payment| payment.get("currency"))
+        .and_then(Value::as_str);
+    if payment_currency.is_some() && payment_currency != loan_currency {
+        errors.push("scheduledPayment.currency must match the loan currency".to_string());
+    }
+    if let (Some(payment_account_id), Some(currency)) =
+        (payment_account_id.as_deref(), loan_currency)
+    {
+        match active_account(document, payment_account_id) {
+            None => errors.push("paymentAccountId must reference an active account".to_string()),
+            Some(payment_account) if is_liability_account(payment_account) => {
+                errors.push("paymentAccountId must reference a non-liability account".to_string())
+            }
+            Some(payment_account)
+                if !payment_account
+                    .get("supportedCurrencies")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| item.as_str() == Some(currency))
+                    }) =>
+            {
+                errors.push("payment account does not support the loan currency".to_string())
+            }
+            Some(_) => {}
+        }
+    }
+    let existing = account.get("liabilityTerms");
+    let existing_start = existing
+        .and_then(|terms| terms.get("interestStartDate"))
+        .and_then(Value::as_str);
+    let existing_last = existing
+        .and_then(|terms| terms.get("lastInterestAccruedThrough"))
+        .and_then(Value::as_str);
+    if let (Some(existing_start), Some(existing_last), Some(next_start)) = (
+        existing_start,
+        existing_last,
+        interest_start_date.as_deref(),
+    ) && existing_last != existing_start
+        && next_start != existing_start
+    {
+        errors.push("interestStartDate cannot change after interest was accrued".to_string());
+    }
+    if let (Some(last), Some(maturity)) = (
+        existing_last.and_then(|value| Date::parse(value, &Iso8601::DATE).ok()),
+        maturity,
+    ) && maturity < last
+    {
+        errors.push("maturityDate cannot precede the last accrued date".to_string());
+    }
+    if !errors.is_empty() {
+        return Err(LedgerError::InvalidInput(errors));
+    }
+    let start = interest_start_date.expect("validated interestStartDate");
+    let repayment_anchor_day = existing
+        .and_then(|terms| terms.get("repaymentAnchorDay"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| u64::from(repayment_start.expect("validated repaymentStartDate").day()));
+    let mut terms = json!({
+        "liabilityType": liability_type.expect("validated liabilityType"),
+        "annualRate": annual_rate.expect("validated annualRate"),
+        "rateType": rate_type.expect("validated rateType"),
+        "dayCountBasis": day_count_basis.expect("validated dayCountBasis"),
+        "interestStartDate": start,
+        "maturityDate": maturity_date.expect("validated maturityDate"),
+        "repaymentStartDate": repayment_start_date.expect("validated repaymentStartDate"),
+        "nextDueDate": next_due_date.expect("validated nextDueDate"),
+        "repaymentFrequency": repayment_frequency.expect("validated repaymentFrequency"),
+        "repaymentAnchorDay": repayment_anchor_day,
+        "scheduledPayment": scheduled_payment.expect("validated scheduledPayment"),
+        "paymentAccountId": payment_account_id.expect("validated paymentAccountId"),
+        "lastInterestAccruedThrough": existing_last.unwrap_or(start.as_str()),
+        "updatedAt": now
+    });
+    if let Some(existing) = existing {
+        for key in [
+            "lastLoanInterestMovementId",
+            "lastLoanPaymentMovementId",
+            "lastPaymentDate",
+        ] {
+            if let Some(value) = existing.get(key) {
+                terms[key] = value.clone();
+            }
+        }
+    }
+    Ok(terms)
+}
+
+fn liability_positions_for_document(
+    document: &Value,
+    through_date: Date,
+) -> Result<Vec<Value>, LedgerError> {
+    let mut positions = Vec::new();
+    for account in document["accounts"]
+        .as_array()
+        .expect("validated accounts")
+        .iter()
+        .filter(|account| account.get("liabilityTerms").is_some())
+    {
+        let terms = account
+            .get("liabilityTerms")
+            .expect("liabilityTerms should exist");
+        let start = Date::parse(
+            terms["lastInterestAccruedThrough"]
+                .as_str()
+                .expect("validated lastInterestAccruedThrough"),
+            &Iso8601::DATE,
+        )
+        .expect("validated lastInterestAccruedThrough should parse");
+        let maturity = Date::parse(
+            terms["maturityDate"]
+                .as_str()
+                .expect("validated maturityDate"),
+            &Iso8601::DATE,
+        )
+        .expect("validated maturityDate should parse");
+        let effective_through = through_date.min(maturity);
+        let (outstanding, currency) = liability_outstanding(account)?;
+        let days = if effective_through > start {
+            (effective_through - start).whole_days()
+        } else {
+            0
+        };
+        let interest = if days > 0 && outstanding > DecimalAmount::ZERO {
+            prorated_interest(
+                outstanding,
+                parse_decimal(terms["annualRate"].as_str().expect("validated annualRate"))?,
+                days,
+                terms["dayCountBasis"]
+                    .as_u64()
+                    .expect("validated dayCountBasis"),
+            )?
+        } else {
+            DecimalAmount::ZERO
+        };
+        let scheduled_payment = parse_decimal(
+            terms["scheduledPayment"]["amount"]
+                .as_str()
+                .expect("validated scheduled payment"),
+        )?;
+        let next_due = Date::parse(
+            terms["nextDueDate"]
+                .as_str()
+                .expect("validated nextDueDate"),
+            &Iso8601::DATE,
+        )
+        .expect("validated nextDueDate should parse")
+        .min(maturity);
+        let next_payment_days = if next_due > start {
+            (next_due - start).whole_days()
+        } else {
+            0
+        };
+        let projected_payment_interest =
+            if next_payment_days > 0 && outstanding > DecimalAmount::ZERO {
+                prorated_interest(
+                    outstanding,
+                    parse_decimal(terms["annualRate"].as_str().expect("validated annualRate"))?,
+                    next_payment_days,
+                    terms["dayCountBasis"]
+                        .as_u64()
+                        .expect("validated dayCountBasis"),
+                )?
+            } else {
+                DecimalAmount::ZERO
+            };
+        let projected_principal = if scheduled_payment > projected_payment_interest {
+            (scheduled_payment - projected_payment_interest).min(outstanding)
+        } else {
+            DecimalAmount::ZERO
+        };
+        positions.push(json!({
+            "accountId": account["id"],
+            "accountName": account["displayName"],
+            "currency": currency,
+            "terms": terms,
+            "outstandingPrincipal": {"amount": outstanding.decimal_string(), "currency": currency},
+            "accruedThrough": effective_through.to_string(),
+            "accrualDays": days,
+            "accruedInterest": {"amount": interest.decimal_string(), "currency": currency},
+            "nextPayment": {
+                "dueDate": next_due.to_string(),
+                "scheduledAmount": terms["scheduledPayment"],
+                "projectedInterest": {"amount": projected_payment_interest.decimal_string(), "currency": currency},
+                "projectedPrincipal": {"amount": projected_principal.decimal_string(), "currency": currency}
+            },
+            "status": if outstanding == DecimalAmount::ZERO {"paid_off"} else if through_date >= maturity {"matured"} else {"active"}
+        }));
+    }
+    Ok(positions)
+}
+
+fn liability_outstanding(account: &Value) -> Result<(DecimalAmount, &str), LedgerError> {
+    let currency = account
+        .get("defaultCurrency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::InvalidInput(vec!["loan currency is missing".to_string()]))?;
+    let balance = account["cashBalances"]
+        .as_array()
+        .expect("validated cash balances")
+        .iter()
+        .find(|balance| balance.get("currency").and_then(Value::as_str) == Some(currency))
+        .and_then(|balance| balance.get("amount"))
+        .and_then(Value::as_str)
+        .map(parse_decimal)
+        .transpose()?
+        .unwrap_or(DecimalAmount::ZERO);
+    Ok((
+        if balance < DecimalAmount::ZERO {
+            -balance
+        } else {
+            DecimalAmount::ZERO
+        },
+        currency,
+    ))
+}
+
+fn projected_loan_repayment_schedule(
+    account: &Value,
+    terms: &Value,
+    outstanding: DecimalAmount,
+    currency: &str,
+    limit: usize,
+) -> Result<Value, LedgerError> {
+    let mut period_start = Date::parse(
+        terms["lastInterestAccruedThrough"]
+            .as_str()
+            .expect("validated lastInterestAccruedThrough"),
+        &Iso8601::DATE,
+    )
+    .expect("validated lastInterestAccruedThrough should parse");
+    let maturity = Date::parse(
+        terms["maturityDate"]
+            .as_str()
+            .expect("validated maturityDate"),
+        &Iso8601::DATE,
+    )
+    .expect("validated maturityDate should parse");
+    let mut due_date = Date::parse(
+        terms["nextDueDate"]
+            .as_str()
+            .expect("validated nextDueDate"),
+        &Iso8601::DATE,
+    )
+    .expect("validated nextDueDate should parse");
+    let anchor_day = due_date.day();
+    while due_date <= period_start && due_date < maturity {
+        due_date = add_calendar_months_with_anchor(due_date, 1, anchor_day).ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["repayment schedule date overflow".to_string()])
+        })?;
+    }
+    due_date = due_date.min(maturity);
+
+    let annual_rate = parse_decimal(terms["annualRate"].as_str().expect("validated annualRate"))?;
+    let basis = terms["dayCountBasis"]
+        .as_u64()
+        .expect("validated dayCountBasis");
+    let scheduled_payment = parse_decimal(
+        terms["scheduledPayment"]["amount"]
+            .as_str()
+            .expect("validated scheduledPayment"),
+    )?;
+    let mut opening = outstanding;
+    let mut items = Vec::new();
+    let mut total_payments = DecimalAmount::ZERO;
+    let mut total_interest = DecimalAmount::ZERO;
+    let mut total_principal = DecimalAmount::ZERO;
+    let mut sequence = 1_u64;
+
+    while opening > DecimalAmount::ZERO && due_date > period_start && items.len() < limit {
+        let days = (due_date - period_start).whole_days();
+        let interest = prorated_interest(opening, annual_rate, days, basis)?;
+        let total_due = opening + interest;
+        let is_maturity = due_date == maturity;
+        let payment = if is_maturity {
+            total_due
+        } else {
+            scheduled_payment.min(total_due)
+        };
+        let interest_paid = payment.min(interest);
+        let principal_paid = payment - interest_paid;
+        let unpaid_interest = interest - interest_paid;
+        let closing = opening - principal_paid + unpaid_interest;
+        total_payments += payment;
+        total_interest += interest;
+        total_principal += principal_paid;
+        items.push(json!({
+            "sequence": sequence,
+            "dueDate": due_date.to_string(),
+            "accrualDays": days,
+            "openingBalance": {"amount": opening.decimal_string(), "currency": currency},
+            "interest": {"amount": interest.decimal_string(), "currency": currency},
+            "principal": {"amount": principal_paid.decimal_string(), "currency": currency},
+            "payment": {"amount": payment.decimal_string(), "currency": currency},
+            "unpaidInterest": {"amount": unpaid_interest.decimal_string(), "currency": currency},
+            "closingBalance": {"amount": closing.decimal_string(), "currency": currency},
+            "kind": if is_maturity && payment > scheduled_payment {"balloon"} else {"scheduled"}
+        }));
+        opening = closing;
+        period_start = due_date;
+        sequence += 1;
+        if is_maturity || opening == DecimalAmount::ZERO {
+            break;
+        }
+        due_date = add_calendar_months_with_anchor(due_date, 1, anchor_day)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["repayment schedule date overflow".to_string()])
+            })?
+            .min(maturity);
+    }
+    let has_more = opening > DecimalAmount::ZERO && due_date > period_start;
+    Ok(json!({
+        "accountId": account["id"],
+        "accountName": account["displayName"],
+        "currency": currency,
+        "generatedFrom": terms["lastInterestAccruedThrough"],
+        "maturityDate": terms["maturityDate"],
+        "items": items,
+        "projectedTotals": {
+            "payments": {"amount": total_payments.decimal_string(), "currency": currency},
+            "interest": {"amount": total_interest.decimal_string(), "currency": currency},
+            "principal": {"amount": total_principal.decimal_string(), "currency": currency}
+        },
+        "remainingBalanceAfterPage": {"amount": opening.decimal_string(), "currency": currency},
+        "hasMore": has_more
+    }))
+}
+
+fn calculate_yield_accrual(
+    terms: &Value,
+    start: Date,
+    through: Date,
+) -> Result<YieldAccrual, LedgerError> {
+    if through <= start {
+        return Ok(YieldAccrual {
+            amount: DecimalAmount::ZERO,
+            days: 0,
+            full_periods: 0,
+        });
+    }
+    let principal = parse_decimal(
+        terms["principal"]["amount"]
+            .as_str()
+            .expect("validated principal amount"),
+    )?;
+    let annual_rate = parse_decimal(terms["annualRate"].as_str().expect("validated annualRate"))?;
+    let basis = terms["dayCountBasis"]
+        .as_u64()
+        .expect("validated dayCountBasis");
+    let days = (through - start).whole_days();
+    if terms["interestMethod"].as_str() == Some("simple") {
+        return Ok(YieldAccrual {
+            amount: prorated_interest(principal, annual_rate, days, basis)?,
+            days,
+            full_periods: 0,
+        });
+    }
+
+    let (months, periods_per_year) = match terms["compoundingFrequency"].as_str() {
+        Some("monthly") => (1_i32, 12_i128),
+        Some("quarterly") => (3_i32, 4_i128),
+        Some("annual") => (12_i32, 1_i128),
+        _ => {
+            return Err(LedgerError::InvalidInput(vec![
+                "compound yield terms have an invalid frequency".to_string(),
+            ]));
+        }
+    };
+    let divisor = DecimalAmount(periods_per_year * DecimalAmount::SCALE);
+    let period_rate = divide_decimal(annual_rate, divisor).ok_or_else(|| {
+        LedgerError::InvalidInput(vec![
+            "annualRate cannot be divided by frequency".to_string(),
+        ])
+    })?;
+    let mut balance = principal;
+    let mut cursor = start;
+    let mut full_periods = 0_u64;
+    while let Some(next) = add_calendar_months(cursor, months)
+        && next <= through
+    {
+        balance += multiply_decimal(balance, period_rate);
+        cursor = next;
+        full_periods = full_periods.checked_add(1).ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["compounding period count overflow".to_string()])
+        })?;
+    }
+    let remaining_days = (through - cursor).whole_days();
+    if remaining_days > 0 {
+        balance += prorated_interest(balance, annual_rate, remaining_days, basis)?;
+    }
+    Ok(YieldAccrual {
+        amount: balance - principal,
+        days,
+        full_periods,
+    })
+}
+
+fn prorated_interest(
+    principal: DecimalAmount,
+    annual_rate: DecimalAmount,
+    days: i64,
+    basis: u64,
+) -> Result<DecimalAmount, LedgerError> {
+    let numerator = principal
+        .0
+        .checked_mul(annual_rate.0)
+        .and_then(|value| value.checked_mul(i128::from(days)))
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["interest calculation overflow".to_string()])
+        })?;
+    let denominator = DecimalAmount::SCALE
+        .checked_mul(i128::from(basis))
+        .ok_or_else(|| LedgerError::InvalidInput(vec!["day count basis overflow".to_string()]))?;
+    if denominator == 0 {
+        return Err(LedgerError::InvalidInput(vec![
+            "day count basis cannot be zero".to_string(),
+        ]));
+    }
+    Ok(DecimalAmount(numerator / denominator))
 }
 
 fn advance_subscription_billing_date(
@@ -6457,6 +12374,31 @@ fn normalized_movement_entries(
                 None
             }
         };
+        let instrument_id = optional_string(item, "instrumentId", errors);
+
+        if let (Some(account_id), Some(currency)) = (account_id.as_deref(), currency.as_deref())
+            && let Some(account) = active_account(document, account_id)
+        {
+            let supports_currency = account
+                .get("supportedCurrencies")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(currency)));
+            if !supports_currency {
+                errors.push(format!(
+                    "entries[{index}].currency is not supported by the account"
+                ));
+            }
+            if instrument_id.is_some()
+                && !matches!(
+                    account.get("balanceMode").and_then(Value::as_str),
+                    Some("holdings" | "mixed")
+                )
+            {
+                errors.push(format!(
+                    "entries[{index}] with instrumentId requires a holdings or mixed account"
+                ));
+            }
+        }
 
         if let (Some(account_id), Some(amount), Some(currency), Some(direction), Some(role)) =
             (account_id, amount, currency, direction, role)
@@ -6470,7 +12412,7 @@ fn normalized_movement_entries(
                 "role": role
             });
 
-            if let Some(instrument_id) = optional_string(item, "instrumentId", errors) {
+            if let Some(instrument_id) = instrument_id {
                 entry["instrumentId"] = json!(instrument_id);
             }
 
@@ -6600,6 +12542,385 @@ fn normalized_transfer_meta(value: Option<&Value>, errors: &mut Vec<String>) -> 
     Some(meta)
 }
 
+fn validate_simple_transfer(
+    entries: Option<&[Value]>,
+    transfer_meta: Option<&Value>,
+    errors: &mut Vec<String>,
+) {
+    let Some(entries) = entries else {
+        return;
+    };
+    if entries.len() != 2 {
+        errors.push(
+            "transfer entries must contain exactly one source and one destination".to_string(),
+        );
+        return;
+    }
+
+    let source_entries = entries
+        .iter()
+        .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("source"))
+        .collect::<Vec<_>>();
+    let destination_entries = entries
+        .iter()
+        .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("destination"))
+        .collect::<Vec<_>>();
+    if source_entries.len() != 1 || destination_entries.len() != 1 {
+        errors.push(
+            "transfer entries must contain exactly one source and one destination".to_string(),
+        );
+        return;
+    }
+
+    let source = source_entries[0];
+    let destination = destination_entries[0];
+    if source.get("direction").and_then(Value::as_str) != Some("out") {
+        errors.push("transfer source entry.direction must be out".to_string());
+    }
+    if destination.get("direction").and_then(Value::as_str) != Some("in") {
+        errors.push("transfer destination entry.direction must be in".to_string());
+    }
+
+    let source_account_id = source.get("accountId").and_then(Value::as_str);
+    let destination_account_id = destination.get("accountId").and_then(Value::as_str);
+    if source_account_id.is_some() && source_account_id == destination_account_id {
+        errors.push("transfer source and destination accounts must differ".to_string());
+    }
+
+    let source_currency = source.get("currency").and_then(Value::as_str);
+    let destination_currency = destination.get("currency").and_then(Value::as_str);
+    if source_currency != destination_currency {
+        errors.push("current server mode supports same-currency transfers only".to_string());
+    }
+    let source_amount = source
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    let destination_amount = destination
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    if source_amount != destination_amount {
+        errors.push("same-currency transfer source and destination amounts must match".to_string());
+    }
+
+    let Some(meta) = transfer_meta.and_then(Value::as_object) else {
+        return;
+    };
+    if meta.get("fromAccountId").and_then(Value::as_str) != source_account_id {
+        errors.push("transferMeta.fromAccountId must match the source entry".to_string());
+    }
+    if meta.get("toAccountId").and_then(Value::as_str) != destination_account_id {
+        errors.push("transferMeta.toAccountId must match the destination entry".to_string());
+    }
+    if let Some(from_amount) = meta.get("fromAmount")
+        && !money_matches_entry(from_amount, source)
+    {
+        errors.push("transferMeta.fromAmount must match the source entry".to_string());
+    }
+    if let Some(to_amount) = meta.get("toAmount")
+        && !money_matches_entry(to_amount, destination)
+    {
+        errors.push("transferMeta.toAmount must match the destination entry".to_string());
+    }
+    if ["feeAmount", "lossAmount", "fxRate"]
+        .iter()
+        .any(|key| meta.contains_key(*key))
+    {
+        errors.push(
+            "current server mode does not support transfer fees, losses, or FX conversion"
+                .to_string(),
+        );
+    }
+}
+
+fn validate_movement_semantics(
+    document: &Value,
+    movement_type: &str,
+    entries: &[Value],
+    errors: &mut Vec<String>,
+) {
+    match movement_type {
+        "income" | "dividend" | "interest" => {
+            validate_single_cash_movement(movement_type, entries, "in", "source", errors);
+        }
+        "expense" | "fee" => {
+            validate_single_cash_movement(movement_type, entries, "out", "source", errors);
+        }
+        "adjustment" => {
+            if entries.len() != 1 {
+                errors.push("adjustment must contain exactly one entry".to_string());
+                return;
+            }
+            let entry = &entries[0];
+            if entry.get("role").and_then(Value::as_str) != Some("adjustment") {
+                errors.push("adjustment entry.role must be adjustment".to_string());
+            }
+        }
+        "buy" => validate_buy_or_sell(entries, true, errors),
+        "sell" => validate_buy_or_sell(entries, false, errors),
+        "loan_disbursement" => validate_loan_movement(document, entries, true, errors),
+        "loan_repayment" => validate_loan_movement(document, entries, false, errors),
+        "loan_interest" => {
+            validate_single_cash_movement(movement_type, entries, "out", "source", errors);
+            if entries.first().is_some_and(|entry| {
+                entry
+                    .get("accountId")
+                    .and_then(Value::as_str)
+                    .and_then(|account_id| active_account(document, account_id))
+                    .is_none_or(|account| !is_liability_account(account))
+            }) {
+                errors.push("loan_interest must target a liability account".to_string());
+            }
+        }
+        "correction" => errors.push(
+            "correction drafts must be created through /v1/movements/corrections".to_string(),
+        ),
+        "transfer" => {}
+        _ => errors.push(format!(
+            "movement type is not supported by current server semantics: {movement_type}"
+        )),
+    }
+}
+
+fn validate_single_cash_movement(
+    movement_type: &str,
+    entries: &[Value],
+    expected_direction: &str,
+    expected_role: &str,
+    errors: &mut Vec<String>,
+) {
+    if entries.len() != 1 {
+        errors.push(format!(
+            "{movement_type} must contain exactly one cash entry"
+        ));
+        return;
+    }
+    let entry = &entries[0];
+    if entry.get("instrumentId").is_some() {
+        errors.push(format!(
+            "{movement_type} entry must not contain instrumentId"
+        ));
+    }
+    if entry.get("direction").and_then(Value::as_str) != Some(expected_direction) {
+        errors.push(format!(
+            "{movement_type} entry.direction must be {expected_direction}"
+        ));
+    }
+    if entry.get("role").and_then(Value::as_str) != Some(expected_role) {
+        errors.push(format!(
+            "{movement_type} entry.role must be {expected_role}"
+        ));
+    }
+}
+
+fn validate_buy_or_sell(entries: &[Value], is_buy: bool, errors: &mut Vec<String>) {
+    let movement_type = if is_buy { "buy" } else { "sell" };
+    if entries.len() < 2 {
+        errors.push(format!(
+            "{movement_type} must contain one principal cash leg and one holding leg"
+        ));
+        return;
+    }
+    let cash_role = if is_buy { "source" } else { "destination" };
+    let holding_role = if is_buy { "destination" } else { "source" };
+    let cash_direction = if is_buy { "out" } else { "in" };
+    let holding_direction = if is_buy { "in" } else { "out" };
+    let cash_legs = entries
+        .iter()
+        .filter(|entry| {
+            entry.get("instrumentId").is_none()
+                && entry.get("role").and_then(Value::as_str) == Some(cash_role)
+        })
+        .collect::<Vec<_>>();
+    let holding_legs = entries
+        .iter()
+        .filter(|entry| {
+            entry.get("instrumentId").is_some()
+                && entry.get("role").and_then(Value::as_str) == Some(holding_role)
+        })
+        .collect::<Vec<_>>();
+    if cash_legs.len() != 1 || holding_legs.len() != 1 {
+        errors.push(format!(
+            "{movement_type} must contain exactly one principal cash leg and one holding leg"
+        ));
+        return;
+    }
+    let cash = cash_legs[0];
+    let holding = holding_legs[0];
+    if cash.get("direction").and_then(Value::as_str) != Some(cash_direction) {
+        errors.push(format!(
+            "{movement_type} principal cash entry.direction must be {cash_direction}"
+        ));
+    }
+    if holding.get("direction").and_then(Value::as_str) != Some(holding_direction) {
+        errors.push(format!(
+            "{movement_type} holding entry.direction must be {holding_direction}"
+        ));
+    }
+    let cash_account = cash.get("accountId").and_then(Value::as_str);
+    let cash_currency = cash.get("currency").and_then(Value::as_str);
+    let mut fee_total = DecimalAmount::ZERO;
+    for entry in entries {
+        if std::ptr::eq(entry, cash) || std::ptr::eq(entry, holding) {
+            continue;
+        }
+        if !matches!(
+            entry.get("role").and_then(Value::as_str),
+            Some("fee" | "tax")
+        ) {
+            errors.push(format!(
+                "{movement_type} additional entries must use fee or tax role"
+            ));
+            continue;
+        }
+        if entry.get("instrumentId").is_some() {
+            errors.push(format!(
+                "{movement_type} fee/tax entries must be cash entries without instrumentId"
+            ));
+        }
+        if entry.get("direction").and_then(Value::as_str) != Some("out") {
+            errors.push(format!(
+                "{movement_type} fee/tax entry.direction must be out"
+            ));
+        }
+        if entry.get("accountId").and_then(Value::as_str) != cash_account
+            || entry.get("currency").and_then(Value::as_str) != cash_currency
+        {
+            errors.push(format!(
+                "{movement_type} fee/tax entries must use the principal cash account and currency"
+            ));
+        }
+        if let Some(amount) = entry
+            .get("amount")
+            .and_then(Value::as_str)
+            .and_then(|amount| parse_decimal(amount).ok())
+        {
+            fee_total += amount;
+        }
+    }
+    if !is_buy
+        && let Some(proceeds) = cash
+            .get("amount")
+            .and_then(Value::as_str)
+            .and_then(|amount| parse_decimal(amount).ok())
+        && fee_total > proceeds
+    {
+        errors.push("sell fee/tax total must not exceed gross proceeds".to_string());
+    }
+}
+
+fn validate_loan_movement(
+    document: &Value,
+    entries: &[Value],
+    is_disbursement: bool,
+    errors: &mut Vec<String>,
+) {
+    let movement_type = if is_disbursement {
+        "loan_disbursement"
+    } else {
+        "loan_repayment"
+    };
+    if entries.len() != 2 {
+        errors.push(format!(
+            "{movement_type} must contain exactly one source and one destination"
+        ));
+        return;
+    }
+    let source_entries = entries
+        .iter()
+        .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("source"))
+        .collect::<Vec<_>>();
+    let destination_entries = entries
+        .iter()
+        .filter(|entry| entry.get("role").and_then(Value::as_str) == Some("destination"))
+        .collect::<Vec<_>>();
+    if source_entries.len() != 1 || destination_entries.len() != 1 {
+        errors.push(format!(
+            "{movement_type} must contain exactly one source and one destination"
+        ));
+        return;
+    }
+
+    let source = source_entries[0];
+    let destination = destination_entries[0];
+    if source.get("direction").and_then(Value::as_str) != Some("out") {
+        errors.push(format!(
+            "{movement_type} source entry.direction must be out"
+        ));
+    }
+    if destination.get("direction").and_then(Value::as_str) != Some("in") {
+        errors.push(format!(
+            "{movement_type} destination entry.direction must be in"
+        ));
+    }
+    if source.get("instrumentId").is_some() || destination.get("instrumentId").is_some() {
+        errors.push(format!(
+            "{movement_type} entries must be cash/liability entries without instrumentId"
+        ));
+    }
+    let source_account_id = source.get("accountId").and_then(Value::as_str);
+    let destination_account_id = destination.get("accountId").and_then(Value::as_str);
+    if source_account_id.is_some() && source_account_id == destination_account_id {
+        errors.push(format!(
+            "{movement_type} source and destination accounts must differ"
+        ));
+    }
+    let source_is_liability = source_account_id
+        .and_then(|account_id| active_account(document, account_id))
+        .is_some_and(is_liability_account);
+    let destination_is_liability = destination_account_id
+        .and_then(|account_id| active_account(document, account_id))
+        .is_some_and(is_liability_account);
+    if is_disbursement {
+        if !source_is_liability || destination_is_liability {
+            errors.push(
+                "loan_disbursement must flow out of a liability account into a non-liability account"
+                    .to_string(),
+            );
+        }
+    } else if source_is_liability || !destination_is_liability {
+        errors.push(
+            "loan_repayment must flow out of a non-liability account into a liability account"
+                .to_string(),
+        );
+    }
+    if source.get("currency").and_then(Value::as_str)
+        != destination.get("currency").and_then(Value::as_str)
+    {
+        errors.push(format!(
+            "current server mode supports same-currency {movement_type} movements only"
+        ));
+    }
+    let source_amount = source
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    let destination_amount = destination
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    if source_amount != destination_amount {
+        errors.push(format!(
+            "{movement_type} source and destination amounts must match"
+        ));
+    }
+}
+
+fn money_matches_entry(money: &Value, entry: &Value) -> bool {
+    let money_amount = money
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    let entry_amount = entry
+        .get("amount")
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok());
+    money_amount == entry_amount
+        && money.get("currency").and_then(Value::as_str)
+            == entry.get("currency").and_then(Value::as_str)
+}
+
 fn normalized_money(value: Option<&Value>, label: &str, errors: &mut Vec<String>) -> Option<Value> {
     let value = value?;
 
@@ -6638,14 +12959,383 @@ fn normalized_required_money(
 }
 
 fn active_account_exists(document: &Value, account_id: &str) -> bool {
+    active_account(document, account_id).is_some()
+}
+
+fn holding_has_pending_adjustment(document: &Value, holding: &Value) -> bool {
+    let account_id = holding.get("accountId").and_then(Value::as_str);
+    let instrument_id = holding.get("instrumentId").and_then(Value::as_str);
+    document["movements"]
+        .as_array()
+        .expect("validated movements")
+        .iter()
+        .any(|movement| {
+            movement.get("status").and_then(Value::as_str) == Some("pending_review")
+                && movement
+                    .get("holdingAdjustment")
+                    .and_then(|adjustment| adjustment.get("accountId"))
+                    .and_then(Value::as_str)
+                    == account_id
+                && movement
+                    .get("holdingAdjustment")
+                    .and_then(|adjustment| adjustment.get("instrumentId"))
+                    .and_then(Value::as_str)
+                    == instrument_id
+        })
+}
+
+fn active_account<'a>(document: &'a Value, account_id: &str) -> Option<&'a Value> {
     document["accounts"]
         .as_array()
         .expect("validated local ledger accounts should be an array")
         .iter()
-        .any(|account| {
+        .find(|account| {
             account.get("id").and_then(Value::as_str) == Some(account_id)
                 && account.get("status").and_then(Value::as_str) != Some("archived")
         })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubscriptionPaymentIssue {
+    AccountUnavailable,
+    CurrencyUnsupported,
+}
+
+fn subscription_payment_issue(
+    document: &Value,
+    account_id: &str,
+    currency: &str,
+) -> Option<SubscriptionPaymentIssue> {
+    let Some(account) = active_account(document, account_id) else {
+        return Some(SubscriptionPaymentIssue::AccountUnavailable);
+    };
+    let supports_currency = account
+        .get("supportedCurrencies")
+        .and_then(Value::as_array)
+        .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(currency)));
+    (!supports_currency).then_some(SubscriptionPaymentIssue::CurrencyUnsupported)
+}
+
+fn apply_movement_effect(
+    document: &mut Value,
+    movement: &Value,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let entries = movement
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["movement.entries is missing".to_string()])
+        })?;
+    match movement.get("type").and_then(Value::as_str) {
+        Some("buy") => apply_buy_or_sell_movement(document, movement, entries, true, now),
+        Some("sell") => apply_buy_or_sell_movement(document, movement, entries, false, now),
+        Some("adjustment") if movement.get("holdingAdjustment").is_some() => {
+            apply_holding_adjustment(document, movement, now)
+        }
+        Some("correction") if movement.get("investmentReplacement").is_some() => {
+            apply_investment_replacement_correction(document, movement, now)
+        }
+        _ => apply_movement_entries(document, entries, now),
+    }
+}
+
+fn apply_holding_adjustment(
+    document: &mut Value,
+    movement: &Value,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let adjustment = movement
+        .get("holdingAdjustment")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["holding adjustment metadata is missing".to_string()])
+        })?;
+    let account_id = adjustment
+        .get("accountId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["holdingAdjustment.accountId is missing".to_string()])
+        })?;
+    let instrument_id = adjustment
+        .get("instrumentId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "holdingAdjustment.instrumentId is missing".to_string(),
+            ])
+        })?;
+    let previous = parse_decimal(
+        adjustment
+            .get("previousQuantity")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![
+                    "holdingAdjustment.previousQuantity is missing".to_string(),
+                ])
+            })?,
+    )
+    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    let target = parse_decimal(
+        adjustment
+            .get("targetQuantity")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![
+                    "holdingAdjustment.targetQuantity is missing".to_string(),
+                ])
+            })?,
+    )
+    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    if target < DecimalAmount::ZERO {
+        return Err(LedgerError::InvalidInput(vec![
+            "holding adjustment target quantity cannot be negative".to_string(),
+        ]));
+    }
+    if !active_account_exists(document, account_id) {
+        return Err(LedgerError::NotFound(format!(
+            "holding account does not exist or is archived: {account_id}"
+        )));
+    }
+    let index = document["holdings"]
+        .as_array()
+        .expect("validated local ledger holdings should be an array")
+        .iter()
+        .position(|holding| {
+            holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                && holding.get("instrumentId").and_then(Value::as_str) == Some(instrument_id)
+        });
+    let current = index
+        .and_then(|index| document["holdings"][index].get("quantity"))
+        .and_then(Value::as_str)
+        .and_then(|value| parse_decimal(value).ok())
+        .unwrap_or(DecimalAmount::ZERO);
+    if current != previous {
+        return Err(LedgerError::Conflict(format!(
+            "holding quantity changed after proposal creation: {instrument_id}"
+        )));
+    }
+    let as_of = movement
+        .get("occurredAt")
+        .and_then(Value::as_str)
+        .unwrap_or(now);
+
+    if target == DecimalAmount::ZERO {
+        if let Some(index) = index {
+            document["holdings"]
+                .as_array_mut()
+                .expect("validated local ledger holdings should be an array")
+                .remove(index);
+        }
+        return Ok(());
+    }
+
+    if let Some(index) = index {
+        let holding = document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .get_mut(index)
+            .expect("holding index should remain valid");
+        holding["quantity"] = json!(target.decimal_string());
+        holding["quoteStatus"] = json!("unpriceable");
+        holding["asOf"] = json!(as_of);
+        if let Some(object) = holding.as_object_mut() {
+            object.remove("marketValue");
+            object.remove("unrealizedPnl");
+            object.remove("unrealizedPnlRate");
+        }
+    } else {
+        document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .push(json!({
+                "id": stable_holding_id(account_id, instrument_id),
+                "accountId": account_id,
+                "instrumentId": instrument_id,
+                "quantity": target.decimal_string(),
+                "quoteStatus": "unpriceable",
+                "asOf": as_of
+            }));
+    }
+    Ok(())
+}
+
+fn apply_investment_replacement_correction(
+    document: &mut Value,
+    correction: &Value,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let target_id = correction
+        .get("source")
+        .and_then(|source| source.get("sourceId"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "investment correction source.sourceId is missing".to_string(),
+            ])
+        })?;
+    let target = document["movements"]
+        .as_array()
+        .expect("validated local ledger movements should be an array")
+        .iter()
+        .find(|movement| movement.get("id").and_then(Value::as_str) == Some(target_id))
+        .cloned()
+        .ok_or_else(|| {
+            LedgerError::NotFound(format!("target movement does not exist: {target_id}"))
+        })?;
+    ensure_investment_correction_target_is_latest(document, &target)?;
+    ensure_investment_target_has_reversible_basis(&target)?;
+
+    reverse_investment_movement_effect(document, &target, now)?;
+
+    let replacement = correction
+        .get("investmentReplacement")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "investment correction metadata is missing".to_string(),
+            ])
+        })?;
+    let target_type = replacement
+        .get("targetType")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "investment correction targetType is missing".to_string(),
+            ])
+        })?;
+    let replacement_entries = replacement
+        .get("replacementEntries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec![
+                "investment correction replacementEntries are missing".to_string(),
+            ])
+        })?;
+    let replacement_movement = json!({
+        "id": correction.get("id").cloned().unwrap_or(Value::Null),
+        "type": target_type,
+        "occurredAt": replacement
+            .get("targetOccurredAt")
+            .cloned()
+            .unwrap_or_else(|| target.get("occurredAt").cloned().unwrap_or(Value::Null)),
+        "entries": replacement_entries
+    });
+    apply_buy_or_sell_movement(
+        document,
+        &replacement_movement,
+        replacement_entries,
+        target_type == "buy",
+        now,
+    )
+}
+
+fn reverse_investment_movement_effect(
+    document: &mut Value,
+    target: &Value,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let entries = target
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| LedgerError::InvalidInput(vec!["target entries are missing".to_string()]))?;
+    let is_buy = target.get("type").and_then(Value::as_str) == Some("buy");
+    let cash_role = if is_buy { "source" } else { "destination" };
+    let holding_role = if is_buy { "destination" } else { "source" };
+    let cash = entries
+        .iter()
+        .find(|entry| {
+            entry.get("instrumentId").is_none()
+                && entry.get("role").and_then(Value::as_str) == Some(cash_role)
+        })
+        .ok_or_else(|| LedgerError::InvalidInput(vec!["target cash leg is missing".to_string()]))?;
+    let holding = entries
+        .iter()
+        .find(|entry| {
+            entry.get("instrumentId").is_some()
+                && entry.get("role").and_then(Value::as_str) == Some(holding_role)
+        })
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["target holding leg is missing".to_string()])
+        })?;
+    let cash_account_id = required_entry_string(cash, "accountId")?;
+    let cash_currency = required_entry_string(cash, "currency")?;
+    let principal = parse_entry_amount(cash)?;
+    let holding_account_id = required_entry_string(holding, "accountId")?;
+    let instrument_id = required_entry_string(holding, "instrumentId")?;
+    let quote_currency = required_entry_string(holding, "currency")?;
+    let quantity = parse_entry_amount(holding)?;
+    let fees = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.get("role").and_then(Value::as_str),
+                Some("fee" | "tax")
+            )
+        })
+        .try_fold(DecimalAmount::ZERO, |total, entry| {
+            parse_entry_amount(entry).map(|amount| total + amount)
+        })?;
+
+    if is_buy {
+        let total_cost = principal + fees;
+        apply_account_cash_delta(document, cash_account_id, cash_currency, total_cost, now)?;
+        reverse_holding_purchase_exact(
+            document,
+            target,
+            ReverseHoldingPurchase {
+                account_id: holding_account_id,
+                instrument_id,
+                quote_currency,
+                quantity,
+                original_cost: total_cost,
+                original_cost_currency: cash_currency,
+            },
+            now,
+        )
+    } else {
+        let net_proceeds = principal - fees;
+        apply_account_cash_delta(document, cash_account_id, cash_currency, -net_proceeds, now)?;
+        let released = target
+            .get("saleResult")
+            .and_then(|result| result.get("costBasisReleased"))
+            .ok_or_else(|| {
+                LedgerError::Conflict(
+                    "sell correction requires persisted costBasisReleased".to_string(),
+                )
+            })?;
+        let released_amount = parse_decimal(
+            released
+                .get("amount")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    LedgerError::InvalidInput(vec![
+                        "saleResult.costBasisReleased.amount is missing".to_string(),
+                    ])
+                })?,
+        )
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+        let released_currency = released
+            .get("currency")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec![
+                    "saleResult.costBasisReleased.currency is missing".to_string(),
+                ])
+            })?;
+        restore_holding_sale_exact(
+            document,
+            RestoreHoldingSale {
+                account_id: holding_account_id,
+                instrument_id,
+                quote_currency,
+                quantity,
+                released_cost: released_amount,
+                released_currency,
+            },
+            now,
+        )
+    }
 }
 
 fn apply_movement_entries(
@@ -6691,6 +13381,231 @@ fn apply_movement_entries(
     Ok(())
 }
 
+fn apply_buy_or_sell_movement(
+    document: &mut Value,
+    movement: &Value,
+    entries: &[Value],
+    is_buy: bool,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let cash_role = if is_buy { "source" } else { "destination" };
+    let holding_role = if is_buy { "destination" } else { "source" };
+    let cash = entries
+        .iter()
+        .find(|entry| {
+            entry.get("instrumentId").is_none()
+                && entry.get("role").and_then(Value::as_str) == Some(cash_role)
+        })
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["buy/sell cash leg is missing".to_string()])
+        })?;
+    let holding = entries
+        .iter()
+        .find(|entry| {
+            entry.get("instrumentId").is_some()
+                && entry.get("role").and_then(Value::as_str) == Some(holding_role)
+        })
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["buy/sell holding leg is missing".to_string()])
+        })?;
+
+    let cash_account_id = required_entry_string(cash, "accountId")?;
+    let cash_currency = required_entry_string(cash, "currency")?;
+    let cash_amount = parse_entry_amount(cash)?;
+    let holding_account_id = required_entry_string(holding, "accountId")?;
+    let quote_currency = required_entry_string(holding, "currency")?;
+    let instrument_id = required_entry_string(holding, "instrumentId")?;
+    let quantity = parse_entry_amount(holding)?;
+    let occurred_at = movement
+        .get("occurredAt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["movement.occurredAt is missing".to_string()])
+        })?;
+    let mut fee_total = DecimalAmount::ZERO;
+    for entry in entries.iter().filter(|entry| {
+        matches!(
+            entry.get("role").and_then(Value::as_str),
+            Some("fee" | "tax")
+        )
+    }) {
+        if required_entry_string(entry, "accountId")? != cash_account_id
+            || required_entry_string(entry, "currency")? != cash_currency
+            || required_entry_string(entry, "direction")? != "out"
+            || entry.get("instrumentId").is_some()
+        {
+            return Err(LedgerError::InvalidInput(vec![
+                "buy/sell fee and tax legs must be cash outflows from the principal account and currency"
+                    .to_string(),
+            ]));
+        }
+        fee_total += parse_entry_amount(entry)?;
+    }
+
+    if is_buy {
+        let total_cash_out = cash_amount + fee_total;
+        apply_account_cash_delta(
+            document,
+            cash_account_id,
+            cash_currency,
+            -total_cash_out,
+            now,
+        )?;
+        let cost_basis_fx = apply_holding_purchase(
+            document,
+            HoldingPurchase {
+                account_id: holding_account_id,
+                instrument_id,
+                quote_currency,
+                quantity,
+                cost_amount: total_cash_out,
+                cost_currency: cash_currency,
+            },
+            occurred_at,
+            now,
+        )?;
+        if let Some(cost_basis_fx) = cost_basis_fx {
+            record_movement_cost_basis_fx(document, movement, cost_basis_fx)?;
+        }
+    } else {
+        if fee_total > cash_amount {
+            return Err(LedgerError::InvalidInput(vec![
+                "sell fee/tax total must not exceed gross proceeds".to_string(),
+            ]));
+        }
+        let released_cost_basis = apply_holding_sale(
+            document,
+            holding_account_id,
+            instrument_id,
+            quote_currency,
+            quantity,
+            now,
+        )?;
+        let net_proceeds = cash_amount - fee_total;
+        apply_account_cash_delta(document, cash_account_id, cash_currency, net_proceeds, now)?;
+        record_investment_sale_result(
+            document,
+            movement,
+            InvestmentSaleInputs {
+                gross_proceeds: cash_amount,
+                fee_and_tax_total: fee_total,
+                net_proceeds,
+                cash_currency,
+                released_cost_basis,
+                occurred_at,
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
+struct InvestmentSaleInputs<'a> {
+    gross_proceeds: DecimalAmount,
+    fee_and_tax_total: DecimalAmount,
+    net_proceeds: DecimalAmount,
+    cash_currency: &'a str,
+    released_cost_basis: Option<(DecimalAmount, String)>,
+    occurred_at: &'a str,
+}
+
+fn record_investment_sale_result(
+    document: &mut Value,
+    movement: &Value,
+    inputs: InvestmentSaleInputs<'_>,
+) -> Result<(), LedgerError> {
+    let InvestmentSaleInputs {
+        gross_proceeds,
+        fee_and_tax_total,
+        net_proceeds,
+        cash_currency,
+        released_cost_basis,
+        occurred_at,
+    } = inputs;
+    let movement_id = movement
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::InvalidInput(vec!["movement.id is missing".to_string()]))?;
+    let mut result = json!({
+        "costBasisMethod": "average_cost",
+        "grossProceeds": money(gross_proceeds, cash_currency),
+        "feeAndTaxTotal": money(fee_and_tax_total, cash_currency),
+        "netProceeds": money(net_proceeds, cash_currency),
+        "realizedPnlStatus": "cost_basis_unavailable"
+    });
+    if let Some((released_amount, released_currency)) = released_cost_basis {
+        result["costBasisReleased"] = money(released_amount, &released_currency);
+        if released_currency == cash_currency {
+            result["realizedPnl"] = money(net_proceeds - released_amount, cash_currency);
+            result["realizedPnlStatus"] = json!("calculated");
+        } else if let Some(conversion) = convert_execution_amount(
+            document,
+            net_proceeds,
+            cash_currency,
+            &released_currency,
+            occurred_at,
+        ) {
+            result["netProceedsInCostBasisCurrency"] = money(conversion.amount, &released_currency);
+            result["realizedPnl"] = money(conversion.amount - released_amount, &released_currency);
+            result["fxBasis"] = conversion.basis;
+            result["realizedPnlStatus"] = json!("calculated_with_fx");
+        } else {
+            result["realizedPnlStatus"] = json!("currency_mismatch");
+        }
+    }
+    let stored = document["movements"]
+        .as_array_mut()
+        .expect("validated local ledger movements should be an array")
+        .iter_mut()
+        .find(|stored| stored.get("id").and_then(Value::as_str) == Some(movement_id))
+        .ok_or_else(|| LedgerError::NotFound(format!("movement does not exist: {movement_id}")))?;
+    if stored.get("type").and_then(Value::as_str) == Some("correction")
+        && stored.get("investmentReplacement").is_some()
+    {
+        stored["investmentReplacement"]["saleResult"] = result;
+    } else {
+        stored["saleResult"] = result;
+    }
+    Ok(())
+}
+
+fn record_movement_cost_basis_fx(
+    document: &mut Value,
+    movement: &Value,
+    cost_basis_fx: Value,
+) -> Result<(), LedgerError> {
+    let movement_id = movement
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::InvalidInput(vec!["movement.id is missing".to_string()]))?;
+    let stored = document["movements"]
+        .as_array_mut()
+        .expect("validated local ledger movements should be an array")
+        .iter_mut()
+        .find(|stored| stored.get("id").and_then(Value::as_str) == Some(movement_id))
+        .ok_or_else(|| LedgerError::NotFound(format!("movement does not exist: {movement_id}")))?;
+    if stored.get("type").and_then(Value::as_str) == Some("correction")
+        && stored.get("investmentReplacement").is_some()
+    {
+        stored["investmentReplacement"]["costBasisFx"] = cost_basis_fx;
+    } else {
+        stored["costBasisFx"] = cost_basis_fx;
+    }
+    Ok(())
+}
+
+fn required_entry_string<'a>(entry: &'a Value, key: &str) -> Result<&'a str, LedgerError> {
+    entry
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::InvalidInput(vec![format!("buy/sell entry.{key} is missing")]))
+}
+
+fn parse_entry_amount(entry: &Value) -> Result<DecimalAmount, LedgerError> {
+    parse_decimal(required_entry_string(entry, "amount")?)
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))
+}
+
 fn apply_account_cash_delta(
     document: &mut Value,
     account_id: &str,
@@ -6732,6 +13647,589 @@ fn apply_account_cash_delta(
         }));
     }
     account["updatedAt"] = json!(now);
+    Ok(())
+}
+
+struct HoldingPurchase<'a> {
+    account_id: &'a str,
+    instrument_id: &'a str,
+    quote_currency: &'a str,
+    quantity: DecimalAmount,
+    cost_amount: DecimalAmount,
+    cost_currency: &'a str,
+}
+
+struct ReverseHoldingPurchase<'a> {
+    account_id: &'a str,
+    instrument_id: &'a str,
+    quote_currency: &'a str,
+    quantity: DecimalAmount,
+    original_cost: DecimalAmount,
+    original_cost_currency: &'a str,
+}
+
+fn reverse_holding_purchase_exact(
+    document: &mut Value,
+    target: &Value,
+    purchase: ReverseHoldingPurchase<'_>,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let ReverseHoldingPurchase {
+        account_id,
+        instrument_id,
+        quote_currency,
+        quantity,
+        original_cost,
+        original_cost_currency,
+    } = purchase;
+    ensure_matching_instrument(document, instrument_id, quote_currency)?;
+    let index = document["holdings"]
+        .as_array()
+        .expect("validated local ledger holdings should be an array")
+        .iter()
+        .position(|holding| {
+            holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                && holding.get("instrumentId").and_then(Value::as_str) == Some(instrument_id)
+        })
+        .ok_or_else(|| {
+            LedgerError::Conflict(format!(
+                "holding does not exist for corrected buy: {instrument_id}"
+            ))
+        })?;
+    let existing = document["holdings"][index].clone();
+    let current_quantity = parse_decimal(
+        existing
+            .get("quantity")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["holding quantity is missing".to_string()])
+            })?,
+    )
+    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    let next_quantity = current_quantity - quantity;
+    if next_quantity < DecimalAmount::ZERO {
+        return Err(LedgerError::Conflict(format!(
+            "corrected buy quantity exceeds current holding: {instrument_id}"
+        )));
+    }
+    let current_cost = existing.get("costBasisTotal").ok_or_else(|| {
+        LedgerError::Conflict("corrected buy requires an existing cost basis".to_string())
+    })?;
+    let current_cost_amount = parse_decimal(
+        current_cost
+            .get("amount")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                LedgerError::InvalidInput(vec!["holding cost basis amount is missing".to_string()])
+            })?,
+    )
+    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    let current_cost_currency = current_cost
+        .get("currency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["holding cost basis currency is missing".to_string()])
+        })?;
+    let contribution = if current_cost_currency == original_cost_currency {
+        original_cost
+    } else {
+        let basis = target.get("costBasisFx").ok_or_else(|| {
+            LedgerError::Conflict(
+                "corrected cross-currency buy requires persisted costBasisFx".to_string(),
+            )
+        })?;
+        if basis.get("baseCurrency").and_then(Value::as_str) != Some(original_cost_currency)
+            || basis.get("quoteCurrency").and_then(Value::as_str) != Some(current_cost_currency)
+        {
+            return Err(LedgerError::Conflict(
+                "corrected buy costBasisFx currencies do not match current holding".to_string(),
+            ));
+        }
+        let rate = parse_decimal(basis.get("rate").and_then(Value::as_str).ok_or_else(|| {
+            LedgerError::InvalidInput(vec!["costBasisFx.rate is missing".to_string()])
+        })?)
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+        multiply_decimal(original_cost, rate)
+    };
+    let next_cost = current_cost_amount - contribution;
+    if next_cost < DecimalAmount::ZERO {
+        return Err(LedgerError::Conflict(
+            "corrected buy cost exceeds current holding cost basis".to_string(),
+        ));
+    }
+
+    let holding = document["holdings"]
+        .as_array_mut()
+        .expect("validated local ledger holdings should be an array")
+        .get_mut(index)
+        .expect("holding index should remain valid");
+    holding["quantity"] = json!(next_quantity.decimal_string());
+    holding["costBasisTotal"] = money(next_cost, current_cost_currency);
+    adjust_estimated_market_value(holding, -contribution, current_cost_currency, now)?;
+    mark_holding_stale(holding, now);
+    Ok(())
+}
+
+struct RestoreHoldingSale<'a> {
+    account_id: &'a str,
+    instrument_id: &'a str,
+    quote_currency: &'a str,
+    quantity: DecimalAmount,
+    released_cost: DecimalAmount,
+    released_currency: &'a str,
+}
+
+fn restore_holding_sale_exact(
+    document: &mut Value,
+    sale: RestoreHoldingSale<'_>,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let RestoreHoldingSale {
+        account_id,
+        instrument_id,
+        quote_currency,
+        quantity,
+        released_cost,
+        released_currency,
+    } = sale;
+    ensure_matching_instrument(document, instrument_id, quote_currency)?;
+    let index = document["holdings"]
+        .as_array()
+        .expect("validated local ledger holdings should be an array")
+        .iter()
+        .position(|holding| {
+            holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                && holding.get("instrumentId").and_then(Value::as_str) == Some(instrument_id)
+        });
+    if let Some(index) = index {
+        let holding = document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .get_mut(index)
+            .expect("holding index should remain valid");
+        let current_quantity = parse_decimal(
+            holding
+                .get("quantity")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    LedgerError::InvalidInput(vec!["holding quantity is missing".to_string()])
+                })?,
+        )
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+        holding["quantity"] = json!((current_quantity + quantity).decimal_string());
+        let current_currency = holding
+            .get("costBasisTotal")
+            .and_then(|value| value.get("currency"))
+            .and_then(Value::as_str)
+            .unwrap_or(released_currency);
+        if current_currency != released_currency {
+            return Err(LedgerError::Conflict(
+                "released cost basis currency does not match current holding".to_string(),
+            ));
+        }
+        apply_holding_money_delta(holding, "costBasisTotal", released_currency, released_cost)?;
+        adjust_estimated_market_value(holding, released_cost, released_currency, now)?;
+        mark_holding_stale(holding, now);
+    } else {
+        document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .push(json!({
+                "id": stable_holding_id(account_id, instrument_id),
+                "accountId": account_id,
+                "instrumentId": instrument_id,
+                "quantity": quantity.decimal_string(),
+                "costBasisTotal": money(released_cost, released_currency),
+                "marketValue": {
+                    "amount": money_amount(released_cost),
+                    "currency": released_currency,
+                    "asOf": now,
+                    "quality": "estimated"
+                },
+                "quoteStatus": "stale",
+                "asOf": now,
+                "note": "Restored cost basis for corrected sale"
+            }));
+    }
+    Ok(())
+}
+
+fn adjust_estimated_market_value(
+    holding: &mut Value,
+    delta: DecimalAmount,
+    currency: &str,
+    now: &str,
+) -> Result<(), LedgerError> {
+    let is_estimated = holding
+        .get("marketValue")
+        .and_then(|value| value.get("quality"))
+        .and_then(Value::as_str)
+        == Some("estimated");
+    let same_currency = holding
+        .get("marketValue")
+        .and_then(|value| value.get("currency"))
+        .and_then(Value::as_str)
+        == Some(currency);
+    if is_estimated && same_currency {
+        apply_holding_valued_money_delta(holding, "marketValue", currency, delta, now)?;
+    }
+    Ok(())
+}
+
+fn mark_holding_stale(holding: &mut Value, now: &str) {
+    holding["quoteStatus"] = json!("stale");
+    holding["asOf"] = json!(now);
+    if let Some(object) = holding.as_object_mut() {
+        object.remove("unrealizedPnl");
+        object.remove("unrealizedPnlRate");
+    }
+}
+
+fn apply_holding_purchase(
+    document: &mut Value,
+    purchase: HoldingPurchase<'_>,
+    occurred_at: &str,
+    now: &str,
+) -> Result<Option<Value>, LedgerError> {
+    let HoldingPurchase {
+        account_id,
+        instrument_id,
+        quote_currency,
+        quantity,
+        cost_amount,
+        cost_currency,
+    } = purchase;
+    if !active_account_exists(document, account_id) {
+        return Err(LedgerError::NotFound(format!(
+            "account does not exist or is archived: {account_id}"
+        )));
+    }
+    ensure_matching_instrument(document, instrument_id, quote_currency)?;
+
+    let existing_index = document["holdings"]
+        .as_array()
+        .expect("validated local ledger holdings should be an array")
+        .iter()
+        .position(|holding| {
+            holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                && holding.get("instrumentId").and_then(Value::as_str) == Some(instrument_id)
+        });
+
+    let mut cost_basis_fx = None;
+    if let Some(index) = existing_index {
+        let existing = document["holdings"][index].clone();
+        let current_quantity = parse_decimal(
+            existing
+                .get("quantity")
+                .and_then(Value::as_str)
+                .expect("holding quantity should be a string"),
+        )
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+        let next_quantity = current_quantity + quantity;
+
+        if let Some(existing_cost_basis) = existing.get("costBasisTotal")
+            && let Some(existing_currency) =
+                existing_cost_basis.get("currency").and_then(Value::as_str)
+            && existing_currency != cost_currency
+        {
+            cost_basis_fx = Some(
+                convert_execution_amount(
+                    document,
+                    cost_amount,
+                    cost_currency,
+                    existing_currency,
+                    occurred_at,
+                )
+                .ok_or_else(|| {
+                    LedgerError::Conflict(format!(
+                        "cannot combine holding cost basis across {cost_currency} and {existing_currency} without an FX rate at or before {occurred_at}"
+                    ))
+                })?
+                .basis,
+            );
+        }
+
+        let next_cost_basis = add_purchase_value(
+            document,
+            existing.get("costBasisTotal"),
+            current_quantity,
+            cost_amount,
+            cost_currency,
+            occurred_at,
+            "holding cost basis",
+        )?;
+        let next_market_value = add_purchase_value(
+            document,
+            existing.get("marketValue"),
+            current_quantity,
+            cost_amount,
+            cost_currency,
+            occurred_at,
+            "holding fallback market value",
+        )?;
+
+        let holding = document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .get_mut(index)
+            .expect("holding index should remain valid");
+        holding["quantity"] = json!(next_quantity.decimal_string());
+        if let Some((amount, currency)) = next_cost_basis {
+            holding["costBasisTotal"] = money(amount, &currency);
+        }
+        if let Some((amount, currency)) = next_market_value {
+            holding["marketValue"] = json!({
+                "amount": money_amount(amount),
+                "currency": currency,
+                "asOf": now,
+                "quality": "estimated"
+            });
+        }
+        holding["quoteStatus"] = json!("stale");
+        holding["asOf"] = json!(now);
+        if let Some(object) = holding.as_object_mut() {
+            object.remove("unrealizedPnl");
+            object.remove("unrealizedPnlRate");
+        }
+    } else {
+        document["holdings"]
+            .as_array_mut()
+            .expect("validated local ledger holdings should be an array")
+            .push(json!({
+                "id": stable_holding_id(account_id, instrument_id),
+                "accountId": account_id,
+                "instrumentId": instrument_id,
+                "quantity": quantity.decimal_string(),
+                "costBasisTotal": money(cost_amount, cost_currency),
+                "marketValue": {
+                    "amount": money_amount(cost_amount),
+                    "currency": cost_currency,
+                    "asOf": now,
+                    "quality": "estimated"
+                },
+                "quoteStatus": "stale",
+                "asOf": now,
+                "note": "Cost fallback until a quote is available"
+            }));
+    }
+
+    Ok(cost_basis_fx)
+}
+
+fn add_purchase_value(
+    document: &Value,
+    existing: Option<&Value>,
+    current_quantity: DecimalAmount,
+    purchase_amount: DecimalAmount,
+    purchase_currency: &str,
+    occurred_at: &str,
+    label: &str,
+) -> Result<Option<(DecimalAmount, String)>, LedgerError> {
+    let Some(existing) = existing else {
+        return if current_quantity == DecimalAmount::ZERO {
+            Ok(Some((purchase_amount, purchase_currency.to_string())))
+        } else {
+            Ok(None)
+        };
+    };
+    let existing_amount = parse_decimal(
+        existing
+            .get("amount")
+            .and_then(Value::as_str)
+            .ok_or_else(|| LedgerError::InvalidInput(vec![format!("{label}.amount is missing")]))?,
+    )
+    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    let existing_currency = existing
+        .get("currency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::InvalidInput(vec![format!("{label}.currency is missing")]))?;
+    let converted_purchase = convert_execution_amount(
+        document,
+        purchase_amount,
+        purchase_currency,
+        existing_currency,
+        occurred_at,
+    )
+    .map(|conversion| conversion.amount)
+    .ok_or_else(|| {
+        LedgerError::Conflict(format!(
+            "cannot combine {label} across {purchase_currency} and {existing_currency} without an FX rate at or before {occurred_at}"
+        ))
+    })?;
+    Ok(Some((
+        existing_amount + converted_purchase,
+        existing_currency.to_string(),
+    )))
+}
+
+fn apply_holding_sale(
+    document: &mut Value,
+    account_id: &str,
+    instrument_id: &str,
+    quote_currency: &str,
+    quantity: DecimalAmount,
+    now: &str,
+) -> Result<Option<(DecimalAmount, String)>, LedgerError> {
+    if !active_account_exists(document, account_id) {
+        return Err(LedgerError::NotFound(format!(
+            "account does not exist or is archived: {account_id}"
+        )));
+    }
+    ensure_matching_instrument(document, instrument_id, quote_currency)?;
+    let index = document["holdings"]
+        .as_array()
+        .expect("validated local ledger holdings should be an array")
+        .iter()
+        .position(|holding| {
+            holding.get("accountId").and_then(Value::as_str) == Some(account_id)
+                && holding.get("instrumentId").and_then(Value::as_str) == Some(instrument_id)
+        })
+        .ok_or_else(|| {
+            LedgerError::Conflict(format!(
+                "holding does not exist for sell/out entry: {instrument_id}"
+            ))
+        })?;
+    let existing = document["holdings"][index].clone();
+    let current_quantity = parse_decimal(
+        existing
+            .get("quantity")
+            .and_then(Value::as_str)
+            .expect("holding quantity should be a string"),
+    )
+    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    let next_quantity = current_quantity - quantity;
+    if next_quantity < DecimalAmount::ZERO {
+        return Err(LedgerError::Conflict(format!(
+            "holding quantity cannot become negative: {instrument_id}"
+        )));
+    }
+    let next_cost_basis = proportional_remaining_value(
+        existing.get("costBasisTotal"),
+        current_quantity,
+        next_quantity,
+        "holding cost basis",
+    )?;
+    let released_cost_basis =
+        match (existing.get("costBasisTotal"), &next_cost_basis) {
+            (Some(current), Some((remaining_amount, remaining_currency))) => {
+                let current_amount =
+                    parse_decimal(current.get("amount").and_then(Value::as_str).ok_or_else(
+                        || {
+                            LedgerError::InvalidInput(vec![
+                                "holding cost basis.amount is missing".to_string(),
+                            ])
+                        },
+                    )?)
+                    .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+                let current_currency =
+                    current
+                        .get("currency")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            LedgerError::InvalidInput(vec![
+                                "holding cost basis.currency is missing".to_string(),
+                            ])
+                        })?;
+                if current_currency != remaining_currency {
+                    return Err(LedgerError::InvalidInput(vec![
+                        "holding cost basis currency changed during sale".to_string(),
+                    ]));
+                }
+                Some((
+                    current_amount - *remaining_amount,
+                    current_currency.to_string(),
+                ))
+            }
+            (None, None) => None,
+            _ => {
+                return Err(LedgerError::InvalidInput(vec![
+                    "holding cost basis reduction is inconsistent".to_string(),
+                ]));
+            }
+        };
+    let next_market_value = proportional_remaining_value(
+        existing.get("marketValue"),
+        current_quantity,
+        next_quantity,
+        "holding fallback market value",
+    )?;
+
+    let holding = document["holdings"]
+        .as_array_mut()
+        .expect("validated local ledger holdings should be an array")
+        .get_mut(index)
+        .expect("holding index should remain valid");
+    holding["quantity"] = json!(next_quantity.decimal_string());
+    if let Some((amount, currency)) = next_cost_basis {
+        holding["costBasisTotal"] = money(amount, &currency);
+    }
+    if let Some((amount, currency)) = next_market_value {
+        holding["marketValue"] = json!({
+            "amount": money_amount(amount),
+            "currency": currency,
+            "asOf": now,
+            "quality": "estimated"
+        });
+    }
+    holding["quoteStatus"] = json!("stale");
+    holding["asOf"] = json!(now);
+    if let Some(object) = holding.as_object_mut() {
+        object.remove("unrealizedPnl");
+        object.remove("unrealizedPnlRate");
+    }
+    Ok(released_cost_basis)
+}
+
+fn proportional_remaining_value(
+    value: Option<&Value>,
+    current_quantity: DecimalAmount,
+    remaining_quantity: DecimalAmount,
+    label: &str,
+) -> Result<Option<(DecimalAmount, String)>, LedgerError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if current_quantity <= DecimalAmount::ZERO {
+        return Err(LedgerError::Conflict(format!(
+            "cannot reduce {label} from a non-positive holding quantity"
+        )));
+    }
+    let current_amount =
+        parse_decimal(value.get("amount").and_then(Value::as_str).ok_or_else(|| {
+            LedgerError::InvalidInput(vec![format!("{label}.amount is missing")])
+        })?)
+        .map_err(|error| LedgerError::InvalidInput(vec![error.to_string()]))?;
+    let currency = value
+        .get("currency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LedgerError::InvalidInput(vec![format!("{label}.currency is missing")]))?;
+    let remaining_amount = divide_decimal(
+        multiply_decimal(current_amount, remaining_quantity),
+        current_quantity,
+    )
+    .ok_or_else(|| LedgerError::Conflict(format!("cannot calculate remaining {label}")))?;
+    Ok(Some((remaining_amount, currency.to_string())))
+}
+
+fn ensure_matching_instrument(
+    document: &mut Value,
+    instrument_id: &str,
+    quote_currency: &str,
+) -> Result<(), LedgerError> {
+    if let Some(instrument) = document["instruments"]
+        .as_array()
+        .expect("validated local ledger instruments should be an array")
+        .iter()
+        .find(|instrument| instrument.get("id").and_then(Value::as_str) == Some(instrument_id))
+    {
+        if instrument.get("quoteCurrency").and_then(Value::as_str) != Some(quote_currency) {
+            return Err(LedgerError::Conflict(format!(
+                "instrument quote currency does not match holding entry: {instrument_id}"
+            )));
+        }
+    } else {
+        ensure_instrument(document, instrument_id, quote_currency);
+    }
     Ok(())
 }
 
@@ -6959,6 +14457,290 @@ fn mark_subscriptions_charged_for_movements(
     Ok(())
 }
 
+fn mark_yield_interest_accrued_for_movements(
+    document: &mut Value,
+    movements: &[Value],
+    now: &str,
+) -> Result<(), LedgerError> {
+    let accruals = movements
+        .iter()
+        .filter_map(|movement| {
+            let accrual = movement.get("yieldAccrual")?;
+            Some((
+                movement.get("id")?.as_str()?.to_string(),
+                accrual.get("holdingId")?.as_str()?.to_string(),
+                accrual.get("previousAccruedThrough")?.as_str()?.to_string(),
+                accrual.get("throughDate")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (movement_id, holding_id, previous, through) in accruals {
+        let updated = {
+            let holding = document["holdings"]
+                .as_array_mut()
+                .expect("validated holdings")
+                .iter_mut()
+                .find(|holding| holding.get("id").and_then(Value::as_str) == Some(&holding_id))
+                .ok_or_else(|| {
+                    LedgerError::NotFound(format!(
+                        "yield holding does not exist during confirmation: {holding_id}"
+                    ))
+                })?;
+            let terms = holding
+                .get_mut("yieldTerms")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    LedgerError::Conflict(format!(
+                        "yield terms disappeared before confirmation: {holding_id}"
+                    ))
+                })?;
+            if terms
+                .get("pendingInterestMovementId")
+                .and_then(Value::as_str)
+                != Some(movement_id.as_str())
+                || terms.get("lastAccruedThrough").and_then(Value::as_str)
+                    != Some(previous.as_str())
+            {
+                return Err(LedgerError::Conflict(format!(
+                    "yield terms changed after proposal creation: {holding_id}"
+                )));
+            }
+            terms.insert("lastAccruedThrough".to_string(), json!(through));
+            terms.insert("lastInterestMovementId".to_string(), json!(movement_id));
+            terms.insert("updatedAt".to_string(), json!(now));
+            terms.remove("pendingInterestMovementId");
+            terms.remove("pendingInterestThroughDate");
+            holding.clone()
+        };
+        append_sync_change(document, "holding", &holding_id, "update", &updated, now);
+    }
+    Ok(())
+}
+
+fn clear_rejected_yield_interest_proposals(document: &mut Value, movements: &[Value], now: &str) {
+    let rejected = movements
+        .iter()
+        .filter_map(|movement| {
+            Some((
+                movement.get("id")?.as_str()?.to_string(),
+                movement
+                    .get("yieldAccrual")?
+                    .get("holdingId")?
+                    .as_str()?
+                    .to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (movement_id, holding_id) in rejected {
+        if let Some(holding) = document["holdings"]
+            .as_array_mut()
+            .expect("validated holdings")
+            .iter_mut()
+            .find(|holding| holding.get("id").and_then(Value::as_str) == Some(&holding_id))
+            && holding["yieldTerms"]["pendingInterestMovementId"].as_str()
+                == Some(movement_id.as_str())
+            && let Some(terms) = holding.get_mut("yieldTerms").and_then(Value::as_object_mut)
+        {
+            terms.remove("pendingInterestMovementId");
+            terms.remove("pendingInterestThroughDate");
+            terms.insert("updatedAt".to_string(), json!(now));
+        }
+    }
+}
+
+fn mark_loan_interest_accrued_for_movements(
+    document: &mut Value,
+    movements: &[Value],
+    now: &str,
+) -> Result<(), LedgerError> {
+    let accruals = movements
+        .iter()
+        .filter_map(|movement| {
+            let accrual = movement.get("loanInterestAccrual")?;
+            Some((
+                movement.get("id")?.as_str()?.to_string(),
+                accrual.get("accountId")?.as_str()?.to_string(),
+                accrual.get("previousAccruedThrough")?.as_str()?.to_string(),
+                accrual.get("throughDate")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (movement_id, account_id, previous, through) in accruals {
+        let updated = {
+            let account = document["accounts"]
+                .as_array_mut()
+                .expect("validated accounts")
+                .iter_mut()
+                .find(|account| account.get("id").and_then(Value::as_str) == Some(&account_id))
+                .ok_or_else(|| {
+                    LedgerError::NotFound(format!(
+                        "loan account does not exist during confirmation: {account_id}"
+                    ))
+                })?;
+            let terms = account
+                .get_mut("liabilityTerms")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    LedgerError::Conflict(format!(
+                        "liability terms disappeared before confirmation: {account_id}"
+                    ))
+                })?;
+            if terms
+                .get("pendingLoanInterestMovementId")
+                .and_then(Value::as_str)
+                != Some(movement_id.as_str())
+                || terms
+                    .get("lastInterestAccruedThrough")
+                    .and_then(Value::as_str)
+                    != Some(previous.as_str())
+            {
+                return Err(LedgerError::Conflict(format!(
+                    "liability terms changed after proposal creation: {account_id}"
+                )));
+            }
+            terms.insert("lastInterestAccruedThrough".to_string(), json!(through));
+            terms.insert("lastLoanInterestMovementId".to_string(), json!(movement_id));
+            terms.insert("updatedAt".to_string(), json!(now));
+            terms.remove("pendingLoanInterestMovementId");
+            terms.remove("pendingLoanInterestThroughDate");
+            account["updatedAt"] = json!(now);
+            account.clone()
+        };
+        append_sync_change(document, "account", &account_id, "update", &updated, now);
+    }
+    Ok(())
+}
+
+fn clear_rejected_loan_interest_proposals(document: &mut Value, movements: &[Value], now: &str) {
+    let rejected = movements
+        .iter()
+        .filter_map(|movement| {
+            Some((
+                movement.get("id")?.as_str()?.to_string(),
+                movement
+                    .get("loanInterestAccrual")?
+                    .get("accountId")?
+                    .as_str()?
+                    .to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (movement_id, account_id) in rejected {
+        if let Some(account) = document["accounts"]
+            .as_array_mut()
+            .expect("validated accounts")
+            .iter_mut()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(&account_id))
+            && account["liabilityTerms"]["pendingLoanInterestMovementId"].as_str()
+                == Some(movement_id.as_str())
+            && let Some(terms) = account
+                .get_mut("liabilityTerms")
+                .and_then(Value::as_object_mut)
+        {
+            terms.remove("pendingLoanInterestMovementId");
+            terms.remove("pendingLoanInterestThroughDate");
+            terms.insert("updatedAt".to_string(), json!(now));
+            account["updatedAt"] = json!(now);
+        }
+    }
+}
+
+fn mark_loan_payments_recorded_for_movements(
+    document: &mut Value,
+    movements: &[Value],
+    now: &str,
+) -> Result<(), LedgerError> {
+    let payments = movements
+        .iter()
+        .filter_map(|movement| {
+            let payment = movement.get("loanPayment")?;
+            Some((
+                movement.get("id")?.as_str()?.to_string(),
+                payment.get("accountId")?.as_str()?.to_string(),
+                payment.get("previousNextDueDate")?.as_str()?.to_string(),
+                payment.get("nextDueDate")?.as_str()?.to_string(),
+                payment.get("paymentDate")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (movement_id, account_id, previous_due, next_due, payment_date) in payments {
+        let updated = {
+            let account = document["accounts"]
+                .as_array_mut()
+                .expect("validated accounts")
+                .iter_mut()
+                .find(|account| account.get("id").and_then(Value::as_str) == Some(&account_id))
+                .ok_or_else(|| {
+                    LedgerError::NotFound(format!(
+                        "loan account does not exist during payment confirmation: {account_id}"
+                    ))
+                })?;
+            let terms = account
+                .get_mut("liabilityTerms")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| {
+                    LedgerError::Conflict(format!(
+                        "liability terms disappeared before payment confirmation: {account_id}"
+                    ))
+                })?;
+            if terms
+                .get("pendingLoanPaymentMovementId")
+                .and_then(Value::as_str)
+                != Some(movement_id.as_str())
+                || terms.get("nextDueDate").and_then(Value::as_str) != Some(previous_due.as_str())
+            {
+                return Err(LedgerError::Conflict(format!(
+                    "liability payment terms changed after proposal creation: {account_id}"
+                )));
+            }
+            terms.insert("nextDueDate".to_string(), json!(next_due));
+            terms.insert("lastPaymentDate".to_string(), json!(payment_date));
+            terms.insert("lastLoanPaymentMovementId".to_string(), json!(movement_id));
+            terms.insert("updatedAt".to_string(), json!(now));
+            terms.remove("pendingLoanPaymentMovementId");
+            terms.remove("pendingLoanPaymentDate");
+            account["updatedAt"] = json!(now);
+            account.clone()
+        };
+        append_sync_change(document, "account", &account_id, "update", &updated, now);
+    }
+    Ok(())
+}
+
+fn clear_rejected_loan_payment_proposals(document: &mut Value, movements: &[Value], now: &str) {
+    let rejected = movements
+        .iter()
+        .filter_map(|movement| {
+            Some((
+                movement.get("id")?.as_str()?.to_string(),
+                movement
+                    .get("loanPayment")?
+                    .get("accountId")?
+                    .as_str()?
+                    .to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (movement_id, account_id) in rejected {
+        if let Some(account) = document["accounts"]
+            .as_array_mut()
+            .expect("validated accounts")
+            .iter_mut()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(&account_id))
+            && account["liabilityTerms"]["pendingLoanPaymentMovementId"].as_str()
+                == Some(movement_id.as_str())
+            && let Some(terms) = account
+                .get_mut("liabilityTerms")
+                .and_then(Value::as_object_mut)
+        {
+            terms.remove("pendingLoanPaymentMovementId");
+            terms.remove("pendingLoanPaymentDate");
+            terms.insert("updatedAt".to_string(), json!(now));
+            account["updatedAt"] = json!(now);
+        }
+    }
+}
+
 fn clear_rejected_subscription_charge_proposals(
     document: &mut Value,
     movements: &[Value],
@@ -7056,7 +14838,7 @@ fn ai_import_group_from_input(
         group["warnings"] = json!([
             {
                 "code": "ai_import_requires_user_confirmation",
-                "message": "AI 导入只生成候选；确认前不会写入账本。",
+                "message": "请确认这条候选记录。",
                 "severity": "info"
             }
         ]);
@@ -7066,7 +14848,7 @@ fn ai_import_group_from_input(
 
     Ok(json!({
         "id": atomic_group_id,
-        "title": format!("{}：待编辑候选", ai_source_label(source_kind, input)),
+        "title": format!("{}：待补全", ai_source_label(source_kind, input)),
         "operation": "create",
         "targetType": "movement",
         "targetId": movement_id,
@@ -7075,7 +14857,7 @@ fn ai_import_group_from_input(
         "warnings": [
             {
                 "code": "local_ai_requires_structured_movement",
-                "message": "本地账本模式不会猜金额；请编辑候选并补全结构化记录后再确认。",
+                "message": "请补全记录。",
                 "severity": "warning"
             }
         ],
@@ -7085,7 +14867,7 @@ fn ai_import_group_from_input(
             "errors": [
                 {
                     "code": "structured_movement_required",
-                    "message": "需要结构化 movement 后才能确认写入账本。"
+                    "message": "请补全记录后再确认。"
                 }
             ]
         },
@@ -7114,7 +14896,7 @@ fn ai_import_proposal_from_groups(
         )
     };
 
-    json!({
+    let mut proposal = json!({
         "id": proposal_id,
         "status": "pending",
         "source": {
@@ -7125,7 +14907,19 @@ fn ai_import_proposal_from_groups(
         "summary": summary,
         "warnings": [],
         "createdAt": now
-    })
+    });
+    if let Some(provider) = input.get("_aiProvider") {
+        if let Some(model) = provider.get("model").and_then(Value::as_str) {
+            proposal["source"]["modelName"] = json!(model);
+        }
+        proposal["source"]["promptVersion"] = json!(
+            provider
+                .get("promptVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("finwealth_cash_movement_v1")
+        );
+    }
+    proposal
 }
 
 fn csv_import_groups_from_input(
@@ -7206,7 +15000,7 @@ fn csv_import_groups_from_input(
                 group["warnings"] = json!([
                     {
                         "code": "csv_import_requires_user_confirmation",
-                        "message": "CSV 导入只生成候选；确认前不会写入账本。",
+                        "message": "请确认这条候选记录。",
                         "severity": "info"
                     }
                 ]);
@@ -7528,7 +15322,7 @@ fn invalid_ai_import_group(
         "warnings": [
             {
                 "code": "local_ai_requires_structured_movement",
-                "message": "本地账本模式不会猜金额；请编辑候选并补全结构化记录后再确认。",
+                "message": "请补全记录。",
                 "severity": "warning"
             }
         ],
@@ -7652,7 +15446,12 @@ fn edited_ai_atomic_group_from_patch(
 fn ai_evidence_ref(source_kind: &str, proposal_id: &str, input: &Value) -> Value {
     let mut evidence = json!({
         "id": format!("ev_{proposal_id}"),
-        "kind": source_kind,
+        "type": match source_kind {
+            "user_text" => "text",
+            "user_image" => "image",
+            "csv_import" => "file",
+            _ => "text"
+        },
         "label": ai_source_label(source_kind, input)
     });
     if let Some(preview) = ai_input_preview(input) {
@@ -7778,8 +15577,8 @@ fn confirm_ai_movement_atomic_group(
             )));
         }
 
-        let entries = required_movement_entries(&proposed)?;
-        apply_movement_entries(document, &entries, now)?;
+        required_movement_entries(&proposed)?;
+        apply_movement_effect(document, &proposed, now)?;
 
         let mut movement = proposed.clone();
         movement["atomicGroupId"] = json!(atomic_group_id);
@@ -8417,6 +16216,654 @@ mod tests {
         assert_eq!(document["aiProposals"], json!([]));
     }
 
+    fn valid_dca_document() -> Value {
+        let now = "2026-07-16T00:00:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        let account = account_from_create_input(
+            &json!({
+                "displayName": "DCA 资金账户",
+                "accountType": "brokerage",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "mixed",
+                "openingBalances": [{"currency": "CNY", "amount": "1000.00"}]
+            }),
+            "acct_dca_validation",
+            now,
+        )
+        .expect("DCA validation account should be valid");
+        document["accounts"] = json!([account]);
+        document["dcaPlans"] = json!([{
+            "id": "plan_dca_validation",
+            "displayName": "指数基金定投",
+            "targetInstrumentId": "inst_dca_validation",
+            "fundingAccountId": "acct_dca_validation",
+            "plannedAmount": {"amount": "200.00", "currency": "CNY"},
+            "frequency": "monthly",
+            "nextDueDate": "2026-08-01",
+            "reminderStatus": "active",
+            "lastActionAt": null,
+            "createdAt": now,
+            "updatedAt": now
+        }]);
+        document["dcaReminders"] = json!([{
+            "id": "reminder_dca_validation",
+            "planId": "plan_dca_validation",
+            "displayName": "指数基金定投",
+            "plannedAmount": {"amount": "200.00", "currency": "CNY"},
+            "dueDate": "2026-08-01",
+            "status": "due"
+        }]);
+        document
+    }
+
+    #[test]
+    fn validate_document_rejects_malformed_dca_entities_and_links() {
+        validate_document(&valid_dca_document()).expect("valid DCA document should pass");
+
+        let cases: [(&str, &str, fn(&mut Value)); 8] = [
+            (
+                "duplicate plan id",
+                "duplicate DCA plan id",
+                |document: &mut Value| {
+                    let duplicate = document["dcaPlans"][0].clone();
+                    document["dcaPlans"]
+                        .as_array_mut()
+                        .expect("plans")
+                        .push(duplicate);
+                },
+            ),
+            (
+                "dangling reminder plan",
+                "planId must reference an existing DCA plan",
+                |document: &mut Value| {
+                    document["dcaReminders"][0]["planId"] = json!("missing_plan");
+                },
+            ),
+            (
+                "invalid due date",
+                "dueDate must be an ISO date",
+                |document: &mut Value| {
+                    document["dcaReminders"][0]["dueDate"] = json!("not-a-date");
+                },
+            ),
+            (
+                "non-positive plan amount",
+                "plannedAmount.amount must be a positive decimal string",
+                |document: &mut Value| {
+                    document["dcaPlans"][0]["plannedAmount"]["amount"] = json!("0");
+                },
+            ),
+            (
+                "open reminder drift",
+                "plannedAmount must match its open DCA plan",
+                |document: &mut Value| {
+                    document["dcaReminders"][0]["plannedAmount"]["amount"] = json!("300.00");
+                },
+            ),
+            (
+                "multiple open reminders",
+                "more than one open reminder",
+                |document: &mut Value| {
+                    let mut duplicate = document["dcaReminders"][0].clone();
+                    duplicate["id"] = json!("reminder_dca_validation_2");
+                    document["dcaReminders"]
+                        .as_array_mut()
+                        .expect("reminders")
+                        .push(duplicate);
+                },
+            ),
+            (
+                "snoozed without timestamp",
+                "snoozedUntil must be an RFC3339 timestamp",
+                |document: &mut Value| {
+                    document["dcaReminders"][0]["status"] = json!("snoozed");
+                },
+            ),
+            (
+                "recorded without movement",
+                "recorded DCA reminder must reference exactly one confirmed movement",
+                |document: &mut Value| {
+                    document["dcaReminders"][0]["status"] = json!("recorded");
+                },
+            ),
+        ];
+
+        for (label, expected, mutate) in cases {
+            let mut document = valid_dca_document();
+            mutate(&mut document);
+            let errors = validate_document(&document).expect_err(label);
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "{label}: expected {expected:?}, got {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_document_rejects_malformed_core_ledger_entities() {
+        let now = "2026-07-15T00:00:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        let account = account_from_create_input(
+            &json!({
+                "displayName": "核心校验账户",
+                "accountType": "brokerage",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "holdings",
+                "openingBalances": [{"currency": "CNY", "amount": "0.00"}]
+            }),
+            "acct_core_validation",
+            now,
+        )
+        .expect("account fixture should be valid");
+        document["accounts"] = json!([account]);
+        document["instruments"] = json!([{
+            "id": "inst_core_validation",
+            "type": "fund",
+            "displayName": "核心校验基金",
+            "quoteCurrency": "CNY"
+        }]);
+        document["holdings"] = json!([{
+            "id": "holding_core_validation",
+            "accountId": "acct_core_validation",
+            "instrumentId": "inst_core_validation",
+            "quantity": "10",
+            "costBasisTotal": {"amount": "100.00", "currency": "CNY"},
+            "marketValue": {
+                "amount": "100.00",
+                "currency": "CNY",
+                "asOf": now,
+                "quality": "estimated"
+            },
+            "quoteStatus": "stale",
+            "asOf": now
+        }]);
+        let mut movement = movement_from_create_input(
+            &document,
+            &json!({
+                "type": "sell",
+                "occurredAt": now,
+                "title": "核心校验卖出",
+                "entries": [
+                    {
+                        "accountId": "acct_core_validation",
+                        "instrumentId": "inst_core_validation",
+                        "amount": "1",
+                        "currency": "CNY",
+                        "direction": "out",
+                        "role": "source"
+                    },
+                    {
+                        "accountId": "acct_core_validation",
+                        "amount": "10.00",
+                        "currency": "CNY",
+                        "direction": "in",
+                        "role": "destination"
+                    }
+                ]
+            }),
+            "movement_core_validation",
+            "group_core_validation",
+            now,
+        )
+        .expect("movement fixture should be valid");
+        movement["status"] = json!("confirmed");
+        document["movementEntries"] = json!(
+            movement["entries"]
+                .as_array()
+                .expect("movement entries")
+                .iter()
+                .map(|entry| {
+                    let mut indexed = entry.clone();
+                    indexed["movementId"] = json!("movement_core_validation");
+                    indexed["atomicGroupId"] = json!("group_core_validation");
+                    indexed
+                })
+                .collect::<Vec<_>>()
+        );
+        document["movements"] = json!([movement]);
+        validate_document(&document).expect("complete core fixture should validate");
+
+        let mut bad_direction = document.clone();
+        bad_direction["movements"][0]["entries"][0]["direction"] = json!("sideways");
+        let errors = validate_document(&bad_direction).expect_err("bad direction must fail");
+        assert!(errors.iter().any(|error| error.contains("direction")));
+
+        let mut negative_holding = document.clone();
+        negative_holding["holdings"][0]["quantity"] = json!("-1");
+        let errors = validate_document(&negative_holding).expect_err("negative holding must fail");
+        assert!(errors.iter().any(|error| error.contains("quantity")));
+
+        let mut missing_instrument = document.clone();
+        missing_instrument["holdings"][0]["instrumentId"] = json!("inst_missing");
+        let errors =
+            validate_document(&missing_instrument).expect_err("missing instrument must fail");
+        assert!(errors.iter().any(|error| error.contains("instrumentId")));
+
+        let mut duplicate_instrument = document.clone();
+        duplicate_instrument["instruments"] = json!([
+            document["instruments"][0].clone(),
+            document["instruments"][0].clone()
+        ]);
+        let errors =
+            validate_document(&duplicate_instrument).expect_err("duplicate instrument must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("duplicate instrument id"))
+        );
+
+        let mut wrong_instrument_currency = document.clone();
+        wrong_instrument_currency["movements"][0]["entries"][0]["currency"] = json!("USD");
+        let errors = validate_document(&wrong_instrument_currency)
+            .expect_err("holding entry currency mismatch must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must match the instrument quoteCurrency"))
+        );
+
+        let mut broken_index = document;
+        broken_index["movementEntries"][0]["movementId"] = json!("movement_missing");
+        let errors = validate_document(&broken_index).expect_err("broken entry index must fail");
+        assert!(errors.iter().any(|error| error.contains("movementId")));
+    }
+
+    #[test]
+    fn validate_document_rejects_malformed_taxonomy_and_quotes() {
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["instruments"] = json!([{
+            "id": "inst_validation_quote",
+            "type": "equity",
+            "symbol": "VALID",
+            "displayName": "Validation Equity",
+            "quoteCurrency": "USD",
+            "market": "US"
+        }]);
+        document["quotes"] = json!([{
+            "id": "quote_validation",
+            "instrumentId": "inst_validation_quote",
+            "price": "12.34",
+            "currency": "USD",
+            "asOf": "2026-07-17T00:00:00Z",
+            "expiresAt": "2026-07-18T00:00:00Z",
+            "source": "validation_test",
+            "status": "fresh"
+        }]);
+        document["categories"] = json!([
+            {
+                "id": "cat_validation_parent",
+                "displayName": "投资",
+                "kind": "investment",
+                "isSystem": true
+            },
+            {
+                "id": "cat_validation_child",
+                "displayName": "股票",
+                "parentId": "cat_validation_parent",
+                "kind": "investment",
+                "isSystem": false,
+                "aiDescription": "股票买卖"
+            }
+        ]);
+        document["counterparties"] = json!([{
+            "id": "cp_validation",
+            "displayName": "示例券商",
+            "aliases": ["示例证券"],
+            "normalizedName": "示例券商",
+            "categoryHintId": "cat_validation_child",
+            "isUserMerged": false
+        }]);
+        validate_document(&document).expect("valid taxonomy and quote document should pass");
+
+        let mut optional_normalized_name = document.clone();
+        optional_normalized_name["counterparties"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("normalizedName");
+        validate_document(&optional_normalized_name)
+            .expect("normalizedName remains optional in the v1 schema");
+
+        let cases: Vec<(&str, &str, Box<dyn Fn(&mut Value)>)> = vec![
+            (
+                "duplicate category",
+                "duplicate category id",
+                Box::new(|document| {
+                    let duplicate = document["categories"][0].clone();
+                    document["categories"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(duplicate);
+                }),
+            ),
+            (
+                "category cycle",
+                "category parent cycle",
+                Box::new(|document| {
+                    document["categories"][0]["parentId"] = json!("cat_validation_child");
+                }),
+            ),
+            (
+                "dangling category hint",
+                "categoryHintId must reference",
+                Box::new(|document| {
+                    document["counterparties"][0]["categoryHintId"] = json!("cat_missing");
+                }),
+            ),
+            (
+                "duplicate alias",
+                "aliases contains duplicate",
+                Box::new(|document| {
+                    document["counterparties"][0]["aliases"] = json!(["示例证券", "示例证券"]);
+                }),
+            ),
+            (
+                "quote instrument missing",
+                "instrumentId must reference",
+                Box::new(|document| {
+                    document["quotes"][0]["instrumentId"] = json!("inst_missing");
+                }),
+            ),
+            (
+                "quote currency mismatch",
+                "currency must match the instrument quoteCurrency",
+                Box::new(|document| {
+                    document["quotes"][0]["currency"] = json!("CNY");
+                }),
+            ),
+            (
+                "duplicate current quote",
+                "duplicate current quote for instrument",
+                Box::new(|document| {
+                    let mut duplicate = document["quotes"][0].clone();
+                    duplicate["id"] = json!("quote_validation_duplicate");
+                    document["quotes"].as_array_mut().unwrap().push(duplicate);
+                }),
+            ),
+            (
+                "invalid quote timestamp",
+                "asOf must be an RFC3339 timestamp",
+                Box::new(|document| {
+                    document["quotes"][0]["asOf"] = json!("not-a-time");
+                }),
+            ),
+        ];
+        for (label, expected, mutate) in cases {
+            let mut candidate = document.clone();
+            mutate(&mut candidate);
+            let errors = validate_document(&candidate).expect_err(label);
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "{label}: expected {expected:?}, got {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_document_rejects_broken_subscription_pending_links() {
+        let now = "2026-07-13T00:00:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        let account = account_from_create_input(
+            &json!({
+                "displayName": "USD card",
+                "accountType": "virtual_card",
+                "defaultCurrency": "USD",
+                "supportedCurrencies": ["USD"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "USD", "amount": "100.00"}]
+            }),
+            "acct_subscription",
+            now,
+        )
+        .expect("account fixture should be valid");
+        document["accounts"] = json!([account]);
+        let mut subscription = subscription_from_create_input(
+            &document,
+            &json!({
+                "displayName": "GPT Plus",
+                "provider": "OpenAI",
+                "amount": {"amount": "20.00", "currency": "USD"},
+                "paymentAccountId": "acct_subscription",
+                "billingCycle": {"unit": "month", "interval": 1},
+                "startDate": "2026-07-13"
+            }),
+            "subscription_1",
+            now,
+        )
+        .expect("subscription fixture should be valid");
+        subscription["pendingChargeMovementId"] = json!("movement_subscription_1");
+        subscription["pendingChargeDate"] = json!("2026-07-13");
+        document["subscriptions"] = json!([subscription]);
+        let mut movement = movement_from_create_input(
+            &document,
+            &json!({
+                "type": "expense",
+                "occurredAt": now,
+                "title": "GPT Plus charge",
+                "entries": [{
+                    "accountId": "acct_subscription",
+                    "amount": "20.00",
+                    "currency": "USD",
+                    "direction": "out",
+                    "role": "source"
+                }]
+            }),
+            "movement_subscription_1",
+            "group_subscription_1",
+            now,
+        )
+        .expect("subscription movement fixture should be valid");
+        movement["status"] = json!("pending_review");
+        movement["subscriptionId"] = json!("subscription_1");
+        movement["scheduledChargeDate"] = json!("2026-07-13");
+        document["movementEntries"] = json!(
+            movement["entries"]
+                .as_array()
+                .expect("movement entries")
+                .iter()
+                .map(|entry| {
+                    let mut indexed = entry.clone();
+                    indexed["movementId"] = json!("movement_subscription_1");
+                    indexed["atomicGroupId"] = json!("group_subscription_1");
+                    indexed
+                })
+                .collect::<Vec<_>>()
+        );
+        document["movements"] = json!([movement]);
+        validate_document(&document).expect("matching pending link should validate");
+
+        let mut missing = document.clone();
+        missing["movements"] = json!([]);
+        let errors = validate_document(&missing).expect_err("missing movement must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must reference an existing movement"))
+        );
+
+        let mut wrong_status = document.clone();
+        wrong_status["movements"][0]["status"] = json!("confirmed");
+        let errors = validate_document(&wrong_status).expect_err("wrong status must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must reference a pending_review movement"))
+        );
+
+        let mut wrong_subscription = document.clone();
+        wrong_subscription["movements"][0]["subscriptionId"] = json!("subscription_other");
+        let errors =
+            validate_document(&wrong_subscription).expect_err("wrong subscription must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must reference the same subscription"))
+        );
+
+        let mut wrong_date = document.clone();
+        wrong_date["movements"][0]["scheduledChargeDate"] = json!("2026-07-14");
+        let errors = validate_document(&wrong_date).expect_err("wrong charge date must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("must match movement.scheduledChargeDate"))
+        );
+
+        let mut wrong_pointer_types = document.clone();
+        wrong_pointer_types["subscriptions"][0]["pendingChargeMovementId"] = json!(123);
+        wrong_pointer_types["subscriptions"][0]["pendingChargeDate"] = json!(false);
+        let errors = validate_document(&wrong_pointer_types)
+            .expect_err("non-string pending pointers must fail");
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("pendingChargeMovementId must be a non-empty string")
+            })
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("pendingChargeDate must be a non-empty string"))
+        );
+
+        let mut wrong_movement_types = document.clone();
+        wrong_movement_types["movements"][0]["subscriptionId"] = json!(123);
+        let errors = validate_document(&wrong_movement_types)
+            .expect_err("non-string movement subscriptionId must fail");
+        assert!(errors.iter().any(|error| {
+            error.contains("movements[0].subscriptionId must be a non-empty string")
+        }));
+
+        let mut missing_group = document.clone();
+        missing_group["movements"][0]["atomicGroupId"] = Value::Null;
+        let errors = validate_document(&missing_group).expect_err("missing atomic group must fail");
+        assert!(errors.iter().any(|error| {
+            error.contains("movements[0].atomicGroupId must be a non-empty string")
+        }));
+
+        let mut orphan = document;
+        orphan["subscriptions"][0]
+            .as_object_mut()
+            .expect("subscription should be an object")
+            .remove("pendingChargeMovementId");
+        orphan["subscriptions"][0]
+            .as_object_mut()
+            .expect("subscription should be an object")
+            .remove("pendingChargeDate");
+        let errors = validate_document(&orphan).expect_err("orphan movement must fail");
+        assert!(errors.iter().any(|error| {
+            error
+                .contains("pending subscription charge must match the subscription pending pointer")
+        }));
+    }
+
+    #[test]
+    fn subscription_due_scan_input_defaults_and_rejects_out_of_range_limits() {
+        assert_eq!(
+            parse_subscription_due_scan_input(&json!({"throughDate": "2026-07-13"}))
+                .expect("default limit should parse"),
+            ("2026-07-13".to_string(), 100)
+        );
+        assert!(
+            parse_subscription_due_scan_input(&json!({"throughDate": "2026-07-13", "limit": 200}))
+                .is_ok()
+        );
+        for invalid in [
+            json!({"throughDate": "2026-07-13", "limit": null}),
+            json!({"throughDate": "2026-07-13", "limit": -1}),
+            json!({"throughDate": "2026-07-13", "limit": 201}),
+        ] {
+            assert!(parse_subscription_due_scan_input(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn standalone_pending_ai_projection_groups_movements_by_atomic_group() {
+        let now = "2026-07-13T00:00:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        let account = account_from_create_input(
+            &json!({
+                "displayName": "Review account",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": [{"currency": "CNY", "amount": "100.00"}]
+            }),
+            "acct_review",
+            now,
+        )
+        .expect("account fixture should be valid");
+        document["accounts"] = json!([account]);
+
+        let mut movement_b = movement_from_create_input(
+            &document,
+            &json!({
+                "type": "expense",
+                "occurredAt": now,
+                "title": "Second movement",
+                "entries": [{
+                    "accountId": "acct_review",
+                    "amount": "2.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }]
+            }),
+            "movement_b",
+            "group_shared",
+            now,
+        )
+        .expect("movement fixture should be valid");
+        movement_b["status"] = json!("pending_review");
+        let mut movement_a = movement_from_create_input(
+            &document,
+            &json!({
+                "type": "expense",
+                "occurredAt": now,
+                "title": "First movement",
+                "entries": [{
+                    "accountId": "acct_review",
+                    "amount": "1.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                }]
+            }),
+            "movement_a",
+            "group_shared",
+            now,
+        )
+        .expect("movement fixture should be valid");
+        movement_a["status"] = json!("pending_review");
+        document["movements"] = json!([movement_b, movement_a]);
+
+        let proposals = pending_ai_proposals_for_document(&document);
+        assert_eq!(pending_ai_proposal_count(&document), 1);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0]["id"], "proposal_movement_movement_a");
+        assert_eq!(proposals[0]["atomicGroups"][0]["id"], "group_shared");
+        assert_eq!(
+            proposals[0]["atomicGroups"][0]["proposedMovements"]
+                .as_array()
+                .expect("proposed movements should be an array")
+                .len(),
+            2
+        );
+        assert_eq!(
+            proposals[0]["atomicGroups"][0]["proposedMovements"][0]["id"],
+            "movement_a"
+        );
+        assert_eq!(
+            proposals[0]["atomicGroups"][0]["proposedMovements"][1]["id"],
+            "movement_b"
+        );
+    }
+
     #[test]
     fn load_or_initialize_creates_empty_real_local_file() {
         let path = unique_temp_path("initialize");
@@ -8432,6 +16879,46 @@ mod tests {
     }
 
     #[test]
+    fn runtime_reads_and_writes_do_not_recreate_a_missing_primary_ledger() {
+        let path = unique_temp_path("runtime_missing_primary");
+        load_or_initialize(&path).expect("ledger should initialize once at startup");
+        fs::remove_file(&path).expect("test should simulate a missing runtime ledger");
+
+        let read_error = list_accounts(&path).expect_err("runtime read must fail closed");
+        assert_eq!(read_error.kind(), io::ErrorKind::NotFound);
+        assert!(!path.exists());
+
+        let request = IdempotencyRequest::new(
+            "key-hash".to_string(),
+            "request-hash".to_string(),
+            "POST /v1/accounts".to_string(),
+            "2026-07-13T00:00:00Z".to_string(),
+            "2026-08-12T00:00:00Z".to_string(),
+        );
+        let write_error = create_account(
+            &path,
+            json!({
+                "displayName": "Must not be created",
+                "accountType": "bank",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "cash_balance",
+                "openingBalances": []
+            }),
+            "acct_missing_ledger",
+            "2026-07-13T00:00:00Z",
+            &request,
+        )
+        .expect_err("runtime write must fail closed");
+        match write_error {
+            LedgerError::Io(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+            other => panic!("expected missing-ledger IO error, got {other:?}"),
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn load_or_initialize_recovers_valid_temp_when_primary_is_missing() {
         let path = unique_temp_path("recover_valid_temp");
         let tmp_path = path.with_extension("json.tmp");
@@ -8439,11 +16926,9 @@ mod tests {
         if let Some(parent) = tmp_path.parent() {
             fs::create_dir_all(parent).expect("temp parent should exist");
         }
-        fs::write(
-            &tmp_path,
-            serde_json::to_vec_pretty(&document).expect("recovery ledger should serialize"),
-        )
-        .expect("recovery temp should write");
+        let original =
+            serde_json::to_vec_pretty(&document).expect("recovery ledger should serialize");
+        fs::write(&tmp_path, &original).expect("recovery temp should write");
 
         let recovered = load_or_initialize(&path).expect("valid recovery temp should promote");
 
@@ -8451,11 +16936,74 @@ mod tests {
         assert!(path.exists());
         assert!(!tmp_path.exists());
         assert_eq!(
+            fs::read(&path).expect("promoted primary bytes should be readable"),
+            original,
+            "recovery must promote the validated temp byte-for-byte"
+        );
+        assert_eq!(
             read_document(&path).expect("promoted ledger should read")["baseCurrency"],
             "USD"
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_or_initialize_preserves_unsupported_or_incomplete_recovery_temp() {
+        for case in ["future", "missing_cursor"] {
+            let path = unique_temp_path(&format!("reject_recovery_{case}"));
+            let tmp_path = path.with_extension("json.tmp");
+            let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+            if case == "future" {
+                document["ledgerVersion"] = json!(LEDGER_VERSION + 1);
+            } else {
+                document["syncState"]
+                    .as_object_mut()
+                    .expect("syncState should be an object")
+                    .remove("cursor");
+            }
+            fs::create_dir_all(tmp_path.parent().expect("temp should have a parent"))
+                .expect("temp parent should exist");
+            let original =
+                serde_json::to_vec_pretty(&document).expect("recovery temp should serialize");
+            fs::write(&tmp_path, &original).expect("recovery temp should write");
+
+            let error =
+                load_or_initialize(&path).expect_err("unsupported recovery temp must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "case {case}");
+            assert!(!path.exists());
+            assert!(tmp_path.exists());
+            assert_eq!(
+                fs::read(&tmp_path).expect("recovery temp bytes should remain readable"),
+                original
+            );
+            let _ = fs::remove_file(tmp_path);
+        }
+    }
+
+    #[test]
+    fn existing_primary_is_never_replaced_by_a_stale_recovery_temp() {
+        let path = unique_temp_path("ignore_stale_temp");
+        let tmp_path = path.with_extension("json.tmp");
+        let primary = empty_document("CNY");
+        write_document(&path, &primary).expect("primary ledger should write");
+        let stale = empty_document("USD");
+        let stale_bytes = serde_json::to_vec_pretty(&stale).expect("stale temp should serialize");
+        fs::write(&tmp_path, &stale_bytes).expect("stale temp should write");
+
+        let loaded = load_or_initialize(&path).expect("existing primary should win");
+
+        assert_eq!(loaded["baseCurrency"], "CNY");
+        assert_eq!(
+            read_document(&path).expect("primary should remain readable")["baseCurrency"],
+            "CNY"
+        );
+        assert_eq!(
+            fs::read(&tmp_path).expect("stale temp should remain untouched"),
+            stale_bytes
+        );
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(tmp_path);
     }
 
     #[test]
@@ -8478,32 +17026,128 @@ mod tests {
     }
 
     #[test]
-    fn read_document_normalizes_legacy_missing_idempotency_state() {
-        let path = unique_temp_path("legacy_idempotency_normalization");
+    fn read_document_applies_narrow_v1_compatibility_without_rewriting() {
+        let path = unique_temp_path("narrow_v1_read_compatibility");
         let mut document = empty_document(DEFAULT_BASE_CURRENCY);
-        document
+        let object = document
             .as_object_mut()
-            .expect("ledger should be an object")
-            .remove("idempotencyState");
-        document
+            .expect("ledger should be an object");
+        object.remove("idempotencyState");
+        object.remove("subscriptions");
+        object.remove("syncChanges");
+        object["syncState"]
             .as_object_mut()
-            .expect("ledger should be an object")
-            .remove("subscriptions");
+            .expect("syncState should be an object")
+            .remove("nextChangeSequence");
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("legacy ledger directory should exist");
         }
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(&document).expect("legacy ledger should serialize"),
-        )
-        .expect("legacy ledger should write");
+        let original =
+            serde_json::to_vec_pretty(&document).expect("legacy ledger should serialize");
+        fs::write(&path, &original).expect("legacy ledger should write");
 
         let loaded = read_document(&path).expect("legacy ledger should normalize on read");
         assert_eq!(loaded["idempotencyState"]["version"], 1);
         assert_eq!(loaded["idempotencyState"]["records"], json!({}));
         assert_eq!(loaded["subscriptions"], json!([]));
+        assert_eq!(loaded["syncChanges"], json!([]));
+        assert_eq!(loaded["syncState"]["nextChangeSequence"], 1);
+        assert_eq!(loaded["migrations"], json!([]));
+        assert_eq!(
+            validate_supported_ledger(&path)
+                .expect("offline validation should accept the supported v1 profile"),
+            loaded
+        );
+        assert_eq!(
+            fs::read(&path).expect("legacy ledger bytes should remain readable"),
+            original,
+            "ordinary reads must not rewrite compatibility fields or migration history"
+        );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_document_fails_closed_when_required_sync_state_is_missing() {
+        for missing in ["syncState", "cursor", "pendingChangeIds"] {
+            let path = unique_temp_path(&format!("missing_{missing}"));
+            let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+            if missing == "syncState" {
+                document
+                    .as_object_mut()
+                    .expect("ledger should be an object")
+                    .remove("syncState");
+            } else {
+                document["syncState"]
+                    .as_object_mut()
+                    .expect("syncState should be an object")
+                    .remove(missing);
+            }
+            let original =
+                serde_json::to_vec_pretty(&document).expect("invalid ledger should serialize");
+            fs::create_dir_all(path.parent().expect("temp ledger should have a parent"))
+                .expect("temp ledger parent should exist");
+            fs::write(&path, &original).expect("invalid ledger should write");
+
+            let error = read_document(&path).expect_err("missing sync state must fail closed");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::InvalidData,
+                "missing {missing}"
+            );
+            assert!(
+                error.to_string().contains("syncState"),
+                "unexpected error for missing {missing}: {error}"
+            );
+            assert_eq!(
+                fs::read(&path).expect("invalid ledger bytes should remain readable"),
+                original
+            );
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn read_document_rejects_invalid_or_unsupported_versions_without_rewriting() {
+        for (label, version) in [
+            ("missing", None),
+            ("string", Some(json!("1"))),
+            ("zero", Some(json!(0))),
+            ("future", Some(json!(LEDGER_VERSION + 1))),
+        ] {
+            let path = unique_temp_path(&format!("ledger_version_{label}"));
+            let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+            match version {
+                Some(version) => document["ledgerVersion"] = version,
+                None => {
+                    document
+                        .as_object_mut()
+                        .expect("ledger should be an object")
+                        .remove("ledgerVersion");
+                }
+            }
+            let original =
+                serde_json::to_vec_pretty(&document).expect("invalid ledger should serialize");
+            fs::create_dir_all(path.parent().expect("temp ledger should have a parent"))
+                .expect("temp ledger parent should exist");
+            fs::write(&path, &original).expect("invalid ledger should write");
+
+            let error = read_document(&path).expect_err("invalid version must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "case {label}");
+            assert!(error.to_string().contains("ledgerVersion"), "{error}");
+            let validation_error = validate_supported_ledger(&path)
+                .expect_err("offline validation must also reject unsupported versions");
+            assert_eq!(
+                validation_error.kind(),
+                io::ErrorKind::InvalidData,
+                "case {label}"
+            );
+            assert_eq!(
+                fs::read(&path).expect("invalid ledger bytes should remain readable"),
+                original
+            );
+            let _ = fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -8699,6 +17343,642 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("duplicate sourceDeviceId/sourceChangeId"))
         );
+    }
+
+    #[test]
+    fn investment_sale_result_requires_conserved_realized_pnl() {
+        let mut movement = json!({
+            "type": "sell",
+            "status": "confirmed",
+            "saleResult": {
+                "costBasisMethod": "average_cost",
+                "grossProceeds": {"amount": "40.00", "currency": "CNY"},
+                "feeAndTaxTotal": {"amount": "2.00", "currency": "CNY"},
+                "netProceeds": {"amount": "38.00", "currency": "CNY"},
+                "costBasisReleased": {"amount": "41.20", "currency": "CNY"},
+                "realizedPnl": {"amount": "-3.20", "currency": "CNY"},
+                "realizedPnlStatus": "calculated"
+            }
+        });
+        let mut errors = Vec::new();
+        validate_investment_sale_result(
+            movement.as_object().expect("movement object"),
+            0,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        movement["saleResult"]["realizedPnl"]["amount"] = json!("3.20");
+        let mut errors = Vec::new();
+        validate_investment_sale_result(
+            movement.as_object().expect("movement object"),
+            0,
+            &mut errors,
+        );
+        assert!(errors.iter().any(|error| {
+            error.contains("realizedPnl must equal net proceeds minus released cost basis")
+        }));
+    }
+
+    #[test]
+    fn investment_sale_result_never_subtracts_mismatched_currencies() {
+        let now = "2026-07-16T00:00:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["accounts"] = json!([
+            account_from_create_input(
+                &json!({
+                    "displayName": "人民币资金",
+                    "accountType": "bank",
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": "cash_balance",
+                    "openingBalances": [{"currency": "CNY", "amount": "0.00"}]
+                }),
+                "acct_sale_cash",
+                now,
+            )
+            .expect("cash account"),
+            account_from_create_input(
+                &json!({
+                    "displayName": "跨币种持仓",
+                    "accountType": "brokerage",
+                    "defaultCurrency": "CNY",
+                    "supportedCurrencies": ["CNY"],
+                    "includeInNetWorth": true,
+                    "balanceMode": "holdings",
+                    "openingBalances": []
+                }),
+                "acct_sale_holding",
+                now,
+            )
+            .expect("holding account")
+        ]);
+        document["instruments"] = json!([{
+            "id": "inst_sale_fx",
+            "type": "fund",
+            "displayName": "跨币种基金",
+            "quoteCurrency": "CNY"
+        }]);
+        document["holdings"] = json!([{
+            "id": "holding_sale_fx",
+            "accountId": "acct_sale_holding",
+            "instrumentId": "inst_sale_fx",
+            "quantity": "10",
+            "costBasisTotal": {"amount": "100.00", "currency": "USD"},
+            "marketValue": {
+                "amount": "100.00",
+                "currency": "USD",
+                "asOf": now,
+                "quality": "estimated"
+            },
+            "quoteStatus": "stale",
+            "asOf": now
+        }]);
+        let movement = json!({
+            "id": "mov_sale_fx",
+            "type": "sell",
+            "occurredAt": "2026-07-16T00:00:00Z",
+            "entries": [
+                {
+                    "accountId": "acct_sale_holding",
+                    "instrumentId": "inst_sale_fx",
+                    "amount": "4",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": "acct_sale_cash",
+                    "amount": "50.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        document["movements"] = json!([movement.clone()]);
+        apply_buy_or_sell_movement(
+            &mut document,
+            &movement,
+            movement["entries"].as_array().expect("entries"),
+            false,
+            now,
+        )
+        .expect("cross-currency sale should apply without fake PnL");
+
+        let result = &document["movements"][0]["saleResult"];
+        assert_eq!(result["costBasisReleased"]["amount"], "40.00");
+        assert_eq!(result["costBasisReleased"]["currency"], "USD");
+        assert_eq!(result["netProceeds"]["currency"], "CNY");
+        assert_eq!(result["realizedPnlStatus"], "currency_mismatch");
+        assert!(result.get("realizedPnl").is_none());
+
+        document["fxRates"] = json!([
+            {
+                "id": "fx_cny_usd_historical",
+                "baseCurrency": "CNY",
+                "quoteCurrency": "USD",
+                "rate": "1",
+                "asOf": "2026-07-15T00:00:00Z",
+                "source": "historical_test",
+                "status": "stale"
+            },
+            {
+                "id": "fx_cny_usd_future",
+                "baseCurrency": "CNY",
+                "quoteCurrency": "USD",
+                "rate": "2",
+                "asOf": "2026-07-17T00:00:00Z",
+                "source": "future_test",
+                "status": "fresh"
+            }
+        ]);
+        let historical_movement = json!({
+            "id": "mov_sale_fx_historical",
+            "type": "sell",
+            "occurredAt": "2026-07-16T00:00:00Z",
+            "entries": [
+                {
+                    "accountId": "acct_sale_holding",
+                    "instrumentId": "inst_sale_fx",
+                    "amount": "1",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": "acct_sale_cash",
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        document["movements"]
+            .as_array_mut()
+            .expect("movements")
+            .push(historical_movement.clone());
+        apply_buy_or_sell_movement(
+            &mut document,
+            &historical_movement,
+            historical_movement["entries"]
+                .as_array()
+                .expect("historical entries"),
+            false,
+            now,
+        )
+        .expect("historical FX sale should calculate PnL");
+        let historical_result = &document["movements"][1]["saleResult"];
+        assert_eq!(historical_result["realizedPnlStatus"], "calculated_with_fx");
+        assert_eq!(
+            historical_result["netProceedsInCostBasisCurrency"],
+            json!({"amount": "10.00", "currency": "USD"})
+        );
+        assert_eq!(
+            historical_result["realizedPnl"],
+            json!({"amount": "0.00", "currency": "USD"})
+        );
+        assert_eq!(
+            historical_result["fxBasis"]["sourceRateId"],
+            "fx_cny_usd_historical"
+        );
+        assert_eq!(historical_result["fxBasis"]["rate"], "1");
+
+        let historical_buy = json!({
+            "id": "mov_buy_fx_historical",
+            "type": "buy",
+            "occurredAt": "2026-07-16T00:00:00Z",
+            "entries": [
+                {
+                    "accountId": "acct_sale_cash",
+                    "amount": "10.00",
+                    "currency": "CNY",
+                    "direction": "out",
+                    "role": "source"
+                },
+                {
+                    "accountId": "acct_sale_holding",
+                    "instrumentId": "inst_sale_fx",
+                    "amount": "1",
+                    "currency": "CNY",
+                    "direction": "in",
+                    "role": "destination"
+                }
+            ]
+        });
+        document["movements"]
+            .as_array_mut()
+            .expect("movements")
+            .push(historical_buy.clone());
+        apply_buy_or_sell_movement(
+            &mut document,
+            &historical_buy,
+            historical_buy["entries"].as_array().expect("buy entries"),
+            true,
+            now,
+        )
+        .expect("historical FX buy should preserve its basis");
+        assert_eq!(document["holdings"][0]["quantity"], "6");
+        assert_eq!(
+            document["holdings"][0]["costBasisTotal"],
+            json!({"amount": "60.00", "currency": "USD"})
+        );
+        assert_eq!(
+            document["movements"][2]["costBasisFx"]["sourceRateId"],
+            "fx_cny_usd_historical"
+        );
+    }
+
+    #[test]
+    fn money_amount_preserves_up_to_eight_decimal_places() {
+        assert_eq!(
+            money_amount(parse_decimal("100").expect("integer")),
+            "100.00"
+        );
+        assert_eq!(
+            money_amount(parse_decimal("1.23000000").expect("two decimals")),
+            "1.23"
+        );
+        assert_eq!(
+            money_amount(parse_decimal("0.00000001").expect("satoshi")),
+            "0.00000001"
+        );
+        assert_eq!(
+            money_amount(parse_decimal("-2.34567890").expect("signed precision")),
+            "-2.3456789"
+        );
+    }
+
+    #[test]
+    fn investment_replacement_distinguishes_principal_and_fee_semantics() {
+        let original = json!([
+            {
+                "accountId": "cash",
+                "amount": "100.00",
+                "currency": "CNY",
+                "direction": "out",
+                "role": "source"
+            },
+            {
+                "accountId": "holding",
+                "instrumentId": "instrument",
+                "amount": "10",
+                "currency": "CNY",
+                "direction": "in",
+                "role": "destination"
+            },
+            {
+                "accountId": "cash",
+                "amount": "2.00",
+                "currency": "CNY",
+                "direction": "out",
+                "role": "fee"
+            }
+        ]);
+        let replacement = json!([
+            {
+                "accountId": "cash",
+                "amount": "101.00",
+                "currency": "CNY",
+                "direction": "out",
+                "role": "source"
+            },
+            {
+                "accountId": "holding",
+                "instrumentId": "instrument",
+                "amount": "10",
+                "currency": "CNY",
+                "direction": "in",
+                "role": "destination"
+            },
+            {
+                "accountId": "cash",
+                "amount": "1.00",
+                "currency": "CNY",
+                "direction": "out",
+                "role": "fee"
+            }
+        ]);
+        let original = original.as_array().expect("original entries");
+        let replacement = replacement.as_array().expect("replacement entries");
+        assert_eq!(
+            movement_entry_effects(original).expect("original effects"),
+            movement_entry_effects(replacement).expect("replacement effects")
+        );
+        assert_ne!(
+            movement_entry_semantics(original).expect("original semantics"),
+            movement_entry_semantics(replacement).expect("replacement semantics")
+        );
+    }
+
+    #[test]
+    fn fx_history_rejects_duplicate_ids_and_identity_changes() {
+        let rate = json!({
+            "id": "fx_history_1",
+            "baseCurrency": "USD",
+            "quoteCurrency": "CNY",
+            "rate": "7.00",
+            "asOf": "2026-07-01T00:00:00Z",
+            "source": "test",
+            "status": "stale"
+        });
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["fxRates"] = json!([rate.clone(), rate.clone()]);
+        let errors = validate_document(&document).expect_err("duplicate FX ids must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("duplicate FX rate id"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("duplicate FX rate time point"))
+        );
+
+        document["fxRates"] = json!([rate]);
+        let changed_identity = json!({
+            "id": "fx_history_1",
+            "baseCurrency": "USD",
+            "quoteCurrency": "CNY",
+            "rate": "7.10",
+            "asOf": "2026-07-02T00:00:00Z",
+            "source": "test",
+            "status": "fresh"
+        });
+        let error = upsert_fx_rate(&mut document, changed_identity)
+            .expect_err("same FX id cannot change its time point");
+        assert!(error.contains("cannot change asOf"));
+
+        let duplicate_time = json!({
+            "id": "fx_history_other_id",
+            "baseCurrency": "USD",
+            "quoteCurrency": "CNY",
+            "rate": "7.20",
+            "asOf": "2026-07-01T00:00:00Z",
+            "source": "test",
+            "status": "fresh"
+        });
+        let error = upsert_fx_rate(&mut document, duplicate_time)
+            .expect_err("same pair/time cannot use another id");
+        assert!(error.contains("pair/asOf already exists"));
+    }
+
+    #[test]
+    fn holding_adjustment_metadata_must_match_its_entry_delta() {
+        let now = "2026-07-18T03:30:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["accounts"] = json!([account_from_create_input(
+            &json!({
+                "displayName": "OKX",
+                "accountType": "exchange",
+                "defaultCurrency": "USDT",
+                "supportedCurrencies": ["USDT"],
+                "includeInNetWorth": true,
+                "balanceMode": "holdings",
+                "openingBalances": []
+            }),
+            "acct_okx",
+            now,
+        )
+        .expect("holding account")]);
+        document["instruments"] = json!([{
+            "id": "inst_btc_usdt",
+            "type": "crypto",
+            "displayName": "Bitcoin",
+            "quoteCurrency": "USDT"
+        }]);
+        let movement = json!({
+            "id": "movement_holding_adjustment",
+            "atomicGroupId": "group_holding_adjustment",
+            "type": "adjustment",
+            "occurredAt": now,
+            "recordedAt": now,
+            "status": "pending_review",
+            "title": "调整 Bitcoin 持仓",
+            "entries": [{
+                "id": "entry_holding_adjustment",
+                "accountId": "acct_okx",
+                "instrumentId": "inst_btc_usdt",
+                "amount": "2",
+                "currency": "USDT",
+                "direction": "in",
+                "role": "adjustment"
+            }],
+            "holdingAdjustment": {
+                "accountId": "acct_okx",
+                "instrumentId": "inst_btc_usdt",
+                "previousQuantity": "1",
+                "targetQuantity": "3"
+            },
+            "tags": ["holding_adjustment"],
+            "source": {"kind": "manual", "createdBy": "user"},
+            "createdAt": now,
+            "updatedAt": now
+        });
+        let mut indexed_entry = movement["entries"][0].clone();
+        indexed_entry["movementId"] = json!("movement_holding_adjustment");
+        indexed_entry["atomicGroupId"] = json!("group_holding_adjustment");
+        document["movements"] = json!([movement]);
+        document["movementEntries"] = json!([indexed_entry]);
+        validate_document(&document).expect("valid holding adjustment should pass");
+
+        let mut wrong_delta = document.clone();
+        wrong_delta["movements"][0]["holdingAdjustment"]["targetQuantity"] = json!("4");
+        let errors = validate_document(&wrong_delta).expect_err("wrong delta must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("delta must match the entry"))
+        );
+
+        let mut wrong_account = document.clone();
+        wrong_account["movements"][0]["holdingAdjustment"]["accountId"] = json!("acct_other");
+        let errors = validate_document(&wrong_account).expect_err("wrong account must fail");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("accountId must match the entry"))
+        );
+
+        let mut missing_metadata = document;
+        missing_metadata["movements"][0]
+            .as_object_mut()
+            .expect("movement object")
+            .remove("holdingAdjustment");
+        let errors = validate_document(&missing_metadata).expect_err("missing metadata must fail");
+        assert!(errors.iter().any(|error| error.contains("is required")));
+    }
+
+    #[test]
+    fn valuation_uses_multi_hop_fx_and_refresh_targets_include_holding_currencies() {
+        let now = "2026-07-18T03:30:00Z";
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["fxRates"] = json!([
+            {
+                "id": "fx_usdt_usd",
+                "baseCurrency": "USDT",
+                "quoteCurrency": "USD",
+                "rate": "1",
+                "asOf": now,
+                "source": "test",
+                "status": "fresh"
+            },
+            {
+                "id": "fx_usd_cny",
+                "baseCurrency": "USD",
+                "quoteCurrency": "CNY",
+                "rate": "7.2",
+                "asOf": now,
+                "source": "test",
+                "status": "stale"
+            }
+        ]);
+        assert_eq!(
+            fx_rate_between(&document, "USDT", "CNY", now),
+            Some((DecimalAmount::parse("7.2").expect("rate"), "stale"))
+        );
+
+        document["accounts"] = json!([account_from_create_input(
+            &json!({
+                "displayName": "OKX",
+                "accountType": "exchange",
+                "defaultCurrency": "USDT",
+                "supportedCurrencies": ["USDT"],
+                "includeInNetWorth": true,
+                "balanceMode": "holdings",
+                "openingBalances": []
+            }),
+            "acct_okx_fx",
+            now,
+        )
+        .expect("holding account")]);
+        document["instruments"] = json!([{
+            "id": "inst_btc_usdt_fx",
+            "type": "crypto",
+            "displayName": "Bitcoin",
+            "quoteCurrency": "USDT"
+        }]);
+        document["holdings"] = json!([{
+            "id": "holding_btc_usdt_fx",
+            "accountId": "acct_okx_fx",
+            "instrumentId": "inst_btc_usdt_fx",
+            "quantity": "0.5",
+            "quoteStatus": "unpriceable",
+            "asOf": now
+        }]);
+        let path = unique_temp_path("holding_fx_targets");
+        load_or_initialize(&path).expect("ledger should initialize");
+        write_document(&path, &document).expect("ledger should persist");
+        let targets = fx_refresh_targets(&path, &json!({"mode": "manual"}))
+            .expect("FX targets should derive from holdings");
+        assert_eq!(
+            targets,
+            json!([
+                {
+                    "baseCurrency": "USDT",
+                    "quoteCurrency": "USD",
+                    "symbol": "USDT-USD"
+                },
+                {
+                    "baseCurrency": "USD",
+                    "quoteCurrency": "CNY",
+                    "symbol": "USDCNY=X"
+                }
+            ])
+            .as_array()
+            .expect("target array")
+            .clone()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn yield_accrual_supports_simple_and_periodic_compound_interest() {
+        let start = Date::parse("2026-01-01", &Iso8601::DATE).expect("start");
+        let end = Date::parse("2027-01-01", &Iso8601::DATE).expect("end");
+        let simple = json!({
+            "principal": {"amount": "1000", "currency": "CNY"},
+            "annualRate": "0.12",
+            "interestMethod": "simple",
+            "dayCountBasis": 365,
+            "compoundingFrequency": "none"
+        });
+        let simple_accrual = calculate_yield_accrual(&simple, start, end).expect("simple accrual");
+        assert_eq!(simple_accrual.amount.decimal_string(), "120");
+        assert_eq!(simple_accrual.days, 365);
+        assert_eq!(simple_accrual.full_periods, 0);
+
+        let basis_360_end = Date::parse("2026-01-31", &Iso8601::DATE).expect("360 basis end");
+        let simple_360 = json!({
+            "principal": {"amount": "1000", "currency": "CNY"},
+            "annualRate": "0.12",
+            "interestMethod": "simple",
+            "dayCountBasis": 360,
+            "compoundingFrequency": "none"
+        });
+        let basis_360_accrual =
+            calculate_yield_accrual(&simple_360, start, basis_360_end).expect("360 basis accrual");
+        assert_eq!(basis_360_accrual.days, 30);
+        assert_eq!(basis_360_accrual.amount.decimal_string(), "10");
+
+        let compound = json!({
+            "principal": {"amount": "1000", "currency": "CNY"},
+            "annualRate": "0.12",
+            "interestMethod": "compound",
+            "dayCountBasis": 365,
+            "compoundingFrequency": "monthly"
+        });
+        let compound_accrual =
+            calculate_yield_accrual(&compound, start, end).expect("compound accrual");
+        assert_eq!(compound_accrual.full_periods, 12);
+        assert!(
+            compound_accrual.amount > simple_accrual.amount,
+            "monthly compounding should exceed simple interest at the same nominal rate"
+        );
+        assert_eq!(compound_accrual.amount.decimal_string(), "126.82503014");
+    }
+
+    #[test]
+    fn loan_schedule_handles_negative_amortization_and_maturity_balloon() {
+        let account = json!({
+            "id": "acct_negative_amortization",
+            "displayName": "高息测试贷款",
+            "defaultCurrency": "CNY",
+            "cashBalances": [{"currency": "CNY", "amount": "-1000"}]
+        });
+        let terms = json!({
+            "annualRate": "1.2",
+            "dayCountBasis": 365,
+            "lastInterestAccruedThrough": "2026-01-01",
+            "nextDueDate": "2026-02-01",
+            "maturityDate": "2026-03-01",
+            "scheduledPayment": {"amount": "1", "currency": "CNY"}
+        });
+        let schedule = projected_loan_repayment_schedule(
+            &account,
+            &terms,
+            DecimalAmount::parse("1000").expect("outstanding"),
+            "CNY",
+            24,
+        )
+        .expect("schedule");
+        assert_eq!(schedule["items"].as_array().unwrap().len(), 2);
+        assert_eq!(schedule["items"][0]["payment"]["amount"], "1");
+        assert!(
+            parse_decimal(
+                schedule["items"][0]["unpaidInterest"]["amount"]
+                    .as_str()
+                    .expect("unpaid interest")
+            )
+            .expect("decimal")
+                > DecimalAmount::ZERO
+        );
+        assert_eq!(schedule["items"][1]["kind"], "balloon");
+        assert_eq!(schedule["items"][1]["closingBalance"]["amount"], "0");
+        assert_eq!(schedule["hasMore"], false);
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

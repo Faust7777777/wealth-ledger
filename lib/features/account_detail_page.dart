@@ -5,7 +5,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../core/format.dart';
-import '../core/types.dart';
 import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../shared/widgets.dart';
@@ -13,6 +12,8 @@ import '../theme/app_colors.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
 import 'account_visuals.dart';
+import 'holding_adjustment_dialog.dart';
+import 'loan_section.dart';
 
 class AccountDetailPage extends ConsumerWidget {
   const AccountDetailPage({super.key, required this.accountId});
@@ -58,35 +59,74 @@ class AccountDetailPage extends ConsumerWidget {
               return const EmptyState(icon: Icons.help_outline, title: '账户不存在');
             }
             final holdings = holdingsAsync.asData?.value ?? const <HoldingVm>[];
+            // 账户是资产容器：现金/稳定币与持仓分组展示，原始数量为主。
+            final holdingsCapable =
+                !a.isLiability &&
+                (a.balanceMode == 'holdings' || a.balanceMode == 'mixed');
             return ListView(
               padding: const EdgeInsets.all(AppSpacing.base),
               children: [
                 _Header(a: a),
                 if (a.cashBalances.isNotEmpty) ...[
-                  const SectionHeader(title: '现金余额'),
+                  SectionHeader(title: a.isLiability ? '欠款明细' : '现金与稳定币'),
                   for (final e in a.cashBalances.entries)
                     ListTile(
                       contentPadding: EdgeInsets.zero,
                       title: Text(e.key),
-                      trailing: Text(
-                        formatMoney(Money(amount: e.value, currency: e.key)),
-                        style: AppType.moneyRow,
-                      ),
+                      // 负债余额按语义展示（绝对值+标签），不出现账本负号。
+                      trailing: a.isLiability
+                          ? Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                Text(
+                                  liabilityBalanceText(e.value, e.key),
+                                  style: AppType.moneyRow,
+                                ),
+                                Text(
+                                  liabilityAmountLabel(e.value),
+                                  style: AppType.caption,
+                                ),
+                              ],
+                            )
+                          // 原始数量为主信息，不折算、不加币种符号。
+                          : Text(
+                              formatDecimalThousands(e.value),
+                              style: AppType.moneyRow,
+                            ),
                     ),
                 ],
-                if (holdings.isNotEmpty) ...[
-                  const SectionHeader(title: '持仓'),
-                  for (final h in holdings) _HoldingTile(h: h),
-                ] else
-                  Padding(
-                    padding: const EdgeInsets.symmetric(
-                      vertical: AppSpacing.sm,
-                    ),
-                    child: Text(
-                      '该账户暂无持仓（现金 / 活期类账户）',
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
+                if (a.isLiability) LoanSection(account: a),
+                if (holdingsCapable || holdings.isNotEmpty) ...[
+                  SectionHeader(
+                    title: '持仓',
+                    trailing: holdingsCapable
+                        ? TextButton.icon(
+                            onPressed:
+                                ref.writeCapabilities.canPersistPendingProposal
+                                ? () => showHoldingAdjustmentDialog(
+                                    context,
+                                    account: a,
+                                  )
+                                : null,
+                            icon: const Icon(Icons.add, size: 18),
+                            label: const Text('添加资产'),
+                          )
+                        : null,
                   ),
+                  if (holdings.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(
+                        vertical: AppSpacing.sm,
+                      ),
+                      child: Text(
+                        '暂无持仓',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    )
+                  else
+                    for (final h in holdings) _HoldingTile(h: h, account: a),
+                ],
               ],
             );
           },
@@ -102,7 +142,7 @@ class AccountDetailPage extends ConsumerWidget {
       context: context,
       builder: (c) => AlertDialog(
         title: const Text('归档账户'),
-        content: const Text('归档后不再计入新记录（后端可恢复）。确认归档？'),
+        content: const Text('归档后不能用于新记录。确认归档？'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(c, false),
@@ -157,25 +197,39 @@ class _Header extends StatelessWidget {
         Text(sub, style: AppType.caption),
         const SizedBox(height: AppSpacing.sm),
         // 账户估值与净值 Hero 同一处理：真实值之间过渡，不伪造中间金额。
+        // 负债账户按语义展示（绝对值+标签），不出现账本负号。
         AnimatedMoneyText(
-          v == null ? '—' : formatValued(v),
+          v == null
+              ? '—'
+              : a.isLiability
+              ? liabilityValuedText(v)
+              : formatValued(v),
           style: Theme.of(context).textTheme.headlineMedium,
         ),
+        // 账户总值必须带估值时间；质量由 ≈ / — 前缀表达。
+        if (v != null)
+          Text(
+            '截至 ${v.asOf.replaceFirst('T', ' ').split('.').first}',
+            style: AppType.caption,
+          ),
+        if (a.isLiability && v != null)
+          Text(liabilityAmountLabel(v.amount), style: AppType.caption),
       ],
     );
   }
 }
 
-class _HoldingTile extends StatelessWidget {
-  const _HoldingTile({required this.h});
+class _HoldingTile extends ConsumerWidget {
+  const _HoldingTile({required this.h, required this.account});
   final HoldingVm h;
+  final AccountVm account;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final dark = Theme.of(context).brightness == Brightness.dark;
     final mv = h.marketValue;
     final cost = h.costBasisTotal == null
-        ? '成本未记录'
+        ? ''
         : '成本 ${formatMoney(h.costBasisTotal!)}';
     String pnl = '';
     Color? color;
@@ -188,21 +242,30 @@ class _HoldingTile extends StatelessWidget {
           ? (dark ? AppColors.negative : AppColorsLight.negative)
           : (dark ? AppColors.positive : AppColorsLight.positive);
     }
+    final sub = pnl.isEmpty ? cost : (cost.isEmpty ? pnl : '$cost   $pnl');
     return ListTile(
       contentPadding: EdgeInsets.zero,
       leading: LeadingAvatar.mono(h.symbol),
-      title: Text(
-        '${h.displayName} · ${h.symbol} · ${h.quantity}',
-        style: AppType.bodyStrong,
+      title: Text('${h.displayName} · ${h.symbol}', style: AppType.bodyStrong),
+      subtitle: sub.isEmpty
+          ? null
+          : Text(sub, style: AppType.caption.copyWith(color: color)),
+      // 原始数量为主信息；缺报价只弱化折算金额，绝不显示成 0。
+      trailing: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          Text(formatDecimalThousands(h.quantity), style: AppType.moneyRow),
+          Text(mv == null ? '暂无估值' : formatValued(mv), style: AppType.caption),
+        ],
       ),
-      subtitle: Text(
-        pnl.isEmpty ? cost : '$cost   $pnl',
-        style: AppType.caption.copyWith(color: color),
-      ),
-      trailing: Text(
-        mv == null ? '—' : formatValued(mv),
-        style: AppType.moneyRow,
-      ),
+      onTap: ref.writeCapabilities.canPersistPendingProposal
+          ? () => showHoldingAdjustmentDialog(
+              context,
+              account: account,
+              existing: h,
+            )
+          : null,
     );
   }
 }

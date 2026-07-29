@@ -36,6 +36,45 @@ function Assert-RegularFile {
   Assert-NotReparsePoint -Path $Path -Label $Label
 }
 
+function Acquire-LedgerRestoreLease {
+  param([string]$LedgerPath)
+
+  $lockPath = "$LedgerPath.lock"
+  if (Test-Path -LiteralPath $lockPath) {
+    Assert-RegularFile -Path $lockPath -Label "ledger lock sidecar"
+  }
+
+  $stream = $null
+  try {
+    $stream = [System.IO.FileStream]::new(
+      $lockPath,
+      [System.IO.FileMode]::OpenOrCreate,
+      [System.IO.FileAccess]::ReadWrite,
+      [System.IO.FileShare]::None
+    )
+    $stream.Lock(0, 1)
+    return $stream
+  } catch {
+    if ($null -ne $stream) {
+      $stream.Dispose()
+    }
+    throw "restore refused because the ledger lock is held or cannot be acquired; stop the local server and retry"
+  }
+}
+
+function Release-LedgerRestoreLease {
+  param([System.IO.FileStream]$Lease)
+
+  try {
+    $Lease.Unlock(0, 1)
+  } catch {
+    # Disposing the handle still releases the OS lock. Never delete the
+    # permanent sidecar based on PID, age, or unlock outcome.
+  } finally {
+    $Lease.Dispose()
+  }
+}
+
 function Read-ManifestValue {
   param([string]$ManifestPath, [string]$Key)
   $prefix = "$Key="
@@ -224,14 +263,6 @@ if (!$Force) {
   }
 }
 
-if (Test-Path -LiteralPath $ledgerFullPath -PathType Leaf) {
-  & (Join-Path $PSScriptRoot "backup_local_ledger.ps1") `
-    -LedgerPath $ledgerFullPath `
-    -BackupDir $preRestoreFullDir `
-    -ServerExecutable $ServerExecutable `
-    -SkipValidate
-}
-
 $ledgerDir = Split-Path -Parent $ledgerFullPath
 if (!$ledgerDir) {
   throw "restore target must have a parent directory"
@@ -239,88 +270,102 @@ if (!$ledgerDir) {
 New-Item -ItemType Directory -Force -Path $ledgerDir | Out-Null
 Assert-NotReparsePoint -Path $ledgerDir -Label "restore target directory"
 
-$operationId = [Guid]::NewGuid().ToString("N")
-$ledgerStaged = Join-Path $ledgerDir ".ledger.restore.$operationId.tmp"
-$authStaged = Join-Path $ledgerDir ".auth.restore.$operationId.tmp"
-$rollbackDir = Join-Path $ledgerDir ".restore-rollback.$operationId"
-$ledgerExisted = Test-Path -LiteralPath $ledgerFullPath -PathType Leaf
-$authExisted = Test-Path -LiteralPath $authTarget -PathType Leaf
-$commitStarted = $false
-$commitSucceeded = $false
+$restoreLease = Acquire-LedgerRestoreLease -LedgerPath $ledgerFullPath
 
 try {
-  New-Item -ItemType Directory -Path $rollbackDir | Out-Null
-  if ($ledgerExisted) {
-    Assert-RegularFile -Path $ledgerFullPath -Label "current ledger"
-    Copy-Item -LiteralPath $ledgerFullPath -Destination (Join-Path $rollbackDir "ledger.json")
-  }
-  if ($authExisted) {
-    Assert-RegularFile -Path $authTarget -Label "current auth state"
-    Copy-Item -LiteralPath $authTarget -Destination (Join-Path $rollbackDir "ledger.auth.json")
+  if (Test-Path -LiteralPath $ledgerFullPath -PathType Leaf) {
+    & (Join-Path $PSScriptRoot "backup_local_ledger.ps1") `
+      -LedgerPath $ledgerFullPath `
+      -BackupDir $preRestoreFullDir `
+      -ServerExecutable $ServerExecutable `
+      -SkipValidate
   }
 
-  Copy-Item -LiteralPath $backupLedger -Destination $ledgerStaged
-  if ($authAction -eq "restore") {
-    Copy-Item -LiteralPath $backupAuth -Destination $authStaged
-  }
+  $operationId = [Guid]::NewGuid().ToString("N")
+  $ledgerStaged = Join-Path $ledgerDir ".ledger.restore.$operationId.tmp"
+  $authStaged = Join-Path $ledgerDir ".auth.restore.$operationId.tmp"
+  $rollbackDir = Join-Path $ledgerDir ".restore-rollback.$operationId"
+  $ledgerExisted = Test-Path -LiteralPath $ledgerFullPath -PathType Leaf
+  $authExisted = Test-Path -LiteralPath $authTarget -PathType Leaf
+  $commitStarted = $false
+  $commitSucceeded = $false
 
-  if ($expectedLedgerHash) {
-    $stagedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ledgerStaged).Hash.ToLowerInvariant()
-    if ($stagedHash -ne $expectedLedgerHash) {
-      throw "staged ledger checksum mismatch"
-    }
-  }
-  if ($expectedAuthHash) {
-    $stagedAuthHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $authStaged).Hash.ToLowerInvariant()
-    if ($stagedAuthHash -ne $expectedAuthHash) {
-      throw "staged auth checksum mismatch"
-    }
-  }
-  if (!$SkipValidate) {
-    Invoke-ServerValidation -Kind ledger -Path $ledgerStaged -Root $root -ServerExecutable $ServerExecutable
-    if ($authAction -eq "restore") {
-      Invoke-ServerValidation -Kind auth -Path $authStaged -Root $root -ServerExecutable $ServerExecutable
-    }
-  }
-
-  $commitStarted = $true
-  Install-StagedFile -StagedPath $ledgerStaged -TargetPath $ledgerFullPath
-  if ($env:FINWEALTH_TEST_FAIL_AFTER_LEDGER_REPLACE -eq "1") {
-    throw "injected restore failure after ledger replacement"
-  }
-  switch ($authAction) {
-    "restore" { Install-StagedFile -StagedPath $authStaged -TargetPath $authTarget }
-    "remove" { Remove-Item -LiteralPath $authTarget -Force -ErrorAction SilentlyContinue }
-  }
-
-  if (!$SkipValidate) {
-    Invoke-ServerValidation -Kind ledger -Path $ledgerFullPath -Root $root -ServerExecutable $ServerExecutable
-    if (Test-Path -LiteralPath $authTarget -PathType Leaf) {
-      Invoke-ServerValidation -Kind auth -Path $authTarget -Root $root -ServerExecutable $ServerExecutable
-    }
-  }
-  $commitSucceeded = $true
-} catch {
-  if ($commitStarted -and !$commitSucceeded) {
-    Write-Warning "Restore failed after replacement began; rolling back current state."
+  try {
+    New-Item -ItemType Directory -Path $rollbackDir | Out-Null
     if ($ledgerExisted) {
-      Copy-Item -LiteralPath (Join-Path $rollbackDir "ledger.json") -Destination $ledgerFullPath -Force
-    } else {
-      Remove-Item -LiteralPath $ledgerFullPath -Force -ErrorAction SilentlyContinue
+      Assert-RegularFile -Path $ledgerFullPath -Label "current ledger"
+      Copy-Item -LiteralPath $ledgerFullPath -Destination (Join-Path $rollbackDir "ledger.json")
     }
     if ($authExisted) {
-      Copy-Item -LiteralPath (Join-Path $rollbackDir "ledger.auth.json") -Destination $authTarget -Force
-    } else {
-      Remove-Item -LiteralPath $authTarget -Force -ErrorAction SilentlyContinue
+      Assert-RegularFile -Path $authTarget -Label "current auth state"
+      Copy-Item -LiteralPath $authTarget -Destination (Join-Path $rollbackDir "ledger.auth.json")
+    }
+
+    Copy-Item -LiteralPath $backupLedger -Destination $ledgerStaged
+    if ($authAction -eq "restore") {
+      Copy-Item -LiteralPath $backupAuth -Destination $authStaged
+    }
+
+    if ($expectedLedgerHash) {
+      $stagedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $ledgerStaged).Hash.ToLowerInvariant()
+      if ($stagedHash -ne $expectedLedgerHash) {
+        throw "staged ledger checksum mismatch"
+      }
+    }
+    if ($expectedAuthHash) {
+      $stagedAuthHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $authStaged).Hash.ToLowerInvariant()
+      if ($stagedAuthHash -ne $expectedAuthHash) {
+        throw "staged auth checksum mismatch"
+      }
+    }
+    if (!$SkipValidate) {
+      Invoke-ServerValidation -Kind ledger -Path $ledgerStaged -Root $root -ServerExecutable $ServerExecutable
+      if ($authAction -eq "restore") {
+        Invoke-ServerValidation -Kind auth -Path $authStaged -Root $root -ServerExecutable $ServerExecutable
+      }
+    }
+
+    $commitStarted = $true
+    Install-StagedFile -StagedPath $ledgerStaged -TargetPath $ledgerFullPath
+    if ($env:FINWEALTH_TEST_FAIL_AFTER_LEDGER_REPLACE -eq "1") {
+      throw "injected restore failure after ledger replacement"
+    }
+    switch ($authAction) {
+      "restore" { Install-StagedFile -StagedPath $authStaged -TargetPath $authTarget }
+      "remove" { Remove-Item -LiteralPath $authTarget -Force -ErrorAction SilentlyContinue }
+    }
+
+    if (!$SkipValidate) {
+      Invoke-ServerValidation -Kind ledger -Path $ledgerFullPath -Root $root -ServerExecutable $ServerExecutable
+      if (Test-Path -LiteralPath $authTarget -PathType Leaf) {
+        Invoke-ServerValidation -Kind auth -Path $authTarget -Root $root -ServerExecutable $ServerExecutable
+      }
+    }
+    $commitSucceeded = $true
+  } catch {
+    if ($commitStarted -and !$commitSucceeded) {
+      Write-Warning "Restore failed after replacement began; rolling back current state."
+      if ($ledgerExisted) {
+        Copy-Item -LiteralPath (Join-Path $rollbackDir "ledger.json") -Destination $ledgerFullPath -Force
+      } else {
+        Remove-Item -LiteralPath $ledgerFullPath -Force -ErrorAction SilentlyContinue
+      }
+      if ($authExisted) {
+        Copy-Item -LiteralPath (Join-Path $rollbackDir "ledger.auth.json") -Destination $authTarget -Force
+      } else {
+        Remove-Item -LiteralPath $authTarget -Force -ErrorAction SilentlyContinue
+      }
+    }
+    throw
+  } finally {
+    foreach ($temporaryPath in @($ledgerStaged, $authStaged, $rollbackDir)) {
+      if (Test-Path -LiteralPath $temporaryPath) {
+        Remove-Item -LiteralPath $temporaryPath -Recurse -Force
+      }
     }
   }
-  throw
 } finally {
-  foreach ($temporaryPath in @($ledgerStaged, $authStaged, $rollbackDir)) {
-    if (Test-Path -LiteralPath $temporaryPath) {
-      Remove-Item -LiteralPath $temporaryPath -Recurse -Force
-    }
-  }
+  Release-LedgerRestoreLease -Lease $restoreLease
 }
 
 Write-Host "Restore complete: $ledgerFullPath (auth: $authAction)"

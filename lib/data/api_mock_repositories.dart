@@ -1,9 +1,10 @@
-// Wealth Ledger — local_server 仓库（LocalServer*）：读取本地 Rust dev/local server 的 /v1 接口。
-// 仅在 DATA_SOURCE=local_server（别名 dev_server / api_mock）时启用，绝非默认；可连 --ledger-path 真实账本；
+// Wealth Ledger — API 仓库（LocalServer*）：读取 Rust server 的 /v1 接口。
+// DATA_SOURCE=local_server 用于本机服务；DATA_SOURCE=api_remote 用于 HTTPS VPS；
 // 写路径只生成 proposal；禁用端点以 403 呈现。（文件名暂留 api_mock_repositories.dart 以免动测试导入。）
 // 形状对齐 docs/contracts（DATA_SCHEMA_V1 / examples / FRONTEND_API_INTEGRATION_HANDOFF_V1）。
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
@@ -25,7 +26,7 @@ class ApiUnauthorizedException implements Exception {
   ApiUnauthorizedException(this.path);
   final String path;
   @override
-  String toString() => '登录已失效或未登录（401）：请到「设置 → 本地服务登录」重新登录后重试（$path）';
+  String toString() => '登录已失效或未登录（401）：请到「设置」重新登录后重试（$path）';
 }
 
 /// 业务冲突（409）：带服务端 error.code（如 duplicate_pending_charge / cancel_conflict），
@@ -40,17 +41,54 @@ class ApiConflictException implements Exception {
       message ?? '操作冲突（409${code == null ? '' : ' · $code'}）：$path';
 }
 
+/// 服务暂不可用（503）：如 AI 整理失败。UI 只显示简短失败状态并允许重试，
+/// 不展示 provider 名、上游状态码或配置字段。
+class ApiServiceUnavailableException implements Exception {
+  ApiServiceUnavailableException(this.path, {this.code, this.message});
+  final String path;
+  final String? code;
+  final String? message;
+  @override
+  String toString() => '服务暂时不可用，请稍后重试';
+}
+
+/// 请求校验失败（400）：携带服务端 message 与 details.errors。
+/// UI 用 [userMessage] 呈现具体校验原因，不展示裸 HTTP 细节。
+class ApiValidationException implements Exception {
+  ApiValidationException(
+    this.path, {
+    this.code,
+    this.message,
+    this.details = const [],
+  });
+  final String path;
+  final String? code;
+  final String? message;
+  final List<String> details;
+
+  String get userMessage =>
+      details.isNotEmpty ? details.first : (message ?? '提交内容未通过校验');
+
+  @override
+  String toString() => '提交内容未通过校验（400）：$userMessage';
+}
+
 class DevApiClient {
   DevApiClient(
     this.baseUrl, {
     this.scenario = '',
     this.tokenStore,
+    this.onSessionExpired,
     http.Client? client,
   }) : _client = client ?? http.Client();
 
   final String baseUrl;
   final String scenario;
   final AuthTokenStore? tokenStore;
+
+  /// refresh 也明确 401 时回调一次：清除失效 token 并把登录态同步为未登录。
+  /// 网络失败、超时与 5xx 不触发。
+  final Future<void> Function()? onSessionExpired;
   final http.Client _client;
   final Random _rng = Random.secure();
 
@@ -80,6 +118,20 @@ class DevApiClient {
       : '$baseUrl$path${path.contains('?') ? '&' : '?'}scenario=$scenario';
 
   Object? _handle(http.Response res, String path) {
+    _throwForStatus(res, path);
+    if (res.statusCode == 204 || res.bodyBytes.isEmpty) {
+      return null; // 如 AI reject 返回 204
+    }
+    final body = jsonDecode(utf8.decode(res.bodyBytes));
+    if (body is Map<String, dynamic>) {
+      if (body['ok'] == false) throw Exception('API error · $path');
+      return body.containsKey('data') ? body['data'] : body;
+    }
+    return body;
+  }
+
+  /// 状态码 → 类型化异常。JSON 与二进制响应共用同一套错误语义。
+  void _throwForStatus(http.Response res, String path) {
     if (res.statusCode == 401) {
       throw ApiUnauthorizedException(path);
     }
@@ -93,18 +145,42 @@ class DevApiClient {
         message: _errorField(res, 'message'),
       );
     }
+    if (res.statusCode == 503) {
+      throw ApiServiceUnavailableException(
+        path,
+        code: _errorField(res, 'code'),
+        message: _errorField(res, 'message'),
+      );
+    }
+    // 400 与 413（附件过大）同属"请求本身不合法"，用同一种类型化异常呈现。
+    if (res.statusCode == 400 || res.statusCode == 413) {
+      throw ApiValidationException(
+        path,
+        code: _errorField(res, 'code'),
+        message: _errorField(res, 'message'),
+        details: _errorDetails(res),
+      );
+    }
     if (res.statusCode >= 400) {
-      throw Exception('HTTP ${res.statusCode} · $path');
+      final message = _errorField(res, 'message');
+      throw Exception(
+        'HTTP ${res.statusCode} · $path${message == null ? '' : ' · $message'}',
+      );
     }
-    if (res.statusCode == 204 || res.bodyBytes.isEmpty) {
-      return null; // 如 AI reject 返回 204
+  }
+
+  /// 读取错误信封 error.details.errors（服务端校验失败的逐条原因）。
+  List<String> _errorDetails(http.Response res) {
+    try {
+      final body = jsonDecode(utf8.decode(res.bodyBytes));
+      final error = body is Map ? body['error'] : null;
+      final details = error is Map ? error['details'] : null;
+      final errors = details is Map ? details['errors'] : details;
+      if (errors is List) return [for (final e in errors) '$e'];
+    } catch (_) {
+      // 信封不完整时回落到 message。
     }
-    final body = jsonDecode(utf8.decode(res.bodyBytes));
-    if (body is Map<String, dynamic>) {
-      if (body['ok'] == false) throw Exception('API error · $path');
-      return body.containsKey('data') ? body['data'] : body;
-    }
-    return body;
+    return const [];
   }
 
   /// 读取错误信封 {ok:false, error:{code, message}} 的字段（供 409 等使用）。
@@ -125,6 +201,146 @@ class DevApiClient {
 
   Future<Object?> patchData(String path, {Object? body}) =>
       _send('PATCH', path, body: body);
+
+  /// multipart 上传（Agent 附件）。写入语义与 JSON POST 一致：
+  /// 首次调用前生成 Idempotency-Key，401 刷新后的重放复用同一个 key，
+  /// 不会因为重试重复归档同一张图。
+  Future<Object?> postMultipart(
+    String path, {
+    required String field,
+    required String fileName,
+    required String mimeType,
+    required Uint8List bytes,
+  }) => _sendMultipart(
+    path,
+    field: field,
+    fileName: fileName,
+    mimeType: mimeType,
+    bytes: bytes,
+    idempotencyKey: _newIdempotencyKey(),
+  );
+
+  Future<Object?> _sendMultipart(
+    String path, {
+    required String field,
+    required String fileName,
+    required String mimeType,
+    required Uint8List bytes,
+    required String idempotencyKey,
+    bool retried = false,
+  }) async {
+    // 手写 multipart：part 的 Content-Type 必须是真实图片 MIME（服务端据此校验），
+    // 而 http 包的 MultipartFile 需要额外依赖才能设置它。
+    final boundary = '----finwealth${_newIdempotencyKey()}';
+    final safeName = fileName.replaceAll(RegExp(r'[\r\n"]'), '_');
+    final head = utf8.encode(
+      '--$boundary\r\n'
+      'content-disposition: form-data; name="$field"; filename="$safeName"\r\n'
+      'content-type: $mimeType\r\n\r\n',
+    );
+    final tail = utf8.encode('\r\n--$boundary--\r\n');
+    final request = http.Request('POST', Uri.parse(_url(path)))
+      ..headers.addAll(await _headers())
+      ..headers['idempotency-key'] = idempotencyKey
+      ..headers['content-type'] = 'multipart/form-data; boundary=$boundary'
+      ..bodyBytes = <int>[...head, ...bytes, ...tail];
+    final res = await http.Response.fromStream(await _client.send(request));
+    if (res.statusCode == 401 && !retried && await _refreshSession()) {
+      return _sendMultipart(
+        path,
+        field: field,
+        fileName: fileName,
+        mimeType: mimeType,
+        bytes: bytes,
+        idempotencyKey: idempotencyKey,
+        retried: true,
+      );
+    }
+    return _handle(res, path);
+  }
+
+  /// 二进制读取（Agent 附件原图）：返回字节与服务端声明的 MIME。
+  Future<({Uint8List bytes, String mimeType})> getBytes(
+    String path, {
+    bool retried = false,
+  }) async {
+    final res = await _client.get(
+      Uri.parse(_url(path)),
+      headers: await _headers(),
+    );
+    if (res.statusCode == 401 && !retried && await _refreshSession()) {
+      return getBytes(path, retried: true);
+    }
+    _throwForStatus(res, path);
+    return (
+      bytes: res.bodyBytes,
+      mimeType: res.headers['content-type']?.split(';').first.trim() ?? '',
+    );
+  }
+
+  /// SSE 订阅：逐帧产出 (cursor, event, data)。`after` 为已应用的最大 cursor，
+  /// 断线重连时由调用方续接；401 刷新后重连一次。
+  Stream<({int cursor, String event, Map<String, dynamic> data})> streamEvents(
+    String path, {
+    int? after,
+  }) async* {
+    var retried = false;
+    while (true) {
+      final uri = Uri.parse(_url(after == null ? path : '$path?after=$after'));
+      final request = http.Request('GET', uri)
+        ..headers.addAll(await _headers())
+        ..headers['accept'] = 'text/event-stream';
+      if (after != null) request.headers['last-event-id'] = '$after';
+      final res = await _client.send(request);
+      if (res.statusCode == 401 && !retried && await _refreshSession()) {
+        retried = true;
+        continue;
+      }
+      if (res.statusCode != 200) {
+        await res.stream.drain<void>();
+        throw res.statusCode == 401
+            ? ApiUnauthorizedException(path)
+            : Exception('HTTP ${res.statusCode} · $path');
+      }
+      var id = 0;
+      var event = '';
+      final data = StringBuffer();
+      await for (final line
+          in res.stream
+              .transform(utf8.decoder)
+              .transform(const LineSplitter())) {
+        if (line.isEmpty) {
+          if (event.isNotEmpty && data.isNotEmpty) {
+            final decoded = jsonDecode(data.toString());
+            yield (
+              cursor: id,
+              event: event,
+              data: decoded is Map
+                  ? decoded.cast<String, dynamic>()
+                  : <String, dynamic>{},
+            );
+          }
+          event = '';
+          data.clear();
+          continue;
+        }
+        if (line.startsWith(':')) continue; // keep-alive
+        final colon = line.indexOf(':');
+        if (colon < 0) continue;
+        final key = line.substring(0, colon);
+        final value = line.substring(colon + 1).trimLeft();
+        switch (key) {
+          case 'id':
+            id = int.tryParse(value) ?? id;
+          case 'event':
+            event = value;
+          case 'data':
+            data.write(value);
+        }
+      }
+      return;
+    }
+  }
 
   /// 统一请求入口：access token 过期（401）时用 refresh token 换新并重放一次。
   /// auth 端点自身不重试，避免刷新循环。写入的 Idempotency-Key 在首次调用前生成，
@@ -183,6 +399,7 @@ class DevApiClient {
     final store = tokenStore;
     if (store == null) return false;
     final session = await store.read();
+    // token 已被清掉：不再重复判定失效，也不重复回调。
     if (session == null || session.refreshToken.isEmpty) return false;
     try {
       final res = await _client.post(
@@ -190,6 +407,11 @@ class DevApiClient {
         headers: {'content-type': 'application/json'},
         body: jsonEncode({'refreshToken': session.refreshToken}),
       );
+      // 只有服务端明确拒绝这张 refresh token 才算会话失效。
+      if (res.statusCode == 401 || res.statusCode == 403) {
+        await _invalidateSession();
+        return false;
+      }
       if (res.statusCode != 200) return false;
       final decoded = jsonDecode(utf8.decode(res.bodyBytes));
       final data = decoded is Map<String, dynamic>
@@ -206,8 +428,16 @@ class DevApiClient {
       await store.write(next);
       return true;
     } catch (_) {
+      // 网络失败/超时：保留登录态，交给调用方按普通错误处理。
       return false;
     }
+  }
+
+  /// 清除失效 token 并通知上层同步登录态。单飞的 refresh 保证只走一次。
+  Future<void> _invalidateSession() async {
+    await tokenStore?.clear();
+    final notify = onSessionExpired;
+    if (notify != null) await notify();
   }
 }
 
@@ -272,6 +502,7 @@ String _movementTypeWire(MovementType t) => switch (t) {
   MovementType.fee => 'fee',
   MovementType.adjustment => 'adjustment',
   MovementType.loanDisbursement => 'loan_disbursement',
+  MovementType.loanInterest => 'loan_interest',
   MovementType.loanRepayment => 'loan_repayment',
   MovementType.correction => 'correction',
 };
@@ -305,6 +536,7 @@ MovementType _movType(Object? s) => switch (s) {
   'fee' => MovementType.fee,
   'loan_disbursement' => MovementType.loanDisbursement,
   'loan_repayment' => MovementType.loanRepayment,
+  'loan_interest' => MovementType.loanInterest,
   'correction' => MovementType.correction,
   _ => MovementType.adjustment,
 };
@@ -432,6 +664,9 @@ AccountVm _account(Map<String, dynamic> j) {
     includeInNetWorth: j['includeInNetWorth'] as bool? ?? true,
     institutionName: j['institutionName'] as String?,
     cashBalances: _cashBalances(j['cashBalances']),
+    supportedCurrencies: [
+      for (final c in _list(j['supportedCurrencies'])) '$c',
+    ],
     isArchived: j['status'] == 'archived' || j['visibility'] == 'archived',
   );
 }
@@ -461,6 +696,7 @@ HoldingVm _holding(Map<String, dynamic> j) {
   return HoldingVm(
     id: '${j['id']}',
     accountId: '${j['accountId']}',
+    instrumentId: '${j['instrumentId'] ?? inst['id'] ?? ''}',
     symbol: '${inst['symbol'] ?? j['symbol'] ?? ''}',
     displayName:
         '${inst['displayName'] ?? j['displayName'] ?? inst['symbol'] ?? ''}',
@@ -500,6 +736,47 @@ List<MovementEntryVm> _entries(Object? v) {
   ];
 }
 
+RealizedPnlStatus _pnlStatus(Object? s) => switch (s) {
+  'calculated' => RealizedPnlStatus.calculated,
+  'calculated_with_fx' => RealizedPnlStatus.calculatedWithFx,
+  'currency_mismatch' => RealizedPnlStatus.currencyMismatch,
+  // 未知状态按"暂不可计算"兜底：宁可少展示，也不给出错误盈亏。
+  _ => RealizedPnlStatus.costBasisUnavailable,
+};
+
+ExecutionFxBasisVm? _fxBasis(Object? o) {
+  if (o is! Map) return null;
+  final j = _m(o);
+  return ExecutionFxBasisVm(
+    baseCurrency: '${j['baseCurrency']}',
+    quoteCurrency: '${j['quoteCurrency']}',
+    rate: '${j['rate']}',
+    asOf: '${j['asOf']}',
+    sourceRateId: '${j['sourceRateId']}',
+    source: '${j['source']}',
+    sourceUrl: j['sourceUrl'] as String?,
+    inverted: _bool(j['inverted']),
+  );
+}
+
+InvestmentSaleResultVm? _saleResult(Object? o) {
+  if (o is! Map) return null;
+  final j = _m(o);
+  return InvestmentSaleResultVm(
+    costBasisMethod: '${j['costBasisMethod']}',
+    grossProceeds: _money(j['grossProceeds']),
+    feeAndTaxTotal: _money(j['feeAndTaxTotal']),
+    netProceeds: _money(j['netProceeds']),
+    costBasisReleased: _moneyOrNull(j['costBasisReleased']),
+    realizedPnl: _moneyOrNull(j['realizedPnl']),
+    netProceedsInCostBasisCurrency: _moneyOrNull(
+      j['netProceedsInCostBasisCurrency'],
+    ),
+    fxBasis: _fxBasis(j['fxBasis']),
+    realizedPnlStatus: _pnlStatus(j['realizedPnlStatus']),
+  );
+}
+
 MovementVm _movement(Map<String, dynamic> j) {
   final settlement = j['settlement'] is Map
       ? _m(j['settlement'])
@@ -529,8 +806,42 @@ MovementVm _movement(Map<String, dynamic> j) {
     entries: _entries(j['entries']),
     categoryId: j['categoryId'] as String?,
     counterpartyId: j['counterpartyId'] as String?,
+    saleResult: _saleResult(j['saleResult']),
+    costBasisFx: _fxBasis(j['costBasisFx']),
   );
 }
+
+/// 公开以便单测直接喂 Movement JSON（saleResult/costBasisFx 映射与缺失兼容）。
+MovementVm parseMovementData(Map<String, dynamic> j) => _movement(j);
+
+InstrumentType _instType(Object? s) => switch (s) {
+  'cash' => InstrumentType.cash,
+  'equity' => InstrumentType.equity,
+  'fund' => InstrumentType.fund,
+  'crypto' => InstrumentType.crypto,
+  'fx_cash' => InstrumentType.fxCash,
+  'receivable' => InstrumentType.receivable,
+  _ => InstrumentType.other,
+};
+
+String _instTypeWire(InstrumentType t) => switch (t) {
+  InstrumentType.cash => 'cash',
+  InstrumentType.equity => 'equity',
+  InstrumentType.fund => 'fund',
+  InstrumentType.crypto => 'crypto',
+  InstrumentType.fxCash => 'fx_cash',
+  InstrumentType.receivable => 'receivable',
+  InstrumentType.other => 'other',
+};
+
+InstrumentVm _instrumentVm(Map<String, dynamic> j) => InstrumentVm(
+  id: '${j['id']}',
+  type: _instType(j['type']),
+  symbol: j['symbol'] as String?,
+  displayName: '${j['displayName']}',
+  quoteCurrency: '${j['quoteCurrency']}',
+  market: j['market'] as String?,
+);
 
 DcaReminderVm _reminder(Map<String, dynamic> j) => DcaReminderVm(
   id: '${j['id']}',
@@ -569,16 +880,28 @@ AiFieldDiffVm _diff(Map<String, dynamic> j) {
   );
 }
 
-AiAtomicGroupVm _group(Map<String, dynamic> j) => AiAtomicGroupVm(
-  id: '${j['id']}',
-  title: '${j['title']}',
-  operation: _aiOp(j['operation']),
-  status: _aiGroupStatus(j['status']),
-  diffs: [for (final d in _list(j['diffs'])) _diff(_m(d))],
-  warnings: [
-    for (final w in _list(j['warnings'])) (w is Map ? '${w['message']}' : '$w'),
-  ],
-);
+AiAtomicGroupVm _group(Map<String, dynamic> j) {
+  final proposed = _list(j['proposedMovements']);
+  final validation = j['validation'] is Map
+      ? _m(j['validation'])
+      : const <String, dynamic>{};
+  return AiAtomicGroupVm(
+    id: '${j['id']}',
+    title: '${j['title']}',
+    operation: _aiOp(j['operation']),
+    status: _aiGroupStatus(j['status']),
+    diffs: [for (final d in _list(j['diffs'])) _diff(_m(d))],
+    warnings: [
+      for (final w in _list(j['warnings']))
+        (w is Map ? '${w['message']}' : '$w'),
+    ],
+    proposedMovement: proposed.isEmpty ? null : _movement(_m(proposed.first)),
+    isValid: _bool(validation['isValid'], fallback: true),
+  );
+}
+
+/// 公开以便单测直接喂 AiProposal JSON（结构化/待补全候选映射）。
+AiProposalVm parseAiProposalData(Map<String, dynamic> j) => _proposal(j);
 
 AiProposalVm _proposal(Map<String, dynamic> j) {
   final src = j['source'] is Map ? _m(j['source']) : const <String, dynamic>{};
@@ -591,6 +914,7 @@ AiProposalVm _proposal(Map<String, dynamic> j) {
     status: _aiPropStatus(j['status']),
     sourceLabel: '${ev['label'] ?? src['kind'] ?? '输入'}',
     summary: j['summary'] as String?,
+    modelName: src['modelName'] as String?,
     groups: [for (final g in _list(j['atomicGroups'])) _group(_m(g))],
   );
 }
@@ -757,6 +1081,7 @@ class LocalServerAccountRepository implements AccountRepository {
   ];
   @override
   Future<AccountVm> createAccount(CreateAccountInput input) async {
+    final opening = input.openingBalance;
     final d = await _c.postData(
       '/v1/accounts',
       body: {
@@ -768,6 +1093,14 @@ class LocalServerAccountRepository implements AccountRepository {
         'balanceMode': input.balanceMode,
         if (input.institutionName != null)
           'institutionName': input.institutionName,
+        'openingBalances': [
+          if (opening != null)
+            {
+              'currency': opening.currency,
+              'amount': opening.amount,
+              'quality': 'exact',
+            },
+        ],
       },
     );
     return _account(_m(d));
@@ -916,6 +1249,24 @@ class LocalServerPortfolioRepository implements PortfolioRepository {
       parseAssetAllocationData(
         _m(await _c.getData('/v1/portfolio/allocation')),
       );
+
+  @override
+  Future<AiAtomicGroupVm> proposeHoldingAdjustment(
+    Id accountId,
+    HoldingAdjustmentInput input,
+  ) async => _group(
+    _m(
+      await _c.postData(
+        '/v1/accounts/$accountId/holding-adjustment-proposals',
+        body: {
+          'instrumentId': input.instrumentId,
+          'targetQuantity': input.targetQuantity,
+          if (input.asOf != null) 'asOf': input.asOf,
+          if (input.note != null && input.note!.isNotEmpty) 'note': input.note,
+        },
+      ),
+    ),
+  );
 }
 
 class LocalServerMovementRepository implements MovementRepository {
@@ -986,6 +1337,8 @@ class LocalServerMovementRepository implements MovementRepository {
       'transferMeta': {
         'fromAccountId': input.fromAccountId,
         'toAccountId': input.toAccountId,
+        'fromAmount': {'amount': input.amount, 'currency': input.currency},
+        'toAmount': {'amount': input.amount, 'currency': input.currency},
         if (input.note != null && input.note!.isNotEmpty) 'note': input.note,
       },
     });
@@ -1033,6 +1386,55 @@ class LocalServerMovementRepository implements MovementRepository {
     );
   }
 
+  @override
+  Future<ConfirmResultVm> createInvestmentTrade(
+    InvestmentTradeInput input,
+  ) async {
+    final isBuy = input.side == TradeSide.buy;
+    // 空值或纯零 fee/tax 不发送对应腿（服务端禁止零金额腿）。
+    bool hasValue(DecimalString? v) =>
+        v != null && v.trim().isNotEmpty && decimalSign(v) > 0;
+    Map<String, Object?> cashLeg(
+      DecimalString amount,
+      String direction,
+      String role,
+    ) => {
+      'accountId': input.cashAccountId,
+      'amount': amount,
+      'currency': input.cashCurrency,
+      'direction': direction,
+      'role': role,
+    };
+    return _recordViaPipeline({
+      'type': isBuy ? 'buy' : 'sell',
+      'occurredAt':
+          input.occurredAt ?? DateTime.now().toUtc().toIso8601String(),
+      'title': input.title,
+      if (input.note != null && input.note!.isNotEmpty)
+        'description': input.note,
+      'entries': [
+        // 现金主腿：买入付款（out/source），卖出毛回款（in/destination）。
+        cashLeg(
+          input.principalAmount,
+          isBuy ? 'out' : 'in',
+          isBuy ? 'source' : 'destination',
+        ),
+        // 持仓数量腿：金额=数量、币种=标的报价币种、必须带 instrumentId。
+        {
+          'accountId': input.holdingAccountId,
+          'instrumentId': input.instrumentId,
+          'amount': input.quantity,
+          'currency': input.holdingCurrency,
+          'direction': isBuy ? 'in' : 'out',
+          'role': isBuy ? 'destination' : 'source',
+        },
+        // 费用/税费：始终为现金流出，且与主腿同账户同币种。
+        if (hasValue(input.feeAmount)) cashLeg(input.feeAmount!, 'out', 'fee'),
+        if (hasValue(input.taxAmount)) cashLeg(input.taxAmount!, 'out', 'tax'),
+      ],
+    });
+  }
+
   // 候选 → 确认：草稿 → 提交复核 → 确认入账（均为用户主动发起的合法写路径）。
   // 返回服务端 confirm 结果；是否"已入账"由 ledgerWrite 决定，前端不猜测。
   Future<ConfirmResultVm> _recordViaPipeline(Map<String, Object?> body) async {
@@ -1043,6 +1445,32 @@ class LocalServerMovementRepository implements MovementRepository {
     return _confirmResult(
       _m(await _c.postData('/v1/atomic-groups/$groupId/confirm')),
     );
+  }
+}
+
+class LocalServerInstrumentRepository implements InstrumentRepository {
+  LocalServerInstrumentRepository(this._c);
+  final DevApiClient _c;
+
+  @override
+  Future<List<InstrumentVm>> listInstruments() async => [
+    for (final i in _list(await _c.getData('/v1/instruments')))
+      _instrumentVm(_m(i)),
+  ];
+
+  @override
+  Future<InstrumentVm> createInstrument(CreateInstrumentInput input) async {
+    final d = await _c.postData(
+      '/v1/instruments',
+      body: {
+        'type': _instTypeWire(input.type),
+        'displayName': input.displayName,
+        'quoteCurrency': input.quoteCurrency,
+        if (input.symbol != null && input.symbol!.isNotEmpty)
+          'symbol': input.symbol,
+      },
+    );
+    return _instrumentVm(_m(d));
   }
 }
 
@@ -1106,9 +1534,19 @@ class LocalServerDcaRepository implements DcaRepository {
   }
 
   @override
-  Future<void> markExecutedAsProposal(Id reminderId) async {
+  Future<void> markExecutedAsProposal(
+    Id reminderId,
+    DcaExecutionInput input,
+  ) async {
     await _c.postData(
       '/v1/dca/reminders/$reminderId/mark-executed-as-proposal',
+      body: {
+        'holdingAccountId': input.holdingAccountId,
+        'quantity': input.quantity,
+        'totalCost': _moneyJson(input.totalCost),
+        'quoteCurrency': input.quoteCurrency,
+        if (input.executedAt != null) 'executedAt': input.executedAt,
+      },
     );
   }
 
@@ -1126,12 +1564,673 @@ class LocalServerDcaRepository implements DcaRepository {
   }
 }
 
+FxRateVm _fxRate(Map<String, dynamic> j) => FxRateVm(
+  baseCurrency: '${j['baseCurrency']}',
+  quoteCurrency: '${j['quoteCurrency']}',
+  rate: '${j['rate']}',
+  asOf: '${j['asOf']}',
+  status: _quote(j['status']),
+);
+
+// ———— 贷款条款 / 头寸 / 还款计划映射 ————
+LiabilityType _liabType(Object? s) => switch (s) {
+  'student_loan' => LiabilityType.studentLoan,
+  'mortgage' => LiabilityType.mortgage,
+  'consumer_loan' => LiabilityType.consumerLoan,
+  'credit_card' => LiabilityType.creditCard,
+  _ => LiabilityType.other,
+};
+
+String _liabTypeWire(LiabilityType t) => switch (t) {
+  LiabilityType.studentLoan => 'student_loan',
+  LiabilityType.mortgage => 'mortgage',
+  LiabilityType.consumerLoan => 'consumer_loan',
+  LiabilityType.creditCard => 'credit_card',
+  LiabilityType.other => 'other',
+};
+
+LiabilityTermsVm _liabilityTerms(Map<String, dynamic> j) => LiabilityTermsVm(
+  liabilityType: _liabType(j['liabilityType']),
+  annualRate: '${j['annualRate']}',
+  rateType: j['rateType'] == 'floating'
+      ? LiabilityRateType.floating
+      : LiabilityRateType.fixed,
+  dayCountBasis: _int(j['dayCountBasis']),
+  interestStartDate: '${j['interestStartDate']}',
+  maturityDate: '${j['maturityDate']}',
+  repaymentStartDate: '${j['repaymentStartDate']}',
+  nextDueDate: '${j['nextDueDate']}',
+  scheduledPayment: _money(j['scheduledPayment']),
+  paymentAccountId: '${j['paymentAccountId']}',
+  lastInterestAccruedThrough: '${j['lastInterestAccruedThrough']}',
+  pendingLoanInterestMovementId: j['pendingLoanInterestMovementId'] as String?,
+  pendingLoanInterestThroughDate:
+      j['pendingLoanInterestThroughDate'] as String?,
+  lastLoanInterestMovementId: j['lastLoanInterestMovementId'] as String?,
+);
+
+LiabilityNextPaymentVm _liabilityNextPayment(Map<String, dynamic> j) =>
+    LiabilityNextPaymentVm(
+      dueDate: '${j['dueDate']}',
+      scheduledAmount: _money(j['scheduledAmount']),
+      projectedInterest: _money(j['projectedInterest']),
+      projectedPrincipal: _money(j['projectedPrincipal']),
+    );
+
+/// 公开以便单测直接喂 LiabilityPosition JSON。
+LiabilityPositionVm parseLiabilityPositionData(Map<String, dynamic> j) =>
+    LiabilityPositionVm(
+      accountId: '${j['accountId']}',
+      accountName: '${j['accountName']}',
+      currency: '${j['currency']}',
+      terms: _liabilityTerms(_m(j['terms'])),
+      outstandingPrincipal: _money(j['outstandingPrincipal']),
+      accruedThrough: '${j['accruedThrough']}',
+      accrualDays: _int(j['accrualDays']),
+      accruedInterest: _money(j['accruedInterest']),
+      nextPayment: _liabilityNextPayment(_m(j['nextPayment'])),
+      status: '${j['status']}',
+    );
+
+LoanRepaymentScheduleItemVm _scheduleItem(Map<String, dynamic> j) =>
+    LoanRepaymentScheduleItemVm(
+      sequence: _int(j['sequence']),
+      dueDate: '${j['dueDate']}',
+      openingBalance: _money(j['openingBalance']),
+      interest: _money(j['interest']),
+      principal: _money(j['principal']),
+      payment: _money(j['payment']),
+      closingBalance: _money(j['closingBalance']),
+      kind: '${j['kind']}',
+    );
+
+/// 公开以便单测直接喂 LoanRepaymentSchedule JSON。
+LoanRepaymentScheduleVm parseRepaymentScheduleData(Map<String, dynamic> j) =>
+    LoanRepaymentScheduleVm(
+      accountId: '${j['accountId']}',
+      currency: '${j['currency']}',
+      maturityDate: '${j['maturityDate']}',
+      items: [for (final i in _list(j['items'])) _scheduleItem(_m(i))],
+      hasMore: _bool(j['hasMore']),
+    );
+
+class LocalServerLoanRepository implements LoanRepository {
+  LocalServerLoanRepository(this._c);
+  final DevApiClient _c;
+
+  @override
+  Future<List<LiabilityPositionVm>> listLiabilityPositions({
+    IsoDate? throughDate,
+  }) async => [
+    for (final p in _list(
+      await _c.getData(
+        throughDate == null
+            ? '/v1/liability-positions'
+            : '/v1/liability-positions?throughDate=$throughDate',
+      ),
+    ))
+      parseLiabilityPositionData(_m(p)),
+  ];
+
+  @override
+  Future<LoanRepaymentScheduleVm> getRepaymentSchedule(
+    Id accountId, {
+    int limit = 24,
+  }) async => parseRepaymentScheduleData(
+    _m(
+      await _c.getData(
+        '/v1/accounts/$accountId/repayment-schedule?limit=${limit.clamp(1, 360)}',
+      ),
+    ),
+  );
+
+  @override
+  Future<AccountVm> updateLiabilityTerms(
+    Id accountId,
+    LiabilityTermsInput input,
+  ) async => _account(
+    _m(
+      await _c.patchData(
+        '/v1/accounts/$accountId/liability-terms',
+        body: {
+          'liabilityType': _liabTypeWire(input.liabilityType),
+          'annualRate': input.annualRate,
+          'rateType': input.rateType == LiabilityRateType.floating
+              ? 'floating'
+              : 'fixed',
+          'dayCountBasis': input.dayCountBasis,
+          'interestStartDate': input.interestStartDate,
+          'maturityDate': input.maturityDate,
+          'repaymentStartDate': input.repaymentStartDate,
+          'nextDueDate': input.nextDueDate,
+          'repaymentFrequency': input.repaymentFrequency,
+          'scheduledPayment': _moneyJson(input.scheduledPayment),
+          'paymentAccountId': input.paymentAccountId,
+        },
+      ),
+    ),
+  );
+
+  @override
+  Future<AiAtomicGroupVm> proposeLoanInterest(
+    Id accountId, {
+    required IsoDate throughDate,
+    String? note,
+  }) async => _group(
+    _m(
+      await _c.postData(
+        '/v1/accounts/$accountId/loan-interest-proposals',
+        body: {
+          'throughDate': throughDate,
+          if (note != null && note.isNotEmpty) 'note': note,
+        },
+      ),
+    ),
+  );
+}
+
+// ———— Pi Agent 映射 ————
+AgentStatusVm _agentStatus(Map<String, dynamic> j) => AgentStatusVm(
+  configured: _bool(j['configured']),
+  modelCount: _int(j['modelCount']),
+  primaryConversationId: j['primaryConversationId'] as String?,
+);
+
+AgentProviderAuthMethod _agentAuthMethod(Object? v) => switch ('$v') {
+  'oauth' => AgentProviderAuthMethod.oauth,
+  'api_key' => AgentProviderAuthMethod.apiKey,
+  _ => AgentProviderAuthMethod.unknown,
+};
+
+AgentProviderVm _agentProvider(Map<String, dynamic> j) => AgentProviderVm(
+  id: '${j['id']}',
+  displayName: '${j['displayName']}',
+  authMethods: [for (final m in _list(j['authMethods'])) _agentAuthMethod(m)],
+  connectionStatus: switch (j['connectionStatus']) {
+    'connected' => AgentProviderConnectionStatus.connected,
+    'connecting' => AgentProviderConnectionStatus.connecting,
+    _ => AgentProviderConnectionStatus.disconnected,
+  },
+);
+
+AgentProviderOAuthAttemptVm _agentOAuthAttempt(Map<String, dynamic> j) =>
+    AgentProviderOAuthAttemptVm(
+      attemptId: '${j['attemptId']}',
+      providerId: '${j['providerId']}',
+      status: switch (j['status']) {
+        'connected' => AgentProviderOAuthStatus.connected,
+        'failed' => AgentProviderOAuthStatus.failed,
+        'cancelled' => AgentProviderOAuthStatus.cancelled,
+        _ => AgentProviderOAuthStatus.pending,
+      },
+      verificationUri: j['verificationUri'] as String?,
+      userCode: j['userCode'] as String?,
+      expiresAt: j['expiresAt'] as String?,
+      errorCode: j['errorCode'] as String?,
+    );
+
+/// 供测试直接校验 wire → VM 映射。
+AgentProviderVm parseAgentProviderData(Map<String, dynamic> j) =>
+    _agentProvider(j);
+AgentProviderOAuthAttemptVm parseAgentOAuthAttemptData(
+  Map<String, dynamic> j,
+) => _agentOAuthAttempt(j);
+
+AgentModelVm _agentModel(Map<String, dynamic> j) => AgentModelVm(
+  id: '${j['id']}',
+  provider: '${j['provider']}',
+  displayName: '${j['displayName']}',
+  supportsImages: _bool(j['supportsImages']),
+);
+
+AgentConversationVm _agentConversation(Map<String, dynamic> j) =>
+    AgentConversationVm(
+      id: '${j['id']}',
+      title: '${j['title']}',
+      isPrimary: _bool(j['isPrimary']),
+      status: j['status'] == 'archived'
+          ? AgentConversationStatus.archived
+          : AgentConversationStatus.active,
+      createdAt: '${j['createdAt']}',
+      updatedAt: '${j['updatedAt']}',
+      selectedModelId: j['selectedModelId'] as String?,
+    );
+
+AgentMessageRole _agentRole(Object? s) => switch (s) {
+  'assistant' => AgentMessageRole.assistant,
+  'system' => AgentMessageRole.system,
+  _ => AgentMessageRole.user,
+};
+
+AgentMessageStatus _agentMessageStatus(Object? s) => switch (s) {
+  'queued' => AgentMessageStatus.queued,
+  'streaming' => AgentMessageStatus.streaming,
+  'failed' => AgentMessageStatus.failed,
+  _ => AgentMessageStatus.completed,
+};
+
+AgentMessageVm _agentMessage(Map<String, dynamic> j) => AgentMessageVm(
+  id: '${j['id']}',
+  conversationId: '${j['conversationId']}',
+  role: _agentRole(j['role']),
+  text: '${j['text'] ?? ''}',
+  status: _agentMessageStatus(j['status']),
+  createdAt: '${j['createdAt']}',
+  runId: j['runId'] as String?,
+  completedAt: j['completedAt'] as String?,
+  errorCode: j['errorCode'] as String?,
+  attachmentIds: [for (final id in _list(j['attachmentIds'])) '$id'],
+);
+
+AgentAttachmentVm _agentAttachment(Map<String, dynamic> j) => AgentAttachmentVm(
+  id: '${j['id']}',
+  fileName: '${j['fileName']}',
+  mimeType: '${j['mimeType']}',
+  sizeBytes: _int(j['sizeBytes']),
+  sha256: '${j['sha256']}',
+  createdAt: '${j['createdAt']}',
+);
+
+AgentMemoryStatus _agentMemoryStatus(Object? s) => switch (s) {
+  'active' => AgentMemoryStatus.active,
+  'rejected' => AgentMemoryStatus.rejected,
+  _ => AgentMemoryStatus.suggested,
+};
+
+AgentMemoryVm _agentMemory(Map<String, dynamic> j) => AgentMemoryVm(
+  id: '${j['id']}',
+  content: '${j['content']}',
+  reason: '${j['reason'] ?? ''}',
+  status: _agentMemoryStatus(j['status']),
+  createdAt: '${j['createdAt']}',
+  updatedAt: '${j['updatedAt']}',
+);
+
+AgentAutomationKind _agentAutomationKind(Object? s) => switch (s) {
+  'subscription_due_scan' => AgentAutomationKind.subscriptionDueScan,
+  'dca_due_check' => AgentAutomationKind.dcaDueCheck,
+  'financial_summary' => AgentAutomationKind.financialSummary,
+  _ => AgentAutomationKind.quoteRefresh,
+};
+
+String agentAutomationKindWire(AgentAutomationKind kind) => switch (kind) {
+  AgentAutomationKind.quoteRefresh => 'quote_refresh',
+  AgentAutomationKind.subscriptionDueScan => 'subscription_due_scan',
+  AgentAutomationKind.dcaDueCheck => 'dca_due_check',
+  AgentAutomationKind.financialSummary => 'financial_summary',
+};
+
+AgentAutomationVm _agentAutomation(Map<String, dynamic> j) => AgentAutomationVm(
+  id: '${j['id']}',
+  kind: _agentAutomationKind(j['kind']),
+  intervalHours: _int(j['intervalHours']),
+  enabled: _bool(j['enabled'], fallback: true),
+  nextRunAt: '${j['nextRunAt']}',
+  createdAt: '${j['createdAt']}',
+  updatedAt: '${j['updatedAt']}',
+  lastRunAt: j['lastRunAt'] as String?,
+  lastStatus: switch (j['lastStatus']) {
+    'success' => AgentAutomationRunStatus.success,
+    'failed' => AgentAutomationRunStatus.failed,
+    _ => null,
+  },
+  lastErrorCode: j['lastErrorCode'] as String?,
+);
+
+AgentNotificationVm _agentNotification(Map<String, dynamic> j) =>
+    AgentNotificationVm(
+      id: '${j['id']}',
+      kind: _agentAutomationKind(j['kind']),
+      title: '${j['title']}',
+      body: '${j['body'] ?? ''}',
+      createdAt: '${j['createdAt']}',
+      action: switch (j['action']) {
+        'review' => AgentNotificationAction.review,
+        'quotes' => AgentNotificationAction.quotes,
+        'dca' => AgentNotificationAction.dca,
+        'agent' => AgentNotificationAction.agent,
+        _ => null,
+      },
+      readAt: j['readAt'] as String?,
+    );
+
+/// 供测试直接校验 wire → VM 映射。
+AgentAutomationVm parseAgentAutomationData(Map<String, dynamic> j) =>
+    _agentAutomation(j);
+AgentNotificationVm parseAgentNotificationData(Map<String, dynamic> j) =>
+    _agentNotification(j);
+
+AgentQuoteCandidateVm _agentQuoteCandidate(Map<String, dynamic> j) =>
+    AgentQuoteCandidateVm(
+      id: '${j['id']}',
+      kind: j['kind'] == 'fx'
+          ? AgentQuoteCandidateKind.fx
+          : AgentQuoteCandidateKind.instrument,
+      asOf: '${j['asOf']}',
+      source: '${j['source']}',
+      sourceUrl: '${j['sourceUrl']}',
+      status: switch (j['status']) {
+        'applied' => AgentQuoteCandidateStatus.applied,
+        'rejected' => AgentQuoteCandidateStatus.rejected,
+        _ => AgentQuoteCandidateStatus.suggested,
+      },
+      createdAt: '${j['createdAt']}',
+      updatedAt: '${j['updatedAt']}',
+      instrumentId: j['instrumentId'] as String?,
+      price: j['price'] as String?,
+      currency: j['currency'] as String?,
+      baseCurrency: j['baseCurrency'] as String?,
+      quoteCurrency: j['quoteCurrency'] as String?,
+      rate: j['rate'] as String?,
+      appliedAt: j['appliedAt'] as String?,
+    );
+
+/// 供测试直接校验 wire → VM 映射。
+AgentQuoteCandidateVm parseAgentQuoteCandidateData(Map<String, dynamic> j) =>
+    _agentQuoteCandidate(j);
+
+AgentEventType _agentEventType(String s) => switch (s) {
+  'run.queued' => AgentEventType.runQueued,
+  'run.started' => AgentEventType.runStarted,
+  'message.delta' => AgentEventType.messageDelta,
+  'tool.started' => AgentEventType.toolStarted,
+  'tool.completed' => AgentEventType.toolCompleted,
+  'run.completed' => AgentEventType.runCompleted,
+  'run.failed' => AgentEventType.runFailed,
+  _ => AgentEventType.unknown,
+};
+
+AgentEventVm agentEventFrom(
+  int cursor,
+  String event,
+  Map<String, dynamic> data,
+) => AgentEventVm(
+  cursor: cursor,
+  type: _agentEventType(event),
+  runId: data['runId'] as String?,
+  userMessageId: data['userMessageId'] as String?,
+  assistantMessageId: data['assistantMessageId'] as String?,
+  delta: data['delta'] as String?,
+  toolName: data['name'] as String?,
+  isError: data['isError'] as bool?,
+  code: data['code'] as String?,
+);
+
+/// 供测试直接校验 wire → VM 映射。
+AgentMessageVm parseAgentMessageData(Map<String, dynamic> j) =>
+    _agentMessage(j);
+AgentConversationVm parseAgentConversationData(Map<String, dynamic> j) =>
+    _agentConversation(j);
+
+class LocalServerAgentRepository implements AgentRepository {
+  LocalServerAgentRepository(this._c);
+  final DevApiClient _c;
+
+  @override
+  Future<AgentStatusVm> getStatus() async =>
+      _agentStatus(_m(await _c.getData('/v1/agent/status')));
+
+  @override
+  Future<List<AgentModelVm>> listModels() async => [
+    for (final m in _list(await _c.getData('/v1/agent/models')))
+      _agentModel(_m(m)),
+  ];
+
+  @override
+  Future<List<AgentProviderVm>> listProviders() async => [
+    for (final p in _list(await _c.getData('/v1/agent/providers')))
+      _agentProvider(_m(p)),
+  ];
+
+  @override
+  Future<AgentProviderOAuthAttemptVm> startProviderOAuth(
+    String providerId,
+  ) async => _agentOAuthAttempt(
+    _m(await _c.postData('/v1/agent/providers/$providerId/oauth/start')),
+  );
+
+  @override
+  Future<AgentProviderOAuthAttemptVm> getProviderOAuthAttempt(
+    Id attemptId,
+  ) async => _agentOAuthAttempt(
+    _m(await _c.getData('/v1/agent/provider-oauth/$attemptId')),
+  );
+
+  @override
+  Future<void> disconnectProvider(String providerId) async {
+    await _c.postData('/v1/agent/providers/$providerId/disconnect');
+  }
+
+  @override
+  Future<AgentAttachmentVm> uploadAttachment({
+    required String fileName,
+    required String mimeType,
+    required Uint8List bytes,
+  }) async => _agentAttachment(
+    _m(
+      await _c.postMultipart(
+        '/v1/agent/attachments',
+        field: 'file',
+        fileName: fileName,
+        mimeType: mimeType,
+        bytes: bytes,
+      ),
+    ),
+  );
+
+  @override
+  Future<AgentAttachmentVm> getAttachment(Id attachmentId) async =>
+      _agentAttachment(
+        _m(await _c.getData('/v1/agent/attachments/$attachmentId')),
+      );
+
+  @override
+  Future<Uint8List> getAttachmentContent(Id attachmentId) async =>
+      (await _c.getBytes('/v1/agent/attachments/$attachmentId/content')).bytes;
+
+  @override
+  Future<List<AgentMemoryVm>> listMemories() async => [
+    for (final m in _list(await _c.getData('/v1/agent/memories')))
+      _agentMemory(_m(m)),
+  ];
+
+  @override
+  Future<AgentMemoryVm> reviewMemory(
+    Id memoryId, {
+    required AgentMemoryStatus decision,
+  }) async => _agentMemory(
+    _m(
+      await _c.postData(
+        '/v1/agent/memories/$memoryId/review',
+        body: {
+          'decision': decision == AgentMemoryStatus.active
+              ? 'active'
+              : 'rejected',
+        },
+      ),
+    ),
+  );
+
+  @override
+  Future<List<AgentConversationVm>> listConversations() async => [
+    for (final c in _list(await _c.getData('/v1/agent/conversations')))
+      _agentConversation(_m(c)),
+  ];
+
+  @override
+  Future<AgentConversationVm> createConversation({String? title}) async =>
+      _agentConversation(
+        _m(
+          await _c.postData(
+            '/v1/agent/conversations',
+            body: {if (title != null && title.isNotEmpty) 'title': title},
+          ),
+        ),
+      );
+
+  @override
+  Future<AgentConversationVm> updateConversation(
+    Id conversationId, {
+    String? title,
+    AgentConversationStatus? status,
+    String? modelId,
+  }) async => _agentConversation(
+    _m(
+      await _c.patchData(
+        '/v1/agent/conversations/$conversationId',
+        body: {
+          'title': ?title,
+          if (status != null)
+            'status': status == AgentConversationStatus.archived
+                ? 'archived'
+                : 'active',
+          'modelId': ?modelId,
+        },
+      ),
+    ),
+  );
+
+  @override
+  Future<List<AgentMessageVm>> listMessages(Id conversationId) async => [
+    for (final m in _list(
+      await _c.getData('/v1/agent/conversations/$conversationId/messages'),
+    ))
+      _agentMessage(_m(m)),
+  ];
+
+  @override
+  Future<AgentRunAcceptedVm> sendMessage(
+    Id conversationId, {
+    required String text,
+    List<Id> attachmentIds = const [],
+  }) async {
+    final d = _m(
+      await _c.postData(
+        '/v1/agent/conversations/$conversationId/messages',
+        body: {
+          'text': text,
+          if (attachmentIds.isNotEmpty) 'attachmentIds': attachmentIds,
+        },
+      ),
+    );
+    return AgentRunAcceptedVm(
+      runId: '${d['runId']}',
+      userMessageId: '${d['userMessageId']}',
+      assistantMessageId: '${d['assistantMessageId']}',
+    );
+  }
+
+  @override
+  Future<List<AgentAutomationVm>> listAutomations() async => [
+    for (final a in _list(await _c.getData('/v1/agent/automations')))
+      _agentAutomation(_m(a)),
+  ];
+
+  @override
+  Future<AgentAutomationVm> createAutomation({
+    required AgentAutomationKind kind,
+    required int intervalHours,
+    bool enabled = true,
+    IsoDateTime? startAt,
+  }) async => _agentAutomation(
+    _m(
+      await _c.postData(
+        '/v1/agent/automations',
+        body: {
+          'kind': agentAutomationKindWire(kind),
+          'intervalHours': intervalHours,
+          'enabled': enabled,
+          'startAt': ?startAt,
+        },
+      ),
+    ),
+  );
+
+  @override
+  Future<AgentAutomationVm> updateAutomation(
+    Id automationId, {
+    int? intervalHours,
+    bool? enabled,
+    IsoDateTime? nextRunAt,
+  }) async => _agentAutomation(
+    _m(
+      await _c.patchData(
+        '/v1/agent/automations/$automationId',
+        body: {
+          'intervalHours': ?intervalHours,
+          'enabled': ?enabled,
+          'nextRunAt': ?nextRunAt,
+        },
+      ),
+    ),
+  );
+
+  @override
+  Future<AgentAutomationVm> runAutomation(Id automationId) async =>
+      _agentAutomation(
+        _m(await _c.postData('/v1/agent/automations/$automationId/run')),
+      );
+
+  @override
+  Future<List<AgentNotificationVm>> listNotifications() async => [
+    for (final n in _list(await _c.getData('/v1/agent/notifications')))
+      _agentNotification(_m(n)),
+  ];
+
+  @override
+  Future<AgentNotificationVm> markNotificationRead(Id notificationId) async =>
+      _agentNotification(
+        _m(await _c.postData('/v1/agent/notifications/$notificationId/read')),
+      );
+
+  @override
+  Future<List<AgentQuoteCandidateVm>> listQuoteCandidates() async => [
+    for (final c in _list(await _c.getData('/v1/agent/quote-candidates')))
+      _agentQuoteCandidate(_m(c)),
+  ];
+
+  @override
+  Future<AgentQuoteCandidateVm> reviewQuoteCandidate(
+    Id candidateId, {
+    required AgentQuoteCandidateStatus decision,
+  }) async => _agentQuoteCandidate(
+    _m(
+      await _c.postData(
+        '/v1/agent/quote-candidates/$candidateId/review',
+        body: {
+          'decision': decision == AgentQuoteCandidateStatus.applied
+              ? 'apply'
+              : 'reject',
+        },
+      ),
+    ),
+  );
+
+  @override
+  Stream<AgentEventVm> events(Id conversationId, {int? after}) => _c
+      .streamEvents(
+        '/v1/agent/conversations/$conversationId/events',
+        after: after,
+      )
+      .map((f) => agentEventFrom(f.cursor, f.event, f.data));
+
+  @override
+  Future<void> cancelRun(Id runId) async {
+    await _c.postData('/v1/agent/runs/$runId/cancel');
+  }
+}
+
 class LocalServerQuoteRepository implements QuoteRepository {
   LocalServerQuoteRepository(this._c);
   final DevApiClient _c;
   @override
   Future<QuoteStatusSummaryVm> getQuoteSummary() async =>
       _quoteSummary(_m(await _c.getData('/v1/quotes/summary')));
+
+  @override
+  Future<List<FxRateVm>> listFxRates() async => [
+    for (final r in _list(await _c.getData('/v1/fx-rates'))) _fxRate(_m(r)),
+  ];
 
   @override
   Future<QuoteRefreshResultVm> refreshQuotes({required String mode}) async =>
@@ -1338,6 +2437,42 @@ SubscriptionVm parseSubscriptionData(Map<String, dynamic> j) => SubscriptionVm(
   note: j['note']?.toString(),
 );
 
+SubscriptionDueScanSkipReason _dueScanSkipReason(Object? s) => switch (s) {
+  'payment_account_unavailable' =>
+    SubscriptionDueScanSkipReason.paymentAccountUnavailable,
+  'payment_currency_unsupported' =>
+    SubscriptionDueScanSkipReason.paymentCurrencyUnsupported,
+  _ => SubscriptionDueScanSkipReason.alreadyPending,
+};
+
+SubscriptionDueScanSkipVm _dueScanSkip(Map<String, dynamic> j) =>
+    SubscriptionDueScanSkipVm(
+      subscriptionId: '${j['subscriptionId']}',
+      scheduledChargeDate: '${j['scheduledChargeDate'] ?? ''}',
+      reason: _dueScanSkipReason(j['reason']),
+    );
+
+// created 项是 AiAtomicGroup 本体附加 subscriptionId/scheduledChargeDate（allOf）。
+SubscriptionDueScanCreatedVm _dueScanCreated(Map<String, dynamic> j) =>
+    SubscriptionDueScanCreatedVm(
+      group: _group(j),
+      subscriptionId: '${j['subscriptionId']}',
+      scheduledChargeDate: '${j['scheduledChargeDate'] ?? ''}',
+    );
+
+/// 公开以便单测直接喂 due-scan JSON。
+SubscriptionDueScanResultVm parseDueScanData(Map<String, dynamic> j) =>
+    SubscriptionDueScanResultVm(
+      throughDate: '${j['throughDate'] ?? ''}',
+      createdCount: _int(j['createdCount']),
+      alreadyPendingCount: _int(j['alreadyPendingCount']),
+      blockedCount: _int(j['blockedCount']),
+      remainingEligibleCount: _int(j['remainingEligibleCount']),
+      hasMore: _bool(j['hasMore'], fallback: false),
+      created: [for (final c in _list(j['created'])) _dueScanCreated(_m(c))],
+      skipped: [for (final s in _list(j['skipped'])) _dueScanSkip(_m(s))],
+    );
+
 Map<String, dynamic> _moneyJson(Money m) => {
   'amount': m.amount,
   'currency': m.currency,
@@ -1358,6 +2493,8 @@ Map<String, dynamic> _createSubBody(CreateSubscriptionInput i) => {
   'paymentAccountId': i.paymentAccountId,
   'billingCycle': _billingCycleJson(i.billingCycle),
   'startDate': i.startDate,
+  if (i.nextChargeDate != null && i.nextChargeDate!.isNotEmpty)
+    'nextChargeDate': i.nextChargeDate,
   if (i.duration != null) 'duration': _durationJson(i.duration!),
   if (i.endDate != null && i.endDate!.isNotEmpty) 'endDate': i.endDate,
   'autoRenew': i.autoRenew,
@@ -1373,6 +2510,8 @@ Map<String, dynamic> _updateSubBody(UpdateSubscriptionInput i) => {
   'paymentAccountId': i.paymentAccountId,
   'billingCycle': _billingCycleJson(i.billingCycle),
   'startDate': i.startDate,
+  if (i.nextChargeDate != null && i.nextChargeDate!.isNotEmpty)
+    'nextChargeDate': i.nextChargeDate,
   'duration': i.duration != null ? _durationJson(i.duration!) : null,
   'endDate': (i.endDate?.isNotEmpty ?? false) ? i.endDate : null,
   'autoRenew': i.autoRenew,
@@ -1429,4 +2568,16 @@ class LocalServerSubscriptionRepository implements SubscriptionRepository {
   @override
   Future<AiAtomicGroupVm> createChargeProposal(Id id) async =>
       _group(_m(await _c.postData('/v1/subscriptions/$id/charge-proposal')));
+  @override
+  Future<SubscriptionDueScanResultVm> scanDueChargeProposals({
+    required IsoDate throughDate,
+    int limit = 100,
+  }) async => parseDueScanData(
+    _m(
+      await _c.postData(
+        '/v1/subscriptions/charge-proposals/due-scan',
+        body: {'throughDate': throughDate, 'limit': limit.clamp(1, 200)},
+      ),
+    ),
+  );
 }

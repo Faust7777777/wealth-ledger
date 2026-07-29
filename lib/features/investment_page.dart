@@ -5,9 +5,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../core/format.dart';
+import '../data/api_mock_repositories.dart' show ApiConflictException;
 import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../shared/widgets.dart';
+import 'dca_execution_dialog.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
@@ -31,6 +33,7 @@ class InvestmentPage extends ConsumerWidget {
       data: (hs) {
         final rs = reminders.asData?.value ?? const <DcaReminderVm>[];
         final canPropose = ref.writeCapabilities.canPersistPendingProposal;
+        final canRecord = ref.writeCapabilities.canRecordMovement;
         if (hs.isEmpty && rs.isEmpty && plans.isEmpty) {
           return EmptyState(
             illustration: Image.asset(
@@ -40,29 +43,55 @@ class InvestmentPage extends ConsumerWidget {
               semanticLabel: '开始你的投资记录',
             ),
             title: '还没有投资持仓',
-            message: '可以先创建定投计划，或添加券商 / 交易所账户与持仓。这里只展示事实统计，非投资建议。',
-            action: WriteGate(
-              enabled: canPropose,
-              child: FilledButton(
-                onPressed: () => context.push('/investment/dca/new'),
-                child: const Text('新建定投计划'),
-              ),
+            message: '记录第一笔成交，或创建定投计划。',
+            action: Wrap(
+              spacing: AppSpacing.sm,
+              runSpacing: AppSpacing.xs,
+              alignment: WrapAlignment.center,
+              children: [
+                WriteGate(
+                  enabled: canRecord,
+                  child: FilledButton(
+                    onPressed: () => context.push('/investment/trade/new'),
+                    child: const Text('投资成交'),
+                  ),
+                ),
+                WriteGate(
+                  enabled: canPropose,
+                  child: OutlinedButton(
+                    onPressed: () => context.push('/investment/dca/new'),
+                    child: const Text('新建定投计划'),
+                  ),
+                ),
+              ],
             ),
           );
         }
         return ListView(
           padding: const EdgeInsets.all(AppSpacing.base),
           children: [
-            Align(
-              alignment: Alignment.centerLeft,
-              child: WriteGate(
-                enabled: canPropose,
-                child: FilledButton.icon(
-                  onPressed: () => context.push('/investment/dca/new'),
-                  icon: const Icon(Icons.add),
-                  label: const Text('新建定投计划'),
+            // 主要操作区：真实成交入口 + 定投计划入口。
+            Wrap(
+              spacing: AppSpacing.sm,
+              runSpacing: AppSpacing.xs,
+              children: [
+                WriteGate(
+                  enabled: canRecord,
+                  child: FilledButton.icon(
+                    onPressed: () => context.push('/investment/trade/new'),
+                    icon: const Icon(Icons.candlestick_chart_outlined),
+                    label: const Text('投资成交'),
+                  ),
                 ),
-              ),
+                WriteGate(
+                  enabled: canPropose,
+                  child: OutlinedButton.icon(
+                    onPressed: () => context.push('/investment/dca/new'),
+                    icon: const Icon(Icons.add),
+                    label: const Text('新建定投计划'),
+                  ),
+                ),
+              ],
             ),
             const SizedBox(height: AppSpacing.base),
             if (hs.isNotEmpty) ...[
@@ -212,15 +241,47 @@ class _ReminderTileState extends ConsumerState<_ReminderTile> {
     }
   }
 
-  Future<void> _record() => _run(() async {
-    final messenger = ScaffoldMessenger.of(context);
-    await ref.read(dcaRepositoryProvider).markExecutedAsProposal(r.id);
-    _refresh();
-    ref.invalidate(aiPendingProvider);
-    messenger.showSnackBar(
-      const SnackBar(content: Text('已生成待确认记录（不下单 / 不转账）；见 AI 待确认')),
+  /// 记录已执行：先收集真实成交（数量/总成本/持仓账户），确认后才发请求。
+  /// 计划金额只作为总成本默认值，绝不当成交数量。
+  Future<void> _record() async {
+    List<AccountVm> accounts;
+    try {
+      accounts = await ref.read(accountsProvider.future);
+    } catch (_) {
+      accounts = const [];
+    }
+    final holdingAccounts = [
+      for (final a in accounts)
+        if (!a.isArchived &&
+            (a.balanceMode == 'holdings' || a.balanceMode == 'mixed'))
+          a,
+    ];
+    if (!mounted) return;
+    final input = await showDcaExecutionDialog(
+      context,
+      reminder: r,
+      holdingAccounts: holdingAccounts,
     );
-  });
+    if (input == null || !mounted) return;
+    await _run(() async {
+      final messenger = ScaffoldMessenger.of(context);
+      try {
+        await ref
+            .read(dcaRepositoryProvider)
+            .markExecutedAsProposal(r.id, input);
+      } on ApiConflictException {
+        messenger.showSnackBar(
+          const SnackBar(content: Text('本期已有待确认记录，请到 AI 审核处理')),
+        );
+        return;
+      }
+      _refresh();
+      ref.invalidate(aiPendingProvider);
+      messenger.showSnackBar(
+        const SnackBar(content: Text('已生成待确认记录，见 AI 待确认')),
+      );
+    });
+  }
 
   Future<void> _skip() => _run(() async {
     final messenger = ScaffoldMessenger.of(context);

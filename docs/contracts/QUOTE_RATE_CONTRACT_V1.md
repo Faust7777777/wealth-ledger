@@ -113,9 +113,13 @@ QuoteRefreshError {
 - 启动刷新失败不阻塞 App 使用。
 - 定时刷新失败不弹强干扰错误，进入待处理/状态区。
 - 如果当前环境没有真实 provider，`quotes` / `fxRates` 可作为手动或外部 provider 已确认结果写入缓存；缺省时不得伪造价格，只能返回 `offline`/`failed` 并继续使用缓存。
-- Rust local server 可用 Yahoo provider 作为第一档实现，但必须由 `FINWEALTH_QUOTE_PROVIDER=yahoo` 显式开启；只对 `Instrument.symbol` 存在，或 `instrumentId` 本身可安全解释为 ticker 的标的自动刷新；内部 ID（如 `inst_*`）缺少 symbol 时必须返回错误并继续使用缓存。
+- Rust local server 支持两个显式 provider：`FINWEALTH_QUOTE_PROVIDER=public` 使用 CoinGecko 获取 BTC/ETH/USDT 最新价、Frankfurter/ECB 获取传统法币汇率；`yahoo` 保留股票、传统行情和历史价格能力。`public` 当前只认 BTC、ETH、USDT，不支持的 symbol 必须逐项报错，不得伪造价格。Yahoo 只对 `Instrument.symbol` 存在，或 `instrumentId` 本身可安全解释为 ticker 的标的自动刷新；内部 ID（如 `inst_*`）缺少 symbol 时必须返回错误并继续使用缓存。
 - FX provider 可按 `currencyPairs` 或账本中的非本位币现金自动推导 Yahoo pair（如 `USD/CNY` → `USDCNY=X`）。
-- 默认 `FINWEALTH_QUOTE_PROVIDER=none`：禁用联网 provider，只保留手动/外部 payload 写入与缓存读取，避免默认暴露 ticker / FX 查询。
+- 自动刷新还必须检查正数量持仓的 `Instrument.quoteCurrency`，不能只检查现金余额。持仓以 USDT 等加密货币报价、账本本位币不是 USD 时，provider 可拆成可验证的桥接路径，例如 `USDT/USD`（`USDT-USD`）+ `USD/CNY`（`USDCNY=X`）。
+- 估值换算优先使用直接汇率；没有直接汇率时，可在已有 FX rate 图中使用最多三跳的无环路径。路径状态取各段最差质量，同跳数存在多条路径时优先质量更好的路径。`incomplete`、`unpriceable`、`error` 段不得参与数值换算。
+- `fxRates` 需要保留同一货币对的历史时间点；相同稳定 ID（同 pair + asOf）可幂等覆盖，
+  不同 `asOf` 不得互相覆盖。投资成交按成交时间选择历史 rate，而非读取最新缓存裸值。
+- 默认 `FINWEALTH_QUOTE_PROVIDER=none`：禁用联网 provider，只保留手动/外部 payload 写入与缓存读取，避免默认暴露 ticker / FX 查询。`public` 和 `yahoo` 都必须由部署者显式开启。
 
 ## 5. TTL 初始建议
 
@@ -162,6 +166,8 @@ QuoteStatusSummary {
 - incomplete：显示 `≈` 或“不完整”，待处理区显示报价问题。
 - unpriceable：对应资产显示 `—`，待处理区显示无法估值。
 - offline_cached：顶栏或状态区显示离线缓存。
+
+估值问题详情由 `GET /v1/portfolio/valuation-issues` 返回。每个问题对应一个纳入净资产的非零现金余额或正数量持仓，保留原始 quantity，并用 `reason` 区分缺报价、缺 FX 路径、报价/汇率过期、离线缓存和 provider 错误。客户端只负责把 reason 映射成界面语言，不自行重建换算图。
 
 首页涨跌：
 

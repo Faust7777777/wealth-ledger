@@ -3,11 +3,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
-import '../core/format.dart';
 import '../data/providers.dart';
 import '../shared/widgets.dart';
 import '../theme/app_dimens.dart';
-import '../theme/app_typography.dart';
 import 'account_visuals.dart';
 
 class AccountsPage extends ConsumerWidget {
@@ -62,10 +60,7 @@ class AccountsPage extends ConsumerWidget {
                           ? accountTypeLabel(a.accountType)
                           : '${accountTypeLabel(a.accountType)} · ${a.note}',
                     ),
-                    trailing: Text(
-                      a.value == null ? '—' : formatValued(a.value!),
-                      style: AppType.moneyRow,
-                    ),
+                    trailing: AccountValueDisplay(account: a),
                   ),
                 ),
               ),

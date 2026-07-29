@@ -1,8 +1,11 @@
 // Wealth Ledger — Riverpod 注入：按 DataSourceMode 切 real_local / debug_fixture。
 // 页面只 watch 这些 provider，不感知数据来源；fixture 仅在 demo 模式注入。
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart' show ThemeMode;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../core/api_endpoint_store.dart';
 import '../core/env.dart';
 import 'api_mock_repositories.dart';
 import 'auth_repositories.dart';
@@ -13,15 +16,52 @@ import 'real_local_repositories.dart';
 import 'repositories.dart';
 import 'view_models.dart';
 
+final apiEndpointStoreProvider = Provider<ApiEndpointStore>(
+  (ref) => PlatformApiEndpointStore(),
+);
+
+class RemoteApiEndpointController extends AsyncNotifier<String?> {
+  @override
+  Future<String?> build() => ref.watch(apiEndpointStoreProvider).read();
+
+  Future<String> configure(String input) async {
+    final normalized = normalizeHttpsApiOrigin(input);
+    await ref.read(apiEndpointStoreProvider).write(normalized);
+    state = AsyncData(normalized);
+    return normalized;
+  }
+
+  Future<void> clear() async {
+    state = const AsyncLoading<String?>();
+    await ref.read(apiEndpointStoreProvider).clear();
+    state = const AsyncData(null);
+  }
+}
+
+final remoteApiEndpointProvider =
+    AsyncNotifierProvider<RemoteApiEndpointController, String?>(
+      RemoteApiEndpointController.new,
+    );
+
+final effectiveAppEnvironmentProvider = Provider<AppEnvironment>((ref) {
+  final base = ref.watch(appEnvironmentProvider);
+  if (base.dataSourceMode != DataSourceMode.apiRemote) return base;
+  final saved = ref.watch(remoteApiEndpointProvider).value;
+  return saved == null ? base : base.copyWith(apiBaseUrl: saved);
+});
+
 DataSourceMode _mode(Ref ref) =>
-    ref.watch(appEnvironmentProvider).dataSourceMode;
+    ref.watch(effectiveAppEnvironmentProvider).dataSourceMode;
 
 final devApiClientProvider = Provider<DevApiClient>((ref) {
-  final env = ref.watch(appEnvironmentProvider);
+  final env = ref.watch(effectiveAppEnvironmentProvider);
   return DevApiClient(
     env.apiBaseUrl,
     scenario: env.apiScenario,
     tokenStore: ref.watch(authTokenStoreProvider),
+    // 延迟 read：避免与 authRepositoryProvider 形成构建期循环依赖。
+    onSessionExpired: () =>
+        ref.read(authControllerProvider.notifier).markSessionExpired(),
   );
 });
 
@@ -30,7 +70,7 @@ final authTokenStoreProvider = Provider<AuthTokenStore>(
 );
 
 final authRepositoryProvider = Provider<AuthRepository>((ref) {
-  if (_mode(ref) != DataSourceMode.localServer) {
+  if (!ref.watch(effectiveAppEnvironmentProvider).isApiBacked) {
     return const UnsupportedAuthRepository();
   }
   return LocalServerAuthRepository(ref.watch(devApiClientProvider));
@@ -115,6 +155,16 @@ class AuthController extends AsyncNotifier<AuthSessionVm?> {
     ref.invalidate(capabilitiesProvider);
   }
 
+  /// 会话已被服务端判定失效（refresh 也 401）：只清本地登录态，不再调用服务端。
+  /// 幂等：已经是未登录就直接返回。
+  Future<void> markSessionExpired() async {
+    if (state.asData?.value == null && state is AsyncData) return;
+    await ref.read(authTokenStoreProvider).clear();
+    state = const AsyncData(null);
+    ref.invalidate(authDevicesProvider);
+    ref.invalidate(capabilitiesProvider);
+  }
+
   Future<void> revokeDevice(String deviceId) async {
     await ref.read(authRepositoryProvider).revokeDevice(deviceId);
     ref.invalidate(authDevicesProvider);
@@ -137,8 +187,8 @@ T _pick<T>(
   required T Function() api,
 }) => switch (_mode(ref)) {
   DataSourceMode.debugFixture => fixture(),
-  DataSourceMode.localServer => api(),
-  _ => real(),
+  DataSourceMode.localServer || DataSourceMode.apiRemote => api(),
+  DataSourceMode.realLocal => real(),
 };
 
 // —— 仓库 provider（按 mode 选实现：real_local / debug_fixture / local_server）——
@@ -202,6 +252,30 @@ final dcaRepositoryProvider = Provider<DcaRepository>(
     api: () => LocalServerDcaRepository(ref.watch(devApiClientProvider)),
   ),
 );
+final instrumentRepositoryProvider = Provider<InstrumentRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalInstrumentRepository(),
+    fixture: () => const FixtureInstrumentRepository(),
+    api: () => LocalServerInstrumentRepository(ref.watch(devApiClientProvider)),
+  ),
+);
+final loanRepositoryProvider = Provider<LoanRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalLoanRepository(),
+    fixture: () => const FixtureLoanRepository(),
+    api: () => LocalServerLoanRepository(ref.watch(devApiClientProvider)),
+  ),
+);
+final agentRepositoryProvider = Provider<AgentRepository>(
+  (ref) => _pick(
+    ref,
+    real: () => const RealLocalAgentRepository(),
+    fixture: () => const FixtureAgentRepository(),
+    api: () => LocalServerAgentRepository(ref.watch(devApiClientProvider)),
+  ),
+);
 final quoteRepositoryProvider = Provider<QuoteRepository>(
   (ref) => _pick(
     ref,
@@ -260,6 +334,78 @@ final aiPendingProvider = FutureProvider<List<AiProposalVm>>(
 final recentMovementsProvider = FutureProvider<List<MovementVm>>(
   (ref) => ref.watch(movementRepositoryProvider).listRecentMovements(),
 );
+final instrumentsProvider = FutureProvider<List<InstrumentVm>>(
+  (ref) => ref.watch(instrumentRepositoryProvider).listInstruments(),
+);
+final fxRatesProvider = FutureProvider<List<FxRateVm>>(
+  (ref) => ref.watch(quoteRepositoryProvider).listFxRates(),
+);
+final agentStatusProvider = FutureProvider<AgentStatusVm>(
+  (ref) => ref.watch(agentRepositoryProvider).getStatus(),
+);
+final agentModelsProvider = FutureProvider<List<AgentModelVm>>(
+  (ref) => ref.watch(agentRepositoryProvider).listModels(),
+);
+
+/// 模型连接列表。失败要能看见错误并重试，因此关掉自动重试
+/// （Riverpod 3 默认会一直重试并把 provider 留在 loading）。
+final agentProvidersProvider = FutureProvider<List<AgentProviderVm>>(
+  (ref) => ref.watch(agentRepositoryProvider).listProviders(),
+  retry: (_, _) => null,
+);
+final agentConversationsProvider = FutureProvider<List<AgentConversationVm>>(
+  (ref) => ref.watch(agentRepositoryProvider).listConversations(),
+);
+final agentMemoriesProvider = FutureProvider<List<AgentMemoryVm>>(
+  (ref) => ref.watch(agentRepositoryProvider).listMemories(),
+);
+final agentAutomationsProvider = FutureProvider<List<AgentAutomationVm>>(
+  (ref) => ref.watch(agentRepositoryProvider).listAutomations(),
+);
+final agentNotificationsProvider = FutureProvider<List<AgentNotificationVm>>(
+  (ref) => ref.watch(agentRepositoryProvider).listNotifications(),
+);
+
+/// 未读数：入口只显示这个数字。
+final agentUnreadNotificationCountProvider = Provider<int>((ref) {
+  final list = ref.watch(agentNotificationsProvider).asData?.value ?? const [];
+  return list.where((n) => n.isUnread).length;
+});
+
+final agentQuoteCandidatesProvider =
+    FutureProvider<List<AgentQuoteCandidateVm>>(
+      (ref) => ref.watch(agentRepositoryProvider).listQuoteCandidates(),
+    );
+
+/// 附件安全元数据：历史消息先读它再决定怎么呈现，避免把非图片字节交给解码器。
+final agentAttachmentMetaProvider =
+    FutureProvider.family<AgentAttachmentVm, String>(
+      (ref, attachmentId) =>
+          ref.watch(agentRepositoryProvider).getAttachment(attachmentId),
+      retry: (_, _) => null,
+    );
+
+/// 附件原图字节（消息历史与重启后恢复预览）；失败不自动退避重试，由 UI 决定。
+final agentAttachmentBytesProvider = FutureProvider.family<Uint8List, String>(
+  (ref, attachmentId) =>
+      ref.watch(agentRepositoryProvider).getAttachmentContent(attachmentId),
+  retry: (_, _) => null,
+);
+
+/// 桌面右栏是否展开（移动端走全屏路由，不用这个开关）。
+class AgentPanelVisibility extends Notifier<bool> {
+  @override
+  bool build() => false;
+  void toggle() => state = !state;
+  void close() => state = false;
+}
+
+final agentPanelOpenProvider = NotifierProvider<AgentPanelVisibility, bool>(
+  AgentPanelVisibility.new,
+);
+final liabilityPositionsProvider = FutureProvider<List<LiabilityPositionVm>>(
+  (ref) => ref.watch(loanRepositoryProvider).listLiabilityPositions(),
+);
 final snapshotsProvider = FutureProvider<List<NetWorthSnapshotVm>>(
   (ref) => ref.watch(snapshotRepositoryProvider).listSnapshots(),
 );
@@ -315,10 +461,45 @@ extension SubscriptionRefreshX on WidgetRef {
     if (id != null) invalidate(subscriptionByIdProvider(id));
   }
 
-  /// 生成扣费候选成功后：订阅视图外还要失效 AI 待确认（候选进了复核队列）。
+  /// 生成扣费候选成功后：订阅视图外还要失效 AI 待确认（候选进了复核队列）
+  /// 与首页聚合（aiPendingCount 变了）。
   void refreshAfterChargeProposal({required String id}) {
     refreshSubscriptions(id: id);
     invalidate(aiPendingProvider);
+    invalidate(overviewProvider);
+  }
+
+  /// 到期扫描成功后：批量候选可能涉及多个订阅，全量失效订阅视图、
+  /// AI 待确认与首页聚合（pending count）。
+  void refreshAfterDueScan() {
+    refreshSubscriptions();
+    invalidate(aiPendingProvider);
+    invalidate(overviewProvider);
+  }
+}
+
+extension InvestmentTradeRefreshX on WidgetRef {
+  /// 投资成交确认成功后的刷新范围：账户/持仓/首页/构成/流水/该 movement 详情；
+  /// 快照与异常遵循现有 snapshotInvalidated 语义（ledgerWrite 视为等效信号）。
+  void refreshAfterInvestmentTrade(
+    ConfirmResultVm result, {
+    String? holdingAccountId,
+  }) {
+    invalidate(recentMovementsProvider);
+    invalidate(overviewProvider);
+    invalidate(accountsProvider);
+    invalidate(holdingsProvider);
+    invalidate(allocationProvider);
+    for (final id in result.confirmedMovementIds) {
+      invalidate(movementByIdProvider(id));
+    }
+    if (holdingAccountId != null) {
+      invalidate(holdingsByAccountProvider(holdingAccountId));
+    }
+    if (result.ledgerWrite || result.snapshotInvalidated) {
+      invalidate(snapshotsProvider);
+      invalidate(anomaliesProvider);
+    }
   }
 }
 

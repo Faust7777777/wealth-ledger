@@ -53,13 +53,20 @@ cargo run --manifest-path server-rs/Cargo.toml -- --port 8791 --ledger-path .\tm
   tokens are used only when auth env vars are absent
 - no model-backed AI; import routes create reviewable proposals only
 - outbound quote/FX/historical-price fetches are disabled by default; set
-  `FINWEALTH_QUOTE_PROVIDER=yahoo` to opt in when symbols are configured
-- validated local sync log/outbox and HTTP push/pull/ack shapes, but no remote
-  coordinator or background transport
+  `FINWEALTH_QUOTE_PROVIDER=public` for BTC/ETH/USDT plus fiat FX, or use
+  `FINWEALTH_QUOTE_PROVIDER=yahoo` for Yahoo-backed quotes and history
+- validated local sync log/outbox and HTTP push/pull/ack shapes; authenticated
+  inbound account/create is applied atomically and idempotently, but there is
+  no general remote coordinator or background transport
 - no transfer execution
 - no broker order endpoints
 - no AI direct ledger writes
 - no coupon planning
+
+For VPS deployment, `--check-production-config` validates the environment
+without starting the listener or printing secrets. It requires auth, an Argon2
+hash, loopback binding, a public Host allow-list, disabled scenario data, and a
+known quote-provider setting.
 
 ## Internal boundary
 
@@ -141,10 +148,34 @@ Persisted files for the default path pair are:
 ```text
 tmp\ledger.json       # business ledger, sync log, idempotency records
 tmp\ledger.auth.json  # optional device state and token hashes; no plaintext tokens
+tmp\ledger.json.lock  # permanent process-lease sidecar; never infer ownership from existence
 ```
 
 The sibling auth state backs login/refresh/logout and device list/revoke routes;
 it is not part of portfolio or movement derivation.
+
+Auth token issue/rotation/revocation is fail-closed on persistence errors. Auth
+state uses a synced temporary file and atomic rename; a corrupt existing auth
+state prevents startup instead of silently resetting all devices.
+
+## Exclusive local-ledger lease
+
+`--ledger-path` mode is single-process by design. Before initializing or reading
+the ledger and before opening its sibling auth state, the server acquires an
+exclusive OS file lock on a permanent sidecar formed by appending `.lock` to the
+normalized ledger path. The `LedgerLease` guard is retained by `AppState` for
+the entire server lifetime, so one lease protects both ledger and auth writes.
+
+Acquisition waits for at most three seconds by default. A second server for the
+same ledger then fails closed with a `ledger is already in use` error; it does
+not continue in a degraded mode or initialize replacement state. Process exit
+or a crash releases the lock through the operating system, but the sidecar file
+itself is deliberately never deleted. Its presence therefore does not mean a
+process currently owns the ledger.
+
+This boundary does not provide active-active service, multiple writers, or
+shared-filesystem clustering. The implementation uses Rust standard-library
+file locking and requires Rust 1.89 or newer.
 
 Running the server with `--ledger-path` makes the first self-use write paths use
 the JSON ledger when no `?scenario=` query is present:
@@ -157,16 +188,21 @@ the JSON ledger when no `?scenario=` query is present:
   `GET /v1/subscriptions/upcoming`,
   `GET/PATCH /v1/subscriptions/{subscription_id}`,
   `POST /v1/subscriptions/{subscription_id}/cancel`, and
-  `POST /v1/subscriptions/{subscription_id}/charge-proposal`; plans never
-  charge an external payment provider, and only confirmed proposals affect
-  balances
+  `POST /v1/subscriptions/{subscription_id}/charge-proposal`, plus the bounded
+  `POST /v1/subscriptions/charge-proposals/due-scan`; plans never charge an
+  external payment provider, and only confirmed proposals affect balances
 - AI proposal review: text/image/CSV import proposals, edit, approve/reject
 - snapshots: latest/list/manual baseline
 - instruments and cached market data: instrument create/update plus quote/FX
   reads and explicit quote refresh when a provider is configured
 - taxonomy: categories, counterparties, counterparty merge proposal
 - portfolio read models: overview, allocation, holdings, quote summary
-- sync outbox: pull/ack plus idempotent remote log relay; no entity merge yet
+- confirmed movement corrections: legacy single-entry amount deltas plus
+  atomic full-entry replacement for multi-leg transfers/trades; originals are
+  immutable and duplicate pending corrections are rejected
+- sync outbox: pull/ack plus authenticated, idempotent account/create inbound
+  apply; remote entries never echo into the local outbox and other entity
+  operations remain unsupported
 - crash-safe file boundary: temp contents are synced before rename; a valid temp
   is promoted only when the primary is missing, while an invalid temp blocks
   empty-ledger initialization and remains available for recovery
@@ -190,6 +226,48 @@ DCA "record executed" in real-local mode may persist a pending proposal/draft so
 the review flow survives refresh/restart. It still does not place orders,
 execute transfers, or affect the confirmed/effective ledger until the user
 confirms the atomic group.
+
+Subscription due-scan is also a real-local-only, explicit command endpoint. It
+is not a background timer: a client or scheduler must call it with a local
+calendar date and an idempotency key. Without `--ledger-path` it returns `501`
+instead of pretending that candidates were persisted. For example:
+
+```powershell
+$headers = @{ 'Idempotency-Key' = 'subscription-scan-2026-07-13' }
+$body = @{ throughDate = '2026-07-13'; limit = 100 } | ConvertTo-Json
+Invoke-RestMethod -Method Post `
+  -Uri 'http://127.0.0.1:8791/v1/subscriptions/charge-proposals/due-scan' `
+  -Headers $headers -ContentType 'application/json' -Body $body
+```
+
+The scan creates `pending_review` charge candidates only. It does not deduct an
+account balance, advance `lastChargeDate`/`nextChargeDate`, call a payment
+provider, or auto-confirm anything. Each candidate remains visible in AI review
+until the user confirms or rejects its atomic group.
+
+## Ledger schema compatibility and migrations
+
+The persisted schema remains `ledgerVersion: 1`. The migration registry is an
+intentionally empty, validated skeleton in this slice; starting the server and
+ordinary API reads do not migrate or rewrite `ledger.json`.
+
+The v1 read-compatibility layer is deliberately narrow. In memory it may add a
+missing `subscriptions` array, `syncChanges` array, or version-1
+`idempotencyState`. It may add `syncState.nextChangeSequence = 1` only when the
+`syncState` object already exists. A missing `syncState`, `syncState.cursor`, or
+`syncState.pendingChangeIds` fails validation instead of guessing sync progress
+or rebuilding the outbox. These compatibility defaults do not bump
+`ledgerVersion` or append migration history.
+
+Initialization and `.tmp` recovery happen only during explicit initialization
+or server startup. Once running, request-time reads and write transactions
+require the primary ledger to still exist; if it disappears they fail closed
+instead of silently creating a new empty ledger.
+
+A future real schema upgrade must use an explicit backup-and-migrate command:
+first create and validate a complete ledger/auth snapshot, then apply one
+unambiguous contiguous registry path, validate the result, and atomically
+replace the live ledger. No such upgrade command is exposed by this slice.
 
 The Rust dev server also accepts two temporary compatibility aliases for early
 frontend integration:
@@ -216,6 +294,10 @@ POST /v1/atomic-groups/{atomic_group_id}/confirm
 POST /v1/atomic-groups/{atomic_group_id}/reject
 ```
 
+The DCA record command requires the actual holding account, acquired quantity,
+total cash cost, quote currency, and optional execution timestamp. It creates a
+pending proposal only; the plan amount is never reused as the holding quantity.
+
 Approve/confirm responses include `ledgerWrite: false` and an empty
 `confirmedMovementIds` list when no ledger path is mounted. This is intentional
 because deterministic dev mode has no durable confirmed ledger.
@@ -234,10 +316,14 @@ python tools\local_ledger_smoke.py
 ```
 
 It verifies persistent account-create replay, account update, manual movement
-confirmation, DCA record-executed confirmation, a foreign-currency subscription
-charge proposal and confirmation, CSV/image proposal creation, AI approval,
-snapshot creation, derived overview/allocation values, forbidden broker
-endpoints, and on-disk persistence.
+confirmation, DCA record-executed confirmation, and a real-local subscription
+due-scan over multiple foreign-currency plans. The subscription checks cover
+same-key replay, different-body conflict, unchanged balance/schedule before
+confirmation, AI-review discovery, confirmed deduction/date advancement, and
+the invariant that the projected candidate is not duplicated in `aiProposals`.
+The smoke also covers CSV/image proposal creation, AI approval, snapshot
+creation, derived overview/allocation values, forbidden broker endpoints, and
+on-disk persistence.
 
 ## Checks
 

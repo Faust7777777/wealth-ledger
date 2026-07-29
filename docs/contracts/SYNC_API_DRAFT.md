@@ -100,6 +100,7 @@ SyncPushRequest {
 SyncPushResult {
   cursor: string;
   acceptedChangeIds: ID[];
+  appliedChangeIds: ID[]; // account entity and relay log committed atomically
   skippedChangeIds: ID[]; // idempotent duplicate push
   conflicts: SyncConflict[];
 }
@@ -127,10 +128,13 @@ SyncAckRequest {
 - pull 的 `cursor` 与 `changes` 来自同一次 ledger 快照；新 change sequence 会以日志内最大 `local_change_N` 自愈，避免人工回退计数器后复用 ID。
 - `POST /v1/sync/ack` 可清理本地 `pendingChangeIds`，但不删除 `syncChanges` 日志。
 - 当前 ack 仅表示单一上游接受了本地 outbox 高水位，不是逐设备 delivery receipt。
-- `POST /v1/sync/push` 会把远端 `SyncChange` 作为同步日志中继保存，给它分配本地 server cursor；不会直接应用到账本实体。
+- `POST /v1/sync/push` 的第一条入站实体切片只接受认证设备提交的 `account/create`；Bearer token 决定真实设备 ID，请求和 change 中的 `deviceId` 必须与之相同。显式关闭认证的隔离开发模式使用固定 `dev_unauthenticated_device`，也不信任请求体自报身份。
+- 入站 account create 必须携带 `baseVersion: 0` 和完整 `Account` payload，且 `payload.id == entityId`；account update、其他实体和其他 operation 均返回 400。
+- 新账户和远端 relay log 在同一次原子 ledger write 中提交，成功 ID 同时出现在 `acceptedChangeIds` 与 `appliedChangeIds`；远端日志不加入 `pendingChangeIds`，避免同步回声。
+- 相同 `(sourceDeviceId, sourceChangeId)` 重试只进入 `skippedChangeIds`。若 account ID 已存在，返回 `entity_already_exists` manual conflict，不覆盖本地实体，也不接收该远端日志。
 - 持久化日志要求 change ID 唯一且严格递增，cursor 必须指向日志尾；pending outbox ID 必须唯一、存在且只属于本地产生的 change。
-- 远端 push 的 `deviceId` 不得冒用服务端保留的 `local_device`；`createdAt` 必须是 RFC3339，服务端保存的 `(sourceDeviceId, sourceChangeId)` 必须唯一。
-- 暂不做远端 merge、冲突解决、设备密钥和 E2EE。
+- 远端 push 的 `createdAt` 与 Account 时间字段必须是 RFC3339，服务端保存的 `(sourceDeviceId, sourceChangeId)` 必须唯一。
+- 暂不做 account update、movement merge、quote/snapshot/AI proposal 同步、冲突解决、设备密钥和 E2EE。
 
 ## 5. 冲突处理
 

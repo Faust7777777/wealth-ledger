@@ -98,7 +98,7 @@ class _TransferPageState extends ConsumerState<TransferPage> {
         ref.invalidate(anomaliesProvider);
       }
       messenger.showSnackBar(
-        SnackBar(content: Text(result.ledgerWrite ? '转账已入账' : '转账已提交候选，尚未入账')),
+        SnackBar(content: Text(result.ledgerWrite ? '转账已入账' : '已加入待确认，尚未入账')),
       );
       if (mounted) router.pop();
     } catch (e) {
@@ -225,8 +225,6 @@ class _TransferPageState extends ConsumerState<TransferPage> {
                   onPressed: _canSave ? () => _save(accounts) : null,
                   child: Text(_busy ? '转账中…' : '转账'),
                 ),
-                const SizedBox(height: AppSpacing.sm),
-                Text('同额同币种转账；暂不支持跨币种折算。不下单、不连银行。', style: AppType.caption),
               ],
             );
           },
