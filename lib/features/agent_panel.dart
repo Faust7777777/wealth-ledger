@@ -296,6 +296,7 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
     });
     final statusAsync = ref.watch(agentStatusProvider);
     final conversationsAsync = ref.watch(agentConversationsProvider);
+    final modelsAsync = ref.watch(agentModelsProvider);
     final chat = ref.watch(agentChatProvider);
     conversationsAsync.whenData(_openPrimaryOnce);
 
@@ -360,12 +361,9 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
           ),
         if (chat.runError != null)
           _InlineNotice(text: chat.runError!, actionLabel: null),
-        // 选中的模型不在可用列表里：只提示重新连接，绝不替用户换一个模型。
+        // 只有模型列表成功返回后才能判定缺失；加载和请求失败不是“模型不可用”。
         if (gate == AgentPanelGate.ready &&
-            agentSelectedModelMissing(
-              active?.selectedModelId,
-              ref.watch(agentModelsProvider).asData?.value ?? const [],
-            ))
+            agentSelectedModelUnavailable(active?.selectedModelId, modelsAsync))
           AgentModelUnavailableNotice(
             onReconnect: () => context.push('/agent/providers'),
           ),

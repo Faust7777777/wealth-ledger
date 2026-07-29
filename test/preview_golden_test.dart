@@ -39,6 +39,7 @@ import 'package:finwealth/features/liability_terms_page.dart';
 import 'package:finwealth/features/loan_section.dart';
 import 'package:finwealth/features/agent_automations_page.dart';
 import 'package:finwealth/features/agent_panel.dart';
+import 'package:finwealth/features/agent_providers_page.dart';
 import 'package:finwealth/features/ai_import_text_page.dart';
 import 'package:finwealth/features/liabilities_page.dart';
 import 'package:finwealth/features/manual_record_page.dart';
@@ -1707,6 +1708,76 @@ void main() {
     ),
   );
 
+  Widget providersHost(ThemeData theme, {required bool connected}) =>
+      ProviderScope(
+        overrides: [
+          agentRepositoryProvider.overrideWithValue(
+            _PreviewAgentRepo(
+              configured: connected,
+              messages: const [],
+              memories: const [],
+              frames: const [],
+              conversations: const [],
+              providers: [
+                AgentProviderVm(
+                  id: 'xai',
+                  displayName: 'Grok',
+                  authMethods: const [AgentProviderAuthMethod.oauth],
+                  connectionStatus: connected
+                      ? AgentProviderConnectionStatus.connected
+                      : AgentProviderConnectionStatus.disconnected,
+                ),
+              ],
+            ),
+          ),
+        ],
+        child: MaterialApp(
+          theme: theme,
+          debugShowCheckedModeBanner: false,
+          home: const AgentProvidersPage(),
+        ),
+      );
+
+  for (final (name, theme) in [
+    ('dark', buildDarkTheme()),
+    ('light', buildLightTheme()),
+  ]) {
+    for (final (state, connected) in [
+      ('disconnected', false),
+      ('connected', true),
+    ]) {
+      testWidgets('agent providers $state - $name', skip: !_previewEnabled, (
+        tester,
+      ) async {
+        await sized(tester, const Size(420, 400));
+        await tester.pumpWidget(providersHost(theme, connected: connected));
+        await _settleEntrance(tester);
+        await expectLater(
+          find.byType(AgentProvidersPage),
+          matchesGoldenFile('goldens/agent_providers_${state}_$name.png'),
+        );
+      });
+    }
+
+    testWidgets('agent provider oauth sheet - $name', skip: !_previewEnabled, (
+      tester,
+    ) async {
+      await sized(tester, const Size(420, 620));
+      await tester.pumpWidget(providersHost(theme, connected: false));
+      await _settleEntrance(tester);
+      await tester.tap(find.widgetWithText(FilledButton, '连接'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+      await expectLater(
+        find.byType(AgentProviderOAuthSheet),
+        matchesGoldenFile('goldens/agent_provider_oauth_$name.png'),
+      );
+      // 关掉面板，避免轮询定时器活到测试结束。
+      await tester.binding.handlePopRoute();
+      await tester.pump(const Duration(milliseconds: 400));
+    });
+  }
+
   for (final (name, theme) in [
     ('dark', buildDarkTheme()),
     ('light', buildLightTheme()),
@@ -1892,6 +1963,7 @@ class _PreviewAgentRepo implements AgentRepository {
     this.attachmentMeta,
     this.automations = const [],
     this.notifications = const [],
+    this.providers = const [],
     this.statusFailure,
   });
 
@@ -1904,6 +1976,7 @@ class _PreviewAgentRepo implements AgentRepository {
   final AgentAttachmentVm? attachmentMeta;
   final List<AgentAutomationVm> automations;
   final List<AgentNotificationVm> notifications;
+  final List<AgentProviderVm> providers;
   final Object? statusFailure;
 
   @override
@@ -2026,10 +2099,18 @@ class _PreviewAgentRepo implements AgentRepository {
   Future<void> cancelRun(Id runId) => throw UnsupportedError('preview');
 
   @override
-  Future<List<AgentProviderVm>> listProviders() async => const [];
+  Future<List<AgentProviderVm>> listProviders() async => providers;
   @override
-  Future<AgentProviderOAuthAttemptVm> startProviderOAuth(String providerId) =>
-      throw UnsupportedError('unused');
+  Future<AgentProviderOAuthAttemptVm> startProviderOAuth(
+    String providerId,
+  ) async => AgentProviderOAuthAttemptVm(
+    attemptId: 'attempt_preview',
+    providerId: providerId,
+    status: AgentProviderOAuthStatus.pending,
+    verificationUri: 'https://x.ai/device',
+    userCode: 'WXYZ-1234',
+    expiresAt: DateTime.now().add(const Duration(minutes: 9)).toIso8601String(),
+  );
   @override
   Future<AgentProviderOAuthAttemptVm> getProviderOAuthAttempt(Id attemptId) =>
       throw UnsupportedError('unused');

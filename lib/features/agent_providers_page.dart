@@ -102,26 +102,29 @@ class _AgentProviderRowState extends ConsumerState<AgentProviderRow> {
       _busy = true;
       _error = null;
     });
+    AgentProviderOAuthAttemptVm attempt;
     try {
-      final attempt = await ref
+      attempt = await ref
           .read(agentRepositoryProvider)
           .startProviderOAuth(widget.provider.id);
-      if (!mounted) return;
-      final result = await showAgentOAuthSheet(context, attempt: attempt);
-      if (!mounted) return;
-      if (result == AgentProviderOAuthStatus.connected) {
-        await _refresh();
-        return;
-      }
-      if (result != null) {
-        setState(() => _error = agentOAuthFailureText(result));
-      }
-      await _refresh();
     } catch (_) {
-      if (mounted) setState(() => _error = '连接未成功，请重试');
-    } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted) {
+        setState(() {
+          _error = '连接未成功，请重试';
+          _busy = false;
+        });
+      }
+      return;
     }
+    if (!mounted) return;
+    // 授权面板自己显示进度，行上的转圈到此为止。
+    setState(() => _busy = false);
+    final result = await showAgentOAuthSheet(context, attempt: attempt);
+    if (!mounted) return;
+    if (result != null && result != AgentProviderOAuthStatus.connected) {
+      setState(() => _error = agentOAuthFailureText(result));
+    }
+    await _refresh();
   }
 
   Future<void> _disconnect() async {
@@ -161,6 +164,12 @@ class _AgentProviderRowState extends ConsumerState<AgentProviderRow> {
 
   @override
   Widget build(BuildContext context) {
+    final connecting =
+        widget.provider.connectionStatus ==
+        AgentProviderConnectionStatus.connecting;
+    final supportsOAuth = widget.provider.authMethods.contains(
+      AgentProviderAuthMethod.oauth,
+    );
     final connected =
         widget.provider.connectionStatus ==
         AgentProviderConnectionStatus.connected;
@@ -196,11 +205,15 @@ class _AgentProviderRowState extends ConsumerState<AgentProviderRow> {
                 )
               else if (connected)
                 TextButton(onPressed: _disconnect, child: const Text('断开连接'))
-              else
+              else if (connecting)
+                TextButton(onPressed: _refresh, child: const Text('刷新'))
+              else if (supportsOAuth)
                 FilledButton(
                   onPressed: _connect,
                   child: Text(_error == null ? '连接' : '重试'),
-                ),
+                )
+              else
+                Text('暂不支持', style: AppType.caption),
             ],
           ),
           if (_error != null)
@@ -297,6 +310,8 @@ class _AgentProviderOAuthSheetState
   Future<void> _open(String url) async {
     final uri = Uri.tryParse(url);
     if (uri == null ||
+        uri.scheme != 'https' ||
+        uri.host.isEmpty ||
         !await launchUrl(uri, mode: LaunchMode.externalApplication)) {
       if (mounted) setState(() => _notice = '打不开浏览器，请复制链接');
     }
@@ -387,6 +402,15 @@ bool agentSelectedModelMissing(
 ) {
   if (selectedModelId == null || selectedModelId.isEmpty) return false;
   return !models.any((m) => m.id == selectedModelId);
+}
+
+/// 只有模型列表成功返回后才判定不可用；加载和请求失败不冒充模型缺失。
+bool agentSelectedModelUnavailable(
+  String? selectedModelId,
+  AsyncValue<List<AgentModelVm>> models,
+) {
+  final data = models.asData;
+  return data != null && agentSelectedModelMissing(selectedModelId, data.value);
 }
 
 /// 选中的模型不可用时的提示条。绝不自动切换到别的模型。

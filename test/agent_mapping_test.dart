@@ -632,6 +632,75 @@ void main() {
     });
   });
 
+  group('模型连接映射', () {
+    test('provider 与 OAuth 状态走真实仓库路径且写请求带幂等键', () async {
+      final requests = <http.Request>[];
+      final repo = LocalServerAgentRepository(
+        DevApiClient(
+          'http://127.0.0.1:8790',
+          client: MockClient((request) async {
+            requests.add(request);
+            return switch ((request.method, request.url.path)) {
+              ('GET', '/v1/agent/providers') => _ok([
+                {
+                  'id': 'xai',
+                  'displayName': 'Grok',
+                  'authMethods': ['oauth'],
+                  'connectionStatus': 'disconnected',
+                },
+              ]),
+              ('POST', '/v1/agent/providers/xai/oauth/start') => _ok({
+                'attemptId': 'oauth_1',
+                'providerId': 'xai',
+                'status': 'pending',
+                'verificationUri': 'https://accounts.x.ai/device',
+                'userCode': 'ABCD-EFGH',
+                'expiresAt': '2026-07-29T12:00:00Z',
+              }, status: 202),
+              ('GET', '/v1/agent/provider-oauth/oauth_1') => _ok({
+                'attemptId': 'oauth_1',
+                'providerId': 'xai',
+                'status': 'connected',
+              }),
+              ('POST', '/v1/agent/providers/xai/disconnect') => _ok({
+                'disconnected': true,
+              }),
+              _ => _err(404, 'not_found'),
+            };
+          }),
+        ),
+      );
+
+      final provider = (await repo.listProviders()).single;
+      expect(provider.id, 'xai');
+      expect(provider.displayName, 'Grok');
+      expect(provider.authMethods, [AgentProviderAuthMethod.oauth]);
+      expect(
+        provider.connectionStatus,
+        AgentProviderConnectionStatus.disconnected,
+      );
+
+      final started = await repo.startProviderOAuth('xai');
+      expect(started.attemptId, 'oauth_1');
+      expect(started.status, AgentProviderOAuthStatus.pending);
+      expect(started.userCode, 'ABCD-EFGH');
+      expect(started.verificationUri, 'https://accounts.x.ai/device');
+
+      final completed = await repo.getProviderOAuthAttempt('oauth_1');
+      expect(completed.status, AgentProviderOAuthStatus.connected);
+      await repo.disconnectProvider('xai');
+
+      final writes = requests.where((request) => request.method == 'POST');
+      expect(writes, hasLength(2));
+      expect(
+        writes.every(
+          (request) => request.headers['idempotency-key']?.isNotEmpty == true,
+        ),
+        isTrue,
+      );
+    });
+  });
+
   group('SSE', () {
     test('解析 id/event/data 帧，跳过 keep-alive', () async {
       final frames = <AgentEventVm>[];
