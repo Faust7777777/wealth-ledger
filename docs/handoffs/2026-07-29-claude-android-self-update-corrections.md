@@ -1,7 +1,7 @@
 # Claude 修正单：Android 应用内更新发布阻塞项
 
-日期：2026-07-29  
-审阅基线：`feat/android-self-update @ e51f345`  
+日期：2026-07-29
+审阅基线：`feat/android-self-update @ e51f345`
 修正分支：从 `origin/feat/android-self-update` 新建，不要改后端、契约、部署和发布脚本。
 
 ## 审阅结论

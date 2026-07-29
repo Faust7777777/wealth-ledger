@@ -15,7 +15,6 @@ function Write-FakePackage([string]$Path, [string]$Marker) {
     'param([switch]$PackageIntegrityOnly); if (!$PackageIntegrityOnly) { exit 2 }; exit 0'
   )
 }
-
 try {
   $env:LOCALAPPDATA = Join-Path $temp "local"
   $cache = Join-Path $env:LOCALAPPDATA "Finwealth\updates"
@@ -74,4 +73,3 @@ try {
     Remove-Item -LiteralPath $temp -Recurse -Force
   }
 }
-
