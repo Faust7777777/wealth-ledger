@@ -17,6 +17,7 @@ const MAX_TOOL_RESPONSE_BYTES = 256 * 1024;
 const QUERY_PATHS = {
   overview: "/v1/portfolio/overview",
   accounts: "/v1/accounts",
+  instruments: "/v1/instruments",
   movements: "/v1/movements",
   holdings: "/v1/holdings",
   liabilities: "/v1/liability-positions",
@@ -86,6 +87,20 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
       `/v1/movements/${encodeURIComponent(movementId)}/submit-review`,
       undefined,
       `agent-review-${randomUUID()}`,
+      signal,
+    );
+  }
+
+  async proposeHoldingSnapshot(
+    accountId: string,
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    return this.#request(
+      "POST",
+      `/v1/accounts/${encodeURIComponent(accountId)}/holding-snapshot-proposals`,
+      input,
+      `agent-holding-snapshot-${randomUUID()}`,
       signal,
     );
   }
@@ -301,12 +316,13 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     name: "finwealth_query",
     label: "查询 Finwealth",
     description:
-      "读取 Finwealth 的权威财务数据。需要账户 ID、余额、持仓、订阅、定投、待审核项或报价时使用；不要从聊天上下文猜测财务数据。",
-    promptSnippet: "读取 Finwealth 账户、交易、持仓、负债、订阅、定投、待审核项和报价。",
+      "读取 Finwealth 的权威财务数据。需要账户 ID、标的 ID、余额、持仓、订阅、定投、待审核项或报价时使用；不要从聊天上下文猜测财务数据。",
+    promptSnippet: "读取 Finwealth 账户、标的、交易、持仓、负债、订阅、定投、待审核项和报价。",
     parameters: Type.Object({
       resource: Type.Union([
         Type.Literal("overview"),
         Type.Literal("accounts"),
+        Type.Literal("instruments"),
         Type.Literal("movements"),
         Type.Literal("holdings"),
         Type.Literal("liabilities"),
@@ -383,5 +399,40 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     },
   });
 
-  return [query, proposeMovement];
+  const proposeHoldingSnapshot = defineTool({
+    name: "finwealth_propose_holding_snapshot",
+    label: "创建持仓快照审核",
+    description:
+      "把同一交易所或钱包账户的多项资产数量整理成一个待审核持仓快照。它只创建一个整体审核组，不会确认持仓、修改余额或写入报价。必须先查询真实账户和标的 ID。",
+    promptSnippet: "把交易所、钱包文件或截图中的多资产数量整理为一个待审核持仓快照。",
+    promptGuidelines: [
+      "先用 finwealth_query 分别读取 accounts 和 holdings，并确认每个资产对应的真实 instrumentId；不要把 BTC、ETH、USDT 代码当作 ID。",
+      "同一份快照的全部资产必须一次提交；不要为每个资产分别创建账务记录。",
+      "targetQuantity 是当前总数量，不是本期增量；不得为负数。文件中不明确、无法可靠识别或不属于目标账户的资产应先询问用户。",
+      "该工具只生成待审核组；不得随后调用确认、批准或报价采用接口。",
+    ],
+    parameters: Type.Object({
+      accountId: Type.String({ minLength: 1 }),
+      asOf: Type.Optional(Type.String({ description: "带时区的 RFC3339 时间" })),
+      positions: Type.Array(
+        Type.Object({
+          instrumentId: Type.String({ minLength: 1 }),
+          targetQuantity: Type.String({ description: "非负十进制定点字符串" }),
+        }),
+        { minItems: 1, maxItems: 100 },
+      ),
+      note: Type.Optional(Type.String({ maxLength: 500 })),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      const { accountId, ...input } = params as {
+        accountId: string;
+        [key: string]: unknown;
+      };
+      const value = await client.proposeHoldingSnapshot(accountId, input, signal);
+      return { content: [{ type: "text", text: toolText(value) }], details: {} };
+    },
+  });
+
+  return [query, proposeMovement, proposeHoldingSnapshot];
 }

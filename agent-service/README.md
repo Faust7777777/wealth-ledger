@@ -13,10 +13,11 @@ Required environment:
 - `PI_CODING_AGENT_DIR`: Pi `auth.json` and `models.json` directory.
 
 The token is removed from `process.env` before any Pi session is created.
-Finance writes expose only draft plus submit-for-review; there is no confirm or
-approve tool. Built-in filesystem tools are replaced with path-checked workspace
-tools. Shell is available only on Linux through `bubblewrap`, with the dedicated
-workspace mounted and a small environment allow-list.
+Finance writes expose movement drafts plus submit-for-review and atomic holding
+snapshot proposals; there is no confirm or approve tool. Built-in filesystem
+tools are replaced with path-checked workspace tools. Shell is available only on
+Linux through `bubblewrap`, with the dedicated workspace mounted and a small
+environment allow-list.
 
 Development checks:
 

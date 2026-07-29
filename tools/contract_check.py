@@ -789,6 +789,34 @@ def check_holding_adjustment_proposal(doc: dict) -> None:
     ok("Holding adjustment proposal contract and implementation passed")
 
 
+def check_holding_snapshot_proposal(doc: dict) -> None:
+    operation = doc["paths"]["/accounts/{accountId}/holding-snapshot-proposals"]["post"]
+    schema = operation["requestBody"]["content"]["application/json"]["schema"]
+    if schema.get("$ref") != "#/components/schemas/HoldingSnapshotInput":
+        fail("Holding snapshot proposal must use HoldingSnapshotInput")
+    positions = doc["components"]["schemas"]["HoldingSnapshotInput"]["properties"]["positions"]
+    if positions.get("minItems") != 1 or positions.get("maxItems") != 100:
+        fail("Holding snapshot must accept between 1 and 100 positions")
+    local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
+    for snippet in [
+        "pub fn create_holding_snapshot_proposal(",
+        '"holding_snapshot"',
+        'group["skippedPositions"]',
+        "holding snapshot does not contain any quantity changes",
+    ]:
+        if snippet not in local_text:
+            fail(f"Holding snapshot implementation is incomplete: {snippet}")
+    rust_text = RUST_SERVER.read_text(encoding="utf-8")
+    for snippet in [
+        '"/v1/accounts/{account_id}/holding-snapshot-proposals"',
+        "local_ledger_holding_snapshot_proposes_and_confirms_multiple_positions_atomically",
+    ]:
+        if snippet not in rust_text:
+            fail(f"Holding snapshot HTTP slice is incomplete: {snippet}")
+
+    ok("Holding snapshot proposal contract and implementation passed")
+
+
 def check_multi_hop_valuation() -> None:
     local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
     for snippet in [
@@ -2347,6 +2375,7 @@ def main() -> None:
     check_local_ledger_reference_integrity()
     check_quote_problem_summary(doc)
     check_holding_adjustment_proposal(doc)
+    check_holding_snapshot_proposal(doc)
     check_multi_hop_valuation()
     check_public_quote_provider()
     check_yield_interest_slice(doc)

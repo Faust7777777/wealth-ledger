@@ -573,23 +573,32 @@ test("Finwealth client reads data and submits a draft only to review", async () 
     method: string | undefined;
     path: string | undefined;
     token: string | undefined;
+    key: string | undefined;
+    body: unknown;
   }> = [];
   const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
     requests.push({
       method: request.method,
       path: request.url,
       token: typeof request.headers["x-finwealth-internal-token"] === "string"
         ? request.headers["x-finwealth-internal-token"]
         : undefined,
+      key: typeof request.headers["idempotency-key"] === "string"
+        ? request.headers["idempotency-key"]
+        : undefined,
+      body: chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined,
     });
     let data: unknown = [];
     let status = 200;
     if (request.url === "/v1/movements/drafts") {
-      for await (const _chunk of request) { /* consume request */ }
       data = { id: "mov_agent_draft" };
       status = 201;
     } else if (request.url === "/v1/movements/mov_agent_draft/submit-review") {
       data = { id: "grp_agent_review", status: "pending" };
+    } else if (request.url === "/v1/accounts/acct%2Fokx/holding-snapshot-proposals") {
+      data = { id: "grp_holding_snapshot", status: "pending" };
     }
     response.writeHead(status, { "content-type": "application/json" });
     response.end(JSON.stringify({ ok: true, data }));
@@ -603,6 +612,7 @@ test("Finwealth client reads data and submits a draft only to review", async () 
       "sidecar-secret",
     );
     await client.query("accounts");
+    await client.query("instruments");
     await client.lookupStructuredQuotes({
       currencyPairs: [{ baseCurrency: "USD", quoteCurrency: "CNY" }],
     });
@@ -611,6 +621,14 @@ test("Finwealth client reads data and submits a draft only to review", async () 
       occurredAt: "2026-07-28T00:00:00Z",
       title: "午餐",
       entries: [],
+    });
+    await client.proposeHoldingSnapshot("acct/okx", {
+      asOf: "2026-07-29T10:00:00Z",
+      positions: [
+        { instrumentId: "inst_btc_usdt", targetQuantity: "0.25" },
+        { instrumentId: "inst_eth_usdt", targetQuantity: "3.2" },
+      ],
+      note: "OKX 持仓快照",
     });
   } finally {
     await new Promise<void>((resolve, reject) =>
@@ -622,14 +640,26 @@ test("Finwealth client reads data and submits a draft only to review", async () 
     requests.map((item) => `${item.method} ${item.path}`),
     [
       "GET /v1/accounts",
+      "GET /v1/instruments",
       "POST /v1/quotes/lookup",
       "POST /v1/movements/drafts",
       "POST /v1/movements/mov_agent_draft/submit-review",
+      "POST /v1/accounts/acct%2Fokx/holding-snapshot-proposals",
     ],
   );
   assert.ok(requests.every((item) => item.token === "sidecar-secret"));
   assert.ok(requests.every((item) => !item.path?.includes("confirm")));
   assert.ok(requests.every((item) => !item.path?.includes("approve")));
+  const snapshot = requests.at(-1);
+  assert.match(snapshot?.key ?? "", /^agent-holding-snapshot-/);
+  assert.deepEqual(snapshot?.body, {
+    asOf: "2026-07-29T10:00:00Z",
+    positions: [
+      { instrumentId: "inst_btc_usdt", targetQuantity: "0.25" },
+      { instrumentId: "inst_eth_usdt", targetQuantity: "3.2" },
+    ],
+    note: "OKX 持仓快照",
+  });
 });
 
 test("Finwealth client applies an approved quote with a stable candidate idempotency key", async () => {

@@ -358,6 +358,27 @@ paths:
               schema:
                 $ref: "#/components/schemas/AiAtomicGroupResponse"
 
+  /accounts/{accountId}/holding-snapshot-proposals:
+    post:
+      tags: [Portfolio]
+      summary: Propose one atomic review group for a multi-asset holding snapshot.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HoldingSnapshotInput"
+      responses:
+        "200":
+          description: Pending atomic group containing one movement per changed position.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AiAtomicGroupResponse"
+
   /portfolio/overview:
     get:
       tags: [Portfolio]
@@ -3332,6 +3353,42 @@ components:
           $ref: "#/components/schemas/ISODateTime"
         note:
           type: string
+    HoldingSnapshotPositionInput:
+      type: object
+      required: [instrumentId, targetQuantity]
+      additionalProperties: false
+      properties:
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        targetQuantity:
+          allOf:
+            - $ref: "#/components/schemas/DecimalString"
+          description: Desired current quantity; must be non-negative.
+    HoldingSnapshotInput:
+      type: object
+      required: [positions]
+      additionalProperties: false
+      properties:
+        positions:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/HoldingSnapshotPositionInput"
+        asOf:
+          $ref: "#/components/schemas/ISODateTime"
+        note:
+          type: string
+    HoldingSnapshotSkippedPosition:
+      type: object
+      required: [instrumentId, quantity, reason]
+      properties:
+        instrumentId:
+          $ref: "#/components/schemas/ID"
+        quantity:
+          $ref: "#/components/schemas/DecimalString"
+        reason:
+          enum: [unchanged]
     YieldAccrual:
       type: object
       required:
@@ -4124,6 +4181,11 @@ components:
           items:
             type: object
             additionalProperties: true
+        skippedPositions:
+          type: array
+          description: Snapshot positions omitted because their quantity was unchanged.
+          items:
+            $ref: "#/components/schemas/HoldingSnapshotSkippedPosition"
         diffs:
           type: array
           items:
