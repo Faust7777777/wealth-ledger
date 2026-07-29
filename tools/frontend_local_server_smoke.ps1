@@ -79,6 +79,7 @@ try {
       test/local_server_dca_integration_test.dart `
       test/local_server_investment_trade_integration_test.dart `
       test/local_server_holding_adjustment_integration_test.dart `
+      test/local_server_holding_snapshot_integration_test.dart `
       test/local_server_loan_interest_integration_test.dart `
       test/local_server_ai_text_integration_test.dart
     $flutterExitCode = $LASTEXITCODE
