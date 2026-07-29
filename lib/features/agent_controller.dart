@@ -203,6 +203,10 @@ class AgentChatController extends Notifier<AgentChatState> {
         state = state.copyWith(activity: agentToolLabel(event.toolName));
       case AgentEventType.toolCompleted:
         state = state.copyWith(activity: null);
+        // 报价类工具刚写完候选：提前刷一次，入口不用等整轮结束。
+        if (agentToolMayCreateQuoteCandidate(event.toolName)) {
+          ref.invalidate(agentQuoteCandidatesProvider);
+        }
       case AgentEventType.runCompleted:
         _setStatus(event.assistantMessageId, AgentMessageStatus.completed);
         if (event.assistantMessageId != null) {
@@ -216,6 +220,8 @@ class AgentChatController extends Notifier<AgentChatState> {
         // Agent 的账务产出只会落到既有待审核列表，这里只刷新入口计数。
         ref.invalidate(aiPendingProvider);
         ref.invalidate(overviewProvider);
+        // 报价候选由工具在服务端写入，客户端只能在一轮结束时重新读取。
+        ref.invalidate(agentQuoteCandidatesProvider);
       case AgentEventType.runFailed:
         _setStatus(event.assistantMessageId, AgentMessageStatus.failed);
         if (event.assistantMessageId != null) {
@@ -226,6 +232,8 @@ class AgentChatController extends Notifier<AgentChatState> {
           activity: null,
           runError: agentRunErrorMessage(event.code),
         );
+        // 失败的一轮也可能已经写下候选（例如报价工具成功、后续步骤失败）。
+        ref.invalidate(agentQuoteCandidatesProvider);
       case AgentEventType.unknown:
         break;
     }

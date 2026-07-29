@@ -169,6 +169,10 @@ class _PanelRepo implements AgentRepository {
   @override
   Future<void> disconnectProvider(String providerId) =>
       throw UnsupportedError('unused');
+
+  @override
+  Future<void> deleteConversation(Id conversationId) =>
+      throw UnsupportedError('unused');
 }
 
 Widget _panelHost(_PanelRepo repo) => ProviderScope(

@@ -608,6 +608,8 @@ class FixtureAgentRepository implements AgentRepository {
     String? modelId,
   }) async => _unsupported();
   @override
+  Future<void> deleteConversation(Id conversationId) async => _unsupported();
+  @override
   Future<List<AgentMessageVm>> listMessages(Id conversationId) async =>
       const [];
   @override

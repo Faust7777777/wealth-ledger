@@ -189,6 +189,19 @@ class _NeedsLoginBlock extends StatelessWidget {
   );
 }
 
+/// 列表已按 updatedAt 降序，取第一条活跃会话；没有活跃会话返回 null。
+AgentConversationVm? agentLatestActive(
+  List<AgentConversationVm> conversations, {
+  String? excludeId,
+}) {
+  for (final c in conversations) {
+    if (c.status != AgentConversationStatus.active) continue;
+    if (excludeId != null && c.id == excludeId) continue;
+    return c;
+  }
+  return null;
+}
+
 class AgentPanel extends ConsumerStatefulWidget {
   const AgentPanel({super.key, this.onClose});
 
@@ -199,7 +212,8 @@ class AgentPanel extends ConsumerStatefulWidget {
   ConsumerState<AgentPanel> createState() => _AgentPanelState();
 }
 
-class _AgentPanelState extends ConsumerState<AgentPanel> {
+class _AgentPanelState extends ConsumerState<AgentPanel>
+    with WidgetsBindingObserver {
   final _draft = TextEditingController();
   final _pending = <({AgentAttachmentVm meta, Uint8List bytes})>[];
   bool _uploading = false;
@@ -207,21 +221,36 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
   bool _opened = false;
 
   @override
+  void initState() {
+    super.initState();
+    // 观察者只在面板挂载时注册一次：rebuild 不会产生额外请求，
+    // 面板不可见时也不会有任何轮询或后台 timer。
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed || !mounted) return;
+    // 回到前台且面板可见：重新读取一次候选，其余时间不请求。
+    ref.invalidate(agentQuoteCandidatesProvider);
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _draft.dispose();
     super.dispose();
   }
 
-  /// 首次可用时进入主会话；会话列表变化不重复打开。
-  void _openPrimaryOnce(List<AgentConversationVm> conversations) {
-    if (_opened || conversations.isEmpty) return;
+  /// 首次可用时进入最新的活跃会话（列表已按 updatedAt 降序）。
+  /// 只做一次：之后列表刷新不得把用户从自己选中的会话上拽走。
+  void _openLatestActiveOnce(List<AgentConversationVm> conversations) {
+    if (_opened) return;
+    final target = agentLatestActive(conversations);
+    if (target == null) return;
     _opened = true;
-    final primary = conversations.firstWhere(
-      (c) => c.isPrimary,
-      orElse: () => conversations.first,
-    );
     Future.microtask(
-      () => ref.read(agentChatProvider.notifier).open(primary.id),
+      () => ref.read(agentChatProvider.notifier).open(target.id),
     );
   }
 
@@ -299,7 +328,7 @@ class _AgentPanelState extends ConsumerState<AgentPanel> {
     final conversationsAsync = ref.watch(agentConversationsProvider);
     final modelsAsync = ref.watch(agentModelsProvider);
     final chat = ref.watch(agentChatProvider);
-    conversationsAsync.whenData(_openPrimaryOnce);
+    conversationsAsync.whenData(_openLatestActiveOnce);
 
     // status 只有成功返回才谈"配置"；loading / 401 / 其他错误各走各的分支，
     // 绝不折叠成"服务器尚未配置模型"。
@@ -413,6 +442,54 @@ class _Header extends ConsumerWidget {
     }
   }
 
+  /// 永久删除一个已归档会话。确认框只出现标题与「永久删除」，
+  /// 不出现内部 id、路径或长解释。409（服务端已拒绝）只重新拉列表并给一句状态。
+  Future<void> _delete(
+    BuildContext context,
+    WidgetRef ref,
+    AgentConversationVm target,
+  ) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        content: Text(target.title),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(c, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(c, true),
+            child: const Text('永久删除'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    String? failure;
+    try {
+      await ref.read(agentRepositoryProvider).deleteConversation(target.id);
+    } on ApiConflictException {
+      failure = '会话状态已变化';
+    } catch (_) {
+      failure = '删除未成功，请重试';
+    } finally {
+      ref.invalidate(agentConversationsProvider);
+    }
+    if (failure == null &&
+        ref.read(agentChatProvider).conversationId == target.id) {
+      final next = agentLatestActive(conversations, excludeId: target.id);
+      if (next != null) {
+        await ref.read(agentChatProvider.notifier).open(next.id);
+      }
+    }
+    if (failure != null && context.mounted) {
+      ScaffoldMessenger.maybeOf(
+        context,
+      )?.showSnackBar(SnackBar(content: Text(failure)));
+    }
+  }
+
   Future<void> _rename(BuildContext context, WidgetRef ref) async {
     final current = active;
     if (current == null) return;
@@ -455,12 +532,38 @@ class _Header extends ConsumerWidget {
       for (final c in conversations)
         if (c.status == AgentConversationStatus.active) c,
     ];
+    // 主会话不参与归档与删除，这里也不会出现在归档列表里。
+    final archived = [
+      for (final c in conversations)
+        if (c.status == AgentConversationStatus.archived && !c.isPrimary) c,
+    ];
     final choice = await showAgentConversationSheet(
       context,
       active: active,
       conversations: visible,
+      archived: archived,
     );
     if (choice == null || !context.mounted) return;
+    if (choice.startsWith(kAgentMenuRestorePrefix)) {
+      final id = choice.substring(kAgentMenuRestorePrefix.length);
+      await _mutate(ref, () async {
+        await ref
+            .read(agentRepositoryProvider)
+            .updateConversation(id, status: AgentConversationStatus.active);
+        await ref.read(agentChatProvider.notifier).open(id);
+      });
+      return;
+    }
+    if (choice.startsWith(kAgentMenuDeletePrefix)) {
+      final id = choice.substring(kAgentMenuDeletePrefix.length);
+      final target = archived
+          .where((c) => c.id == id)
+          .cast<AgentConversationVm?>()
+          .firstWhere((c) => true, orElse: () => null);
+      if (target == null || !context.mounted) return;
+      await _delete(context, ref, target);
+      return;
+    }
     switch (choice) {
       case kAgentMenuNewConversation:
         await _mutate(ref, () async {
@@ -481,11 +584,10 @@ class _Header extends ConsumerWidget {
                 current.id,
                 status: AgentConversationStatus.archived,
               );
-          final primary = visible.firstWhere(
-            (c) => c.isPrimary,
-            orElse: () => visible.first,
-          );
-          await ref.read(agentChatProvider.notifier).open(primary.id);
+          final next = agentLatestActive(visible, excludeId: current.id);
+          if (next != null) {
+            await ref.read(agentChatProvider.notifier).open(next.id);
+          }
         });
       default:
         await ref.read(agentChatProvider.notifier).open(choice);
@@ -556,6 +658,14 @@ const kAgentMenuNewConversation = '__agent_menu_new__';
 const kAgentMenuRenameConversation = '__agent_menu_rename__';
 const kAgentMenuArchiveConversation = '__agent_menu_archive__';
 
+/// 归档项动作：前缀 + 会话 id。
+const kAgentMenuRestorePrefix = '__agent_menu_restore__:';
+const kAgentMenuDeletePrefix = '__agent_menu_delete__:';
+
+/// 归档入口与归档列表的稳定 Key。
+const kAgentArchivedEntryKey = ValueKey('agent_archived_entry');
+const kAgentArchivedListKey = ValueKey('agent_archived_list');
+
 Future<String?> showAgentModelSheet(
   BuildContext context, {
   required AgentConversationVm active,
@@ -608,25 +718,42 @@ Future<String?> showAgentConversationSheet(
   BuildContext context, {
   required AgentConversationVm? active,
   required List<AgentConversationVm> conversations,
+  List<AgentConversationVm> archived = const [],
 }) => showModalBottomSheet<String>(
   context: context,
   showDragHandle: true,
   isScrollControlled: true,
-  builder: (_) =>
-      AgentConversationSheet(active: active, conversations: conversations),
+  builder: (_) => AgentConversationSheet(
+    active: active,
+    conversations: conversations,
+    archived: archived,
+  ),
 );
 
-class AgentConversationSheet extends StatelessWidget {
+class AgentConversationSheet extends StatefulWidget {
   const AgentConversationSheet({
     super.key,
     required this.active,
     required this.conversations,
+    this.archived = const [],
   });
   final AgentConversationVm? active;
   final List<AgentConversationVm> conversations;
+  final List<AgentConversationVm> archived;
+
+  @override
+  State<AgentConversationSheet> createState() => _AgentConversationSheetState();
+}
+
+class _AgentConversationSheetState extends State<AgentConversationSheet> {
+  // 归档列表在同一个 sheet 里展开，不新开一层路由，返回键行为不变。
+  bool _showArchived = false;
 
   @override
   Widget build(BuildContext context) {
+    final active = widget.active;
+    final conversations = widget.conversations;
+    final archived = widget.archived;
     final current = active;
     final maxHeight = (MediaQuery.sizeOf(context).height * 0.7).clamp(
       200.0,
@@ -636,6 +763,49 @@ class AgentConversationSheet extends StatelessWidget {
       for (final c in conversations)
         if (c.id != current?.id) c,
     ];
+    if (_showArchived) {
+      return SafeArea(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: maxHeight),
+          child: ListView(
+            key: kAgentArchivedListKey,
+            shrinkWrap: true,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.arrow_back, size: 20),
+                title: const Text('返回'),
+                onTap: () => setState(() => _showArchived = false),
+              ),
+              const Divider(height: 1),
+              for (final c in archived)
+                ListTile(
+                  key: ValueKey('agent_archived_${c.id}'),
+                  title: Text(c.title, overflow: TextOverflow.ellipsis),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextButton(
+                        key: ValueKey('agent_restore_${c.id}'),
+                        onPressed: () => Navigator.of(
+                          context,
+                        ).pop('$kAgentMenuRestorePrefix${c.id}'),
+                        child: const Text('恢复'),
+                      ),
+                      TextButton(
+                        key: ValueKey('agent_delete_${c.id}'),
+                        onPressed: () => Navigator.of(
+                          context,
+                        ).pop('$kAgentMenuDeletePrefix${c.id}'),
+                        child: const Text('删除'),
+                      ),
+                    ],
+                  ),
+                ),
+            ],
+          ),
+        ),
+      );
+    }
     return SafeArea(
       child: ConstrainedBox(
         constraints: BoxConstraints(maxHeight: maxHeight),
@@ -668,6 +838,16 @@ class AgentConversationSheet extends StatelessWidget {
                 title: Text(c.title, overflow: TextOverflow.ellipsis),
                 onTap: () => Navigator.of(context).pop(c.id),
               ),
+            if (archived.isNotEmpty) ...[
+              const Divider(height: 1),
+              ListTile(
+                key: kAgentArchivedEntryKey,
+                leading: const Icon(Icons.inventory_2_outlined, size: 20),
+                title: Text('已归档 ${archived.length}'),
+                trailing: const Icon(Icons.chevron_right, size: 20),
+                onTap: () => setState(() => _showArchived = true),
+              ),
+            ],
           ],
         ),
       ),

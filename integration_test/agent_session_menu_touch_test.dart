@@ -187,6 +187,10 @@ class _MenuRepo implements AgentRepository {
   @override
   Future<void> disconnectProvider(String providerId) =>
       throw UnsupportedError('unused');
+
+  @override
+  Future<void> deleteConversation(Id conversationId) =>
+      throw UnsupportedError('unused');
 }
 
 /// 全屏页宿主：与 Android 上的实际结构一致（Scaffold + AgentPage）。

@@ -180,6 +180,10 @@ class _FakeAgentRepo implements AgentRepository {
   @override
   Future<void> disconnectProvider(String providerId) =>
       throw UnsupportedError('unused');
+
+  @override
+  Future<void> deleteConversation(Id conversationId) =>
+      throw UnsupportedError('unused');
 }
 
 ProviderContainer _container(_FakeAgentRepo repo) {

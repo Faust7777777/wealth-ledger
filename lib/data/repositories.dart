@@ -154,6 +154,9 @@ abstract interface class AgentRepository {
     String? modelId,
   });
 
+  /// 永久删除一个已归档的非主会话。服务端拒绝删除主会话与活跃会话。
+  Future<void> deleteConversation(Id conversationId);
+
   Future<List<AgentMessageVm>> listMessages(Id conversationId);
   Future<AgentRunAcceptedVm> sendMessage(
     Id conversationId, {

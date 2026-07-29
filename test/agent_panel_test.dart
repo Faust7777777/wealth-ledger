@@ -257,6 +257,10 @@ class _FakeAgentRepo implements AgentRepository {
   @override
   Future<void> disconnectProvider(String providerId) =>
       throw UnsupportedError('unused');
+
+  @override
+  Future<void> deleteConversation(Id conversationId) =>
+      throw UnsupportedError('unused');
 }
 
 /// Riverpod 未导出 Override 类型，覆盖列表只能就地写在 ProviderScope 里。

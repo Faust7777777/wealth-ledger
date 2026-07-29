@@ -202,6 +202,9 @@ class DevApiClient {
   Future<Object?> patchData(String path, {Object? body}) =>
       _send('PATCH', path, body: body);
 
+  /// 真删除。与其他写入一样带 Idempotency-Key，401 重放复用同一个 key。
+  Future<Object?> deleteData(String path) => _send('DELETE', path);
+
   /// multipart 上传（Agent 附件）。写入语义与 JSON POST 一致：
   /// 首次调用前生成 Idempotency-Key，401 刷新后的重放复用同一个 key，
   /// 不会因为重试重复归档同一张图。
@@ -385,6 +388,7 @@ class DevApiClient {
       'GET' => _client.get(uri, headers: headers),
       'POST' => _client.post(uri, headers: headers, body: encoded),
       'PATCH' => _client.patch(uri, headers: headers, body: encoded),
+      'DELETE' => _client.delete(uri, headers: headers),
       _ => throw ArgumentError.value(method, 'method'),
     };
   }
@@ -2089,6 +2093,11 @@ class LocalServerAgentRepository implements AgentRepository {
       ),
     ),
   );
+
+  @override
+  Future<void> deleteConversation(Id conversationId) async {
+    await _c.deleteData('/v1/agent/conversations/$conversationId');
+  }
 
   @override
   Future<List<AgentMessageVm>> listMessages(Id conversationId) async => [

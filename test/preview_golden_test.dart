@@ -2313,6 +2313,10 @@ class _PreviewAgentRepo implements AgentRepository {
   @override
   Future<void> disconnectProvider(String providerId) =>
       throw UnsupportedError('unused');
+
+  @override
+  Future<void> deleteConversation(Id conversationId) =>
+      throw UnsupportedError('unused');
 }
 
 /// 预览用 AI 提案仓库。

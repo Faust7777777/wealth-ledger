@@ -10,5 +10,15 @@ const Map<String, String> _knownToolLabels = {
   'finwealth_lookup_fx_candidate': '正在查询汇率…',
 };
 
+/// 会写入报价/汇率候选的工具：完成后值得立刻重新读取候选列表。
+const Set<String> _quoteCandidateTools = {
+  'finwealth_lookup_quote_candidate',
+  'finwealth_lookup_fx_candidate',
+  'finwealth_suggest_quote',
+};
+
+bool agentToolMayCreateQuoteCandidate(String? toolName) =>
+    toolName != null && _quoteCandidateTools.contains(toolName);
+
 String agentToolLabel(String? toolName) =>
     _knownToolLabels[toolName] ?? '正在处理…';
