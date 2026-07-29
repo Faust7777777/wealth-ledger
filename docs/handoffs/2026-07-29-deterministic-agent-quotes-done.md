@@ -32,4 +32,7 @@
 
 ## 生产验收
 
-部署 Rust 与 Agent sidecar 后，运行 `tools/agent_vps_web_quote_smoke.py`。该脚本现在验证 Grok 调用结构化 USD/CNY 工具、不调用 bash 或网页候选工具、只生成一条待审核候选，且候选前后权威报价摘要完全不变。
+- Rust 与 Agent sidecar 已从 `c9688c5` 部署；部署前分别备份了账本/认证状态与 Agent 状态，并保留旧二进制和旧 Agent dist。
+- 生产原配置仍为 `FINWEALTH_QUOTE_PROVIDER=none`，已窄改为 `public`；未修改 sub2api、Cloudflare、Caddy 或同机中转服务。
+- `check_vps_readiness.sh --public-base-url https://wuwaidut.com`：通过。
+- `tools/agent_vps_web_quote_smoke.py`：真实 Grok 调用结构化 USD/CNY 工具，不调用 bash 或网页候选工具，只生成一条待审核候选；候选前后权威报价摘要完全不变。
