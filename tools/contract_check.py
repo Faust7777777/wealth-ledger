@@ -801,7 +801,9 @@ def check_holding_snapshot_proposal(doc: dict) -> None:
     for snippet in [
         "pub fn create_holding_snapshot_proposal(",
         '"holding_snapshot"',
+        '"holdingSnapshot": {',
         'group["skippedPositions"]',
+        'movement.get("holdingSnapshot")',
         "holding snapshot does not contain any quantity changes",
     ]:
         if snippet not in local_text:

@@ -104,6 +104,15 @@ void main() {
       );
       expect(second.skippedPositions.single.instrumentId, eth.id);
       expect(second.skippedPositions.single.reason, 'unchanged');
+      // 创建响应之后重新读取待审核列表，快照元数据仍必须存在；
+      // App 实际会走这条刷新路径，而不是一直持有 POST 的即时响应。
+      final pending = await aiRepo.listPending();
+      final reloaded = pending
+          .expand((proposal) => proposal.groups)
+          .singleWhere((candidate) => candidate.id == second.id);
+      expect(reloaded.title, '更新快照联调交易所持仓');
+      expect(reloaded.proposedMovements, hasLength(1));
+      expect(reloaded.skippedPositions.single.instrumentId, eth.id);
       await aiRepo.approveAtomicGroup(second.id);
       expect(compareDecimal((await quantities())[btc.id]!, '0.4'), 0);
 

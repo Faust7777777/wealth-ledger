@@ -2286,6 +2286,11 @@ pub fn create_holding_snapshot_proposal(
                     "previousQuantity": previous.decimal_string(),
                     "targetQuantity": target.decimal_string()
                 },
+                "holdingSnapshot": {
+                    "accountId": account_id,
+                    "title": group_title,
+                    "skippedPositions": skipped.clone()
+                },
                 "tags": ["holding_adjustment", "holding_snapshot"],
                 "source": {"kind": "manual", "createdBy": "user"},
                 "createdAt": now,
@@ -4257,6 +4262,21 @@ fn standalone_pending_movement_group_proposal(movements: &[&Value]) -> Value {
             .map(|movement| project_movement_for_api(movement))
             .collect::<Vec<_>>()
     );
+    if let Some(snapshot) = movements
+        .iter()
+        .find_map(|movement| movement.get("holdingSnapshot"))
+    {
+        if let Some(title) = snapshot.get("title").and_then(Value::as_str) {
+            group["title"] = json!(title);
+        }
+        if let Some(account_id) = snapshot.get("accountId").and_then(Value::as_str) {
+            group["targetType"] = json!("holding");
+            group["targetId"] = json!(account_id);
+        }
+        if let Some(skipped) = snapshot.get("skippedPositions") {
+            group["skippedPositions"] = skipped.clone();
+        }
+    }
     group["warnings"] = warnings.clone();
     if let Some(subscription_id) = movement.get("subscriptionId").and_then(Value::as_str) {
         group["subscriptionId"] = json!(subscription_id);
@@ -5888,6 +5908,14 @@ fn validate_movements<'a>(
                 validate_movement_semantics(document, movement_type, entries, errors);
             }
             validate_holding_adjustment_metadata(movement, movement_type, entries, index, errors);
+            validate_holding_snapshot_metadata(
+                movement,
+                movement_type,
+                entries,
+                index,
+                instrument_ids,
+                errors,
+            );
             validate_yield_accrual_metadata(
                 document,
                 movement,
@@ -5999,6 +6027,95 @@ fn validate_holding_adjustment_metadata(
             errors.push(format!(
                 "movements[{movement_index}].holdingAdjustment delta must match the entry"
             ));
+        }
+    }
+}
+
+fn validate_holding_snapshot_metadata(
+    movement: &serde_json::Map<String, Value>,
+    movement_type: &str,
+    entries: &[Value],
+    movement_index: usize,
+    instrument_ids: &BTreeSet<&str>,
+    errors: &mut Vec<String>,
+) {
+    let tagged = movement
+        .get("tags")
+        .and_then(Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter()
+                .any(|tag| tag.as_str() == Some("holding_snapshot"))
+        });
+    let Some(snapshot) = movement.get("holdingSnapshot") else {
+        if tagged {
+            errors.push(format!(
+                "movements[{movement_index}].holdingSnapshot is required for a holding_snapshot movement"
+            ));
+        }
+        return;
+    };
+    if !tagged || movement_type != "adjustment" || entries.len() != 1 {
+        errors.push(format!(
+            "movements[{movement_index}].holdingSnapshot is only valid on a tagged holding adjustment"
+        ));
+        return;
+    }
+    let Some(snapshot) = snapshot.as_object() else {
+        errors.push(format!(
+            "movements[{movement_index}].holdingSnapshot must be an object"
+        ));
+        return;
+    };
+    let account_id = snapshot.get("accountId").and_then(Value::as_str);
+    if account_id.is_none_or(str::is_empty)
+        || account_id != entries[0].get("accountId").and_then(Value::as_str)
+    {
+        errors.push(format!(
+            "movements[{movement_index}].holdingSnapshot.accountId must match the entry"
+        ));
+    }
+    if snapshot
+        .get("title")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        errors.push(format!(
+            "movements[{movement_index}].holdingSnapshot.title must be a non-empty string"
+        ));
+    }
+    let Some(skipped) = snapshot.get("skippedPositions").and_then(Value::as_array) else {
+        errors.push(format!(
+            "movements[{movement_index}].holdingSnapshot.skippedPositions must be an array"
+        ));
+        return;
+    };
+    let mut seen = BTreeSet::new();
+    for (skipped_index, item) in skipped.iter().enumerate() {
+        let label = format!(
+            "movements[{movement_index}].holdingSnapshot.skippedPositions[{skipped_index}]"
+        );
+        let Some(item) = item.as_object() else {
+            errors.push(format!("{label} must be an object"));
+            continue;
+        };
+        let instrument_id = item.get("instrumentId").and_then(Value::as_str);
+        if instrument_id.is_none_or(|id| !instrument_ids.contains(id) || !seen.insert(id)) {
+            errors.push(format!(
+                "{label}.instrumentId must reference one unique instrument"
+            ));
+        }
+        if item
+            .get("quantity")
+            .and_then(Value::as_str)
+            .and_then(|value| parse_decimal(value).ok())
+            .is_none_or(|value| value < DecimalAmount::ZERO)
+        {
+            errors.push(format!(
+                "{label}.quantity must be a non-negative decimal string"
+            ));
+        }
+        if item.get("reason").and_then(Value::as_str) != Some("unchanged") {
+            errors.push(format!("{label}.reason must be unchanged"));
         }
     }
 }

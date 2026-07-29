@@ -10027,6 +10027,28 @@ mod tests {
             "inst_btc_usdt"
         );
         let partial_group = partial_body["data"]["id"].as_str().expect("partial group");
+        let (pending_status, pending_body) =
+            request_json_from(router.clone(), Method::GET, "/v1/ai/proposals/pending").await;
+        assert_eq!(pending_status, StatusCode::OK, "{pending_body}");
+        let reloaded_group = pending_body["data"]
+            .as_array()
+            .expect("pending proposals")
+            .iter()
+            .flat_map(|proposal| {
+                proposal["atomicGroups"]
+                    .as_array()
+                    .expect("atomic groups")
+                    .iter()
+            })
+            .find(|group| group["id"].as_str() == Some(partial_group))
+            .expect("reloaded snapshot group");
+        assert_eq!(reloaded_group["title"], "更新OKX持仓");
+        assert_eq!(reloaded_group["targetType"], "holding");
+        assert_eq!(reloaded_group["targetId"], account_id);
+        assert_eq!(
+            reloaded_group["skippedPositions"][0]["instrumentId"],
+            "inst_btc_usdt"
+        );
         let (partial_confirm_status, partial_confirm_body) = request_json_from(
             router.clone(),
             Method::POST,

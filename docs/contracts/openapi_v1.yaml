@@ -3389,6 +3389,18 @@ components:
           $ref: "#/components/schemas/DecimalString"
         reason:
           enum: [unchanged]
+    HoldingSnapshotMetadata:
+      type: object
+      required: [accountId, title, skippedPositions]
+      properties:
+        accountId:
+          $ref: "#/components/schemas/ID"
+        title:
+          type: string
+        skippedPositions:
+          type: array
+          items:
+            $ref: "#/components/schemas/HoldingSnapshotSkippedPosition"
     YieldAccrual:
       type: object
       required:
@@ -3561,6 +3573,8 @@ components:
           $ref: "#/components/schemas/InvestmentReplacement"
         holdingAdjustment:
           $ref: "#/components/schemas/HoldingAdjustment"
+        holdingSnapshot:
+          $ref: "#/components/schemas/HoldingSnapshotMetadata"
         yieldAccrual:
           $ref: "#/components/schemas/YieldAccrual"
         loanInterestAccrual:
