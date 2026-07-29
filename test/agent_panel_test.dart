@@ -14,6 +14,7 @@ import 'package:finwealth/data/api_mock_repositories.dart'
 import 'package:finwealth/data/providers.dart';
 import 'package:finwealth/data/repositories.dart';
 import 'package:finwealth/data/view_models.dart';
+import 'package:finwealth/features/agent_chat_view.dart';
 import 'package:finwealth/features/agent_panel.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -977,7 +978,7 @@ void main() {
         // 外层只有一条入口，聊天消息仍然可见且有可用高度。
         expect(find.text('报价建议 10'), findsOneWidget);
         expect(find.text('这是会话里的一条历史消息'), findsOneWidget);
-        final list = tester.getRect(find.byType(ListView).first);
+        final list = tester.getRect(find.byType(AgentTranscript));
         expect(
           list.height,
           greaterThan(120),

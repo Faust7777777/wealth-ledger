@@ -38,6 +38,9 @@ dependencies:
   go_router: ^17.3.0
   http: ^1.6.0
   file_selector: ^1.1.0
+  flutter_chat_ui: ^2.11.1
+  flutter_chat_core: ^2.9.0
+  gpt_markdown: ^1.1.8
   win32: ^6.3.0
   ffi: ^2.2.0
 
