@@ -63,5 +63,6 @@ GET /v1/client-updates/{platform}/{channel}/assets/{fileName}
 - 只发布干净 Git commit 构建的产物。
 - publisher 必须验证 provenance manifest、文件大小和 SHA-256。
 - 同平台/channel 的 `versionCode` 必须单调递增；默认拒绝覆盖或降级。
+- Android 发布到 wire 的 `asset.fileName` 只使用字母、数字、点、下划线和连字符；构建号中的 `+` 转写为 `-build`，兼容已发布的旧客户端校验器。
 - 先写版本化资源与 sidecar，最后原子替换 `latest.json`；失败时旧版本继续可用。
 - 更新目录由 root 写、`finwealth-server` 只读。

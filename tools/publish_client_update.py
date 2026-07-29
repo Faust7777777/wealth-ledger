@@ -17,6 +17,8 @@ from pathlib import Path
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 CHANNEL_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+ANDROID_PUBLISHED_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.apk$")
+WINDOWS_PUBLISHED_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*\.zip$")
 
 
 def fail(message: str) -> None:
@@ -67,6 +69,20 @@ def normalized_notes(args: argparse.Namespace) -> list[str]:
     if len(notes) > 20 or any(len(line) > 240 for line in notes):
         fail("release notes allow at most 20 non-empty lines of 240 characters")
     return notes
+
+
+def published_asset_name(platform: str, artifact_name: str) -> str:
+    if platform == "android":
+        # Android clients released before build 4208bf1 reject '+' in update
+        # asset names. Keep the wire name backward-compatible while provenance
+        # continues to describe the original build artifact exactly.
+        name = artifact_name.replace("+", "-build")
+        if not ANDROID_PUBLISHED_NAME_RE.fullmatch(name):
+            fail("the Android published asset name is unsafe")
+        return name
+    if not WINDOWS_PUBLISHED_NAME_RE.fullmatch(artifact_name):
+        fail("the Windows published asset name is unsafe")
+    return artifact_name
 
 
 def validate_android_provenance(artifact: Path, value: dict) -> tuple[str, int, str, str]:
@@ -166,6 +182,7 @@ def publish(args: argparse.Namespace) -> Path:
     if args.minimum_version_code < 1 or args.minimum_version_code > version_code:
         fail("minimum-version-code must be between 1 and the published versionCode")
     notes = normalized_notes(args)
+    asset_name = published_asset_name(platform, artifact.name)
 
     channel_dir = args.update_dir.resolve() / platform / args.channel
     release_dir = channel_dir / "releases"
@@ -185,12 +202,12 @@ def publish(args: argparse.Namespace) -> Path:
     os.chmod((args.update_dir.resolve() / platform), 0o755)
     os.chmod(channel_dir, 0o755)
     os.chmod(release_dir, 0o755)
-    destination = release_dir / artifact.name
-    if destination.exists() or destination.with_name(f"{artifact.name}.sha256").exists():
+    destination = release_dir / asset_name
+    if destination.exists() or destination.with_name(f"{asset_name}.sha256").exists():
         fail("versioned artifact already exists; refusing overwrite")
 
     with artifact.open("rb") as source:
-        fd, temp_name = tempfile.mkstemp(prefix=f".{artifact.name}.", dir=release_dir)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{asset_name}.", dir=release_dir)
         temp = Path(temp_name)
         try:
             with os.fdopen(fd, "wb") as target:
@@ -204,8 +221,8 @@ def publish(args: argparse.Namespace) -> Path:
         finally:
             temp.unlink(missing_ok=True)
 
-    sidecar = release_dir / f"{artifact.name}.sha256"
-    atomic_write(sidecar, f"{sha256}  {artifact.name}\n".encode("ascii"))
+    sidecar = release_dir / f"{asset_name}.sha256"
+    atomic_write(sidecar, f"{sha256}  {asset_name}\n".encode("ascii"))
     manifest = {
         "schemaVersion": 1,
         "platform": platform,
@@ -218,8 +235,8 @@ def publish(args: argparse.Namespace) -> Path:
         "minimumVersionCode": args.minimum_version_code,
         "notes": notes,
         "asset": {
-            "url": f"/v1/client-updates/{platform}/{args.channel}/assets/{artifact.name}",
-            "fileName": artifact.name,
+            "url": f"/v1/client-updates/{platform}/{args.channel}/assets/{asset_name}",
+            "fileName": asset_name,
             "sizeBytes": artifact.stat().st_size,
             "sha256": sha256,
             "contentType": content_type,

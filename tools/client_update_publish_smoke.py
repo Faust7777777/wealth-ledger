@@ -93,9 +93,13 @@ def main() -> None:
         latest = json.loads(latest_path.read_text(encoding="utf-8"))
         assert latest["versionCode"] == 2
         assert latest["notes"] == ["应用内更新"]
-        release = updates / "android/stable/releases" / artifact_v2.name
+        published_android_name = "finwealth-1.1.0-build2-android.apk"
+        assert latest["asset"]["fileName"] == published_android_name
+        assert "+" not in latest["asset"]["url"]
+        release = updates / "android/stable/releases" / published_android_name
         assert release.read_bytes() == b"apk-v2"
         assert hashlib.sha256(release.read_bytes()).hexdigest() == latest["asset"]["sha256"]
+        assert (release.with_name(f"{published_android_name}.sha256")).is_file()
 
         artifact_v1 = temp / "finwealth-1.0.0+1-android.apk"
         artifact_v1.write_bytes(b"apk-v1")
