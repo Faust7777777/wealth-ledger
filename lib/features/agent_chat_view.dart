@@ -17,6 +17,42 @@ import 'agent_controller.dart';
 /// 用户气泡的最大宽度：窄屏跟随内容，宽屏不至于拉成整行。
 const double kAgentUserBubbleMaxWidth = 420;
 
+/// 代码片段沿用正文字族（不额外打包等宽字体），靠等宽数字保证列对齐。
+
+/// 围栏代码块：只保留可横向滚动的代码本身，不加语言标签与工具条。
+Widget _codeBlock(BuildContext context, String name, String code, bool closed) {
+  final scheme = Theme.of(context).colorScheme;
+  return Container(
+    width: double.infinity,
+    margin: const EdgeInsets.symmetric(vertical: AppSpacing.xs),
+    padding: const EdgeInsets.all(AppSpacing.sm),
+    decoration: BoxDecoration(
+      color: scheme.surfaceContainerHighest,
+      borderRadius: BorderRadius.circular(AppRadius.sm),
+    ),
+    child: SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: SelectableText(
+        code.trimRight(),
+        style: AppType.body.copyWith(fontFeatures: AppType.tnum, height: 1.5),
+      ),
+    ),
+  );
+}
+
+/// 行内代码：只做轻底色，不改变阅读节奏。
+Widget _inlineCode(BuildContext context, String code, TextStyle style) {
+  final scheme = Theme.of(context).colorScheme;
+  return Container(
+    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+    decoration: BoxDecoration(
+      color: scheme.surfaceContainerHighest,
+      borderRadius: BorderRadius.circular(4),
+    ),
+    child: Text(code, style: style.copyWith(fontFeatures: AppType.tnum)),
+  );
+}
+
 /// 对话流。附件预览由外部注入，避免本文件反向依赖面板实现。
 class AgentTranscript extends ConsumerStatefulWidget {
   const AgentTranscript({
@@ -258,7 +294,12 @@ class _AgentMessageContent extends StatelessWidget {
           ),
         if (text.isNotEmpty)
           markdown
-              ? GptMarkdown(text, style: AppType.body)
+              ? GptMarkdown(
+                  text,
+                  style: AppType.body,
+                  codeBuilder: _codeBlock,
+                  highlightBuilder: _inlineCode,
+                )
               : Text(text, style: AppType.body)
         else if (placeholder != null)
           Text(placeholder!, style: AppType.caption),
