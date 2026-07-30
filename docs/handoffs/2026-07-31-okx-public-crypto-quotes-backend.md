@@ -31,4 +31,11 @@
 
 ## 部署
 
-待提交、备份与生产只读验证后补充。
+- 集成提交 `a812163` 已推送 `origin/feat/integration-self-use` 并部署到 VPS。
+- 部署前账本备份：`/var/backups/finwealth/20260730-200128Z`；备份结束后 Rust 与 Agent 均恢复 active。
+- 部署前 Agent 状态备份：`/var/backups/finwealth-agent/20260730-200213Z`。
+- 旧 Rust 二进制回滚目录：`/opt/finwealth/rollback-20260730-200238Z`。
+- 新二进制在 VPS Rust 1.97.1 环境重新执行 155 条测试、release 构建、生产配置校验、账本与认证状态校验后原子替换。
+- `check_vps_readiness.sh --public-base-url https://wuwaidut.com` 通过；Rust 与 Agent 服务均为 active。
+- 生产只读探针确认安装二进制摘要匹配、VPS 到 OKX 公共 ticker 的响应结构有效、公网 health 正常，探针前后账本摘要不变。
+- 生产账本当前没有可用于 SOL 等新路径实测的既有非内置 USDT crypto 标的，因此没有为了验收创建标的或持仓；该分支由 mock HTTP 全路径测试覆盖。
