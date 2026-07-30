@@ -33,3 +33,13 @@
 
 - 内置 public provider 仍只覆盖明确支持的 BTC、ETH、USDT；任意新代码不会被伪造报价。
 - 本轮不修改 Flutter；Claude 的 OKX 前端修正分支仍待后续处理。
+
+## 生产部署
+
+- 集成提交 `2623509` 已部署到 VPS，Rust 与 Pi Agent systemd 服务均为 active。
+- 部署前账本备份：`/var/backups/finwealth/20260730-192715Z`。
+- 部署前 Agent 状态备份：`/var/backups/finwealth-agent/20260730-192715Z`。
+- 代码回滚目录：`/opt/finwealth/rollback-20260730-193013Z`，包含上一版 Rust 二进制与 Agent 程序目录。
+- 新 Rust 二进制通过生产配置校验后原子替换；Agent 安装重新执行 31 条测试、TypeScript 构建和生产依赖审计，审计无已知漏洞。
+- 生产 Agent 状态为 configured；现有 OKX 的 BTC、ETH、USDT 均被复用，探针前后 holding 条目数不变。
+- 公网 readiness 通过；未修改 Caddy、Cloudflare、`sub2api.wuwaidut.com` 或中转站配置。
