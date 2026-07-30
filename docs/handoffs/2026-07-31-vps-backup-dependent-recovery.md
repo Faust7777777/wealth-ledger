@@ -19,3 +19,9 @@
 - 正常备份后 Rust、Agent 与 proxy socket 全部恢复；
 - 无效账本导致备份失败后，三者仍全部恢复；
 - 原有校验、校验和、防篡改、恢复回滚和无 auth 状态用例继续通过。
+
+## 生产验证
+
+- 修复脚本已安装到 `/opt/finwealth/tools/backup_vps_ledger.sh`；旧脚本保存在 `/opt/finwealth/rollback-20260730-194028Z`。
+- 使用新脚本完成真实备份：`/var/backups/finwealth/20260730-194042Z`，账本和 auth 状态均通过离线校验。
+- 备份前 Rust 与 Agent 均为 active；备份完成后两者仍为 active，不再需要人工恢复 Agent。
