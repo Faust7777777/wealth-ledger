@@ -81,38 +81,47 @@ try {
   $accountId = [string]$account.data.id
   if (!$accountId) { throw "account creation returned no id" }
 
+  $investmentInstruments = @(
+    @("AAPL", "Apple", "NASDAQ"),
+    @("MSFT", "Microsoft", "NASDAQ"),
+    @("GOOG", "Alphabet", "NASDAQ"),
+    @("AMZN", "Amazon", "NASDAQ"),
+    @("META", "Meta", "NASDAQ"),
+    @("NVDA", "NVIDIA", "NASDAQ"),
+    @("TSLA", "Tesla", "NASDAQ"),
+    @("JPM", "JPMorgan", "NYSE"),
+    @("XOM", "Exxon Mobil", "NYSE")
+  ) | ForEach-Object {
+    @{
+      type = "equity"
+      symbol = $_[0]
+      displayName = $_[1]
+      quoteCurrency = "USD"
+      market = $_[2]
+    }
+  }
+  $investmentInstruments += @{
+    type = "fund"
+    symbol = "510300"
+    displayName = "SSE 300 ETF"
+    quoteCurrency = "CNY"
+    market = "SSE"
+  }
   $ensured = Invoke-JsonPost `
     -Uri "$base/v1/accounts/$accountId/investment-instruments/ensure" `
     -IdempotencyKey "public-investment-smoke-instruments" `
-    -Body @{
-      instruments = @(
-        @{
-          type = "equity"
-          symbol = "AAPL"
-          displayName = "Apple"
-          quoteCurrency = "USD"
-          market = "NASDAQ"
-        },
-        @{
-          type = "fund"
-          symbol = "510300"
-          displayName = "SSE 300 ETF"
-          quoteCurrency = "CNY"
-          market = "SSE"
-        }
-      )
-    }
+    -Body @{ instruments = $investmentInstruments }
   $instrumentIds = @($ensured.data.instruments | ForEach-Object { [string]$_.id })
-  if ($instrumentIds.Count -ne 2 -or $instrumentIds -contains "") {
-    throw "instrument ensure did not return two real ids"
+  if ($instrumentIds.Count -ne 10 -or $instrumentIds -contains "") {
+    throw "instrument ensure did not return ten real ids"
   }
 
   $lookup = Invoke-JsonPost `
     -Uri "$base/v1/quotes/lookup" `
     -Body @{ instruments = $instrumentIds; currencyPairs = @() }
   $quotes = @($lookup.data.quotes)
-  if ($quotes.Count -ne 2) {
-    throw "public provider did not return both investment quotes"
+  if ($quotes.Count -ne 10) {
+    throw "public provider did not return all ten investment quotes"
   }
   foreach ($quote in $quotes) {
     if ($quote.source -ne "yahoo_finance_api") { throw "unexpected investment quote source" }
@@ -128,7 +137,7 @@ try {
   $after = Invoke-RestMethod -Uri "$base/v1/quotes" -TimeoutSec 10
   if (@($after.data).Count -ne 0) { throw "read-only lookup wrote authoritative quotes" }
 
-  Write-Host "Public investment quote smoke passed: two structured candidates, ledger unchanged."
+  Write-Host "Public investment quote smoke passed: ten structured candidates, ledger unchanged."
 } finally {
   if ($process -and !$process.HasExited) {
     Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue

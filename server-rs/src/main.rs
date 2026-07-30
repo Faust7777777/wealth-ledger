@@ -56,6 +56,7 @@ const AGENT_INTERNAL_DEVICE_ID: &str = "dev_agent_sidecar";
 const OWNER_USER_ID: &str = "usr_owner";
 const OWNER_LEDGER_ID: &str = "ledger_default";
 const AGENT_PROXY_BODY_LIMIT: usize = 55 * 1024 * 1024;
+const PUBLIC_QUOTE_MAX_CONCURRENCY: usize = 8;
 const OKX_PUBLIC_TICKER_ENDPOINT: &str = "https://www.okx.com/api/v5/market/ticker";
 const YAHOO_PUBLIC_CHART_ENDPOINT: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 const OVERVIEW_EMPTY: &str =
@@ -4305,26 +4306,23 @@ async fn enrich_quote_refresh_with_public(
     let mut quotes = Vec::new();
     let mut fx_rates = Vec::new();
     let mut errors = Vec::new();
-    for target in &quote_targets {
-        let result = if public_crypto_coin_id_for_target(target) {
-            match coingecko_error.as_deref() {
-                Some(error) => Err(error.to_string()),
-                None => public_latest_quote(target, coingecko.as_ref(), now),
-            }
-        } else if public_okx_pair_for_target(target).is_some() {
-            public_okx_latest_quote(&client, target, now).await
-        } else if public_yahoo_symbol_for_target(target).is_some() {
-            public_yahoo_latest_quote(&client, target, now).await
-        } else {
-            public_latest_quote(target, coingecko.as_ref(), now)
-        };
-        let retryable = public_okx_pair_for_target(target).is_some()
-            || public_yahoo_symbol_for_target(target).is_some();
+    for (instrument_id, result, retryable) in public_quote_targets_bounded_from(
+        &client,
+        quote_targets,
+        coingecko.clone(),
+        coingecko_error.clone(),
+        now,
+        YAHOO_PUBLIC_CHART_ENDPOINT,
+        OKX_PUBLIC_TICKER_ENDPOINT,
+        PUBLIC_QUOTE_MAX_CONCURRENCY,
+    )
+    .await
+    {
         match result {
             Ok(quote) => quotes.push(quote),
             Err(message) => errors.push(public_provider_error(
                 "instrument",
-                target.get("instrumentId").and_then(Value::as_str),
+                (!instrument_id.is_empty()).then_some(instrument_id.as_str()),
                 &message,
                 retryable,
             )),
@@ -4362,6 +4360,60 @@ async fn enrich_quote_refresh_with_public(
         }
     }
     Ok(input)
+}
+
+async fn public_quote_targets_bounded_from(
+    client: &reqwest::Client,
+    targets: Vec<Value>,
+    coingecko: Option<Value>,
+    coingecko_error: Option<String>,
+    now: &str,
+    yahoo_endpoint: &str,
+    okx_endpoint: &str,
+    max_concurrency: usize,
+) -> Vec<(String, Result<Value, String>, bool)> {
+    let mut results = Vec::with_capacity(targets.len());
+    let concurrency = max_concurrency.max(1);
+    for chunk in targets.chunks(concurrency) {
+        let mut tasks = Vec::with_capacity(chunk.len());
+        for target in chunk.iter().cloned() {
+            let instrument_id = target
+                .get("instrumentId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let retryable = public_okx_pair_for_target(&target).is_some()
+                || public_yahoo_symbol_for_target(&target).is_some();
+            let client = client.clone();
+            let coingecko = coingecko.clone();
+            let coingecko_error = coingecko_error.clone();
+            let now = now.to_string();
+            let yahoo_endpoint = yahoo_endpoint.to_string();
+            let okx_endpoint = okx_endpoint.to_string();
+            let task = tokio::spawn(async move {
+                if public_crypto_coin_id_for_target(&target) {
+                    match coingecko_error.as_deref() {
+                        Some(error) => Err(error.to_string()),
+                        None => public_latest_quote(&target, coingecko.as_ref(), &now),
+                    }
+                } else if public_okx_pair_for_target(&target).is_some() {
+                    public_okx_latest_quote_from(&client, &target, &now, &okx_endpoint).await
+                } else if public_yahoo_symbol_for_target(&target).is_some() {
+                    public_yahoo_latest_quote_from(&client, &target, &now, &yahoo_endpoint).await
+                } else {
+                    public_latest_quote(&target, coingecko.as_ref(), &now)
+                }
+            });
+            tasks.push((instrument_id, retryable, task));
+        }
+        for (instrument_id, retryable, task) in tasks {
+            let result = task
+                .await
+                .unwrap_or_else(|error| Err(format!("public provider task failed: {error}")));
+            results.push((instrument_id, result, retryable));
+        }
+    }
+    results
 }
 
 fn public_provider_failure(now: &str, message: String) -> Value {
@@ -4572,14 +4624,6 @@ fn public_yahoo_symbol_for_target(target: &Value) -> Option<String> {
     }
 }
 
-async fn public_yahoo_latest_quote(
-    client: &reqwest::Client,
-    target: &Value,
-    now: &str,
-) -> Result<Value, String> {
-    public_yahoo_latest_quote_from(client, target, now, YAHOO_PUBLIC_CHART_ENDPOINT).await
-}
-
 async fn public_yahoo_latest_quote_from(
     client: &reqwest::Client,
     target: &Value,
@@ -4660,14 +4704,6 @@ async fn public_yahoo_latest_quote_from(
         "status": "fresh",
         "expiresAt": expires_at
     }))
-}
-
-async fn public_okx_latest_quote(
-    client: &reqwest::Client,
-    target: &Value,
-    now: &str,
-) -> Result<Value, String> {
-    public_okx_latest_quote_from(client, target, now, OKX_PUBLIC_TICKER_ENDPOINT).await
 }
 
 async fn public_okx_latest_quote_from(
@@ -13679,6 +13715,156 @@ mod tests {
             task.abort();
             assert!(error.contains(expected), "unexpected error: {error}");
         }
+    }
+
+    #[tokio::test]
+    async fn public_provider_bounds_parallel_instrument_requests_and_preserves_order() {
+        use std::sync::atomic::AtomicUsize;
+
+        async fn chart(
+            State((active, maximum)): State<(Arc<AtomicUsize>, Arc<AtomicUsize>)>,
+        ) -> Json<Value> {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            active.fetch_sub(1, Ordering::SeqCst);
+            Json(json!({"chart": {"result": [{"meta": {
+                "currency": "USD",
+                "regularMarketPrice": 100.0,
+                "regularMarketTime": 1785468600
+            }}], "error": null}}))
+        }
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Yahoo concurrency mock listener");
+        let address = listener
+            .local_addr()
+            .expect("Yahoo concurrency mock address");
+        let state = (active, maximum.clone());
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v8/finance/chart/{symbol}", get(chart))
+                    .with_state(state),
+            )
+            .await
+            .expect("Yahoo concurrency mock server");
+        });
+        let targets = (0..10)
+            .map(|index| {
+                json!({
+                    "instrumentId": format!("inst_{index:02}"),
+                    "type": "equity",
+                    "symbol": format!("TEST{index}"),
+                    "quoteCurrency": "USD",
+                    "market": "NASDAQ"
+                })
+            })
+            .collect::<Vec<_>>();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+        let results = public_quote_targets_bounded_from(
+            &client,
+            targets,
+            None,
+            None,
+            "2026-07-31T00:00:00Z",
+            &format!("http://{address}/v8/finance/chart"),
+            OKX_PUBLIC_TICKER_ENDPOINT,
+            3,
+        )
+        .await;
+        task.abort();
+
+        assert_eq!(maximum.load(Ordering::SeqCst), 3);
+        assert_eq!(results.len(), 10);
+        for (index, result) in results.into_iter().enumerate() {
+            assert_eq!(result.0, format!("inst_{index:02}"));
+            assert!(result.1.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn public_provider_parallel_failures_stay_isolated_in_request_order() {
+        async fn chart(Path(symbol): Path<String>) -> Json<Value> {
+            let delay = if symbol == "SLOW" { 60 } else { 5 };
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            if symbol == "BAD" {
+                return Json(json!({"chart": {
+                    "result": null,
+                    "error": {"code": "Not Found", "description": "No data"}
+                }}));
+            }
+            Json(json!({"chart": {"result": [{"meta": {
+                "currency": "USD",
+                "regularMarketPrice": 100.0,
+                "regularMarketTime": 1785468600
+            }}], "error": null}}))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Yahoo isolation mock listener");
+        let address = listener.local_addr().expect("Yahoo isolation mock address");
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v8/finance/chart/{symbol}", get(chart)),
+            )
+            .await
+            .expect("Yahoo isolation mock server");
+        });
+        let targets = ["SLOW", "BAD", "FAST"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, symbol)| {
+                json!({
+                    "instrumentId": format!("inst_{index}"),
+                    "type": "equity",
+                    "symbol": symbol,
+                    "quoteCurrency": "USD",
+                    "market": "NASDAQ"
+                })
+            })
+            .collect::<Vec<_>>();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+        let results = public_quote_targets_bounded_from(
+            &client,
+            targets,
+            None,
+            None,
+            "2026-07-31T00:00:00Z",
+            &format!("http://{address}/v8/finance/chart"),
+            OKX_PUBLIC_TICKER_ENDPOINT,
+            3,
+        )
+        .await;
+        task.abort();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|item| item.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["inst_0", "inst_1", "inst_2"]
+        );
+        assert!(results[0].1.is_ok());
+        assert!(
+            results[1]
+                .1
+                .as_ref()
+                .is_err_and(|error| error.contains("chart error"))
+        );
+        assert!(results[2].1.is_ok());
     }
 
     #[tokio::test]
