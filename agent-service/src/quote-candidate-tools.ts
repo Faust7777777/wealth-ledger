@@ -4,8 +4,12 @@ import { Type } from "typebox";
 import type {
   FinwealthClient,
   HoldingSnapshotQuoteContext,
+  HoldingSnapshotQuoteResult,
 } from "./finwealth-client.js";
-import { quoteCandidateInputsFromLookup } from "./finwealth-client.js";
+import {
+  quoteCandidateInputsFromLookup,
+  quoteLookupDiagnosticsFromLookup,
+} from "./finwealth-client.js";
 import { StateStore } from "./state-store.js";
 import type { AgentConversation, AgentQuoteCandidate } from "./types.js";
 
@@ -137,12 +141,20 @@ export function createSnapshotQuoteCandidateSink(
 ): (
   context: HoldingSnapshotQuoteContext,
   signal?: AbortSignal,
-) => Promise<number> {
+) => Promise<HoldingSnapshotQuoteResult> {
   return async (context, signal) => {
     const positive = context.instruments.filter((item) =>
       validPositiveDecimal(item.targetQuantity)
     );
-    if (!positive.length) return 0;
+    if (!positive.length) {
+      return {
+        createdCount: 0,
+        requestedInstrumentCount: 0,
+        requestedFxCount: 0,
+        status: "success",
+        errors: [],
+      };
+    }
     const accountResponse = await client.getAccount(context.accountId, signal);
     const account = accountResponse && typeof accountResponse === "object"
       ? (accountResponse as { data?: unknown }).data
@@ -181,10 +193,17 @@ export function createSnapshotQuoteCandidateSink(
       signal,
     );
     const inputs = quoteCandidateInputsFromLookup(response);
+    const lookup = quoteLookupDiagnosticsFromLookup(response);
     for (const input of inputs) {
       await suggestQuoteCandidate(store, owner, input);
     }
-    return inputs.length;
+    return {
+      createdCount: inputs.length,
+      requestedInstrumentCount: instrumentIds.length,
+      requestedFxCount: currencyPairs.length,
+      status: lookup.status,
+      errors: lookup.errors,
+    };
   };
 }
 
@@ -227,6 +246,7 @@ export function createQuoteCandidateTools(
           signal,
         );
         const inputs = quoteCandidateInputsFromLookup(response);
+        const lookupResult = quoteLookupDiagnosticsFromLookup(response);
         const candidates = [];
         for (const candidateInput of inputs) {
           candidates.push(
@@ -245,13 +265,18 @@ export function createQuoteCandidateTools(
                 candidateIds: candidates.map((candidate) => candidate.id),
                 approvalRequired: candidates.length > 0,
                 fallbackAllowed: candidates.length === 0,
+                lookupStatus: lookupResult.status,
+                errors: lookupResult.errors,
               },
             }),
           }],
           details: {},
         };
-      } catch {
+      } catch (error) {
         fallbackEligible.add(key);
+        const message = error instanceof Error
+          ? cleanText(error.message, 300)
+          : "structured_quote_lookup_failed";
         return {
           content: [{
             type: "text",
@@ -261,6 +286,12 @@ export function createQuoteCandidateTools(
                 createdCount: 0,
                 approvalRequired: false,
                 fallbackAllowed: true,
+                lookupStatus: "failed",
+                errors: [{
+                  targetType: "request",
+                  message: message || "structured_quote_lookup_failed",
+                  retryable: true,
+                }],
               },
             }),
           }],

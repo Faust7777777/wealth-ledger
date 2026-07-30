@@ -38,11 +38,26 @@ export interface HoldingSnapshotQuoteContext {
   }>;
 }
 
+export interface QuoteLookupDiagnostic {
+  targetType: "request" | "instrument" | "fx_pair";
+  targetId?: string;
+  message: string;
+  retryable: boolean;
+}
+
+export interface HoldingSnapshotQuoteResult {
+  createdCount: number;
+  requestedInstrumentCount: number;
+  requestedFxCount: number;
+  status: "success" | "partial_success" | "failed" | "offline";
+  errors: QuoteLookupDiagnostic[];
+}
+
 export interface FinwealthToolOptions {
   onHoldingSnapshotProposed?: (
     context: HoldingSnapshotQuoteContext,
     signal?: AbortSignal,
-  ) => Promise<number>;
+  ) => Promise<HoldingSnapshotQuoteResult>;
 }
 
 export class FinwealthRequestError extends Error {
@@ -578,6 +593,38 @@ export function quoteCandidateInputsFromLookup(
   return candidates;
 }
 
+export function quoteLookupDiagnosticsFromLookup(value: unknown): {
+  status: HoldingSnapshotQuoteResult["status"];
+  errors: QuoteLookupDiagnostic[];
+} {
+  const data = responseData(value);
+  const rawStatus = data?.status;
+  const status = rawStatus === "success" || rawStatus === "partial_success" ||
+      rawStatus === "failed" || rawStatus === "offline"
+    ? rawStatus
+    : "failed";
+  const errors: QuoteLookupDiagnostic[] = [];
+  for (const item of Array.isArray(data?.errors) ? data.errors : []) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const error = item as Record<string, unknown>;
+    const targetType = error.targetType;
+    const message = safeDiagnostic(error.message);
+    if (
+      !message ||
+      (targetType !== "request" && targetType !== "instrument" && targetType !== "fx_pair")
+    ) continue;
+    const targetId = safeDiagnostic(error.targetId);
+    errors.push({
+      targetType,
+      ...(targetId ? { targetId: [...targetId].slice(0, 128).join("") } : {}),
+      message,
+      retryable: error.retryable === true,
+    });
+    if (errors.length === 100) break;
+  }
+  return { status, errors };
+}
+
 function numberField(value: Record<string, unknown> | undefined, field: string): number {
   const item = value?.[field];
   return typeof item === "number" && Number.isSafeInteger(item) && item >= 0 ? item : 0;
@@ -628,8 +675,17 @@ async function snapshotToolResult(
   if (!context || !options.onHoldingSnapshotProposed) return value;
   let quoteCandidateCreatedCount = 0;
   let quoteLookupCompleted = false;
+  let quoteLookupStatus: HoldingSnapshotQuoteResult["status"] = "failed";
+  let quoteLookupErrors: QuoteLookupDiagnostic[] = [];
+  let quoteLookupRequestedInstrumentCount = 0;
+  let quoteLookupRequestedFxCount = 0;
   try {
-    quoteCandidateCreatedCount = await options.onHoldingSnapshotProposed(context, signal);
+    const result = await options.onHoldingSnapshotProposed(context, signal);
+    quoteCandidateCreatedCount = result.createdCount;
+    quoteLookupStatus = result.status;
+    quoteLookupErrors = result.errors;
+    quoteLookupRequestedInstrumentCount = result.requestedInstrumentCount;
+    quoteLookupRequestedFxCount = result.requestedFxCount;
     quoteLookupCompleted = true;
   } catch {
     // The holding snapshot is already persisted. Quote lookup is ancillary and
@@ -645,6 +701,10 @@ async function snapshotToolResult(
       ...data,
       quoteCandidateCreatedCount,
       quoteLookupCompleted,
+      quoteLookupStatus,
+      quoteLookupErrors,
+      quoteLookupRequestedInstrumentCount,
+      quoteLookupRequestedFxCount,
     },
   };
 }

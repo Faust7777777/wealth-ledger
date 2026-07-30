@@ -36,6 +36,7 @@ SERVER_SMOKE = ROOT / "tools" / "server_smoke.py"
 LOCAL_LEDGER_SMOKE = ROOT / "tools" / "local_ledger_smoke.py"
 PRODUCTION_TOPOLOGY_SMOKE = ROOT / "tools" / "production_topology_smoke.py"
 FRONTEND_LOCAL_SERVER_SMOKE = ROOT / "tools" / "frontend_local_server_smoke.ps1"
+PUBLIC_MULTI_ASSET_SMOKE = ROOT / "tools" / "public_multi_asset_account_smoke.ps1"
 LOCAL_SERVER_SUBSCRIPTION_TEST = (
     ROOT / "test" / "local_server_subscription_integration_test.dart"
 )
@@ -849,12 +850,27 @@ def check_holding_snapshot_proposal(doc: dict) -> None:
     for text, snippet in [
         (agent_client_text, "onHoldingSnapshotProposed"),
         (agent_client_text, "quoteLookupCompleted"),
+        (agent_client_text, "quoteLookupStatus"),
+        (agent_client_text, "quoteLookupErrors"),
+        (agent_client_text, "quoteLookupRequestedInstrumentCount"),
+        (agent_client_text, "quoteLookupRequestedFxCount"),
         (agent_quote_text, "createSnapshotQuoteCandidateSink"),
         (agent_quote_text, 'client.lookupStructuredQuotes('),
+        (agent_quote_text, "quoteLookupDiagnosticsFromLookup"),
         (agent_engine_text, "createSnapshotQuoteCandidateSink("),
     ]:
         if snippet not in text:
             fail(f"Holding snapshot quote-candidate chain is incomplete: {snippet}")
+    smoke_text = PUBLIC_MULTI_ASSET_SMOKE.read_text(encoding="utf-8")
+    for snippet in [
+        '@("BTC", "ETH", "USDT", "SOL")',
+        'baseCurrency = "USDT"; quoteCurrency = "CNY"',
+        '"$base/v1/quotes/lookup"',
+        '"$base/v1/atomic-groups/$groupId/confirm"',
+        "accountMarketValue.currency",
+    ]:
+        if snippet not in smoke_text:
+            fail(f"Public multi-asset smoke is incomplete: {snippet}")
 
     ok("Holding snapshot proposal and quote-candidate chain passed")
 

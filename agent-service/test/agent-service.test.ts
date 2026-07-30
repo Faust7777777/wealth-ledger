@@ -1042,6 +1042,10 @@ test("investment snapshot tool deterministically creates quote and FX review can
     ).data;
     assert.equal(toolData.quoteCandidateCreatedCount, 2);
     assert.equal(toolData.quoteLookupCompleted, true);
+    assert.equal(toolData.quoteLookupStatus, "success");
+    assert.equal(toolData.quoteLookupRequestedInstrumentCount, 1);
+    assert.equal(toolData.quoteLookupRequestedFxCount, 1);
+    assert.deepEqual(toolData.quoteLookupErrors, []);
 
     const state = await store.read(owner.userId);
     assert.equal(state.quoteCandidates.length, 2);
@@ -1064,6 +1068,72 @@ test("investment snapshot tool deterministically creates quote and FX review can
       server.close((error) => (error ? reject(error) : resolve()))
     );
   }
+});
+
+test("holding snapshot quote sink preserves partial per-target lookup failures", async () => {
+  const root = await mkdtemp(join(tmpdir(), "finwealth-snapshot-partial-quotes-"));
+  roots.push(root);
+  const store = new StateStore(root);
+  const sink = createSnapshotQuoteCandidateSink(store, owner, {
+    async getAccount() {
+      return { ok: true, data: { id: "acct_okx", defaultCurrency: "CNY" } };
+    },
+    async lookupStructuredQuotes(input) {
+      assert.deepEqual(input, {
+        instruments: ["inst_btc", "inst_sol"],
+        currencyPairs: [{ baseCurrency: "USDT", quoteCurrency: "CNY" }],
+      });
+      return {
+        ok: true,
+        data: {
+          status: "partial_success",
+          quotes: [{
+            instrumentId: "inst_btc",
+            price: "118000",
+            currency: "USDT",
+            asOf: "2026-07-31T12:00:00Z",
+            source: "coingecko",
+            sourceUrl: "https://www.coingecko.com/",
+          }],
+          fxRates: [],
+          errors: [{
+            targetType: "instrument",
+            targetId: "inst_sol",
+            message: "OKX returned no SOL-USDT ticker",
+            retryable: true,
+          }, {
+            targetType: "fx_pair",
+            targetId: "USDT/CNY",
+            message: "FX provider unavailable",
+            retryable: true,
+          }],
+        },
+      };
+    },
+  });
+  const result = await sink({
+    accountId: "acct_okx",
+    instruments: [{
+      instrumentId: "inst_btc",
+      quoteCurrency: "USDT",
+      targetQuantity: "0.25",
+    }, {
+      instrumentId: "inst_sol",
+      quoteCurrency: "USDT",
+      targetQuantity: "12",
+    }],
+  });
+  assert.equal(result.createdCount, 1);
+  assert.equal(result.requestedInstrumentCount, 2);
+  assert.equal(result.requestedFxCount, 1);
+  assert.equal(result.status, "partial_success");
+  assert.deepEqual(result.errors.map((item) => item.targetId), [
+    "inst_sol",
+    "USDT/CNY",
+  ]);
+  const state = await store.read(owner.userId);
+  assert.equal(state.quoteCandidates.length, 1);
+  assert.equal(state.quoteCandidates[0]?.instrumentId, "inst_btc");
 });
 
 test("quote lookup failure never turns a persisted snapshot into a failed tool call", async () => {
@@ -1119,6 +1189,8 @@ test("quote lookup failure never turns a persisted snapshot into a failed tool c
     assert.equal(data.status, "pending");
     assert.equal(data.quoteCandidateCreatedCount, 0);
     assert.equal(data.quoteLookupCompleted, false);
+    assert.equal(data.quoteLookupStatus, "failed");
+    assert.deepEqual(data.quoteLookupErrors, []);
     assert.equal(lookupAttempts, 1);
     assert.deepEqual(requests, [
       "POST /v1/accounts/acct_okx/crypto-instruments/ensure",
@@ -1500,6 +1572,7 @@ test("quote tools require deterministic lookup before web fallback", async () =>
         ? {
           ok: true,
           data: {
+            status: "success",
             fxRates: [{
               baseCurrency: "USD",
               quoteCurrency: "CNY",
@@ -1512,7 +1585,20 @@ test("quote tools require deterministic lookup before web fallback", async () =>
             errors: [],
           },
         }
-        : { ok: true, data: { fxRates: [], quotes: [], errors: [{}] } };
+        : {
+          ok: true,
+          data: {
+            status: "offline",
+            fxRates: [],
+            quotes: [],
+            errors: [{
+              targetType: "fx_pair",
+              targetId: "EUR/CNY",
+              message: "FX pair unavailable",
+              retryable: true,
+            }],
+          },
+        };
     },
   });
   const lookup = tools.find((tool) => tool.name === "finwealth_lookup_quote_candidate");
@@ -1545,13 +1631,20 @@ test("quote tools require deterministic lookup before web fallback", async () =>
   );
 
   lookupReturnsRate = false;
-  await lookup.execute(
+  const miss = await lookup.execute(
     "structured-miss",
     { kind: "fx", baseCurrency: "EUR", quoteCurrency: "CNY" },
     undefined,
     undefined,
     {} as never,
   );
+  assert.equal(miss.content[0]?.type, "text");
+  const missData = JSON.parse(
+    miss.content[0]?.type === "text" ? miss.content[0].text : "null",
+  ).data;
+  assert.equal(missData.lookupStatus, "offline");
+  assert.equal(missData.fallbackAllowed, true);
+  assert.equal(missData.errors[0].targetId, "EUR/CNY");
   await suggest.execute(
     "web-after-miss",
     { ...webInput, baseCurrency: "EUR", rate: "8.2" },
