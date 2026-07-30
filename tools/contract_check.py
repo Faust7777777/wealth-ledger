@@ -892,6 +892,8 @@ def check_public_quote_provider() -> None:
         "PUBLIC_QUOTE_MAX_CONCURRENCY: usize = 8",
         "public_quote_targets_bounded_from(",
         "public_provider_maps_investment_markets_to_yahoo_symbols_deterministically",
+        '"HKEX" | "XHKG" | "SEHK"',
+        "public_provider_fetches_hong_kong_quotes_in_hkd",
         "public_provider_bounds_parallel_instrument_requests_and_preserves_order",
         "public_provider_parallel_failures_stay_isolated_in_request_order",
         "public_yahoo_quote_rejects_currency_price_and_timestamp_mismatches",

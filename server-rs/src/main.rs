@@ -4620,6 +4620,22 @@ fn public_yahoo_symbol_for_target(target: &Value) -> Option<String> {
             .then(|| format!("{symbol}.SS")),
         "SZSE" | "XSHE" => (symbol.len() == 6 && symbol.chars().all(|ch| ch.is_ascii_digit()))
             .then(|| format!("{symbol}.SZ")),
+        "HKEX" | "XHKG" | "SEHK" => {
+            let quote_currency = target
+                .get("quoteCurrency")
+                .and_then(Value::as_str)?
+                .trim()
+                .to_ascii_uppercase();
+            if quote_currency != "HKD"
+                || symbol.is_empty()
+                || symbol.len() > 5
+                || !symbol.chars().all(|ch| ch.is_ascii_digit())
+            {
+                return None;
+            }
+            let code = symbol.parse::<u32>().ok()?;
+            (code > 0 && code <= 99_999).then(|| format!("{code:04}.HK"))
+        }
         _ => None,
     }
 }
@@ -13549,6 +13565,13 @@ mod tests {
             "quoteCurrency": "CNY",
             "market": "SZSE"
         });
+        let hkex_equity = json!({
+            "instrumentId": "inst_equity_hkex_0700",
+            "type": "equity",
+            "symbol": "700",
+            "quoteCurrency": "HKD",
+            "market": "HKEX"
+        });
 
         assert_eq!(
             public_yahoo_symbol_for_target(&aapl).as_deref(),
@@ -13561,6 +13584,26 @@ mod tests {
         assert_eq!(
             public_yahoo_symbol_for_target(&szse_fund).as_deref(),
             Some("159919.SZ")
+        );
+        assert_eq!(
+            public_yahoo_symbol_for_target(&hkex_equity).as_deref(),
+            Some("0700.HK")
+        );
+        assert_eq!(
+            public_yahoo_symbol_for_target(&json!({
+                "type": "equity", "symbol": "00700", "quoteCurrency": "HKD",
+                "market": "XHKG"
+            }))
+            .as_deref(),
+            Some("0700.HK")
+        );
+        assert_eq!(
+            public_yahoo_symbol_for_target(&json!({
+                "type": "fund", "symbol": "9988", "quoteCurrency": "HKD",
+                "market": "SEHK"
+            }))
+            .as_deref(),
+            Some("9988.HK")
         );
         assert!(
             public_yahoo_symbol_for_target(&json!({
@@ -13580,6 +13623,14 @@ mod tests {
             }))
             .is_none()
         );
+        for invalid in [
+            json!({"type": "equity", "symbol": "0", "quoteCurrency": "HKD", "market": "HKEX"}),
+            json!({"type": "equity", "symbol": "700A", "quoteCurrency": "HKD", "market": "HKEX"}),
+            json!({"type": "equity", "symbol": "123456", "quoteCurrency": "HKD", "market": "HKEX"}),
+            json!({"type": "equity", "symbol": "700", "quoteCurrency": "CNY", "market": "HKEX"}),
+        ] {
+            assert!(public_yahoo_symbol_for_target(&invalid).is_none());
+        }
     }
 
     #[tokio::test]
@@ -13646,6 +13697,67 @@ mod tests {
         assert_eq!(
             quote["sourceUrl"],
             "https://finance.yahoo.com/quote/510300.SS"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_provider_fetches_hong_kong_quotes_in_hkd() {
+        async fn chart(Path(symbol): Path<String>) -> Json<Value> {
+            assert_eq!(symbol, "0700.HK");
+            Json(json!({
+                "chart": {
+                    "result": [{
+                        "meta": {
+                            "currency": "HKD",
+                            "regularMarketPrice": 612.5,
+                            "regularMarketTime": 1785468600
+                        }
+                    }],
+                    "error": null
+                }
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Yahoo mock listener");
+        let address = listener.local_addr().expect("Yahoo mock address");
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v8/finance/chart/{symbol}", get(chart)),
+            )
+            .await
+            .expect("Yahoo mock server");
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+        let target = json!({
+            "instrumentId": "inst_equity_hkex_0700",
+            "type": "equity",
+            "symbol": "00700",
+            "quoteCurrency": "HKD",
+            "market": "XHKG"
+        });
+        let quote = public_yahoo_latest_quote_from(
+            &client,
+            &target,
+            "2026-07-31T00:00:00Z",
+            &format!("http://{address}/v8/finance/chart"),
+        )
+        .await
+        .expect("Hong Kong equity quote should map");
+        task.abort();
+
+        assert_eq!(quote["instrumentId"], "inst_equity_hkex_0700");
+        assert_eq!(quote["price"], "612.5");
+        assert_eq!(quote["currency"], "HKD");
+        assert_eq!(quote["source"], "yahoo_finance_api");
+        assert_eq!(
+            quote["sourceUrl"],
+            "https://finance.yahoo.com/quote/0700.HK"
         );
     }
 

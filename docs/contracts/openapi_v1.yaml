@@ -2852,7 +2852,7 @@ components:
           minLength: 1
           maxLength: 24
           pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,23}$"
-          description: Explicit exchange or source market code such as NASDAQ, SSE, SZSE, or OTC.
+          description: Explicit exchange or source market code such as NASDAQ, SSE, SZSE, HKEX, or OTC.
     EnsureInvestmentInstrumentsRequest:
       type: object
       additionalProperties: false

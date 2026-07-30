@@ -73,7 +73,7 @@ try {
       displayName = "Quote Smoke Brokerage"
       accountType = "brokerage"
       defaultCurrency = "CNY"
-      supportedCurrencies = @("CNY", "USD")
+      supportedCurrencies = @("CNY", "USD", "HKD")
       includeInNetWorth = $true
       balanceMode = "holdings"
       openingBalances = @()
@@ -107,21 +107,40 @@ try {
     quoteCurrency = "CNY"
     market = "SSE"
   }
+  $investmentInstruments += @(
+    @{
+      type = "equity"
+      symbol = "700"
+      displayName = "Tencent"
+      quoteCurrency = "HKD"
+      market = "HKEX"
+    },
+    @{
+      type = "equity"
+      symbol = "9988"
+      displayName = "Alibaba"
+      quoteCurrency = "HKD"
+      market = "HKEX"
+    }
+  )
   $ensured = Invoke-JsonPost `
     -Uri "$base/v1/accounts/$accountId/investment-instruments/ensure" `
     -IdempotencyKey "public-investment-smoke-instruments" `
     -Body @{ instruments = $investmentInstruments }
   $instrumentIds = @($ensured.data.instruments | ForEach-Object { [string]$_.id })
-  if ($instrumentIds.Count -ne 10 -or $instrumentIds -contains "") {
-    throw "instrument ensure did not return ten real ids"
+  if ($instrumentIds.Count -ne 12 -or $instrumentIds -contains "") {
+    throw "instrument ensure did not return twelve real ids"
   }
 
   $lookup = Invoke-JsonPost `
     -Uri "$base/v1/quotes/lookup" `
     -Body @{ instruments = $instrumentIds; currencyPairs = @() }
   $quotes = @($lookup.data.quotes)
-  if ($quotes.Count -ne 10) {
-    throw "public provider did not return all ten investment quotes"
+  if ($quotes.Count -ne 12) {
+    throw "public provider did not return all twelve investment quotes"
+  }
+  if ((@($quotes | ForEach-Object { [string]$_.instrumentId }) -join "|") -ne ($instrumentIds -join "|")) {
+    throw "public provider did not preserve investment request order"
   }
   foreach ($quote in $quotes) {
     if ($quote.source -ne "yahoo_finance_api") { throw "unexpected investment quote source" }
@@ -130,14 +149,19 @@ try {
     }
   }
   $currencies = @($quotes | ForEach-Object { [string]$_.currency } | Sort-Object -Unique)
-  if ($currencies.Count -ne 2 -or $currencies -notcontains "CNY" -or $currencies -notcontains "USD") {
+  if (
+    $currencies.Count -ne 3 -or
+    $currencies -notcontains "CNY" -or
+    $currencies -notcontains "USD" -or
+    $currencies -notcontains "HKD"
+  ) {
     throw "investment quote currencies do not match registered instruments"
   }
 
   $after = Invoke-RestMethod -Uri "$base/v1/quotes" -TimeoutSec 10
   if (@($after.data).Count -ne 0) { throw "read-only lookup wrote authoritative quotes" }
 
-  Write-Host "Public investment quote smoke passed: ten structured candidates, ledger unchanged."
+  Write-Host "Public investment quote smoke passed: twelve structured candidates, ledger unchanged."
 } finally {
   if ($process -and !$process.HasExited) {
     Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
