@@ -62,8 +62,11 @@ python3 tools/agent_vps_document_smoke.py
 
 It generates synthetic PDF/XLSX files, uploads them through the authenticated
 sidecar surface, and requires the model to recover file-only markers using
-`pdftotext` and Python/ZIP inside bubblewrap. It does not print model responses
-or credentials and does not write the ledger.
+`pdftotext` and Python/ZIP inside bubblewrap. PDFs without a usable text layer
+are rendered with `pdftoppm` into at most eight bounded JPEG page images and
+sent to the selected vision-capable model; no second model or fallback provider
+is selected. The smoke does not print model responses or credentials and does
+not write the ledger.
 
 Pi provider credentials and model configuration live under
 `/var/lib/finwealth-agent/pi/` and must remain owned by `finwealth` with mode

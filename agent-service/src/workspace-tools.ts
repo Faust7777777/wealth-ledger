@@ -2,13 +2,17 @@ import { spawn } from "node:child_process";
 import {
   access,
   lstat,
+  mkdtemp,
   mkdir,
   readFile,
+  readdir,
   realpath,
+  rm,
+  stat,
   writeFile,
 } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   createBashToolDefinition,
   createEditToolDefinition,
@@ -20,6 +24,9 @@ import {
 import { Type } from "typebox";
 
 const MAX_DOCUMENT_TEXT_BYTES = 256 * 1024;
+const MAX_RENDERED_PDF_PAGES = 8;
+const MAX_RENDERED_PDF_IMAGE_BYTES = 4 * 1024 * 1024;
+const MAX_RENDERED_PDF_SET_BYTES = 16 * 1024 * 1024;
 const XLSX_READER = String.raw`
 import posixpath, sys, zipfile
 import xml.etree.ElementTree as ET
@@ -258,6 +265,111 @@ export async function extractWorkspacePdfText(
   }
   const relativeTarget = relative(workspace, target).replaceAll("\\", "/");
   return readPdfText(workspace, relativeTarget, signal);
+}
+
+export interface RenderedPdfImage {
+  data: Buffer;
+  mimeType: "image/jpeg";
+}
+
+export async function renderWorkspacePdfImages(
+  workspace: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<RenderedPdfImage[]> {
+  if (process.platform !== "linux") {
+    throw new Error("workspace_shell_requires_linux_bubblewrap");
+  }
+  const target = await readablePath(workspace, resolve(workspace, path));
+  if (!target.toLowerCase().endsWith(".pdf")) {
+    throw new Error("workspace_pdf_required");
+  }
+  const renderDirectory = await mkdtemp(join(workspace, ".finwealth-pdf-render-"));
+  try {
+    const relativeTarget = relative(workspace, target).replaceAll("\\", "/");
+    const outputPrefix = relative(
+      workspace,
+      join(renderDirectory, "page"),
+    ).replaceAll("\\", "/");
+    const command = [
+      "pdftoppm",
+      "-f 1",
+      `-l ${MAX_RENDERED_PDF_PAGES}`,
+      "-scale-to 2000",
+      "-jpeg",
+      "-jpegopt quality=80",
+      shellQuote(relativeTarget),
+      shellQuote(outputPrefix),
+    ].join(" ");
+    await new Promise<void>((resolvePromise, reject) => {
+      const child = spawn("bwrap", bubblewrapArguments(workspace, command), {
+        cwd: workspace,
+        env: safeShellEnvironment(),
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+      let settled = false;
+      let timedOut = false;
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+        if (error) reject(error);
+        else resolvePromise();
+      };
+      const abort = (): void => { child.kill("SIGKILL"); };
+      const timer = setTimeout(() => {
+        timedOut = true;
+        abort();
+      }, 30_000);
+      signal?.addEventListener("abort", abort, { once: true });
+      child.on("error", (error) => finish(error));
+      child.on("close", (exitCode) => {
+        if (signal?.aborted) finish(new Error("agent_run_aborted"));
+        else if (timedOut) finish(new Error("workspace_pdf_render_timeout"));
+        else if (exitCode !== 0) finish(new Error("workspace_pdf_render_failed"));
+        else finish();
+      });
+    });
+
+    const pages = (await readdir(renderDirectory))
+      .map((name) => ({
+        name,
+        page: Number.parseInt(/^page-(\d+)\.jpg$/.exec(name)?.[1] ?? "", 10),
+      }))
+      .filter((item) => Number.isSafeInteger(item.page) && item.page > 0)
+      .sort((left, right) => left.page - right.page);
+    if (pages.length === 0 || pages.length > MAX_RENDERED_PDF_PAGES) {
+      throw new Error("workspace_pdf_render_failed");
+    }
+    const images: RenderedPdfImage[] = [];
+    let totalBytes = 0;
+    for (const page of pages) {
+      const pagePath = join(renderDirectory, page.name);
+      const size = (await stat(pagePath)).size;
+      totalBytes += size;
+      if (
+        size <= 0 ||
+        size > MAX_RENDERED_PDF_IMAGE_BYTES ||
+        totalBytes > MAX_RENDERED_PDF_SET_BYTES
+      ) {
+        throw new Error("workspace_document_too_large");
+      }
+      const data = await readFile(pagePath);
+      if (
+        data[0] !== 0xff ||
+        data[1] !== 0xd8 ||
+        data.at(-2) !== 0xff ||
+        data.at(-1) !== 0xd9
+      ) {
+        throw new Error("workspace_pdf_render_failed");
+      }
+      images.push({ data, mimeType: "image/jpeg" });
+    }
+    return images;
+  } finally {
+    await rm(renderDirectory, { recursive: true, force: true });
+  }
 }
 
 export async function extractWorkspaceXlsxText(

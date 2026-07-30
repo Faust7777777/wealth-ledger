@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real-Grok image-to-valued-holdings smoke for isolated Rust/Agent instances.
+"""Real-Grok attachment-to-valued-holdings smoke for isolated services.
 
 The caller must point both base URLs at temporary services backed by temporary
 state. The model may only create review candidates; the harness then simulates
@@ -147,16 +147,26 @@ def agent_request(
     )
 
 
-def upload_image(path: Path) -> str:
+ATTACHMENT_MIME_TYPES = {
+    ".png": "image/png",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".pdf": "application/pdf",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+
+def upload_attachment(path: Path) -> str:
     content = path.read_bytes()
-    if not content.startswith(b"\x89PNG\r\n\x1a\n"):
-        raise RuntimeError("holding snapshot smoke fixture must be a PNG")
+    mime_type = ATTACHMENT_MIME_TYPES.get(path.suffix.lower())
+    if mime_type is None:
+        raise RuntimeError("unsupported holding snapshot smoke attachment type")
     boundary = f"----finwealth-{secrets.token_hex(16)}"
     body = b"".join(
         [
             f"--{boundary}\r\n".encode(),
             f'Content-Disposition: form-data; name="file"; filename="{path.name}"\r\n'.encode(),
-            b"Content-Type: image/png\r\n\r\n",
+            f"Content-Type: {mime_type}\r\n\r\n".encode(),
             content,
             f"\r\n--{boundary}--\r\n".encode(),
         ]
@@ -237,7 +247,7 @@ def pending_groups() -> list[dict[str, object]]:
     ]
 
 
-def run(image: Path, *, investment: bool) -> None:
+def run(attachment: Path, *, investment: bool) -> None:
     deadline = time.monotonic() + 30
     while True:
         try:
@@ -290,17 +300,24 @@ def run(image: Path, *, investment: bool) -> None:
         body={"modelId": model["id"]},
         key=f"holding-smoke-model-{NONCE}",
     )
-    attachment_id = upload_image(image)
+    attachment_id = upload_attachment(attachment)
+    source_label = "附件"
+    if attachment.suffix.lower() == ".png":
+        source_label = "截图"
+    elif attachment.suffix.lower() in {".csv", ".xlsx"}:
+        source_label = "表格"
+    elif attachment.suffix.lower() == ".pdf":
+        source_label = "PDF"
     prompt = (
-        "这是 Investment Snapshot Smoke Brokerage 的完整券商持仓截图。"
-        "先查询 accounts、instruments 和 holdings；然后把截图中的全部投资代码、名称、"
+        f"这是 Investment Snapshot Smoke Brokerage 的完整券商持仓{source_label}。"
+        "先查询 accounts、instruments 和 holdings；然后把附件中的全部投资代码、名称、"
         "类型、市场、计价币和当前总数量一次性调用 "
         "finwealth_propose_investment_holding_snapshot，生成一个待审核持仓快照。"
         "不得提交或编造 instrumentId，不得确认、批准或采用报价。最后只说明已加入待确认。"
         if investment
         else (
-            "这是 Holding Snapshot Smoke Exchange 的完整 OKX 持仓截图。"
-            "先查询 accounts 和 holdings；然后把截图中的全部资产代码和当前总数量"
+            f"这是 Holding Snapshot Smoke Exchange 的完整 OKX 持仓{source_label}。"
+            "先查询 accounts 和 holdings；然后把附件中的全部资产代码和当前总数量"
             "一次性调用 finwealth_propose_holding_snapshot，生成一个待审核持仓快照。"
             "工具参数只提交 symbol 和 targetQuantity。不得确认、批准或采用报价。"
             "最后只说明已加入待确认。"
@@ -469,13 +486,13 @@ def run(image: Path, *, investment: bool) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("image", type=Path)
+    parser.add_argument("attachment", type=Path)
     parser.add_argument("--investment", action="store_true")
     args = parser.parse_args()
-    image = args.image.resolve(strict=True)
-    if not image.is_file():
+    attachment = args.attachment.resolve(strict=True)
+    if not attachment.is_file():
         raise RuntimeError("holding snapshot fixture must be a regular file")
-    run(image, investment=args.investment)
+    run(attachment, investment=args.investment)
 
 
 if __name__ == "__main__":

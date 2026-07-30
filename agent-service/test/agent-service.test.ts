@@ -34,7 +34,10 @@ import {
   createSnapshotQuoteCandidateSink,
   suggestQuoteCandidate,
 } from "../src/quote-candidate-tools.js";
-import { prepareFileAttachmentPrompt } from "../src/pi-engine.js";
+import {
+  prepareFileAttachmentContext,
+  prepareFileAttachmentPrompt,
+} from "../src/pi-engine.js";
 import { attachmentMatchesMime } from "../src/attachment-formats.js";
 
 const roots: string[] = [];
@@ -272,6 +275,92 @@ test("pre-extracts PDF and XLSX text before the model prompt", async () => {
   assert.match(prompt.join("\n"), /<finwealth_xlsx_text>/);
   assert.match(prompt.join("\n"), /XLSX_MARKER_456/);
   assert.match(prompt.join("\n"), /不要再解析这些原文件/);
+});
+
+test("renders an image-only PDF into bounded model vision input", async () => {
+  const workspace = join(tmpdir(), "finwealth-scanned-pdf-test");
+  const events: Array<[string, boolean?]> = [];
+  const context = await prepareFileAttachmentContext(
+    workspace,
+    [
+      {
+        id: "att_scan",
+        userId: owner.userId,
+        ledgerId: owner.ledgerId,
+        fileName: "scanned-statement.pdf",
+        mimeType: "application/pdf",
+        sizeBytes: 321,
+        sha256: "2".repeat(64),
+        originalPath: join(workspace, "original", "scanned-statement.pdf"),
+        workingPath: join(
+          workspace,
+          "attachments",
+          "att_scan",
+          "scanned-statement.pdf",
+        ),
+        createdAt: "2026-07-31T00:00:00Z",
+      },
+    ],
+    {
+      onToolStarted(name) { events.push([name]); },
+      onToolCompleted(name, isError) { events.push([name, isError]); },
+    },
+    async () => "  \n",
+    async () => "unused",
+    async () => [
+      {
+        data: Buffer.from([0xff, 0xd8, 0xff, 0xd9]),
+        mimeType: "image/jpeg",
+      },
+    ],
+  );
+
+  assert.deepEqual(events, [
+    ["finwealth_read_pdf_text"],
+    ["finwealth_read_pdf_text", false],
+    ["finwealth_render_pdf_pages"],
+    ["finwealth_render_pdf_pages", false],
+  ]);
+  assert.equal(context.images.length, 1);
+  assert.equal(context.images[0]?.type, "image");
+  assert.equal(context.images[0]?.mimeType, "image/jpeg");
+  assert.equal(
+    context.images[0]?.data,
+    Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64"),
+  );
+  assert.match(context.prompt.join("\n"), /扫描版 PDF/);
+  assert.doesNotMatch(context.prompt.join("\n"), /<finwealth_pdf_text>/);
+});
+
+test("bounds rendered PDF pages across the whole attachment set", async () => {
+  const workspace = join(tmpdir(), "finwealth-multi-scan-test");
+  const attachments = ["first", "second"].map((name, index) => ({
+    id: `att_${name}`,
+    userId: owner.userId,
+    ledgerId: owner.ledgerId,
+    fileName: `${name}.pdf`,
+    mimeType: "application/pdf",
+    sizeBytes: 100,
+    sha256: String(index).repeat(64),
+    originalPath: join(workspace, "original", `${name}.pdf`),
+    workingPath: join(workspace, "attachments", `att_${name}`, `${name}.pdf`),
+    createdAt: "2026-07-31T00:00:00Z",
+  }));
+
+  await assert.rejects(
+    prepareFileAttachmentContext(
+      workspace,
+      attachments,
+      { onToolStarted() {}, onToolCompleted() {} },
+      async () => "",
+      async () => "unused",
+      async () => Array.from({ length: 5 }, () => ({
+        data: Buffer.from([0xff, 0xd8, 0xff, 0xd9]),
+        mimeType: "image/jpeg" as const,
+      })),
+    ),
+    /workspace_document_set_too_large/,
+  );
 });
 
 async function serviceWith(
