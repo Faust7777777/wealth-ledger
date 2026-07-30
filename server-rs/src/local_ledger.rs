@@ -3951,12 +3951,17 @@ pub fn ensure_account_crypto_instruments(
                     instrument_id = format!("{base_id}_{suffix}");
                     suffix += 1;
                 }
+                let quote_currency = if is_builtin_public_crypto_symbol(symbol) {
+                    preferred_quote_currency
+                } else {
+                    "USDT"
+                };
                 let instrument = json!({
                     "id": instrument_id,
                     "type": "crypto",
                     "symbol": symbol,
                     "displayName": crypto_display_name(symbol),
-                    "quoteCurrency": preferred_quote_currency,
+                    "quoteCurrency": quote_currency,
                     "market": "crypto",
                     "sourceRef": if is_builtin_public_crypto_symbol(symbol) {
                         "finwealth_builtin_crypto"
@@ -3964,8 +3969,8 @@ pub fn ensure_account_crypto_instruments(
                         "finwealth_agent_discovered_crypto"
                     }
                 });
-                if !required_quote_currencies.contains(&preferred_quote_currency.to_string()) {
-                    required_quote_currencies.push(preferred_quote_currency.to_string());
+                if !required_quote_currencies.contains(&quote_currency.to_string()) {
+                    required_quote_currencies.push(quote_currency.to_string());
                 }
                 instruments.push(instrument.clone());
                 ensured.push(instrument);

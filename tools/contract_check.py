@@ -831,7 +831,10 @@ def check_multi_hop_valuation() -> None:
         if snippet not in local_text:
             fail(f"Multi-hop valuation implementation is incomplete: {snippet}")
     rust_text = RUST_SERVER.read_text(encoding="utf-8")
-    if "local_ledger_multi_hop_fx_values_a_usdt_quoted_crypto_holding" not in rust_text:
+    if (
+        "local_ledger_multi_hop_fx_values_a_discovered_usdt_crypto_holding"
+        not in rust_text
+    ):
         fail("Multi-hop crypto valuation HTTP regression is missing")
 
     ok("Multi-hop holding valuation and FX target inference passed")

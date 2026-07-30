@@ -10018,8 +10018,8 @@ mod tests {
             json!({
                 "displayName": "Exchange",
                 "accountType": "exchange",
-                "defaultCurrency": "USDT",
-                "supportedCurrencies": ["USDT"],
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
                 "includeInNetWorth": true,
                 "balanceMode": "holdings",
                 "openingBalances": []
@@ -10094,6 +10094,14 @@ mod tests {
         assert_eq!(sol["displayName"], "SOL");
         assert_eq!(sol["market"], "crypto");
         assert_eq!(sol["sourceRef"], "finwealth_agent_discovered_crypto");
+        assert_eq!(sol["quoteCurrency"], "USDT");
+        let eth = body["data"]["instruments"]
+            .as_array()
+            .expect("instruments")
+            .iter()
+            .find(|instrument| instrument["symbol"] == "ETH")
+            .expect("built-in ETH instrument");
+        assert_eq!(eth["quoteCurrency"], "CNY");
         assert!(
             sol["id"]
                 .as_str()
@@ -10148,7 +10156,7 @@ mod tests {
         assert_eq!(document["instruments"].as_array().map(Vec::len), Some(6));
         assert_eq!(
             document["accounts"][0]["supportedCurrencies"],
-            json!(["USDT", "BTC"])
+            json!(["CNY", "BTC", "USDT"])
         );
 
         let _ = std::fs::remove_file(path);
@@ -13511,7 +13519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_ledger_multi_hop_fx_values_a_usdt_quoted_crypto_holding() {
+    async fn local_ledger_multi_hop_fx_values_a_discovered_usdt_crypto_holding() {
         let path = unique_test_ledger_path("multi_hop_crypto_valuation");
         local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
         let router = app_with_state(AppState::local(path.clone()));
@@ -13523,8 +13531,8 @@ mod tests {
             json!({
                 "displayName": "OKX",
                 "accountType": "exchange",
-                "defaultCurrency": "USDT",
-                "supportedCurrencies": ["USDT"],
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
                 "includeInNetWorth": true,
                 "balanceMode": "holdings",
                 "openingBalances": []
@@ -13537,18 +13545,15 @@ mod tests {
         let (instrument_status, instrument_body) = request_json_body_from(
             router.clone(),
             Method::POST,
-            "/v1/instruments",
-            json!({
-                "id": "inst_btc_usdt_multihop",
-                "type": "crypto",
-                "symbol": "BTC-USDT",
-                "displayName": "Bitcoin",
-                "quoteCurrency": "USDT",
-                "market": "CRYPTO"
-            }),
+            &format!("/v1/accounts/{account_id}/crypto-instruments/ensure"),
+            json!({"symbols": ["SOL"]}),
         )
         .await;
-        assert_eq!(instrument_status, StatusCode::CREATED, "{instrument_body}");
+        assert_eq!(instrument_status, StatusCode::OK, "{instrument_body}");
+        let instrument = &instrument_body["data"]["instruments"][0];
+        let instrument_id = instrument["id"].as_str().expect("instrument id");
+        assert_eq!(instrument["symbol"], "SOL");
+        assert_eq!(instrument["quoteCurrency"], "USDT");
 
         let endpoint = format!("/v1/accounts/{account_id}/holding-adjustment-proposals");
         let (proposal_status, proposal_body) = request_json_body_from(
@@ -13556,7 +13561,7 @@ mod tests {
             Method::POST,
             &endpoint,
             json!({
-                "instrumentId": "inst_btc_usdt_multihop",
+                "instrumentId": instrument_id,
                 "targetQuantity": "0.05",
                 "asOf": "2026-07-18T03:30:00Z"
             }),
@@ -13580,7 +13585,7 @@ mod tests {
         .await;
         assert_eq!(missing_quote_status, StatusCode::OK, "{missing_quote_body}");
         assert_eq!(missing_quote_body["data"][0]["accountName"], "OKX");
-        assert_eq!(missing_quote_body["data"][0]["assetLabel"], "BTC");
+        assert_eq!(missing_quote_body["data"][0]["assetLabel"], "SOL");
         assert_eq!(missing_quote_body["data"][0]["quantity"], "0.05");
         assert_eq!(missing_quote_body["data"][0]["reason"], "missing_quote");
 
@@ -13591,7 +13596,7 @@ mod tests {
             json!({
                 "mode": "manual",
                 "quotes": [{
-                    "instrumentId": "inst_btc_usdt_multihop",
+                    "instrumentId": instrument_id,
                     "price": "100",
                     "currency": "USDT",
                     "asOf": "2026-07-18T03:30:00Z",
@@ -13667,6 +13672,10 @@ mod tests {
         assert_eq!(account_after_status, StatusCode::OK, "{account_after_body}");
         assert_eq!(account_after_body["data"]["value"]["amount"], "36.00");
         assert_eq!(account_after_body["data"]["value"]["currency"], "CNY");
+        assert_eq!(
+            account_after_body["data"]["supportedCurrencies"],
+            json!(["CNY", "USDT"])
+        );
 
         let _ = std::fs::remove_file(path);
     }

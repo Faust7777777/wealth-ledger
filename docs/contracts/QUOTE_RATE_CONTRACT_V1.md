@@ -119,6 +119,7 @@ QuoteRefreshError {
 - 自动刷新还必须检查正数量持仓的 `Instrument.quoteCurrency`，不能只检查现金余额。持仓以 USDT 等加密货币报价、账本本位币不是 USD 时，provider 可拆成可验证的桥接路径，例如 `USDT/USD`（`USDT-USD`）+ `USD/CNY`（`USDCNY=X`）。
 - 内置 public provider 对 BTC、ETH、USDT 自计价资产支持单位报价 `1`，并用 CoinGecko 生成 BTC/ETH/USDT 与 USD、CNY 或彼此之间的 FX；这用于兼容交易所账户中按原始币种保存的旧标的。任意其他币种仍逐项失败，不做猜测。
 - BTC、ETH、USDT 标的允许使用另一种内置 crypto 作为 `quoteCurrency`；public provider 使用同一时点的 USD 价格比值生成交叉报价，例如 ETH/BTC。不得把该能力泛化为未登记币种或任意文本 ticker。
+- Agent 新登记的非内置 crypto 标的必须以 USDT 计价，不得继承账户的 CNY/USD/BTC 展示币种；账户估值使用该标的的 USDT Quote，再沿最多三跳 FX 路径折算到本位币。这样 SOL 等原始数量、市场计价单位和账户展示单位彼此独立。
 - 估值换算优先使用直接汇率；没有直接汇率时，可在已有 FX rate 图中使用最多三跳的无环路径。路径状态取各段最差质量，同跳数存在多条路径时优先质量更好的路径。`incomplete`、`unpriceable`、`error` 段不得参与数值换算。
 - `fxRates` 需要保留同一货币对的历史时间点；相同稳定 ID（同 pair + asOf）可幂等覆盖，
   不同 `asOf` 不得互相覆盖。投资成交按成交时间选择历史 rate，而非读取最新缓存裸值。
