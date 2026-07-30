@@ -32,4 +32,10 @@
 
 - 本批不修改 Flutter；未知工具名仍会使用前端现有通用活动文案，run 完成后会刷新待审核列表。
 - 当前 public 最新报价 provider 仍主要覆盖 crypto 与法币 FX；新登记股票/基金在没有已保存报价时保留原始数量并报告缺报价，不伪造估值。
-- 待推送和 VPS 部署后，用临时账本、临时 Agent state 与生产 Grok 连接运行券商图片隔离 smoke，并在此补充结果。
+- 实现提交 `d1d3fba` 已推送 `origin/feat/integration-self-use` 并部署到 VPS；服务器端重新执行 Rust 156 项、Agent 33 项、TypeScript check/build 与生产依赖审计，审计为 0 个已知漏洞。
+- 部署前账本与认证状态备份：`/var/backups/finwealth/20260730-210450Z`；Agent 状态备份：`/var/backups/finwealth-agent/20260730-210539Z`。
+- 旧 Rust 与 Agent dist 回滚目录：`/opt/finwealth/rollback-20260730-210539Z`。
+- 使用临时端口、临时账本和临时 Agent state 复用生产 Grok 连接，真实读取合成券商 PNG；AAPL 与 510300 的类型、市场、计价币和数量均精确匹配，`finwealth_propose_investment_holding_snapshot` 成功生成一个两项待审核组。
+- 隔离验收确认账户仍以 CNY 展示并补入 USD 支持，确认前持仓为空，权威报价摘要前后相同；没有调用确认、批准或报价采用。
+- 隔离服务、临时账本、会话、附件、源码构建目录和上传包均已清理；VPS 根分区恢复约 39 GB 可用。
+- Rust/Agent 服务均为 active，公网 readiness 通过；未修改 Caddy、Cloudflare、`sub2api.wuwaidut.com` 或中转站配置。
