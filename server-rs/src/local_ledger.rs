@@ -890,8 +890,13 @@ pub fn quote_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value
             .and_then(|instrument| instrument.get("displayName").and_then(Value::as_str))
             .unwrap_or(instrument_id.as_str())
             .to_string();
+        let instrument_type = instrument
+            .and_then(|instrument| instrument.get("type").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string();
         targets.push(json!({
             "instrumentId": instrument_id,
+            "type": instrument_type,
             "symbol": symbol,
             "quoteCurrency": quote_currency,
             "displayName": display_name
@@ -18629,6 +18634,7 @@ mod tests {
         let targets =
             quote_refresh_targets(&path, &json!({"mode": "manual"})).expect("targets should load");
         assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0]["type"], "crypto");
         assert_eq!(targets[0]["symbol"], "BTC");
         assert_eq!(targets[0]["quoteCurrency"], "BTC");
     }

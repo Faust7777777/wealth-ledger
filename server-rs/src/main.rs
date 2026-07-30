@@ -56,6 +56,7 @@ const AGENT_INTERNAL_DEVICE_ID: &str = "dev_agent_sidecar";
 const OWNER_USER_ID: &str = "usr_owner";
 const OWNER_LEDGER_ID: &str = "ledger_default";
 const AGENT_PROXY_BODY_LIMIT: usize = 55 * 1024 * 1024;
+const OKX_PUBLIC_TICKER_ENDPOINT: &str = "https://www.okx.com/api/v5/market/ticker";
 const OVERVIEW_EMPTY: &str =
     include_str!("../../docs/contracts/examples/portfolio_overview_empty.response.json");
 const OVERVIEW_DEGRADED: &str =
@@ -4287,46 +4288,30 @@ async fn enrich_quote_refresh_with_public(
         .map_err(|error| public_provider_failure(now, format!("HTTP client failed: {error}")))?;
     let needs_coingecko = quote_targets.iter().any(public_crypto_coin_id_for_target)
         || fx_targets.iter().any(public_fx_uses_coingecko);
-    let coingecko = if needs_coingecko {
+    let (coingecko, coingecko_error) = if needs_coingecko {
         match fetch_coingecko_prices(&client).await {
-            Ok(value) => Some(value),
-            Err(error) => {
-                let mut errors = Vec::new();
-                for target in &quote_targets {
-                    if public_crypto_coin_id_for_target(target) {
-                        errors.push(public_provider_error(
-                            "instrument",
-                            target.get("instrumentId").and_then(Value::as_str),
-                            &error,
-                            true,
-                        ));
-                    }
-                }
-                for target in &fx_targets {
-                    if public_fx_uses_coingecko(target) {
-                        errors.push(public_provider_error(
-                            "fx_pair",
-                            public_fx_target_id(target).as_deref(),
-                            &error,
-                            true,
-                        ));
-                    }
-                }
-                if let Some(object) = input.as_object_mut() {
-                    object.insert("_providerErrors".to_string(), json!(errors));
-                }
-                return Ok(input);
-            }
+            Ok(value) => (Some(value), None),
+            Err(error) => (None, Some(error)),
         }
     } else {
-        None
+        (None, None)
     };
 
     let mut quotes = Vec::new();
     let mut fx_rates = Vec::new();
     let mut errors = Vec::new();
     for target in &quote_targets {
-        match public_latest_quote(target, coingecko.as_ref(), now) {
+        let result = if public_crypto_coin_id_for_target(target) {
+            match coingecko_error.as_deref() {
+                Some(error) => Err(error.to_string()),
+                None => public_latest_quote(target, coingecko.as_ref(), now),
+            }
+        } else if public_okx_pair_for_target(target).is_some() {
+            public_okx_latest_quote(&client, target, now).await
+        } else {
+            public_latest_quote(target, coingecko.as_ref(), now)
+        };
+        match result {
             Ok(quote) => quotes.push(quote),
             Err(message) => errors.push(public_provider_error(
                 "instrument",
@@ -4338,7 +4323,10 @@ async fn enrich_quote_refresh_with_public(
     }
     for target in &fx_targets {
         let result = if public_fx_uses_coingecko(target) {
-            public_crypto_fx_rate(target, coingecko.as_ref(), now)
+            match coingecko_error.as_deref() {
+                Some(error) => Err(error.to_string()),
+                None => public_crypto_fx_rate(target, coingecko.as_ref(), now),
+            }
         } else {
             public_fiat_fx_rate(&client, target, now).await
         };
@@ -4509,6 +4497,129 @@ fn public_coin_as_of(data: &Value, coin_id: &str) -> Option<String> {
         .ok()?
         .format(&Rfc3339)
         .ok()
+}
+
+fn public_okx_pair_for_target(target: &Value) -> Option<String> {
+    if target.get("type").and_then(Value::as_str) != Some("crypto") {
+        return None;
+    }
+    let quote = target
+        .get("quoteCurrency")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_ascii_uppercase();
+    if quote != "USDT" {
+        return None;
+    }
+    let symbol = target
+        .get("symbol")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_ascii_uppercase();
+    let base = symbol
+        .strip_suffix(&format!("-{quote}"))
+        .or_else(|| symbol.strip_suffix(&format!("/{quote}")))
+        .or_else(|| symbol.strip_suffix(&format!("_{quote}")))
+        .unwrap_or(&symbol);
+    if base.is_empty()
+        || base.len() > 20
+        || !base.chars().all(|ch| ch.is_ascii_alphanumeric())
+        || public_coin_id_for_symbol(base).is_some()
+    {
+        return None;
+    }
+    Some(format!("{base}-{quote}"))
+}
+
+async fn public_okx_latest_quote(
+    client: &reqwest::Client,
+    target: &Value,
+    now: &str,
+) -> Result<Value, String> {
+    public_okx_latest_quote_from(client, target, now, OKX_PUBLIC_TICKER_ENDPOINT).await
+}
+
+async fn public_okx_latest_quote_from(
+    client: &reqwest::Client,
+    target: &Value,
+    _now: &str,
+    endpoint: &str,
+) -> Result<Value, String> {
+    let instrument_id = target
+        .get("instrumentId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "quote target has no instrumentId".to_string())?;
+    let quote_currency = target
+        .get("quoteCurrency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "quote target has no quoteCurrency".to_string())?;
+    let pair = public_okx_pair_for_target(target)
+        .ok_or_else(|| "instrument is not eligible for OKX public ticker lookup".to_string())?;
+    let response = client
+        .get(endpoint)
+        .query(&[("instId", pair.as_str())])
+        .send()
+        .await
+        .map_err(|error| format!("OKX request failed for {pair}: {error}"))?;
+    let status = response.status();
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("OKX response was invalid for {pair}: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("OKX returned HTTP {status} for {pair}"));
+    }
+    let code = payload
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if code != "0" {
+        let message = payload
+            .get("msg")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or("provider rejected the ticker request");
+        return Err(format!("OKX returned code {code} for {pair}: {message}"));
+    }
+    let item = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .ok_or_else(|| format!("OKX returned no ticker for {pair}"))?;
+    if item.get("instId").and_then(Value::as_str) != Some(pair.as_str()) {
+        return Err(format!("OKX ticker did not match requested pair {pair}"));
+    }
+    let raw_price = item
+        .get("last")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("OKX ticker has no last price for {pair}"))?;
+    let price = raw_price
+        .parse::<f64>()
+        .map_err(|_| format!("OKX returned an invalid price for {pair}"))
+        .and_then(provider_decimal_string)?;
+    let timestamp = item
+        .get("ts")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<i128>().ok())
+        .and_then(|millis| millis.checked_mul(1_000_000))
+        .and_then(|nanos| OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())
+        .ok_or_else(|| format!("OKX returned an invalid timestamp for {pair}"))?;
+    let as_of = timestamp
+        .format(&Rfc3339)
+        .map_err(|_| format!("OKX timestamp could not be formatted for {pair}"))?;
+    let expires_at = (OffsetDateTime::now_utc() + Duration::minutes(5))
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
+    Ok(json!({
+        "instrumentId": instrument_id,
+        "price": price,
+        "currency": quote_currency,
+        "asOf": as_of,
+        "source": "okx_public",
+        "sourceUrl": "https://www.okx.com/markets/prices",
+        "status": "fresh",
+        "expiresAt": expires_at
+    }))
 }
 
 fn public_fx_uses_coingecko(target: &Value) -> bool {
@@ -13001,6 +13112,179 @@ mod tests {
         assert_eq!(lookup["status"], "success");
         assert_eq!(lookup["quotes"].as_array().map(Vec::len), Some(1));
         assert_eq!(lookup["fxRates"][0]["rate"], "6.7775");
+    }
+
+    async fn okx_test_endpoint(
+        status: StatusCode,
+        payload: Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        async fn ticker(
+            State((status, payload)): State<(StatusCode, Value)>,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> (StatusCode, Json<Value>) {
+            assert_eq!(query.get("instId").map(String::as_str), Some("SOL-USDT"));
+            (status, Json(payload))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("OKX mock listener");
+        let address = listener.local_addr().expect("OKX mock address");
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/api/v5/market/ticker", get(ticker))
+                    .with_state((status, payload)),
+            )
+            .await
+            .expect("OKX mock server");
+        });
+        (format!("http://{address}/api/v5/market/ticker"), task)
+    }
+
+    fn sol_quote_target() -> Value {
+        json!({
+            "instrumentId": "inst_crypto_sol",
+            "type": "crypto",
+            "symbol": "SOL",
+            "quoteCurrency": "USDT"
+        })
+    }
+
+    #[tokio::test]
+    async fn public_provider_maps_discovered_crypto_through_okx_ticker() {
+        let (endpoint, task) = okx_test_endpoint(
+            StatusCode::OK,
+            json!({
+                "code": "0",
+                "msg": "",
+                "data": [{
+                    "instId": "SOL-USDT",
+                    "last": "184.12500000",
+                    "ts": "1785468600123"
+                }]
+            }),
+        )
+        .await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+        let quote = public_okx_latest_quote_from(
+            &client,
+            &sol_quote_target(),
+            "2026-07-31T00:00:00Z",
+            &endpoint,
+        )
+        .await
+        .expect("SOL/USDT ticker should map");
+        task.abort();
+
+        assert_eq!(quote["instrumentId"], "inst_crypto_sol");
+        assert_eq!(quote["price"], "184.125");
+        assert_eq!(quote["currency"], "USDT");
+        assert_eq!(quote["source"], "okx_public");
+        assert_eq!(quote["asOf"], "2026-07-31T03:30:00.123Z");
+        assert_eq!(
+            public_okx_pair_for_target(&sol_quote_target()).as_deref(),
+            Some("SOL-USDT")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_okx_ticker_rejects_empty_mismatched_and_invalid_data() {
+        let cases = [
+            (json!({"code": "0", "data": []}), "no ticker"),
+            (
+                json!({"code": "0", "data": [{
+                    "instId": "BTC-USDT", "last": "184", "ts": "1785468600123"
+                }]}),
+                "did not match",
+            ),
+            (
+                json!({"code": "0", "data": [{
+                    "instId": "SOL-USDT", "last": "not-a-price", "ts": "1785468600123"
+                }]}),
+                "invalid price",
+            ),
+            (
+                json!({"code": "0", "data": [{
+                    "instId": "SOL-USDT", "last": "184", "ts": "not-a-timestamp"
+                }]}),
+                "invalid timestamp",
+            ),
+            (
+                json!({"code": "50011", "msg": "Rate limit reached", "data": []}),
+                "50011",
+            ),
+        ];
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+        for (payload, expected) in cases {
+            let (endpoint, task) = okx_test_endpoint(StatusCode::OK, payload).await;
+            let error = public_okx_latest_quote_from(
+                &client,
+                &sol_quote_target(),
+                "2026-07-31T00:00:00Z",
+                &endpoint,
+            )
+            .await
+            .expect_err("invalid OKX response must fail closed");
+            task.abort();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_okx_ticker_isolated_network_failures_and_non_crypto_targets() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserved test listener");
+        let address = listener.local_addr().expect("reserved address");
+        drop(listener);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .expect("test HTTP client");
+        let error = public_okx_latest_quote_from(
+            &client,
+            &sol_quote_target(),
+            "2026-07-31T00:00:00Z",
+            &format!("http://{address}/api/v5/market/ticker"),
+        )
+        .await
+        .expect_err("network failure must stay an item error");
+        assert!(error.contains("OKX request failed"));
+
+        assert!(
+            public_okx_pair_for_target(&json!({
+                "type": "equity", "symbol": "SOL", "quoteCurrency": "USDT"
+            }))
+            .is_none()
+        );
+        assert!(
+            public_okx_pair_for_target(&json!({
+                "type": "crypto", "symbol": "SOL", "quoteCurrency": "CNY"
+            }))
+            .is_none()
+        );
+        assert!(
+            public_okx_pair_for_target(&json!({
+                "type": "crypto", "symbol": "SOL../BTC", "quoteCurrency": "USDT"
+            }))
+            .is_none()
+        );
+        assert!(
+            public_okx_pair_for_target(&json!({
+                "type": "crypto", "symbol": "BTC", "quoteCurrency": "USDT"
+            }))
+            .is_none(),
+            "built-in crypto must keep the CoinGecko path"
+        );
     }
 
     #[tokio::test]

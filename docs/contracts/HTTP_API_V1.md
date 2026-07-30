@@ -204,7 +204,7 @@ GET /v1/portfolio/allocation
 - `crypto-instruments/ensure` 登记或复用用户消息、附件或查询结果中实际出现的加密资产代码，并补齐账户的报价币种支持；服务端规范化代码并生成真实 `instrumentId`，不接受模型自造 ID。它不创建持仓、余额、报价或 movement。Agent 在持仓快照遇到缺失标的时必须先调用该接口，随后仍只生成待审核快照。内置 public provider 仍只为其明确支持的资产提供结构化行情；其他资产没有报价时保留原始数量并逐项报告缺报价。
 - 持仓估值允许使用最多三跳的 FX 路径，例如 `BTC quantity × BTC/USDT quote × USDT/USD × USD/CNY`；每一段必须来自已保存的有效 Quote/FXRate，结果质量取整条路径中最差状态。
 - `valuation-issues` 是估值问题的权威逐资产读模型，返回账户、资产、原始数量、状态和结构化 reason；不返回面向用户的解释文案。它与 overview 的 `quoteProblemCount` 使用相同估值路径，前端不得再用直连汇率自行推断多跳路径是否缺失。
-- 最新估值刷新可显式配置 `FINWEALTH_QUOTE_PROVIDER=public`：BTC/ETH/USDT 使用 CoinGecko，传统法币 FX 使用 Frankfurter/ECB；默认 `none` 不联网。`public` 不提供历史行情，历史价格仍只在 Yahoo provider 下可用。
+- 最新估值刷新可显式配置 `FINWEALTH_QUOTE_PROVIDER=public`：BTC/ETH/USDT 使用 CoinGecko，其他已登记且以 USDT 计价的 crypto 标的使用 OKX 公共现货 ticker，传统法币 FX 使用 Frankfurter/ECB；默认 `none` 不联网。结构化 lookup 只读，Agent 仍须把结果提交为待审核报价候选，采用前不改变估值。`public` 不提供历史行情，历史价格仍只在 Yahoo provider 下可用。
 - 固定收益条款配置在具体 holding 上，包含明确本金、年利率、起息/到期日、360/365 日计数、单利或月/季/年复利及收款账户。`yield-positions` 返回截至指定日期的应计收益；`interest-proposals` 固化本期计算依据并进入既有审核队列，确认前不增加余额，确认后才推进累计截止日。
 - 贷款条款配置在负债 account 上。`liability-positions` 按当前负余额计算未偿本金、应计利息及下一期计划金额的预计本金/利息拆分；`repayment-schedule` 从当前债务逐月投影，使用每期真实间隔天数，支持负摊销、到期气球款和 1–360 条分页；`loan-interest-proposals` 只生成待审核利息；`loan-payment-proposals` 将付款日前利息与实际还款组成同一审核组，确认后原子更新付款余额、债务、计息截止日与下次还款日。浮动利率只使用用户当前维护的年利率，不自动调用外部基准。
 

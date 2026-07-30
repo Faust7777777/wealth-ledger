@@ -114,7 +114,7 @@ QuoteRefreshError {
 - Agent 定时刷新只生成待审核报价候选，不直接更新权威报价；失败不弹强干扰错误，进入待处理/状态区。
 - Agent 交互式报价必须先请求只读结构化 lookup。只有同一目标明确 lookup 失败后才允许网页兜底；两条路径最终都生成相同的 `suggested` 候选，采用前不得改变估值。
 - 如果当前环境没有真实 provider，`quotes` / `fxRates` 可作为手动或外部 provider 已确认结果写入缓存；缺省时不得伪造价格，只能返回 `offline`/`failed` 并继续使用缓存。
-- Rust local server 支持两个显式 provider：`FINWEALTH_QUOTE_PROVIDER=public` 使用 CoinGecko 获取 BTC/ETH/USDT 最新价、Frankfurter/ECB 获取传统法币汇率；`yahoo` 保留股票、传统行情和历史价格能力。`public` 当前只认 BTC、ETH、USDT，不支持的 symbol 必须逐项报错，不得伪造价格。Yahoo 只对 `Instrument.symbol` 存在，或 `instrumentId` 本身可安全解释为 ticker 的标的自动刷新；内部 ID（如 `inst_*`）缺少 symbol 时必须返回错误并继续使用缓存。
+- Rust local server 支持两个显式 provider：`FINWEALTH_QUOTE_PROVIDER=public` 使用 CoinGecko 获取 BTC/ETH/USDT 最新价、OKX 公共 ticker 获取其他已登记 crypto 标的的 USDT 现货最新价、Frankfurter/ECB 获取传统法币汇率；`yahoo` 保留股票、传统行情和历史价格能力。OKX 路径只接受账本中 `type=crypto`、安全规范化 ticker 与 `quoteCurrency=USDT` 的标的，逐项校验返回的 `instId`、正数价格与毫秒时间戳；不存在的交易对、限流、超时或异常响应只能成为该标的的 lookup 错误，不得伪造价格，也不得阻断其他 provider 目标。Yahoo 只对 `Instrument.symbol` 存在，或 `instrumentId` 本身可安全解释为 ticker 的标的自动刷新；内部 ID（如 `inst_*`）缺少 symbol 时必须返回错误并继续使用缓存。
 - FX provider 可按 `currencyPairs` 或账本中的非本位币现金自动推导 Yahoo pair（如 `USD/CNY` → `USDCNY=X`）。
 - 自动刷新还必须检查正数量持仓的 `Instrument.quoteCurrency`，不能只检查现金余额。持仓以 USDT 等加密货币报价、账本本位币不是 USD 时，provider 可拆成可验证的桥接路径，例如 `USDT/USD`（`USDT-USD`）+ `USD/CNY`（`USDCNY=X`）。
 - 内置 public provider 对 BTC、ETH、USDT 自计价资产支持单位报价 `1`，并用 CoinGecko 生成 BTC/ETH/USDT 与 USD、CNY 或彼此之间的 FX；这用于兼容交易所账户中按原始币种保存的旧标的。任意其他币种仍逐项失败，不做猜测。
