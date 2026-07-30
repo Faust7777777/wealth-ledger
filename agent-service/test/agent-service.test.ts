@@ -625,11 +625,10 @@ test("Finwealth client reads data and submits a draft only to review", async () 
       data = {
         accountId: "acct/okx",
         instruments: [
-          { id: "inst_btc", symbol: "BTC" },
-          { id: "inst_eth", symbol: "ETH" },
-          { id: "inst_sol", symbol: "SOL" },
+          { id: "inst_btc", type: "crypto", symbol: "BTC" },
+          { id: "inst_eth", type: "crypto", symbol: "ETH" },
         ],
-        createdCount: 3,
+        createdCount: 2,
         updatedCount: 0,
         reusedCount: 0,
       };
@@ -656,15 +655,46 @@ test("Finwealth client reads data and submits a draft only to review", async () 
       title: "午餐",
       entries: [],
     });
-    await client.ensureCryptoInstruments("acct/okx", ["BTC", "ETH", "SOL"]);
-    await client.proposeHoldingSnapshot("acct/okx", {
-      asOf: "2026-07-29T10:00:00Z",
-      positions: [
-        { instrumentId: "inst_btc_usdt", targetQuantity: "0.25" },
-        { instrumentId: "inst_eth_usdt", targetQuantity: "3.2" },
-      ],
-      note: "OKX 持仓快照",
-    });
+    const snapshotTool = createFinwealthTools(client).find(
+      (tool) => tool.name === "finwealth_propose_holding_snapshot",
+    );
+    assert.ok(snapshotTool);
+    await snapshotTool.execute(
+      "snapshot-with-source-symbols",
+      {
+        accountId: "acct/okx",
+        asOf: "2026-07-29T10:00:00Z",
+        positions: [
+          { symbol: "btc", targetQuantity: "0.25" },
+          { symbol: "ETH", targetQuantity: "3.2" },
+        ],
+        note: "OKX 持仓快照",
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    const requestCountAfterValidSnapshot = requests.length;
+    await assert.rejects(
+      snapshotTool.execute(
+        "snapshot-with-fabricated-ids",
+        {
+          accountId: "acct/okx",
+          positions: [
+            { instrumentId: "inst_btc", targetQuantity: "0.25" },
+          ],
+        } as never,
+        undefined,
+        undefined,
+        {} as never,
+      ),
+      /invalid_crypto_snapshot_positions/,
+    );
+    assert.equal(
+      requests.length,
+      requestCountAfterValidSnapshot,
+      "fabricated IDs must fail before any server request",
+    );
   } finally {
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
@@ -688,14 +718,14 @@ test("Finwealth client reads data and submits a draft only to review", async () 
   assert.ok(requests.every((item) => !item.path?.includes("approve")));
   const ensure = requests.at(-2);
   assert.match(ensure?.key ?? "", /^agent-crypto-instruments-/);
-  assert.deepEqual(ensure?.body, { symbols: ["BTC", "ETH", "SOL"] });
+  assert.deepEqual(ensure?.body, { symbols: ["BTC", "ETH"] });
   const snapshot = requests.at(-1);
   assert.match(snapshot?.key ?? "", /^agent-holding-snapshot-/);
   assert.deepEqual(snapshot?.body, {
     asOf: "2026-07-29T10:00:00Z",
     positions: [
-      { instrumentId: "inst_btc_usdt", targetQuantity: "0.25" },
-      { instrumentId: "inst_eth_usdt", targetQuantity: "3.2" },
+      { instrumentId: "inst_btc", targetQuantity: "0.25" },
+      { instrumentId: "inst_eth", targetQuantity: "3.2" },
     ],
     note: "OKX 持仓快照",
   });
@@ -717,6 +747,55 @@ test("Finwealth tools expose bounded crypto registration before holding snapshot
   assert.ok(ensure);
   assert.match(ensure.description, /不会创建或改变持仓数量/);
   assert.match(ensure.description, /来源中实际出现/);
+  const snapshot = tools.find((tool) => tool.name === "finwealth_propose_holding_snapshot");
+  assert.ok(snapshot);
+  assert.match(snapshot.description, /服务端.*真实 instrumentId/);
+});
+
+test("crypto snapshot resolution fails closed before review when ensure omits a symbol", async () => {
+  const paths: string[] = [];
+  const server = createServer(async (request, response) => {
+    paths.push(request.url ?? "");
+    for await (const _chunk of request) {
+      // Drain the request before responding.
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      ok: true,
+      data: {
+        accountId: "acct_okx",
+        instruments: [{ id: "inst_crypto_btc", type: "crypto", symbol: "BTC" }],
+        createdCount: 1,
+        updatedCount: 0,
+        reusedCount: 0,
+      },
+    }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    const client = new FinwealthClient(
+      `http://127.0.0.1:${address.port}`,
+      "sidecar-secret",
+    );
+    await assert.rejects(
+      client.proposeCryptoHoldingSnapshot("acct_okx", {
+        positions: [
+          { symbol: "BTC", targetQuantity: "0.25" },
+          { symbol: "ETH", targetQuantity: "3.2" },
+        ],
+      }),
+      /finwealth_invalid_crypto_instrument_response/,
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+  assert.deepEqual(paths, [
+    "/v1/accounts/acct_okx/crypto-instruments/ensure",
+  ]);
 });
 
 test("Finwealth client applies an approved quote with a stable candidate idempotency key", async () => {

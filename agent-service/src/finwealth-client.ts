@@ -105,6 +105,48 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
     );
   }
 
+  async proposeCryptoHoldingSnapshot(
+    accountId: string,
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const positions = cryptoSnapshotPositions(input.positions);
+    const symbols = positions.map((position) => position.symbol);
+    const ensured = responseData(
+      await this.ensureCryptoInstruments(accountId, symbols, signal),
+    );
+    if (ensured?.accountId !== accountId) {
+      throw new Error("finwealth_invalid_crypto_instrument_response");
+    }
+    const instruments = Array.isArray(ensured?.instruments)
+      ? ensured.instruments
+      : [];
+    const instrumentIds = new Map<string, string>();
+    for (const item of instruments) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const instrument = item as Record<string, unknown>;
+      const symbol = typeof instrument.symbol === "string"
+        ? instrument.symbol.trim().toUpperCase()
+        : "";
+      const id = typeof instrument.id === "string" ? instrument.id.trim() : "";
+      if (!symbol || !id || instrument.type !== "crypto" || instrumentIds.has(symbol)) {
+        throw new Error("finwealth_invalid_crypto_instrument_response");
+      }
+      instrumentIds.set(symbol, id);
+    }
+    const resolvedPositions = positions.map(({ symbol, targetQuantity }) => {
+      const instrumentId = instrumentIds.get(symbol);
+      if (!instrumentId) throw new Error("finwealth_invalid_crypto_instrument_response");
+      return { instrumentId, targetQuantity };
+    });
+    const { positions: _sourcePositions, ...snapshot } = input;
+    return this.proposeHoldingSnapshot(
+      accountId,
+      { ...snapshot, positions: resolvedPositions },
+      signal,
+    );
+  }
+
   async ensureCryptoInstruments(
     accountId: string,
     symbols: string[],
@@ -271,6 +313,39 @@ function responseData(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function cryptoSnapshotPositions(value: unknown): Array<{
+  symbol: string;
+  targetQuantity: string;
+}> {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) {
+    throw new Error("invalid_crypto_snapshot_positions");
+  }
+  const positions: Array<{ symbol: string; targetQuantity: string }> = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error("invalid_crypto_snapshot_positions");
+    }
+    const position = item as Record<string, unknown>;
+    const symbol = typeof position.symbol === "string"
+      ? position.symbol.trim().toUpperCase()
+      : "";
+    const targetQuantity = typeof position.targetQuantity === "string"
+      ? position.targetQuantity.trim()
+      : "";
+    if (
+      !/^[A-Z0-9][A-Z0-9._-]{0,19}$/.test(symbol) ||
+      !/^(?:0|[1-9]\d*)(?:\.\d{1,8})?$/.test(targetQuantity) ||
+      seen.has(symbol)
+    ) {
+      throw new Error("invalid_crypto_snapshot_positions");
+    }
+    seen.add(symbol);
+    positions.push({ symbol, targetQuantity });
+  }
+  return positions;
+}
+
 /// Convert the read-only structured lookup response into the same candidate
 /// input shape used by web fallback. Validation still happens when persisted.
 export function quoteCandidateInputsFromLookup(
@@ -417,11 +492,11 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     name: "finwealth_propose_holding_snapshot",
     label: "创建持仓快照审核",
     description:
-      "把同一交易所或钱包账户的多项资产数量整理成一个待审核持仓快照。它只创建一个整体审核组，不会确认持仓、修改余额或写入报价。必须先查询真实账户和标的 ID。",
+      "把同一交易所或钱包账户的多项加密资产数量整理成一个待审核持仓快照。只提交来源中的资产代码和数量；工具会由服务端登记或复用标的并替换为真实 instrumentId。它不会确认持仓、修改余额或写入报价。",
     promptSnippet: "把交易所、钱包文件或截图中的多资产数量整理为一个待审核持仓快照。",
     promptGuidelines: [
-      "先用 finwealth_query 分别读取 accounts、instruments 和 holdings，并确认每个资产对应的真实 instrumentId；不要把任何资产代码当作 ID。",
-      "若来源中实际出现的加密资产缺少标的，先调用 finwealth_ensure_crypto_instruments，再使用返回的真实 instrumentId；不得虚构来源中没有的资产。",
+      "先用 finwealth_query 读取 accounts 和 holdings，确认目标账户；positions 只填写来源中实际出现的 symbol 和当前总数量。",
+      "不要提交 instrumentId，也不要根据 symbol 自造 ID；工具内部会调用服务端登记或复用标的，并使用服务端返回的真实 ID。",
       "同一份快照的全部资产必须一次提交；不要为每个资产分别创建账务记录。",
       "targetQuantity 是当前总数量，不是本期增量；不得为负数。文件中不明确、无法可靠识别或不属于目标账户的资产应先询问用户。",
       "该工具只生成待审核组；不得随后调用确认、批准或报价采用接口。",
@@ -431,7 +506,11 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
       asOf: Type.Optional(Type.String({ description: "带时区的 RFC3339 时间" })),
       positions: Type.Array(
         Type.Object({
-          instrumentId: Type.String({ minLength: 1 }),
+          symbol: Type.String({
+            minLength: 1,
+            maxLength: 20,
+            pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,19}$",
+          }),
           targetQuantity: Type.String({ description: "非负十进制定点字符串" }),
         }),
         { minItems: 1, maxItems: 100 },
@@ -444,7 +523,7 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
         accountId: string;
         [key: string]: unknown;
       };
-      const value = await client.proposeHoldingSnapshot(accountId, input, signal);
+      const value = await client.proposeCryptoHoldingSnapshot(accountId, input, signal);
       return { content: [{ type: "text", text: toolText(value) }], details: {} };
     },
   });

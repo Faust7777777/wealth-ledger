@@ -412,7 +412,7 @@ try {
   $prompt = if ($IncludeTextAttachment) {
     "请先用 read 工具读取所附 CSV，再调用 finwealth_query 查询 overview；最后只回复 CSV 的 marker 值和当前净资产。不要创建、提交或修改任何记录。"
   } elseif ($CreateHoldingSnapshot) {
-    "这是 Holding Snapshot Smoke Exchange 的完整 OKX 持仓截图。先用 finwealth_query 查询 accounts、instruments 和 holdings；对截图里缺少标的的加密资产调用 finwealth_ensure_crypto_instruments，并使用返回的真实 instrumentId；然后把截图中的全部资产和当前总数量一次性调用 finwealth_propose_holding_snapshot，生成一个待审核持仓快照。不得确认、批准或采用报价。最后只说明已加入待确认。"
+    "这是 Holding Snapshot Smoke Exchange 的完整 OKX 持仓截图。先用 finwealth_query 查询 accounts 和 holdings；然后把截图中的全部资产代码和当前总数量一次性调用 finwealth_propose_holding_snapshot，生成一个待审核持仓快照。不要提交或编造 instrumentId，工具会在服务端登记或复用标的。不得确认、批准或采用报价。最后只说明已加入待确认。"
   } elseif ($CreateVisionDraft) {
     "这是一张需要入账的消费票据。先用 finwealth_query 查询 accounts，找到 Vision Smoke Wallet；识别图片后调用 finwealth_propose_movement 创建一条 CNY 支出待审核记录，金额、时间和商户按图片，图片时间按 Asia/Shanghai。资金从该账户流出。不要确认或批准。最后只说明已提交审核。"
   } elseif ($IncludeVisionAttachment) {
@@ -497,7 +497,6 @@ try {
     $events -notmatch '"name":"finwealth_query"' -or
     ($IncludeTextAttachment -and $events -notmatch '"name":"read"') -or
     ($CreateVisionDraft -and $events -notmatch '"name":"finwealth_propose_movement"') -or
-    ($CreateHoldingSnapshot -and $events -notmatch '"name":"finwealth_ensure_crypto_instruments"') -or
     ($CreateHoldingSnapshot -and $events -notmatch '"name":"finwealth_propose_holding_snapshot"') -or
     $events -notmatch "(?m)^event: run\.completed\r?$"
   ) {
@@ -531,10 +530,7 @@ try {
   }
 
   if ($CreateHoldingSnapshot) {
-    foreach ($toolName in @(
-      "finwealth_ensure_crypto_instruments",
-      "finwealth_propose_holding_snapshot"
-    )) {
+    foreach ($toolName in @("finwealth_propose_holding_snapshot")) {
       $escapedToolName = [regex]::Escape($toolName)
       if (
         $events -notmatch "(?s)event: tool\.completed\r?\ndata: \{[^\r\n]*`"name`":`"$escapedToolName`"[^\r\n]*`"isError`":false"
