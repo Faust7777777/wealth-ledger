@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Real-Grok image-to-holding-snapshot smoke for isolated Rust/Agent instances.
+"""Real-Grok image-to-valued-holdings smoke for isolated Rust/Agent instances.
 
 The caller must point both base URLs at temporary services backed by temporary
-state. This script deliberately refuses the production ports so it cannot add
-test accounts, instruments, or pending movements to the self-use ledger.
+state. The model may only create review candidates; the harness then simulates
+explicit user approvals and verifies the resulting valuation. This script
+deliberately refuses the production ports so it cannot add test accounts,
+instruments, quotes, or movements to the self-use ledger.
 """
 
 from __future__ import annotations
@@ -269,6 +271,8 @@ def run(image: Path, *, investment: bool) -> None:
     )
     account_id = account["id"]
     before_quotes = server_request("GET", "/v1/quotes/summary")
+    if agent_request("GET", "/quote-candidates"):
+        raise RuntimeError("temporary Agent state unexpectedly contains quote candidates")
 
     conversation = agent_request(
         "POST",
@@ -391,11 +395,76 @@ def run(image: Path, *, investment: bool) -> None:
     )
     if observed_quantities != expected_quantities:
         raise RuntimeError("Grok did not preserve the quantities shown in the image")
+    candidates = agent_request("GET", "/quote-candidates")
+    if not isinstance(candidates, list):
+        raise RuntimeError("Agent returned invalid quote candidate state")
+    if any(item.get("status") != "suggested" for item in candidates):
+        raise RuntimeError("snapshot quote candidates were applied without review")
+    expected_instrument_ids = {
+        by_symbol[symbol]["id"] for symbol in expected_symbols
+    }
+    instrument_candidates = {
+        item.get("instrumentId")
+        for item in candidates
+        if item.get("kind") == "instrument"
+    }
+    if instrument_candidates != expected_instrument_ids:
+        raise RuntimeError("snapshot did not create one quote candidate per source asset")
+    expected_fx_pairs = (
+        {("USD", "CNY")}
+        if investment
+        else {("USDT", "USD"), ("USD", "CNY")}
+    )
+    fx_candidates = {
+        (item.get("baseCurrency"), item.get("quoteCurrency"))
+        for item in candidates
+        if item.get("kind") == "fx"
+    }
+    if fx_candidates != expected_fx_pairs:
+        raise RuntimeError("snapshot did not create the required valuation FX candidates")
+    if len(candidates) != len(expected_instrument_ids) + len(expected_fx_pairs):
+        raise RuntimeError("snapshot created duplicate or unrelated quote candidates")
     if server_request("GET", "/v1/quotes/summary") != before_quotes:
         raise RuntimeError("holding snapshot smoke changed authoritative quotes")
 
+    server_request(
+        "POST",
+        f"/v1/atomic-groups/{groups[0]['id']}/confirm",
+        key=f"holding-smoke-confirm-{NONCE}",
+    )
+    confirmed_holdings = server_request("GET", f"/v1/accounts/{account_id}/holdings")
+    if len(confirmed_holdings) != len(expected_symbols):
+        raise RuntimeError("explicit snapshot confirmation did not create all holdings")
+    if any(item.get("marketValue") is not None for item in confirmed_holdings):
+        raise RuntimeError("holdings were valued before quote candidates were approved")
+
+    for candidate in candidates:
+        reviewed = agent_request(
+            "POST",
+            f"/quote-candidates/{candidate['id']}/review",
+            body={"decision": "apply"},
+            key=f"holding-smoke-quote-{candidate['id']}",
+        )
+        if reviewed.get("status") != "applied":
+            raise RuntimeError("explicit quote approval did not apply the candidate")
+    valued_holdings = server_request("GET", f"/v1/accounts/{account_id}/holdings")
+    if any(
+        not isinstance(item.get("marketValue"), dict)
+        or item["marketValue"].get("currency") != "CNY"
+        or not isinstance(item.get("accountMarketValue"), dict)
+        or item["accountMarketValue"].get("currency") != "CNY"
+        for item in valued_holdings
+    ):
+        raise RuntimeError("approved quote and FX candidates did not value every holding in CNY")
+    if server_request("GET", "/v1/quotes/summary") == before_quotes:
+        raise RuntimeError("explicit quote approvals did not change authoritative quotes")
+
     label = "non-crypto investment" if investment else "four-asset crypto"
-    print(f"OK: isolated production Grok created one review-only {label} holding snapshot.")
+    print(
+        f"OK: isolated production Grok created one review-only {label} holding "
+        "snapshot and separate suggested valuation candidates; explicit harness "
+        "approvals produced fully valued CNY holdings."
+    )
 
 
 def main() -> None:

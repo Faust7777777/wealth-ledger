@@ -29,6 +29,22 @@ const QUERY_PATHS = {
 
 type QueryName = keyof typeof QUERY_PATHS;
 
+export interface HoldingSnapshotQuoteContext {
+  accountId: string;
+  instruments: Array<{
+    instrumentId: string;
+    quoteCurrency: string;
+    targetQuantity: string;
+  }>;
+}
+
+export interface FinwealthToolOptions {
+  onHoldingSnapshotProposed?: (
+    context: HoldingSnapshotQuoteContext,
+    signal?: AbortSignal,
+  ) => Promise<number>;
+}
+
 const CASH_ONLY_MOVEMENT_TYPES = new Set([
   "expense",
   "fee",
@@ -64,6 +80,16 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
 
   async query(name: QueryName, signal?: AbortSignal): Promise<unknown> {
     return this.#request("GET", QUERY_PATHS[name], undefined, undefined, signal);
+  }
+
+  async getAccount(accountId: string, signal?: AbortSignal): Promise<unknown> {
+    return this.#request(
+      "GET",
+      `/v1/accounts/${encodeURIComponent(accountId)}`,
+      undefined,
+      undefined,
+      signal,
+    );
   }
 
   async proposeMovement(
@@ -109,6 +135,7 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
     accountId: string,
     input: Record<string, unknown>,
     signal?: AbortSignal,
+    captureResolved?: (context: HoldingSnapshotQuoteContext) => void,
   ): Promise<unknown> {
     const positions = cryptoSnapshotPositions(input.positions);
     const symbols = positions.map((position) => position.symbol);
@@ -121,7 +148,7 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
     const instruments = Array.isArray(ensured?.instruments)
       ? ensured.instruments
       : [];
-    const instrumentIds = new Map<string, string>();
+    const instrumentIds = new Map<string, { id: string; quoteCurrency: string }>();
     for (const item of instruments) {
       if (!item || typeof item !== "object" || Array.isArray(item)) continue;
       const instrument = item as Record<string, unknown>;
@@ -129,22 +156,37 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
         ? instrument.symbol.trim().toUpperCase()
         : "";
       const id = typeof instrument.id === "string" ? instrument.id.trim() : "";
+      const quoteCurrency = typeof instrument.quoteCurrency === "string"
+        ? instrument.quoteCurrency.trim().toUpperCase()
+        : "";
       if (!symbol || !id || instrument.type !== "crypto" || instrumentIds.has(symbol)) {
         throw new Error("finwealth_invalid_crypto_instrument_response");
       }
-      instrumentIds.set(symbol, id);
+      instrumentIds.set(symbol, { id, quoteCurrency });
     }
     const resolvedPositions = positions.map(({ symbol, targetQuantity }) => {
-      const instrumentId = instrumentIds.get(symbol);
-      if (!instrumentId) throw new Error("finwealth_invalid_crypto_instrument_response");
-      return { instrumentId, targetQuantity };
+      const instrument = instrumentIds.get(symbol);
+      if (!instrument) throw new Error("finwealth_invalid_crypto_instrument_response");
+      return { instrumentId: instrument.id, targetQuantity };
     });
     const { positions: _sourcePositions, ...snapshot } = input;
-    return this.proposeHoldingSnapshot(
+    const response = await this.proposeHoldingSnapshot(
       accountId,
       { ...snapshot, positions: resolvedPositions },
       signal,
     );
+    captureResolved?.({
+      accountId,
+      instruments: positions.map(({ symbol, targetQuantity }) => {
+        const instrument = instrumentIds.get(symbol)!;
+        return {
+          instrumentId: instrument.id,
+          quoteCurrency: instrument.quoteCurrency,
+          targetQuantity,
+        };
+      }),
+    });
+    return response;
   }
 
   async ensureCryptoInstruments(
@@ -165,6 +207,7 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
     accountId: string,
     input: Record<string, unknown>,
     signal?: AbortSignal,
+    captureResolved?: (context: HoldingSnapshotQuoteContext) => void,
   ): Promise<unknown> {
     const positions = investmentSnapshotPositions(input.positions);
     const sourceInstruments = positions.map((position) => ({
@@ -202,11 +245,20 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
       return { instrumentId, targetQuantity: position.targetQuantity };
     });
     const { positions: _sourcePositions, ...snapshot } = input;
-    return this.proposeHoldingSnapshot(
+    const response = await this.proposeHoldingSnapshot(
       accountId,
       { ...snapshot, positions: resolvedPositions },
       signal,
     );
+    captureResolved?.({
+      accountId,
+      instruments: positions.map((position) => ({
+        instrumentId: instrumentIds.get(investmentInstrumentIdentity(position) ?? "")!,
+        quoteCurrency: position.quoteCurrency,
+        targetQuantity: position.targetQuantity,
+      })),
+    });
+    return response;
   }
 
   async ensureInvestmentInstruments(
@@ -529,7 +581,40 @@ function toolText(value: unknown): string {
   return JSON.stringify(value);
 }
 
-export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] {
+async function snapshotToolResult(
+  value: unknown,
+  context: HoldingSnapshotQuoteContext | undefined,
+  options: FinwealthToolOptions,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  if (!context || !options.onHoldingSnapshotProposed) return value;
+  let quoteCandidateCreatedCount = 0;
+  let quoteLookupCompleted = false;
+  try {
+    quoteCandidateCreatedCount = await options.onHoldingSnapshotProposed(context, signal);
+    quoteLookupCompleted = true;
+  } catch {
+    // The holding snapshot is already persisted. Quote lookup is ancillary and
+    // must never make the model retry a successful snapshot proposal.
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const envelope = value as Record<string, unknown>;
+  const data = envelope.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) return value;
+  return {
+    ...envelope,
+    data: {
+      ...data,
+      quoteCandidateCreatedCount,
+      quoteLookupCompleted,
+    },
+  };
+}
+
+export function createFinwealthTools(
+  client: FinwealthClient,
+  options: FinwealthToolOptions = {},
+): ToolDefinition[] {
   const query = defineTool({
     name: "finwealth_query",
     label: "查询 Finwealth",
@@ -621,13 +706,14 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     name: "finwealth_propose_holding_snapshot",
     label: "创建持仓快照审核",
     description:
-      "把同一交易所或钱包账户的多项加密资产数量整理成一个待审核持仓快照。只提交来源中的资产代码和数量；工具会由服务端登记或复用标的并替换为真实 instrumentId。它不会确认持仓、修改余额或写入报价。",
+      "把同一交易所或钱包账户的多项加密资产数量整理成一个待审核持仓快照。只提交来源中的资产代码和数量；工具会由服务端登记或复用标的并替换为真实 instrumentId。快照成功后会从结构化来源生成独立的待审核报价候选；它不会确认持仓、修改余额或写入报价。",
     promptSnippet: "把交易所、钱包文件或截图中的多资产数量整理为一个待审核持仓快照。",
     promptGuidelines: [
       "先用 finwealth_query 读取 accounts 和 holdings，确认目标账户；positions 只填写来源中实际出现的 symbol 和当前总数量。",
       "不要提交 instrumentId，也不要根据 symbol 自造 ID；工具内部会调用服务端登记或复用标的，并使用服务端返回的真实 ID。",
       "同一份快照的全部资产必须一次提交；不要为每个资产分别创建账务记录。",
       "targetQuantity 是当前总数量，不是本期增量；不得为负数。文件中不明确、无法可靠识别或不属于目标账户的资产应先询问用户。",
+      "快照成功后工具会自动查询相关标的报价与折算汇率；不要为同一批标的重复调用报价工具。",
       "该工具只生成待审核组；不得随后调用确认、批准或报价采用接口。",
     ],
     parameters: Type.Object({
@@ -652,8 +738,15 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
         accountId: string;
         [key: string]: unknown;
       };
-      const value = await client.proposeCryptoHoldingSnapshot(accountId, input, signal);
-      return { content: [{ type: "text", text: toolText(value) }], details: {} };
+      let context: HoldingSnapshotQuoteContext | undefined;
+      const value = await client.proposeCryptoHoldingSnapshot(
+        accountId,
+        input,
+        signal,
+        (resolved) => context = resolved,
+      );
+      const output = await snapshotToolResult(value, context, options, signal);
+      return { content: [{ type: "text", text: toolText(output) }], details: {} };
     },
   });
 
@@ -661,7 +754,7 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     name: "finwealth_propose_investment_holding_snapshot",
     label: "创建投资持仓快照审核",
     description:
-      "把券商、基金平台或其他非加密投资来源中的当前数量整理成一个待审核持仓快照。只提交来源中明确出现的类型、代码、名称、市场、计价币和数量；Rust 会严格匹配或登记并返回真实 instrumentId。它不会确认持仓、修改余额或写入报价。",
+      "把券商、基金平台或其他非加密投资来源中的当前数量整理成一个待审核持仓快照。只提交来源中明确出现的类型、代码、名称、市场、计价币和数量；Rust 会严格匹配或登记并返回真实 instrumentId。快照成功后会从结构化来源生成独立的待审核报价候选；它不会确认持仓、修改余额或写入报价。",
     promptSnippet: "把券商或基金来源中的非加密投资数量整理为一个待审核持仓快照。",
     promptGuidelines: [
       "先查询 accounts、instruments 和 holdings，确认目标账户与已有标的。",
@@ -670,6 +763,7 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
       "不得提交或编造 instrumentId；工具内部由 Rust 严格匹配或生成 ID，并验证完整映射。",
       "equity 用于股票，fund 用于基金或 ETF，other 只用于来源明确但现有类型没有覆盖的投资品；加密资产必须使用加密持仓快照工具。",
       "同一份快照的全部资产必须一次提交；targetQuantity 是当前总数量，不是本期增量，且不得为负数。",
+      "快照成功后工具会自动查询相关标的报价与折算汇率；不要为同一批标的重复调用报价工具。",
       "该工具只生成待审核组；不得随后调用确认、批准或报价采用接口。",
     ],
     parameters: Type.Object({
@@ -710,8 +804,15 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
         accountId: string;
         [key: string]: unknown;
       };
-      const value = await client.proposeInvestmentHoldingSnapshot(accountId, input, signal);
-      return { content: [{ type: "text", text: toolText(value) }], details: {} };
+      let context: HoldingSnapshotQuoteContext | undefined;
+      const value = await client.proposeInvestmentHoldingSnapshot(
+        accountId,
+        input,
+        signal,
+        (resolved) => context = resolved,
+      );
+      const output = await snapshotToolResult(value, context, options, signal);
+      return { content: [{ type: "text", text: toolText(output) }], details: {} };
     },
   });
 

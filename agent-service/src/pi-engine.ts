@@ -21,7 +21,10 @@ import {
   extractWorkspaceXlsxText,
 } from "./workspace-tools.js";
 import { createMemoryTools } from "./memory-tools.js";
-import { createQuoteCandidateTools } from "./quote-candidate-tools.js";
+import {
+  createQuoteCandidateTools,
+  createSnapshotQuoteCandidateSink,
+} from "./quote-candidate-tools.js";
 import { isImageAttachment } from "./attachment-formats.js";
 
 interface CachedSession {
@@ -334,7 +337,13 @@ export class PiAgentEngine implements AgentEngine {
       noTools: "builtin",
       customTools: [
         ...createWorkspaceTools(cwd),
-        ...createFinwealthTools(this.#finwealth),
+        ...createFinwealthTools(this.#finwealth, {
+          onHoldingSnapshotProposed: createSnapshotQuoteCandidateSink(
+            this.#store,
+            conversation,
+            this.#finwealth,
+          ),
+        }),
         ...createMemoryTools(this.#store, conversation),
         ...createQuoteCandidateTools(this.#store, conversation, this.#finwealth),
       ],

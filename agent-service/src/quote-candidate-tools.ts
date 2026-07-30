@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { FinwealthClient } from "./finwealth-client.js";
+import type {
+  FinwealthClient,
+  HoldingSnapshotQuoteContext,
+} from "./finwealth-client.js";
 import { quoteCandidateInputsFromLookup } from "./finwealth-client.js";
 import { StateStore } from "./state-store.js";
 import type { AgentConversation, AgentQuoteCandidate } from "./types.js";
@@ -124,6 +127,64 @@ function lookupRequest(input: Record<string, unknown>): Record<string, unknown> 
       baseCurrency: String(input.baseCurrency ?? "").trim().toUpperCase(),
       quoteCurrency: String(input.quoteCurrency ?? "").trim().toUpperCase(),
     }],
+  };
+}
+
+export function createSnapshotQuoteCandidateSink(
+  store: StateStore,
+  owner: Pick<AgentConversation, "userId" | "ledgerId">,
+  client: Pick<FinwealthClient, "getAccount" | "lookupStructuredQuotes">,
+): (
+  context: HoldingSnapshotQuoteContext,
+  signal?: AbortSignal,
+) => Promise<number> {
+  return async (context, signal) => {
+    const positive = context.instruments.filter((item) =>
+      validPositiveDecimal(item.targetQuantity)
+    );
+    if (!positive.length) return 0;
+    const accountResponse = await client.getAccount(context.accountId, signal);
+    const account = accountResponse && typeof accountResponse === "object"
+      ? (accountResponse as { data?: unknown }).data
+      : undefined;
+    const accountData = account && typeof account === "object" && !Array.isArray(account)
+      ? account as Record<string, unknown>
+      : undefined;
+    if (accountData?.id !== context.accountId) {
+      throw new Error("finwealth_snapshot_account_unavailable");
+    }
+    const defaultCurrency = typeof accountData.defaultCurrency === "string"
+      ? accountData.defaultCurrency.trim().toUpperCase()
+      : "";
+    if (!CURRENCY.test(defaultCurrency)) {
+      throw new Error("finwealth_snapshot_account_currency_unavailable");
+    }
+    const instrumentIds = [...new Set(positive.map((item) => item.instrumentId.trim()))];
+    if (instrumentIds.some((id) => !id)) {
+      throw new Error("finwealth_snapshot_instrument_unavailable");
+    }
+    const pairKeys = new Set<string>();
+    const currencyPairs: Array<{ baseCurrency: string; quoteCurrency: string }> = [];
+    for (const item of positive) {
+      const quoteCurrency = item.quoteCurrency.trim().toUpperCase();
+      if (!CURRENCY.test(quoteCurrency)) {
+        throw new Error("finwealth_snapshot_quote_currency_unavailable");
+      }
+      if (quoteCurrency === defaultCurrency) continue;
+      const key = `${quoteCurrency}/${defaultCurrency}`;
+      if (pairKeys.has(key)) continue;
+      pairKeys.add(key);
+      currencyPairs.push({ baseCurrency: quoteCurrency, quoteCurrency: defaultCurrency });
+    }
+    const response = await client.lookupStructuredQuotes(
+      { instruments: instrumentIds, currencyPairs },
+      signal,
+    );
+    const inputs = quoteCandidateInputsFromLookup(response);
+    for (const input of inputs) {
+      await suggestQuoteCandidate(store, owner, input);
+    }
+    return inputs.length;
   };
 }
 

@@ -31,6 +31,7 @@ import { createWorkspaceTools } from "../src/workspace-tools.js";
 import { createMemoryTools } from "../src/memory-tools.js";
 import {
   createQuoteCandidateTools,
+  createSnapshotQuoteCandidateSink,
   suggestQuoteCandidate,
 } from "../src/quote-candidate-tools.js";
 import { prepareFileAttachmentPrompt } from "../src/pi-engine.js";
@@ -835,6 +836,209 @@ test("Finwealth client reads data and submits a draft only to review", async () 
       { instrumentId: "inst_510300", targetQuantity: "100" },
     ],
   });
+});
+
+test("investment snapshot tool deterministically creates quote and FX review candidates", async () => {
+  const requests: Array<{
+    method: string | undefined;
+    path: string | undefined;
+    body: unknown;
+  }> = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    const body = chunks.length
+      ? JSON.parse(Buffer.concat(chunks).toString("utf8"))
+      : undefined;
+    requests.push({ method: request.method, path: request.url, body });
+    let data: unknown;
+    if (request.url === "/v1/accounts/acct_broker/investment-instruments/ensure") {
+      data = {
+        accountId: "acct_broker",
+        instruments: [{
+          id: "inst_aapl",
+          type: "equity",
+          symbol: "AAPL",
+          displayName: "Apple Inc.",
+          quoteCurrency: "USD",
+          market: "NASDAQ",
+        }],
+      };
+    } else if (request.url === "/v1/accounts/acct_broker/holding-snapshot-proposals") {
+      data = { id: "grp_snapshot", status: "pending" };
+    } else if (request.url === "/v1/accounts/acct_broker") {
+      data = { id: "acct_broker", defaultCurrency: "CNY" };
+    } else if (request.url === "/v1/quotes/lookup") {
+      assert.deepEqual(body, {
+        instruments: ["inst_aapl"],
+        currencyPairs: [{ baseCurrency: "USD", quoteCurrency: "CNY" }],
+      });
+      data = {
+        status: "success",
+        quotes: [{
+          instrumentId: "inst_aapl",
+          price: "210.25",
+          currency: "USD",
+          asOf: "2026-07-31T12:00:00Z",
+          source: "yahoo_finance_api",
+          sourceUrl: "https://finance.yahoo.com/quote/AAPL",
+        }],
+        fxRates: [{
+          baseCurrency: "USD",
+          quoteCurrency: "CNY",
+          rate: "7.2",
+          asOf: "2026-07-31T00:00:00Z",
+          source: "frankfurter_ecb",
+          sourceUrl: "https://frankfurter.app/",
+        }],
+        errors: [],
+      };
+    } else {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, data }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const root = await mkdtemp(join(tmpdir(), "finwealth-snapshot-quotes-"));
+  roots.push(root);
+  try {
+    const store = new StateStore(root);
+    const conversation: AgentConversation = {
+      id: "conv_snapshot",
+      userId: owner.userId,
+      ledgerId: owner.ledgerId,
+      title: "持仓导入",
+      isPrimary: false,
+      status: "active",
+      createdAt: "2026-07-31T00:00:00Z",
+      updatedAt: "2026-07-31T00:00:00Z",
+    };
+    const client = new FinwealthClient(
+      `http://127.0.0.1:${address.port}`,
+      "sidecar-secret",
+    );
+    const tool = createFinwealthTools(client, {
+      onHoldingSnapshotProposed: createSnapshotQuoteCandidateSink(
+        store,
+        conversation,
+        client,
+      ),
+    }).find((item) => item.name === "finwealth_propose_investment_holding_snapshot");
+    assert.ok(tool);
+    const result = await tool.execute(
+      "snapshot-with-quotes",
+      {
+        accountId: "acct_broker",
+        positions: [{
+          type: "equity",
+          symbol: "AAPL",
+          displayName: "Apple Inc.",
+          quoteCurrency: "USD",
+          market: "NASDAQ",
+          targetQuantity: "12",
+        }],
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    assert.equal(result.content[0]?.type, "text");
+    const toolData = JSON.parse(
+      result.content[0]?.type === "text" ? result.content[0].text : "null",
+    ).data;
+    assert.equal(toolData.quoteCandidateCreatedCount, 2);
+    assert.equal(toolData.quoteLookupCompleted, true);
+
+    const state = await store.read(owner.userId);
+    assert.equal(state.quoteCandidates.length, 2);
+    assert.deepEqual(
+      state.quoteCandidates.map((item) => item.kind).sort(),
+      ["fx", "instrument"],
+    );
+    assert.ok(state.quoteCandidates.every((item) => item.status === "suggested"));
+    assert.deepEqual(
+      requests.map((item) => `${item.method} ${item.path}`),
+      [
+        "POST /v1/accounts/acct_broker/investment-instruments/ensure",
+        "POST /v1/accounts/acct_broker/holding-snapshot-proposals",
+        "GET /v1/accounts/acct_broker",
+        "POST /v1/quotes/lookup",
+      ],
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve()))
+    );
+  }
+});
+
+test("quote lookup failure never turns a persisted snapshot into a failed tool call", async () => {
+  const requests: string[] = [];
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) { /* drain */ }
+    requests.push(`${request.method} ${request.url}`);
+    const data = request.url === "/v1/accounts/acct_okx/crypto-instruments/ensure"
+      ? {
+        accountId: "acct_okx",
+        instruments: [{
+          id: "inst_sol",
+          type: "crypto",
+          symbol: "SOL",
+          quoteCurrency: "USDT",
+        }],
+      }
+      : { id: "grp_snapshot", status: "pending" };
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: true, data }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    const client = new FinwealthClient(
+      `http://127.0.0.1:${address.port}`,
+      "sidecar-secret",
+    );
+    let lookupAttempts = 0;
+    const tool = createFinwealthTools(client, {
+      onHoldingSnapshotProposed: async () => {
+        lookupAttempts += 1;
+        throw new Error("quote_provider_offline");
+      },
+    }).find((item) => item.name === "finwealth_propose_holding_snapshot");
+    assert.ok(tool);
+    const result = await tool.execute(
+      "snapshot-with-offline-quotes",
+      {
+        accountId: "acct_okx",
+        positions: [{ symbol: "SOL", targetQuantity: "2" }],
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    assert.equal(result.content[0]?.type, "text");
+    const data = JSON.parse(
+      result.content[0]?.type === "text" ? result.content[0].text : "null",
+    ).data;
+    assert.equal(data.id, "grp_snapshot");
+    assert.equal(data.status, "pending");
+    assert.equal(data.quoteCandidateCreatedCount, 0);
+    assert.equal(data.quoteLookupCompleted, false);
+    assert.equal(lookupAttempts, 1);
+    assert.deepEqual(requests, [
+      "POST /v1/accounts/acct_okx/crypto-instruments/ensure",
+      "POST /v1/accounts/acct_okx/holding-snapshot-proposals",
+    ]);
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve()))
+    );
+  }
 });
 
 test("Finwealth tools expose bounded crypto registration before holding snapshots", () => {

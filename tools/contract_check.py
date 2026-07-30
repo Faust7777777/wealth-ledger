@@ -29,6 +29,9 @@ RUST_LEDGER_MIGRATIONS = ROOT / "server-rs" / "src" / "ledger_migrations.rs"
 RUST_LEDGER_LEASE = ROOT / "server-rs" / "src" / "ledger_lease.rs"
 RUST_MANIFEST = ROOT / "server-rs" / "Cargo.toml"
 RUST_SERVER_README = ROOT / "server-rs" / "README.md"
+AGENT_FINWEALTH_CLIENT = ROOT / "agent-service" / "src" / "finwealth-client.ts"
+AGENT_QUOTE_TOOLS = ROOT / "agent-service" / "src" / "quote-candidate-tools.ts"
+AGENT_PI_ENGINE = ROOT / "agent-service" / "src" / "pi-engine.ts"
 SERVER_SMOKE = ROOT / "tools" / "server_smoke.py"
 LOCAL_LEDGER_SMOKE = ROOT / "tools" / "local_ledger_smoke.py"
 PRODUCTION_TOPOLOGY_SMOKE = ROOT / "tools" / "production_topology_smoke.py"
@@ -840,8 +843,20 @@ def check_holding_snapshot_proposal(doc: dict) -> None:
     ]:
         if snippet not in rust_text:
             fail(f"Holding snapshot HTTP slice is incomplete: {snippet}")
+    agent_client_text = AGENT_FINWEALTH_CLIENT.read_text(encoding="utf-8")
+    agent_quote_text = AGENT_QUOTE_TOOLS.read_text(encoding="utf-8")
+    agent_engine_text = AGENT_PI_ENGINE.read_text(encoding="utf-8")
+    for text, snippet in [
+        (agent_client_text, "onHoldingSnapshotProposed"),
+        (agent_client_text, "quoteLookupCompleted"),
+        (agent_quote_text, "createSnapshotQuoteCandidateSink"),
+        (agent_quote_text, 'client.lookupStructuredQuotes('),
+        (agent_engine_text, "createSnapshotQuoteCandidateSink("),
+    ]:
+        if snippet not in text:
+            fail(f"Holding snapshot quote-candidate chain is incomplete: {snippet}")
 
-    ok("Holding snapshot proposal contract and implementation passed")
+    ok("Holding snapshot proposal and quote-candidate chain passed")
 
 
 def check_multi_hop_valuation() -> None:
