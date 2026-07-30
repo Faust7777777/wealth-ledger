@@ -9,6 +9,7 @@ import { AgentService } from "../src/agent-service.js";
 import { EventHub } from "../src/event-hub.js";
 import {
   FinwealthClient,
+  FinwealthRequestError,
   createFinwealthTools,
   normalizeMovementProposalForLedger,
   quoteCandidateInputsFromLookup,
@@ -1258,6 +1259,62 @@ test("investment snapshot resolution fails closed before review when ensure iden
   assert.deepEqual(paths, [
     "/v1/accounts/acct_broker/investment-instruments/ensure",
   ]);
+});
+
+test("Finwealth client preserves bounded per-item diagnostics from rejected instrument ensure", async () => {
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) {
+      // Drain the request before responding.
+    }
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      ok: false,
+      error: {
+        code: "invalid_investment_instrument_input",
+        message: "Local ledger request is invalid.",
+        details: {
+          errors: [
+            "instruments[1].market must be explicit",
+            "instruments[1].quoteCurrency must be explicit",
+          ],
+        },
+      },
+    }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    const client = new FinwealthClient(
+      `http://127.0.0.1:${address.port}`,
+      "sidecar-secret",
+    );
+    await assert.rejects(
+      client.ensureInvestmentInstruments("acct_broker", [{
+        type: "equity",
+        symbol: "700",
+        displayName: "Tencent",
+        quoteCurrency: "",
+        market: "",
+      }]),
+      (error: unknown) => {
+        assert.ok(error instanceof FinwealthRequestError);
+        assert.equal(error.status, 400);
+        assert.equal(error.code, "invalid_investment_instrument_input");
+        assert.deepEqual(error.diagnostics, [
+          "instruments[1].market must be explicit",
+          "instruments[1].quoteCurrency must be explicit",
+        ]);
+        assert.match(error.message, /instruments\[1\]\.market/);
+        assert.doesNotMatch(error.message, /Local ledger request is invalid/);
+        return true;
+      },
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve()))
+    );
+  }
 });
 
 test("Finwealth client applies an approved quote with a stable candidate idempotency key", async () => {

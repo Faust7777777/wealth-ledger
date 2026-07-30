@@ -10511,6 +10511,13 @@ mod tests {
         )
         .await;
         assert_eq!(conflict_status, StatusCode::CONFLICT, "{conflict_body}");
+        assert_eq!(conflict_body["error"]["code"], "local_ledger_conflict");
+        assert!(
+            conflict_body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.starts_with("instruments[0] ")),
+            "{conflict_body}"
+        );
 
         let (invalid_status, invalid_body) = request_json_body_from(
             router.clone(),
@@ -10530,6 +10537,15 @@ mod tests {
         assert_eq!(
             invalid_body["error"]["code"],
             "invalid_investment_instrument_input"
+        );
+        let errors = invalid_body["error"]["details"]["errors"]
+            .as_array()
+            .expect("invalid input should preserve per-item diagnostics");
+        assert!(
+            errors.iter().all(|error| error
+                .as_str()
+                .is_some_and(|message| message.starts_with("instruments[0]"))),
+            "{invalid_body}"
         );
 
         let document = local_ledger::read_document(&path).expect("ledger should remain readable");

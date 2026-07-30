@@ -45,6 +45,20 @@ export interface FinwealthToolOptions {
   ) => Promise<number>;
 }
 
+export class FinwealthRequestError extends Error {
+  readonly code: string;
+  readonly status: number;
+  readonly diagnostics: string[];
+
+  constructor(code: string, status: number, diagnostics: string[]) {
+    super(diagnostics.length ? `${code}: ${diagnostics.join("; ")}` : code);
+    this.name = "FinwealthRequestError";
+    this.code = code;
+    this.status = status;
+    this.diagnostics = diagnostics;
+  }
+}
+
 const CASH_ONLY_MOVEMENT_TYPES = new Set([
   "expense",
   "fee",
@@ -410,7 +424,7 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
     }
     if (!response.ok) {
       const code = errorCode(value) ?? `finwealth_http_${response.status}`;
-      throw new Error(code);
+      throw new FinwealthRequestError(code, response.status, errorDiagnostics(value));
     }
     return value;
   }
@@ -575,6 +589,30 @@ function errorCode(value: unknown): string | undefined {
   if (!error || typeof error !== "object") return undefined;
   const code = (error as { code?: unknown }).code;
   return typeof code === "string" && /^[a-z0-9_]+$/.test(code) ? code : undefined;
+}
+
+function errorDiagnostics(value: unknown): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  const error = (value as { error?: unknown }).error;
+  if (!error || typeof error !== "object" || Array.isArray(error)) return [];
+  const record = error as Record<string, unknown>;
+  const details = record.details;
+  const errors = details && typeof details === "object" && !Array.isArray(details)
+    ? (details as { errors?: unknown }).errors
+    : undefined;
+  const diagnostics = Array.isArray(errors)
+    ? errors.map(safeDiagnostic).filter((item): item is string => Boolean(item))
+    : [];
+  if (diagnostics.length) return [...new Set(diagnostics)].slice(0, 10);
+  const message = safeDiagnostic(record.message);
+  return message ? [message] : [];
+}
+
+function safeDiagnostic(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  if (!normalized) return undefined;
+  return [...normalized].slice(0, 300).join("");
 }
 
 function toolText(value: unknown): string {

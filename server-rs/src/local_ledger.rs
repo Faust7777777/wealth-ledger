@@ -4060,8 +4060,8 @@ pub fn ensure_account_investment_instruments(
                     .collect::<Vec<_>>();
                 if matching_indexes.len() > 1 {
                     return Err(LedgerError::Conflict(format!(
-                        "multiple instruments match {} on {}",
-                        spec.symbol, spec.market
+                        "instruments[{}] matches multiple existing instruments for {} on {}",
+                        spec.source_index, spec.symbol, spec.market
                     )));
                 }
                 if let Some(index) = matching_indexes.first().copied() {
@@ -4072,8 +4072,8 @@ pub fn ensure_account_investment_instruments(
                         .expect("validated instrument quoteCurrency");
                     if !existing_currency.eq_ignore_ascii_case(&spec.quote_currency) {
                         return Err(LedgerError::Conflict(format!(
-                            "instrument {} on {} uses a different quote currency",
-                            spec.symbol, spec.market
+                            "instruments[{}] {} on {} uses a different quote currency",
+                            spec.source_index, spec.symbol, spec.market
                         )));
                     }
                     let mut changed = false;
@@ -11226,6 +11226,7 @@ fn normalized_crypto_symbol_from_instrument(instrument: &Value) -> Option<String
 
 #[derive(Clone)]
 struct InvestmentInstrumentSpec {
+    source_index: usize,
     instrument_type: String,
     symbol: String,
     display_name: String,
@@ -11334,6 +11335,7 @@ fn parse_investment_instrument_specs(
                 continue;
             }
             specs.push(InvestmentInstrumentSpec {
+                source_index: index,
                 instrument_type,
                 symbol,
                 display_name,
