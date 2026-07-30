@@ -1272,7 +1272,7 @@ paths:
     post:
       tags: [Quotes]
       summary: Look up structured quotes and FX rates without changing the ledger.
-      description: When the public provider is enabled, registered crypto instruments use CoinGecko for the built-in BTC/ETH/USDT set and OKX public spot tickers for other USDT-quoted symbols. Results are read-only and require separate candidate review before ledger valuation changes.
+      description: When the public provider is enabled, registered crypto instruments use CoinGecko for the built-in BTC/ETH/USDT set and OKX public spot tickers for other USDT-quoted symbols; registered equity and fund instruments use Yahoo current quotes only when their explicit market and symbol map deterministically. Results are read-only and require separate candidate review before ledger valuation changes.
       requestBody:
         required: true
         content:

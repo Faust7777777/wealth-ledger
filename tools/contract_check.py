@@ -872,6 +872,10 @@ def check_public_quote_provider() -> None:
         "async fn enrich_quote_refresh_with_public(",
         "https://api.coingecko.com/api/v3/simple/price",
         "https://api.frankfurter.app/latest",
+        "https://query1.finance.yahoo.com/v8/finance/chart",
+        "fn public_yahoo_symbol_for_target(",
+        "public_provider_maps_investment_markets_to_yahoo_symbols_deterministically",
+        "public_yahoo_quote_rejects_currency_price_and_timestamp_mismatches",
         "public_provider_maps_crypto_quotes_and_fiat_rates_without_fabrication",
         '"historical_prices_provider_unsupported"',
     ]:
@@ -881,7 +885,7 @@ def check_public_quote_provider() -> None:
     if 'reqwest = { version = "0.13"' not in cargo_text:
         fail("Public quote provider must use the pinned reqwest 0.13 client")
 
-    ok("Opt-in public crypto and FX provider passed")
+    ok("Opt-in public crypto, investment and FX provider passed")
 
 
 def check_yield_interest_slice(doc: dict) -> None:

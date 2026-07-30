@@ -894,13 +894,21 @@ pub fn quote_refresh_targets(path: &Path, input: &Value) -> io::Result<Vec<Value
             .and_then(|instrument| instrument.get("type").and_then(Value::as_str))
             .unwrap_or_default()
             .to_string();
-        targets.push(json!({
+        let market = instrument
+            .and_then(|instrument| instrument.get("market").and_then(Value::as_str))
+            .filter(|market| !market.trim().is_empty())
+            .map(str::to_string);
+        let mut target = json!({
             "instrumentId": instrument_id,
             "type": instrument_type,
             "symbol": symbol,
             "quoteCurrency": quote_currency,
             "displayName": display_name
-        }));
+        });
+        if let Some(market) = market {
+            target["market"] = json!(market);
+        }
+        targets.push(target);
     }
 
     Ok(targets)
@@ -18941,6 +18949,32 @@ mod tests {
         assert_eq!(targets[0]["type"], "crypto");
         assert_eq!(targets[0]["symbol"], "BTC");
         assert_eq!(targets[0]["quoteCurrency"], "BTC");
+    }
+
+    #[test]
+    fn quote_refresh_target_preserves_investment_market_for_provider_routing() {
+        let mut document = empty_document(DEFAULT_BASE_CURRENCY);
+        document["instruments"] = json!([{
+            "id": "inst_fund_sse_510300",
+            "type": "fund",
+            "symbol": "510300",
+            "displayName": "沪深300ETF",
+            "quoteCurrency": "CNY",
+            "market": "SSE"
+        }]);
+        let path = unique_temp_path("investment_market_quote_target");
+        load_or_initialize(&path).expect("ledger should initialize");
+        write_document(&path, &document).expect("ledger should persist");
+
+        let targets =
+            quote_refresh_targets(&path, &json!({"instruments": ["inst_fund_sse_510300"]}))
+                .expect("targets should load");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0]["type"], "fund");
+        assert_eq!(targets[0]["symbol"], "510300");
+        assert_eq!(targets[0]["market"], "SSE");
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

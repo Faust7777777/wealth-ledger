@@ -666,6 +666,7 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     promptGuidelines: [
       "先查询 accounts、instruments 和 holdings，确认目标账户与已有标的。",
       "positions 只能填写来源中明确出现的 type、symbol、displayName、market、quoteCurrency 和当前总数量；缺少市场或计价币时先询问用户。",
+      "市场使用来源可验证的规范代码；美股使用 NASDAQ/NYSE/AMEX/ARCA，沪市使用 SSE，深市使用 SZSE。不要根据证券代码猜市场。",
       "不得提交或编造 instrumentId；工具内部由 Rust 严格匹配或生成 ID，并验证完整映射。",
       "equity 用于股票，fund 用于基金或 ETF，other 只用于来源明确但现有类型没有覆盖的投资品；加密资产必须使用加密持仓快照工具。",
       "同一份快照的全部资产必须一次提交；targetQuantity 是当前总数量，不是本期增量，且不得为负数。",

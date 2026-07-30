@@ -57,6 +57,7 @@ const OWNER_USER_ID: &str = "usr_owner";
 const OWNER_LEDGER_ID: &str = "ledger_default";
 const AGENT_PROXY_BODY_LIMIT: usize = 55 * 1024 * 1024;
 const OKX_PUBLIC_TICKER_ENDPOINT: &str = "https://www.okx.com/api/v5/market/ticker";
+const YAHOO_PUBLIC_CHART_ENDPOINT: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 const OVERVIEW_EMPTY: &str =
     include_str!("../../docs/contracts/examples/portfolio_overview_empty.response.json");
 const OVERVIEW_DEGRADED: &str =
@@ -4312,16 +4313,20 @@ async fn enrich_quote_refresh_with_public(
             }
         } else if public_okx_pair_for_target(target).is_some() {
             public_okx_latest_quote(&client, target, now).await
+        } else if public_yahoo_symbol_for_target(target).is_some() {
+            public_yahoo_latest_quote(&client, target, now).await
         } else {
             public_latest_quote(target, coingecko.as_ref(), now)
         };
+        let retryable = public_okx_pair_for_target(target).is_some()
+            || public_yahoo_symbol_for_target(target).is_some();
         match result {
             Ok(quote) => quotes.push(quote),
             Err(message) => errors.push(public_provider_error(
                 "instrument",
                 target.get("instrumentId").and_then(Value::as_str),
                 &message,
-                false,
+                retryable,
             )),
         }
     }
@@ -4533,6 +4538,128 @@ fn public_okx_pair_for_target(target: &Value) -> Option<String> {
         return None;
     }
     Some(format!("{base}-{quote}"))
+}
+
+fn public_yahoo_symbol_for_target(target: &Value) -> Option<String> {
+    if !matches!(
+        target.get("type").and_then(Value::as_str),
+        Some("equity" | "fund")
+    ) {
+        return None;
+    }
+    let symbol = target
+        .get("symbol")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_ascii_uppercase();
+    let market = target
+        .get("market")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_ascii_uppercase();
+    match market.as_str() {
+        "NASDAQ" | "NYSE" | "AMEX" | "ARCA" => (!symbol.is_empty()
+            && symbol.len() <= 16
+            && symbol
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-')))
+        .then_some(symbol),
+        "SSE" | "XSHG" => (symbol.len() == 6 && symbol.chars().all(|ch| ch.is_ascii_digit()))
+            .then(|| format!("{symbol}.SS")),
+        "SZSE" | "XSHE" => (symbol.len() == 6 && symbol.chars().all(|ch| ch.is_ascii_digit()))
+            .then(|| format!("{symbol}.SZ")),
+        _ => None,
+    }
+}
+
+async fn public_yahoo_latest_quote(
+    client: &reqwest::Client,
+    target: &Value,
+    now: &str,
+) -> Result<Value, String> {
+    public_yahoo_latest_quote_from(client, target, now, YAHOO_PUBLIC_CHART_ENDPOINT).await
+}
+
+async fn public_yahoo_latest_quote_from(
+    client: &reqwest::Client,
+    target: &Value,
+    _now: &str,
+    endpoint: &str,
+) -> Result<Value, String> {
+    let instrument_id = target
+        .get("instrumentId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "quote target has no instrumentId".to_string())?;
+    let expected_currency = target
+        .get("quoteCurrency")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "quote target has no quoteCurrency".to_string())?
+        .trim()
+        .to_ascii_uppercase();
+    let symbol = public_yahoo_symbol_for_target(target)
+        .ok_or_else(|| "instrument is not eligible for Yahoo public quote lookup".to_string())?;
+    let response = client
+        .get(format!("{}/{symbol}", endpoint.trim_end_matches('/')))
+        .query(&[("interval", "1d"), ("range", "5d")])
+        .send()
+        .await
+        .map_err(|error| format!("Yahoo request failed for {symbol}: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Yahoo returned an error for {symbol}: {error}"))?
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Yahoo response was invalid for {symbol}: {error}"))?;
+    if !response["chart"]["error"].is_null() {
+        return Err(format!(
+            "Yahoo returned a chart error for {symbol}: {}",
+            response["chart"]["error"]
+        ));
+    }
+    let meta = response["chart"]["result"]
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|result| result.get("meta"))
+        .ok_or_else(|| format!("Yahoo returned no quote metadata for {symbol}"))?;
+    let currency = meta
+        .get("currency")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("Yahoo returned no quote currency for {symbol}"))?
+        .trim()
+        .to_ascii_uppercase();
+    if currency != expected_currency {
+        return Err(format!(
+            "Yahoo currency mismatch for {symbol}: expected {expected_currency}, received {currency}"
+        ));
+    }
+    let price = meta
+        .get("regularMarketPrice")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| format!("Yahoo returned no current price for {symbol}"))?;
+    let price = provider_decimal_string(price)?;
+    let timestamp = meta
+        .get("regularMarketTime")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("Yahoo returned no market timestamp for {symbol}"))?;
+    let as_of = OffsetDateTime::from_unix_timestamp(timestamp)
+        .map_err(|_| format!("Yahoo returned an invalid market timestamp for {symbol}"))?
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
+    let expires_at = (OffsetDateTime::now_utc() + Duration::minutes(15))
+        .format(&Rfc3339)
+        .expect("RFC3339 formatting should succeed");
+
+    Ok(json!({
+        "instrumentId": instrument_id,
+        "price": price,
+        "currency": currency,
+        "asOf": as_of,
+        "source": "yahoo_finance_api",
+        "sourceUrl": format!("https://finance.yahoo.com/quote/{symbol}"),
+        "status": "fresh",
+        "expiresAt": expires_at
+    }))
 }
 
 async fn public_okx_latest_quote(
@@ -13361,6 +13488,197 @@ mod tests {
             "symbol": "SOL",
             "quoteCurrency": "USDT"
         })
+    }
+
+    #[test]
+    fn public_provider_maps_investment_markets_to_yahoo_symbols_deterministically() {
+        let aapl = json!({
+            "instrumentId": "inst_equity_nasdaq_aapl",
+            "type": "equity",
+            "symbol": "AAPL",
+            "quoteCurrency": "USD",
+            "market": "NASDAQ"
+        });
+        let sse_fund = json!({
+            "instrumentId": "inst_fund_sse_510300",
+            "type": "fund",
+            "symbol": "510300",
+            "quoteCurrency": "CNY",
+            "market": "SSE"
+        });
+        let szse_fund = json!({
+            "instrumentId": "inst_fund_szse_159919",
+            "type": "fund",
+            "symbol": "159919",
+            "quoteCurrency": "CNY",
+            "market": "SZSE"
+        });
+
+        assert_eq!(
+            public_yahoo_symbol_for_target(&aapl).as_deref(),
+            Some("AAPL")
+        );
+        assert_eq!(
+            public_yahoo_symbol_for_target(&sse_fund).as_deref(),
+            Some("510300.SS")
+        );
+        assert_eq!(
+            public_yahoo_symbol_for_target(&szse_fund).as_deref(),
+            Some("159919.SZ")
+        );
+        assert!(
+            public_yahoo_symbol_for_target(&json!({
+                "type": "crypto", "symbol": "SOL", "market": "crypto"
+            }))
+            .is_none()
+        );
+        assert!(
+            public_yahoo_symbol_for_target(&json!({
+                "type": "equity", "symbol": "AAPL", "market": "unknown"
+            }))
+            .is_none()
+        );
+        assert!(
+            public_yahoo_symbol_for_target(&json!({
+                "type": "equity", "symbol": "../AAPL", "market": "NASDAQ"
+            }))
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_provider_fetches_a_structured_investment_quote_without_writing() {
+        async fn chart(
+            Path(symbol): Path<String>,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> Json<Value> {
+            assert_eq!(symbol, "510300.SS");
+            assert_eq!(query.get("interval").map(String::as_str), Some("1d"));
+            assert_eq!(query.get("range").map(String::as_str), Some("5d"));
+            Json(json!({
+                "chart": {
+                    "result": [{
+                        "meta": {
+                            "currency": "CNY",
+                            "regularMarketPrice": 4.125,
+                            "regularMarketTime": 1785468600
+                        }
+                    }],
+                    "error": null
+                }
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Yahoo mock listener");
+        let address = listener.local_addr().expect("Yahoo mock address");
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v8/finance/chart/{symbol}", get(chart)),
+            )
+            .await
+            .expect("Yahoo mock server");
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+        let target = json!({
+            "instrumentId": "inst_fund_sse_510300",
+            "type": "fund",
+            "symbol": "510300",
+            "quoteCurrency": "CNY",
+            "market": "SSE"
+        });
+        let quote = public_yahoo_latest_quote_from(
+            &client,
+            &target,
+            "2026-07-31T00:00:00Z",
+            &format!("http://{address}/v8/finance/chart"),
+        )
+        .await
+        .expect("SSE fund quote should map");
+        task.abort();
+
+        assert_eq!(quote["instrumentId"], "inst_fund_sse_510300");
+        assert_eq!(quote["price"], "4.125");
+        assert_eq!(quote["currency"], "CNY");
+        assert_eq!(quote["source"], "yahoo_finance_api");
+        assert_eq!(quote["asOf"], "2026-07-31T03:30:00Z");
+        assert_eq!(
+            quote["sourceUrl"],
+            "https://finance.yahoo.com/quote/510300.SS"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_yahoo_quote_rejects_currency_price_and_timestamp_mismatches() {
+        async fn chart(State(payload): State<Value>) -> Json<Value> {
+            Json(payload)
+        }
+
+        let target = json!({
+            "instrumentId": "inst_equity_nasdaq_aapl",
+            "type": "equity",
+            "symbol": "AAPL",
+            "quoteCurrency": "USD",
+            "market": "NASDAQ"
+        });
+        let cases = [
+            (
+                json!({"chart": {"result": [{"meta": {
+                    "currency": "CNY", "regularMarketPrice": 200.0,
+                    "regularMarketTime": 1785468600
+                }}], "error": null}}),
+                "currency mismatch",
+            ),
+            (
+                json!({"chart": {"result": [{"meta": {
+                    "currency": "USD", "regularMarketPrice": 0,
+                    "regularMarketTime": 1785468600
+                }}], "error": null}}),
+                "finite and positive",
+            ),
+            (
+                json!({"chart": {"result": [{"meta": {
+                    "currency": "USD", "regularMarketPrice": 200.0,
+                    "regularMarketTime": "not-a-time"
+                }}], "error": null}}),
+                "market timestamp",
+            ),
+        ];
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test HTTP client");
+        for (payload, expected) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("Yahoo mock listener");
+            let address = listener.local_addr().expect("Yahoo mock address");
+            let task = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/v8/finance/chart/{symbol}", get(chart))
+                        .with_state(payload),
+                )
+                .await
+                .expect("Yahoo mock server");
+            });
+            let error = public_yahoo_latest_quote_from(
+                &client,
+                &target,
+                "2026-07-31T00:00:00Z",
+                &format!("http://{address}/v8/finance/chart"),
+            )
+            .await
+            .expect_err("invalid Yahoo metadata must fail closed");
+            task.abort();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
     }
 
     #[tokio::test]
