@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../core/format.dart';
+import '../core/types.dart';
 import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../theme/app_dimens.dart';
@@ -21,6 +22,23 @@ List<MovementVm> holdingSnapshotMovements(AiAtomicGroupVm group) => [
   for (final m in group.proposedMovements)
     if (m.tags.contains(kHoldingSnapshotTag) && m.holdingAdjustment != null) m,
 ];
+
+/// 组内涉及的账户 ID：优先 holdingAdjustment.accountId，退回 entry 的 accountId。
+/// 用于审核动作后精确失效该账户的详情与持仓，不必退出重进。
+Set<Id> holdingGroupAccountIds(AiAtomicGroupVm group) {
+  final ids = <Id>{};
+  for (final m in group.proposedMovements) {
+    final adjustment = m.holdingAdjustment;
+    if (adjustment != null && adjustment.accountId.isNotEmpty) {
+      ids.add(adjustment.accountId);
+      continue;
+    }
+    for (final e in m.entries) {
+      if (e.accountId.isNotEmpty) ids.add(e.accountId);
+    }
+  }
+  return ids;
+}
 
 /// 快照卡：默认只报变化项数，展开后逐项显示 previous → target。
 class HoldingSnapshotCard extends ConsumerStatefulWidget {

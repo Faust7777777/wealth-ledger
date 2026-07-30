@@ -343,6 +343,7 @@ class HoldingVm {
     this.instrumentId = '',
     this.costBasisTotal,
     this.marketValue,
+    this.accountMarketValue,
     this.dayChange,
     this.unrealizedPnl,
     this.unrealizedPnlRate,
@@ -357,7 +358,11 @@ class HoldingVm {
   final DecimalString quantity;
   final QuoteStatus quoteStatus;
   final Money? costBasisTotal; // null → "成本未记录"
-  final ValuedMoney? marketValue; // unpriceable → null（UI 显 —）
+  final ValuedMoney? marketValue; // 账本本位币（组合/净资产用）；unpriceable → null
+
+  /// 折算到所属账户 defaultCurrency 的价值（账户详情合计用）。
+  /// 服务端缺省时为 null：账户合计不得拿本位币的 marketValue 混算。
+  final ValuedMoney? accountMarketValue;
   final Money? dayChange;
   final Money? unrealizedPnl;
   final DecimalString? unrealizedPnlRate;
@@ -1004,6 +1009,22 @@ class QuoteStatusSummaryVm {
       errorCount == 0;
 }
 
+/// 报价刷新的单条失败。message 是服务端英文实现细节，只能进低强调详情。
+class QuoteRefreshErrorVm {
+  const QuoteRefreshErrorVm({
+    required this.targetType,
+    required this.message,
+    this.targetId,
+    this.retryable = true,
+  });
+
+  /// request | instrument | fx_pair
+  final String targetType;
+  final String message;
+  final Id? targetId;
+  final bool retryable;
+}
+
 class QuoteRefreshResultVm {
   const QuoteRefreshResultVm({
     required this.status,
@@ -1011,12 +1032,18 @@ class QuoteRefreshResultVm {
     this.quoteCount = 0,
     this.fxRateCount = 0,
     this.errors = const [],
+    this.errorDetails = const [],
   });
   final String status; // success | partial_success | failed | offline
   final IsoDateTime completedAt;
   final int quoteCount;
   final int fxRateCount;
+
+  /// 兼容旧调用点的原始 message 列表（不要直接展示给用户）。
   final List<String> errors;
+
+  /// 结构化失败项：用于映射成简短中文。
+  final List<QuoteRefreshErrorVm> errorDetails;
 
   bool get hasProblems =>
       status == 'partial_success' ||

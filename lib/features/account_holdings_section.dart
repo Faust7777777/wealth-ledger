@@ -21,13 +21,21 @@ bool accountIsMultiAsset(AccountVm account) {
       account.balanceMode == 'mixed';
 }
 
-/// 一项持仓是否缺少可用折算价值（缺报价 / 报价失败 / 无法定价）。
-bool holdingLacksValue(HoldingVm holding) {
-  final value = holding.marketValue;
-  if (value == null) return true;
-  return value.quality == ValueQuality.unpriceable ||
-      value.quality == ValueQuality.anomaly;
+/// 账户合计只认账户折算单位的价值：服务端的 accountMarketValue。
+/// 本位币 marketValue 属于组合/净资产口径，不能与账户默认单位混算。
+ValuedMoney? holdingAccountValue(HoldingVm holding) {
+  final value = holding.accountMarketValue;
+  if (value == null) return null;
+  if (value.quality == ValueQuality.unpriceable ||
+      value.quality == ValueQuality.anomaly) {
+    return null;
+  }
+  return value;
 }
+
+/// 一项持仓在账户口径下是否缺少可用折算价值。
+bool holdingLacksValue(HoldingVm holding) =>
+    holdingAccountValue(holding) == null;
 
 /// 账户持仓合计：只累加能折算且币种一致的部分，缺报价的项被排除而不是当 0。
 class AccountHoldingsTotal {
@@ -41,6 +49,9 @@ class AccountHoldingsTotal {
   final CurrencyCode currency;
   final DecimalString amount;
   final int pricedCount;
+
+  /// 没有任何一项成功计价时不显示 0：合计只能是 —。
+  bool get hasAmount => pricedCount > 0;
 
   /// 缺报价因而无法折算的项数。
   final int missingQuoteCount;
@@ -71,8 +82,8 @@ AccountHoldingsTotal accountHoldingsTotal(
   var missingQuote = 0;
   var otherCurrency = 0;
   for (final h in holdings) {
-    final value = h.marketValue;
-    if (holdingLacksValue(h) || value == null) {
+    final value = holdingAccountValue(h);
+    if (value == null) {
       missingQuote += 1;
       continue;
     }
@@ -189,9 +200,11 @@ class AccountHoldingsSection extends ConsumerWidget {
                 ),
               ),
               Text(
-                formatMoney(
-                  Money(amount: total.amount, currency: total.currency),
-                ),
+                total.hasAmount
+                    ? formatMoney(
+                        Money(amount: total.amount, currency: total.currency),
+                      )
+                    : '—',
                 style: AppType.moneyRow,
               ),
             ],
@@ -242,7 +255,8 @@ class AccountHoldingRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final value = holding.marketValue;
+    // 行内折算价值与合计同口径：账户折算单位。
+    final value = holdingAccountValue(holding) ?? holding.accountMarketValue;
     final statusText = holdingQuoteStatusText(holding.quoteStatus);
     final unit = quoteUnit;
     return ListTile(

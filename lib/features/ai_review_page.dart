@@ -203,6 +203,11 @@ class _GroupBlock extends ConsumerWidget {
     try {
       final result = await op();
       ref.invalidate(aiPendingProvider);
+      // 持仓类候选：精确失效涉及账户的详情与持仓，账户详情保持打开也能原地更新。
+      for (final accountId in holdingGroupAccountIds(g)) {
+        ref.invalidate(accountByIdProvider(accountId));
+        ref.invalidate(holdingsByAccountProvider(accountId));
+      }
       // 该组可能是订阅扣费候选：确认或拒绝后订阅 pending/nextCharge 都会变，一并刷新。
       ref.invalidate(subscriptionsProvider);
       ref.invalidate(upcomingSubscriptionsProvider);

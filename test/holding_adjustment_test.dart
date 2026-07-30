@@ -54,9 +54,17 @@ const _btc = HoldingVm(
   displayName: 'Bitcoin',
   quantity: '0.00076078',
   quoteStatus: QuoteStatus.fresh,
+  // 组合口径（本位币）。
   marketValue: ValuedMoney(
     amount: '380.00',
     currency: 'CNY',
+    asOf: '2026-07-18T09:00:00+08:00',
+    quality: ValueQuality.estimated,
+  ),
+  // 账户口径（账户折算单位 USDT）：账户详情的行内价值与合计只用这个。
+  accountMarketValue: ValuedMoney(
+    amount: '52.10',
+    currency: 'USDT',
     asOf: '2026-07-18T09:00:00+08:00',
     quality: ValueQuality.estimated,
   ),

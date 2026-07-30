@@ -17,6 +17,15 @@ import 'account_visuals.dart';
 
 const List<String> _currencies = ['CNY', 'USD', 'HKD', 'USDT', 'BTC', 'ETH'];
 
+/// 「交易计价单位」帮助入口的稳定 Key。
+const kAccountTradingUnitsHelpKey = ValueKey('account_trading_units_help');
+
+/// 各账户类型的默认折算单位：交易所/钱包按 USDT 记，其余按 CNY。
+String defaultConversionUnitFor(AccountType type) => switch (type) {
+  AccountType.exchange || AccountType.wallet => 'USDT',
+  _ => 'CNY',
+};
+
 /// 交易所/钱包等多资产账户才需要维护多币种；其余账户保持单一默认币种。
 bool accountSupportsMultipleCurrencies(AccountType type) =>
     type == AccountType.exchange ||
@@ -45,7 +54,12 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
   final _institution = TextEditingController();
   final _openingAmount = TextEditingController();
   late AccountType _type = widget.initialType ?? AccountType.bank;
-  String _currency = 'CNY';
+  late String _currency = widget.existing == null
+      ? defaultConversionUnitFor(_type)
+      : 'CNY';
+
+  /// 新建时切换账户类型会跟随该类型的默认折算单位；用户手动改过就不再跟随。
+  bool _currencyTouched = false;
   // 支持币种与默认折算币种分开：默认币种始终隐含被支持。
   final Set<String> _supported = <String>{};
   bool _includeInNetWorth = true;
@@ -86,7 +100,14 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
 
   Future<void> _pickType() async {
     final picked = await showAccountTypePicker(context, selected: _type);
-    if (picked != null && mounted) setState(() => _type = picked);
+    if (picked == null || !mounted) return;
+    setState(() {
+      _type = picked;
+      // 编辑既有账户时绝不静默改折算单位：只有新建且用户没手动选过才跟随类型。
+      if (widget.existing == null && !_currencyTouched) {
+        _currency = defaultConversionUnitFor(picked);
+      }
+    });
   }
 
   /// 期初余额（仅新建）：欠款正数输入 → 账本负数；空/零 → null（发送空数组）。
@@ -192,18 +213,46 @@ class _AccountFormPageState extends ConsumerState<AccountFormPage> {
             DropdownButtonFormField<String>(
               initialValue: _currency,
               decoration: const InputDecoration(
-                labelText: '默认币种',
+                labelText: '账户折算单位',
                 border: OutlineInputBorder(),
               ),
               items: [
                 for (final c in currencyItems)
                   DropdownMenuItem(value: c, child: Text(c)),
               ],
-              onChanged: (v) => setState(() => _currency = v ?? _currency),
+              onChanged: (v) => setState(() {
+                _currency = v ?? _currency;
+                _currencyTouched = true;
+              }),
             ),
             if (accountSupportsMultipleCurrencies(_type)) ...[
               const SizedBox(height: AppSpacing.base),
-              Text('支持币种', style: AppType.caption),
+              Row(
+                children: [
+                  Text('交易计价单位', style: AppType.caption),
+                  IconButton(
+                    key: kAccountTradingUnitsHelpKey,
+                    tooltip: '交易计价单位说明',
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.help_outline, size: 16),
+                    onPressed: () => showDialog<void>(
+                      context: context,
+                      builder: (c) => AlertDialog(
+                        content: const Text(
+                          '交易计价单位是这个账户成交时使用的计价单位。'
+                          '持有哪些资产由持仓与标的决定，不在这里勾选。',
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(c),
+                            child: const Text('知道了'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
               Wrap(
                 spacing: AppSpacing.xs,
                 children: [

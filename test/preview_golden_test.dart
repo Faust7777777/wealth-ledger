@@ -1030,6 +1030,12 @@ void main() {
       quoteStatus: QuoteStatus.fresh,
       marketValue: ValuedMoney(
         amount: '9000.00',
+        currency: 'CNY',
+        asOf: '2026-07-29T09:00:00+08:00',
+        quality: ValueQuality.exact,
+      ),
+      accountMarketValue: ValuedMoney(
+        amount: '1250.00',
         currency: 'USDT',
         asOf: '2026-07-29T09:00:00+08:00',
         quality: ValueQuality.exact,
@@ -1046,6 +1052,12 @@ void main() {
       marketValue: ValuedMoney(
         amount: '380.00',
         currency: 'CNY',
+        asOf: '2026-07-18T09:00:00+08:00',
+        quality: ValueQuality.estimated,
+      ),
+      accountMarketValue: ValuedMoney(
+        amount: '52.10',
+        currency: 'USDT',
         asOf: '2026-07-18T09:00:00+08:00',
         quality: ValueQuality.estimated,
       ),

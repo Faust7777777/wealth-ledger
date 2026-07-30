@@ -708,6 +708,7 @@ HoldingVm _holding(Map<String, dynamic> j) {
     quoteStatus: _quote(j['quoteStatus']),
     costBasisTotal: _moneyOrNull(j['costBasisTotal']),
     marketValue: _valuedOrNull(j['marketValue']),
+    accountMarketValue: _valuedOrNull(j['accountMarketValue']),
     dayChange: _moneyOrNull(j['dayChange']),
     unrealizedPnl: _moneyOrNull(j['unrealizedPnl']),
     unrealizedPnlRate: j['unrealizedPnlRate'] as String?,
@@ -990,6 +991,10 @@ QuoteStatusSummaryVm _quoteSummary(Map<String, dynamic> j) =>
       errorCount: _int(j['errorCount']),
     );
 
+/// 供单测直接校验 wire → VM（结构化错误字段）。
+QuoteRefreshResultVm parseQuoteRefreshResultData(Map<String, dynamic> j) =>
+    _quoteRefreshResult(j);
+
 QuoteRefreshResultVm _quoteRefreshResult(Map<String, dynamic> j) =>
     QuoteRefreshResultVm(
       status: '${j['status'] ?? 'failed'}',
@@ -999,6 +1004,18 @@ QuoteRefreshResultVm _quoteRefreshResult(Map<String, dynamic> j) =>
       fxRateCount: _list(j['fxRates']).length,
       errors: [
         for (final e in _list(j['errors'])) e is Map ? '${e['message']}' : '$e',
+      ],
+      errorDetails: [
+        for (final e in _list(j['errors']))
+          if (e is Map)
+            QuoteRefreshErrorVm(
+              targetType: '${_m(e)['targetType'] ?? 'request'}',
+              message: '${_m(e)['message'] ?? ''}',
+              targetId: _m(e)['targetId'] as String?,
+              retryable: _bool(_m(e)['retryable'], fallback: true),
+            )
+          else
+            QuoteRefreshErrorVm(targetType: 'request', message: '$e'),
       ],
     );
 

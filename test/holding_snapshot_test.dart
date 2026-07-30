@@ -97,6 +97,8 @@ HoldingVm _holding(
   quantity: quantity,
   quoteStatus: status,
   marketValue: value,
+  // 账户合计口径：accountMarketValue（账户折算单位）。
+  accountMarketValue: value,
 );
 
 List<HoldingVm> get _holdings => [
@@ -294,6 +296,29 @@ class _DetailPortfolioRepo implements PortfolioRepository {
   );
 }
 
+/// 标的仓库 fake：登记资产由服务端分配 id，前端不生成。
+class _FakeInstrumentRepo implements InstrumentRepository {
+  _FakeInstrumentRepo({this.fails = false});
+  final bool fails;
+  final List<CreateInstrumentInput> created = [];
+
+  @override
+  Future<List<InstrumentVm>> listInstruments() async => _instruments;
+
+  @override
+  Future<InstrumentVm> createInstrument(CreateInstrumentInput input) async {
+    created.add(input);
+    if (fails) throw Exception('offline');
+    return InstrumentVm(
+      id: 'inst_server_${created.length}',
+      type: input.type,
+      symbol: input.symbol,
+      displayName: input.displayName,
+      quoteCurrency: input.quoteCurrency,
+    );
+  }
+}
+
 class _FakeAccountRepo implements AccountRepository {
   const _FakeAccountRepo();
   @override
@@ -345,11 +370,16 @@ class _ReviewRepo implements AiProposalRepository {
   dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 }
 
-Widget _detailHost(_DetailPortfolioRepo repo) => ProviderScope(
+Widget _detailHost(
+  _DetailPortfolioRepo repo, {
+  _FakeInstrumentRepo? instrumentRepo,
+}) => ProviderScope(
   overrides: [
     capabilitiesProvider.overrideWith((ref) async => _caps),
     accountRepositoryProvider.overrideWithValue(const _FakeAccountRepo()),
     portfolioRepositoryProvider.overrideWithValue(repo),
+    if (instrumentRepo != null)
+      instrumentRepositoryProvider.overrideWithValue(instrumentRepo),
     instrumentsProvider.overrideWith((ref) async => _instruments),
     aiPendingProvider.overrideWith((ref) async => const <AiProposalVm>[]),
   ],
@@ -625,6 +655,69 @@ void main() {
       expect(body['positions'], [
         {'instrumentId': 'inst_sol', 'targetQuantity': '12'},
       ]);
+    });
+
+    testWidgets('找不到标的时可登记：id 由服务端分配，失败不假装成功', (tester) async {
+      tester.view.physicalSize = const Size(720, 1280);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      final captured = _snapshotRepo();
+      final instrumentRepo = _FakeInstrumentRepo();
+      await tester.pumpWidget(
+        _detailHost(
+          _DetailPortfolioRepo(captured.repo),
+          instrumentRepo: instrumentRepo,
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(kAccountUpdateHoldingsKey));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(kHoldingSnapshotAddKey));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byKey(kHoldingSnapshotSearchKey), 'doge');
+      await tester.pumpAndSettle();
+
+      expect(find.text('没有匹配的资产'), findsOneWidget);
+      expect(find.byKey(kHoldingSnapshotRegisterKey), findsOneWidget);
+      expect(find.text('登记 DOGE'), findsOneWidget);
+
+      await tester.tap(find.byKey(kHoldingSnapshotRegisterKey));
+      await tester.pumpAndSettle();
+
+      // 登记走服务端接口：前端只传符号与计价单位，不生成 id。
+      expect(instrumentRepo.created.single.symbol, 'DOGE');
+      expect(instrumentRepo.created.single.quoteCurrency, 'CNY');
+      expect(instrumentRepo.created.single.type, InstrumentType.crypto);
+      // 回到批量弹窗，用服务端返回的真实 id 建行。
+      expect(
+        find.byKey(const ValueKey('holding_snapshot_field_inst_server_1')),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('登记失败：给短提示，不建行也不假装成功', (tester) async {
+      tester.view.physicalSize = const Size(720, 1280);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      final instrumentRepo = _FakeInstrumentRepo(fails: true);
+      await tester.pumpWidget(
+        _detailHost(
+          _DetailPortfolioRepo(_snapshotRepo().repo),
+          instrumentRepo: instrumentRepo,
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(kAccountUpdateHoldingsKey));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(kHoldingSnapshotAddKey));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byKey(kHoldingSnapshotSearchKey), 'doge');
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(kHoldingSnapshotRegisterKey));
+      await tester.pumpAndSettle();
+
+      expect(find.text('登记未成功，请重试'), findsOneWidget);
+      expect(instrumentRepo.created, hasLength(1));
     });
 
     test('401 刷新后重放复用同一个 Idempotency-Key', () async {

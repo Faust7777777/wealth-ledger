@@ -10,6 +10,7 @@ import '../data/providers.dart';
 import '../data/view_models.dart';
 import '../theme/app_dimens.dart';
 import '../theme/app_typography.dart';
+import 'quote_refresh_messages.dart';
 
 /// 面板里的一行：某账户下某资产的原始数量与估值状态说明。
 class ValuationIssueVm {
@@ -98,6 +99,9 @@ List<ValuationIssueVm> composeValuationIssues({
   return issues;
 }
 
+/// 低强调「详情」入口的稳定 Key。
+const kValuationErrorDetailsKey = ValueKey('valuation_error_details');
+
 Future<void> showValuationStatusDialog(BuildContext context) =>
     showDialog<void>(
       context: context,
@@ -115,6 +119,10 @@ class ValuationStatusDialog extends ConsumerStatefulWidget {
 class _ValuationStatusDialogState extends ConsumerState<ValuationStatusDialog> {
   bool _busy = false;
 
+  /// 上一次刷新的失败项：只在低强调「详情」里展开，主界面不出现英文。
+  List<QuoteRefreshErrorVm> _lastErrors = const [];
+  bool _showDetails = false;
+
   Future<void> _refresh() async {
     final messenger = ScaffoldMessenger.of(context);
     setState(() => _busy = true);
@@ -127,20 +135,22 @@ class _ValuationStatusDialogState extends ConsumerState<ValuationStatusDialog> {
       ref.invalidate(holdingsProvider);
       ref.invalidate(overviewProvider);
       ref.invalidate(allocationProvider);
+      if (mounted) {
+        setState(() {
+          _lastErrors = result.errorDetails;
+          if (result.errorDetails.isEmpty) _showDetails = false;
+        });
+      }
       if (result.hasProblems) {
         // 刷新有问题：面板保持打开，列表会随新数据重算。
         messenger.showSnackBar(
-          SnackBar(
-            content: Text(
-              result.errors.isEmpty
-                  ? '部分估值仍未刷新'
-                  : '刷新失败：${result.errors.first}',
-            ),
-          ),
+          SnackBar(content: Text(quoteRefreshResultText(result))),
         );
       }
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('刷新失败：$e')));
+    } catch (_) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text(kQuoteRefreshFailureText)),
+      );
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -220,6 +230,31 @@ class _ValuationStatusDialogState extends ConsumerState<ValuationStatusDialog> {
                   ],
                 ),
               ),
+          if (_lastErrors.isNotEmpty) ...[
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: AppSpacing.base),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton(
+                  key: kValuationErrorDetailsKey,
+                  onPressed: () => setState(() => _showDetails = !_showDetails),
+                  child: Text(_showDetails ? '收起详情' : '详情'),
+                ),
+              ),
+            ),
+            if (_showDetails)
+              for (final error in _lastErrors)
+                Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: AppSpacing.base,
+                    vertical: AppSpacing.xxs,
+                  ),
+                  child: Text(
+                    quoteRefreshErrorDetailText(error),
+                    style: AppType.caption,
+                  ),
+                ),
+          ],
         ],
       );
     }

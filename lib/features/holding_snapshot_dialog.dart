@@ -20,6 +20,7 @@ import 'account_form_validation.dart' show targetQuantityError;
 const Key kHoldingSnapshotSubmitKey = Key('holding_snapshot_submit');
 const Key kHoldingSnapshotAddKey = Key('holding_snapshot_add');
 const Key kHoldingSnapshotSearchKey = Key('holding_snapshot_search');
+const Key kHoldingSnapshotRegisterKey = Key('holding_snapshot_register');
 
 Future<void> showHoldingSnapshotDialog(
   BuildContext context, {
@@ -106,6 +107,7 @@ class _HoldingSnapshotDialogState extends ConsumerState<HoldingSnapshotDialog> {
     final picked = await showDialog<InstrumentVm>(
       context: context,
       builder: (_) => _InstrumentPicker(
+        quoteCurrency: widget.account.defaultCurrency,
         instruments: [
           for (final i in instruments)
             if (!taken.contains(i.id)) i,
@@ -282,16 +284,56 @@ class _HoldingSnapshotDialogState extends ConsumerState<HoldingSnapshotDialog> {
 }
 
 /// 标的选择：在服务端返回的真实标的里搜索，前端不生成 instrumentId。
-class _InstrumentPicker extends StatefulWidget {
-  const _InstrumentPicker({required this.instruments});
+class _InstrumentPicker extends ConsumerStatefulWidget {
+  const _InstrumentPicker({
+    required this.instruments,
+    required this.quoteCurrency,
+  });
   final List<InstrumentVm> instruments;
 
+  /// 登记新资产时的默认计价单位：取账户折算单位。
+  final CurrencyCode quoteCurrency;
+
   @override
-  State<_InstrumentPicker> createState() => _InstrumentPickerState();
+  ConsumerState<_InstrumentPicker> createState() => _InstrumentPickerState();
 }
 
-class _InstrumentPickerState extends State<_InstrumentPicker> {
+class _InstrumentPickerState extends ConsumerState<_InstrumentPicker> {
   String _query = '';
+  bool _registering = false;
+  String? _registerError;
+
+  /// 登记资产：由服务端创建标的并回传真实 id，前端不生成 instrumentId、
+  /// 也不在失败时假装成功。
+  Future<void> _register() async {
+    final symbol = _query.trim().toUpperCase();
+    if (symbol.isEmpty || _registering) return;
+    setState(() {
+      _registering = true;
+      _registerError = null;
+    });
+    try {
+      final created = await ref
+          .read(instrumentRepositoryProvider)
+          .createInstrument(
+            CreateInstrumentInput(
+              type: InstrumentType.crypto,
+              displayName: symbol,
+              quoteCurrency: widget.quoteCurrency,
+              symbol: symbol,
+            ),
+          );
+      ref.invalidate(instrumentsProvider);
+      if (mounted) Navigator.of(context).pop(created);
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _registerError = '登记未成功，请重试';
+          _registering = false;
+        });
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -325,7 +367,30 @@ class _InstrumentPickerState extends State<_InstrumentPicker> {
               const SizedBox(height: AppSpacing.sm),
               Flexible(
                 child: matches.isEmpty
-                    ? Text('没有匹配的资产', style: AppType.caption)
+                    ? Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('没有匹配的资产', style: AppType.caption),
+                          if (_query.trim().isNotEmpty)
+                            TextButton(
+                              key: kHoldingSnapshotRegisterKey,
+                              onPressed: _registering ? null : _register,
+                              child: Text(
+                                _registering
+                                    ? '登记中…'
+                                    : '登记 ${_query.trim().toUpperCase()}',
+                              ),
+                            ),
+                          if (_registerError != null)
+                            Text(
+                              _registerError!,
+                              style: AppType.caption.copyWith(
+                                color: Theme.of(context).colorScheme.error,
+                              ),
+                            ),
+                        ],
+                      )
                     : ListView(
                         shrinkWrap: true,
                         children: [
