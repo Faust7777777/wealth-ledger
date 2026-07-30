@@ -16,4 +16,14 @@
 
 - CNY 默认的 exchange 登记 ETH 与 SOL：ETH 仍可用 CNY，SOL 必须是 USDT，账户支持币种成为 CNY/BTC/USDT 的真实并集。
 - CNY 默认的 exchange 登记 SOL、确认持仓后，在 SOL/USDT、USDT/USD、USD/CNY 三段数据齐备时正确汇总为 CNY；缺 Quote 与缺 FX path 分别保持结构化问题状态。
-- 待全量门禁、推送与部署后补生产结果。
+
+## 门禁与部署
+
+- Rust 全量 `155 passed`；Agent 全量 `32 passed`；TypeScript check/build、OpenAPI/契约检查和 `cargo fmt --check` 均通过。
+- 实现提交 `931185d` 已推送到 `origin/feat/integration-self-use`。
+- VPS 使用 Rust 1.97.1 从该提交归档重新执行 `cargo test --locked` 与 `cargo build --release --locked`，服务器侧同样为 `155 passed`。
+- 候选二进制先通过生产配置、真实账本和 auth state 离线校验，再执行替换；未为验收创建 SOL、持仓、报价或其他生产记录。
+- 部署前账本与认证状态备份：`/var/backups/finwealth/20260730-203712Z`。
+- 旧 Rust 二进制回滚目录：`/opt/finwealth/rollback-20260730-203712Z`。
+- Rust 与 Agent 服务均为 active；`check_vps_readiness.sh --public-base-url https://wuwaidut.com` 和公网 health 通过。
+- VPS 临时源码归档与构建目录已清理；部署后根分区约有 38 GB 可用。未修改 Caddy、Cloudflare、`sub2api.wuwaidut.com` 或中转站配置。
