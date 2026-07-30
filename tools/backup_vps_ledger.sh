@@ -8,10 +8,19 @@ SERVER_BIN="${FINWEALTH_SERVER_BIN:-/opt/finwealth/finwealth-server}"
 SERVICE_NAME="${FINWEALTH_SERVICE_NAME:-finwealth-server.service}"
 STOP_SERVICE="${FINWEALTH_BACKUP_STOP_SERVICE:-true}"
 ALLOW_UNVALIDATED="${FINWEALTH_ALLOW_UNVALIDATED_BACKUP:-false}"
+DEPENDENT_SERVICES_RAW="${FINWEALTH_BACKUP_DEPENDENT_SERVICES:-finwealth-agent.service}"
 
 STAGING=""
 SERVICE_WAS_ACTIVE="false"
 ACTIVE_PROXY_SOCKETS=()
+ACTIVE_DEPENDENT_SERVICES=()
+read -r -a DEPENDENT_SERVICES <<<"$DEPENDENT_SERVICES_RAW"
+for service in "${DEPENDENT_SERVICES[@]}"; do
+  if [[ ! "$service" =~ ^[A-Za-z0-9_.@:-]+\.service$ ]]; then
+    echo "invalid dependent systemd service name: $service" >&2
+    exit 2
+  fi
+done
 
 stop_proxy_companions() {
   mapfile -t ACTIVE_PROXY_SOCKETS < <(
@@ -48,11 +57,15 @@ cleanup() {
       status=1
     fi
   fi
-  if [ "$status" -eq 0 ]; then
-    if ! start_proxy_sockets; then
-      echo "failed to restore Finwealth Docker bridge proxy sockets after backup" >&2
+  if [ "${#ACTIVE_DEPENDENT_SERVICES[@]}" -gt 0 ]; then
+    if ! systemctl start "${ACTIVE_DEPENDENT_SERVICES[@]}"; then
+      echo "failed to restart dependent services after backup" >&2
       status=1
     fi
+  fi
+  if ! start_proxy_sockets; then
+    echo "failed to restore Finwealth Docker bridge proxy sockets after backup" >&2
+    status=1
   fi
   exit "$status"
 }
@@ -82,6 +95,12 @@ if [ "$STOP_SERVICE" = "true" ] && [ -n "$SERVICE_NAME" ]; then
   fi
   if systemctl is-active --quiet "$SERVICE_NAME"; then
     SERVICE_WAS_ACTIVE="true"
+    for service in "${DEPENDENT_SERVICES[@]}"; do
+      if [ -n "$service" ] && [ "$service" != "$SERVICE_NAME" ] &&
+        systemctl is-active --quiet "$service"; then
+        ACTIVE_DEPENDENT_SERVICES+=("$service")
+      fi
+    done
     stop_proxy_companions
     systemctl stop "$SERVICE_NAME"
   fi
@@ -143,6 +162,7 @@ chmod 0600 "$STAGING/SHA256SUMS"
   echo "validatedLedger=$VALIDATED_LEDGER"
   echo "validatedAuth=$VALIDATED_AUTH"
   echo "serviceStopped=$SERVICE_WAS_ACTIVE"
+  echo "dependentServicesStopped=${ACTIVE_DEPENDENT_SERVICES[*]}"
 } > "$STAGING/manifest.txt"
 chmod 0600 "$STAGING/manifest.txt"
 
