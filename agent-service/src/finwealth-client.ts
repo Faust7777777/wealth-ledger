@@ -161,6 +161,68 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
     );
   }
 
+  async proposeInvestmentHoldingSnapshot(
+    accountId: string,
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const positions = investmentSnapshotPositions(input.positions);
+    const sourceInstruments = positions.map((position) => ({
+      type: position.type,
+      symbol: position.symbol,
+      displayName: position.displayName,
+      quoteCurrency: position.quoteCurrency,
+      market: position.market,
+    }));
+    const ensured = responseData(
+      await this.ensureInvestmentInstruments(accountId, sourceInstruments, signal),
+    );
+    if (ensured?.accountId !== accountId) {
+      throw new Error("finwealth_invalid_investment_instrument_response");
+    }
+    const instruments = Array.isArray(ensured?.instruments)
+      ? ensured.instruments
+      : [];
+    const instrumentIds = new Map<string, string>();
+    for (const item of instruments) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const instrument = item as Record<string, unknown>;
+      const identity = investmentInstrumentIdentity(instrument);
+      const id = typeof instrument.id === "string" ? instrument.id.trim() : "";
+      if (!identity || !id || instrumentIds.has(identity)) {
+        throw new Error("finwealth_invalid_investment_instrument_response");
+      }
+      instrumentIds.set(identity, id);
+    }
+    const resolvedPositions = positions.map((position) => {
+      const instrumentId = instrumentIds.get(investmentInstrumentIdentity(position) ?? "");
+      if (!instrumentId) {
+        throw new Error("finwealth_invalid_investment_instrument_response");
+      }
+      return { instrumentId, targetQuantity: position.targetQuantity };
+    });
+    const { positions: _sourcePositions, ...snapshot } = input;
+    return this.proposeHoldingSnapshot(
+      accountId,
+      { ...snapshot, positions: resolvedPositions },
+      signal,
+    );
+  }
+
+  async ensureInvestmentInstruments(
+    accountId: string,
+    instruments: Array<Record<string, string>>,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    return this.#request(
+      "POST",
+      `/v1/accounts/${encodeURIComponent(accountId)}/investment-instruments/ensure`,
+      { instruments },
+      `agent-investment-instruments-${randomUUID()}`,
+      signal,
+    );
+  }
+
   async lookupStructuredQuotes(
     input: Record<string, unknown>,
     signal?: AbortSignal,
@@ -342,6 +404,73 @@ function cryptoSnapshotPositions(value: unknown): Array<{
     }
     seen.add(symbol);
     positions.push({ symbol, targetQuantity });
+  }
+  return positions;
+}
+
+type InvestmentSnapshotPosition = {
+  type: "equity" | "fund" | "other";
+  symbol: string;
+  displayName: string;
+  quoteCurrency: string;
+  market: string;
+  targetQuantity: string;
+};
+
+function investmentInstrumentIdentity(
+  value: Record<string, unknown>,
+): string | undefined {
+  const type = typeof value.type === "string" ? value.type : "";
+  const symbol = typeof value.symbol === "string" ? value.symbol.trim().toUpperCase() : "";
+  const market = typeof value.market === "string" ? value.market.trim().toUpperCase() : "";
+  const quoteCurrency = typeof value.quoteCurrency === "string"
+    ? value.quoteCurrency.trim().toUpperCase()
+    : "";
+  if (
+    !["equity", "fund", "other"].includes(type) ||
+    !/^[A-Z0-9][A-Z0-9._-]{0,31}$/.test(symbol) ||
+    !/^[A-Z0-9][A-Z0-9._-]{0,23}$/.test(market) ||
+    !/^[A-Z0-9][A-Z0-9._-]{1,11}$/.test(quoteCurrency)
+  ) return undefined;
+  return `${type}\0${market}\0${symbol}\0${quoteCurrency}`;
+}
+
+function investmentSnapshotPositions(value: unknown): InvestmentSnapshotPosition[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) {
+    throw new Error("invalid_investment_snapshot_positions");
+  }
+  const positions: InvestmentSnapshotPosition[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error("invalid_investment_snapshot_positions");
+    }
+    const position = item as Record<string, unknown>;
+    const identity = investmentInstrumentIdentity(position);
+    const displayName = typeof position.displayName === "string"
+      ? position.displayName.trim()
+      : "";
+    const targetQuantity = typeof position.targetQuantity === "string"
+      ? position.targetQuantity.trim()
+      : "";
+    if (
+      !identity ||
+      !displayName ||
+      [...displayName].length > 120 ||
+      !/^(?:0|[1-9]\d*)(?:\.\d{1,8})?$/.test(targetQuantity) ||
+      seen.has(identity)
+    ) {
+      throw new Error("invalid_investment_snapshot_positions");
+    }
+    seen.add(identity);
+    positions.push({
+      type: position.type as InvestmentSnapshotPosition["type"],
+      symbol: String(position.symbol).trim().toUpperCase(),
+      displayName,
+      quoteCurrency: String(position.quoteCurrency).trim().toUpperCase(),
+      market: String(position.market).trim().toUpperCase(),
+      targetQuantity,
+    });
   }
   return positions;
 }
@@ -528,6 +657,63 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     },
   });
 
+  const proposeInvestmentHoldingSnapshot = defineTool({
+    name: "finwealth_propose_investment_holding_snapshot",
+    label: "创建投资持仓快照审核",
+    description:
+      "把券商、基金平台或其他非加密投资来源中的当前数量整理成一个待审核持仓快照。只提交来源中明确出现的类型、代码、名称、市场、计价币和数量；Rust 会严格匹配或登记并返回真实 instrumentId。它不会确认持仓、修改余额或写入报价。",
+    promptSnippet: "把券商或基金来源中的非加密投资数量整理为一个待审核持仓快照。",
+    promptGuidelines: [
+      "先查询 accounts、instruments 和 holdings，确认目标账户与已有标的。",
+      "positions 只能填写来源中明确出现的 type、symbol、displayName、market、quoteCurrency 和当前总数量；缺少市场或计价币时先询问用户。",
+      "不得提交或编造 instrumentId；工具内部由 Rust 严格匹配或生成 ID，并验证完整映射。",
+      "equity 用于股票，fund 用于基金或 ETF，other 只用于来源明确但现有类型没有覆盖的投资品；加密资产必须使用加密持仓快照工具。",
+      "同一份快照的全部资产必须一次提交；targetQuantity 是当前总数量，不是本期增量，且不得为负数。",
+      "该工具只生成待审核组；不得随后调用确认、批准或报价采用接口。",
+    ],
+    parameters: Type.Object({
+      accountId: Type.String({ minLength: 1 }),
+      asOf: Type.Optional(Type.String({ description: "带时区的 RFC3339 时间" })),
+      positions: Type.Array(
+        Type.Object({
+          type: Type.Union([
+            Type.Literal("equity"),
+            Type.Literal("fund"),
+            Type.Literal("other"),
+          ]),
+          symbol: Type.String({
+            minLength: 1,
+            maxLength: 32,
+            pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$",
+          }),
+          displayName: Type.String({ minLength: 1, maxLength: 120 }),
+          market: Type.String({
+            minLength: 1,
+            maxLength: 24,
+            pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,23}$",
+          }),
+          quoteCurrency: Type.String({
+            minLength: 2,
+            maxLength: 12,
+            pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{1,11}$",
+          }),
+          targetQuantity: Type.String({ description: "非负十进制定点字符串" }),
+        }),
+        { minItems: 1, maxItems: 100 },
+      ),
+      note: Type.Optional(Type.String({ maxLength: 500 })),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      const { accountId, ...input } = params as {
+        accountId: string;
+        [key: string]: unknown;
+      };
+      const value = await client.proposeInvestmentHoldingSnapshot(accountId, input, signal);
+      return { content: [{ type: "text", text: toolText(value) }], details: {} };
+    },
+  });
+
   const ensureCryptoInstruments = defineTool({
     name: "finwealth_ensure_crypto_instruments",
     label: "登记加密资产标的",
@@ -549,7 +735,7 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
           maxLength: 20,
           pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,19}$",
         }),
-        { minItems: 1, maxItems: 20 },
+        { minItems: 1, maxItems: 100 },
       ),
     }),
     executionMode: "sequential",
@@ -563,5 +749,11 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     },
   });
 
-  return [query, ensureCryptoInstruments, proposeMovement, proposeHoldingSnapshot];
+  return [
+    query,
+    ensureCryptoInstruments,
+    proposeMovement,
+    proposeHoldingSnapshot,
+    proposeInvestmentHoldingSnapshot,
+  ];
 }

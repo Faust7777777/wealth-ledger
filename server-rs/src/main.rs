@@ -1348,6 +1348,10 @@ fn app_with_state(state: AppState) -> Router {
             "/v1/accounts/{account_id}/crypto-instruments/ensure",
             post(ensure_account_crypto_instruments),
         )
+        .route(
+            "/v1/accounts/{account_id}/investment-instruments/ensure",
+            post(ensure_account_investment_instruments),
+        )
         .route("/v1/portfolio/overview", get(portfolio_overview))
         .route("/v1/portfolio/valuation-issues", get(valuation_issues))
         .route("/v1/portfolio/holdings", get(holdings))
@@ -5332,6 +5336,33 @@ async fn ensure_account_crypto_instruments(
     }
 }
 
+async fn ensure_account_investment_instruments(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("POST /v1/accounts/{account_id}/investment-instruments/ensure");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::ensure_account_investment_instruments(
+        path,
+        &account_id,
+        input,
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_investment_instrument_input"),
+    }
+}
+
 async fn instrument_detail(
     State(state): State<AppState>,
     Path(instrument_id): Path<String>,
@@ -8808,6 +8839,10 @@ mod tests {
                 Method::POST,
                 "/v1/accounts/missing/crypto-instruments/ensure",
             ),
+            (
+                Method::POST,
+                "/v1/accounts/missing/investment-instruments/ensure",
+            ),
             (Method::POST, "/v1/movements/drafts"),
             (Method::POST, "/v1/movements/missing/submit-review"),
             (Method::POST, "/v1/movements/corrections"),
@@ -10157,6 +10192,174 @@ mod tests {
         assert_eq!(
             document["accounts"][0]["supportedCurrencies"],
             json!(["CNY", "BTC", "USDT"])
+        );
+
+        let expanded_symbols = (0..21)
+            .map(|index| format!("ASSET{index}"))
+            .collect::<Vec<_>>();
+        let (expanded_status, expanded_body) = request_json_body_from(
+            router,
+            Method::POST,
+            &endpoint,
+            json!({"symbols": expanded_symbols}),
+        )
+        .await;
+        assert_eq!(expanded_status, StatusCode::OK, "{expanded_body}");
+        assert_eq!(expanded_body["data"]["createdCount"], 21);
+        let expanded_document =
+            local_ledger::read_document(&path).expect("expanded ledger should remain readable");
+        assert_eq!(expanded_document["holdings"], json!([]));
+        assert_eq!(expanded_document["movements"], json!([]));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_ensures_source_investment_instruments_without_client_ids() {
+        let path = unique_test_ledger_path("ensure_investment_instruments");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "Brokerage",
+                "accountType": "brokerage",
+                "defaultCurrency": "CNY",
+                "supportedCurrencies": ["CNY"],
+                "includeInNetWorth": true,
+                "balanceMode": "holdings",
+                "openingBalances": []
+            }),
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED, "{account_body}");
+        let account_id = account_body["data"]["id"].as_str().expect("account id");
+        let (legacy_status, legacy_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            json!({
+                "id": "inst_existing_aapl",
+                "type": "equity",
+                "symbol": "aapl",
+                "displayName": "Apple Inc.",
+                "quoteCurrency": "USD"
+            }),
+        )
+        .await;
+        assert_eq!(legacy_status, StatusCode::CREATED, "{legacy_body}");
+
+        let endpoint = format!("/v1/accounts/{account_id}/investment-instruments/ensure");
+        let input = json!({
+            "instruments": [
+                {
+                    "type": "equity",
+                    "symbol": "aapl",
+                    "displayName": "Apple Inc.",
+                    "quoteCurrency": "usd",
+                    "market": "nasdaq"
+                },
+                {
+                    "type": "fund",
+                    "symbol": "510300",
+                    "displayName": "沪深300ETF",
+                    "quoteCurrency": "CNY",
+                    "market": "SSE"
+                }
+            ]
+        });
+        let (status, headers, body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            input.clone(),
+            Some("ensure-investment-replay"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(headers.get("idempotency-replayed").is_none());
+        assert_eq!(body["data"]["createdCount"], 1);
+        assert_eq!(body["data"]["updatedCount"], 1);
+        assert_eq!(body["data"]["reusedCount"], 0);
+        let instruments = body["data"]["instruments"].as_array().expect("instruments");
+        assert_eq!(instruments[0]["id"], "inst_existing_aapl");
+        assert_eq!(instruments[0]["symbol"], "aapl");
+        assert_eq!(instruments[0]["market"], "NASDAQ");
+        assert_eq!(instruments[1]["symbol"], "510300");
+        assert_eq!(instruments[1]["market"], "SSE");
+        assert_eq!(instruments[1]["quoteCurrency"], "CNY");
+        assert_eq!(
+            instruments[1]["sourceRef"],
+            "finwealth_agent_source_instrument"
+        );
+        assert!(
+            instruments[1]["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("inst_fund_sse_510300"))
+        );
+
+        let (replay_status, replay_headers, replay_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            input,
+            Some("ensure-investment-replay"),
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::OK, "{replay_body}");
+        assert_eq!(replay_body, body);
+        assert_eq!(
+            replay_headers
+                .get("idempotency-replayed")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+
+        let (conflict_status, conflict_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({"instruments": [{
+                "type": "equity",
+                "symbol": "AAPL",
+                "displayName": "Apple Inc.",
+                "quoteCurrency": "EUR",
+                "market": "NASDAQ"
+            }]}),
+        )
+        .await;
+        assert_eq!(conflict_status, StatusCode::CONFLICT, "{conflict_body}");
+
+        let (invalid_status, invalid_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({"instruments": [{
+                "id": "model_made_this_up",
+                "type": "crypto",
+                "symbol": "BTC",
+                "displayName": "Bitcoin",
+                "quoteCurrency": "USD",
+                "market": "CRYPTO"
+            }]}),
+        )
+        .await;
+        assert_eq!(invalid_status, StatusCode::BAD_REQUEST, "{invalid_body}");
+        assert_eq!(
+            invalid_body["error"]["code"],
+            "invalid_investment_instrument_input"
+        );
+
+        let document = local_ledger::read_document(&path).expect("ledger should remain readable");
+        assert_eq!(document["holdings"], json!([]));
+        assert_eq!(document["movements"], json!([]));
+        assert_eq!(document["instruments"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            document["accounts"][0]["supportedCurrencies"],
+            json!(["CNY", "USD"])
         );
 
         let _ = std::fs::remove_file(path);

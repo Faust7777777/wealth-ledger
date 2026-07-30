@@ -20,11 +20,25 @@ from pathlib import Path
 
 
 TIMEOUT_SECONDS = 600
-EXPECTED_QUANTITIES = {
+EXPECTED_CRYPTO_QUANTITIES = {
     "BTC": "0.25",
     "ETH": "3.2",
     "USDT": "1250",
     "SOL": "5.5",
+}
+EXPECTED_INVESTMENTS = {
+    "AAPL": {
+        "type": "equity",
+        "market": "NASDAQ",
+        "quoteCurrency": "USD",
+        "quantity": "12",
+    },
+    "510300": {
+        "type": "fund",
+        "market": "SSE",
+        "quoteCurrency": "CNY",
+        "quantity": "100",
+    },
 }
 
 
@@ -221,7 +235,7 @@ def pending_groups() -> list[dict[str, object]]:
     ]
 
 
-def run(image: Path) -> None:
+def run(image: Path, *, investment: bool) -> None:
     deadline = time.monotonic() + 30
     while True:
         try:
@@ -234,12 +248,17 @@ def run(image: Path) -> None:
             raise RuntimeError("temporary Agent did not load the production Grok connection")
         time.sleep(0.25)
 
+    account_name = (
+        "Investment Snapshot Smoke Brokerage"
+        if investment
+        else "Holding Snapshot Smoke Exchange"
+    )
     account = server_request(
         "POST",
         "/v1/accounts",
         body={
-            "displayName": "Holding Snapshot Smoke Exchange",
-            "accountType": "exchange",
+            "displayName": account_name,
+            "accountType": "brokerage" if investment else "exchange",
             "defaultCurrency": "CNY",
             "supportedCurrencies": ["CNY"],
             "includeInNetWorth": True,
@@ -268,24 +287,38 @@ def run(image: Path) -> None:
         key=f"holding-smoke-model-{NONCE}",
     )
     attachment_id = upload_image(image)
+    prompt = (
+        "这是 Investment Snapshot Smoke Brokerage 的完整券商持仓截图。"
+        "先查询 accounts、instruments 和 holdings；然后把截图中的全部投资代码、名称、"
+        "类型、市场、计价币和当前总数量一次性调用 "
+        "finwealth_propose_investment_holding_snapshot，生成一个待审核持仓快照。"
+        "不得提交或编造 instrumentId，不得确认、批准或采用报价。最后只说明已加入待确认。"
+        if investment
+        else (
+            "这是 Holding Snapshot Smoke Exchange 的完整 OKX 持仓截图。"
+            "先查询 accounts 和 holdings；然后把截图中的全部资产代码和当前总数量"
+            "一次性调用 finwealth_propose_holding_snapshot，生成一个待审核持仓快照。"
+            "工具参数只提交 symbol 和 targetQuantity。不得确认、批准或采用报价。"
+            "最后只说明已加入待确认。"
+        )
+    )
     accepted = agent_request(
         "POST",
         f"/conversations/{conversation['id']}/messages",
         body={
-            "text": (
-                "这是 Holding Snapshot Smoke Exchange 的完整 OKX 持仓截图。"
-                "先查询 accounts 和 holdings；然后把截图中的全部资产代码和当前总数量"
-                "一次性调用 finwealth_propose_holding_snapshot，生成一个待审核持仓快照。"
-                "工具参数只提交 symbol 和 targetQuantity。不得确认、批准或采用报价。"
-                "最后只说明已加入待确认。"
-            ),
+            "text": prompt,
             "attachmentIds": [attachment_id],
         },
         key=f"holding-smoke-message-{NONCE}",
     )
     wait_for_run(conversation["id"], accepted["runId"])
     tools = completed_tools(conversation["id"], accepted["runId"])
-    if "finwealth_propose_holding_snapshot:False" not in tools:
+    expected_tool = (
+        "finwealth_propose_investment_holding_snapshot"
+        if investment
+        else "finwealth_propose_holding_snapshot"
+    )
+    if f"{expected_tool}:False" not in tools:
         raise RuntimeError(f"holding snapshot tool did not complete successfully: {tools}")
 
     instruments = server_request("GET", "/v1/instruments")
@@ -294,17 +327,26 @@ def run(image: Path) -> None:
         for item in instruments
         if isinstance(item.get("symbol"), str)
     }
-    missing = sorted(set(EXPECTED_QUANTITIES) - set(by_symbol))
+    expected_symbols = set(EXPECTED_INVESTMENTS if investment else EXPECTED_CRYPTO_QUANTITIES)
+    missing = sorted(expected_symbols - set(by_symbol))
     if missing:
         raise RuntimeError(f"snapshot did not ensure expected symbols: {missing}")
-    if by_symbol["SOL"].get("quoteCurrency") != "USDT":
+    if investment:
+        for symbol, expected in EXPECTED_INVESTMENTS.items():
+            instrument = by_symbol[symbol]
+            if any(instrument.get(field) != expected[field] for field in ("type", "market", "quoteCurrency")):
+                raise RuntimeError(f"registered investment identity is wrong for {symbol}")
+            if instrument.get("sourceRef") != "finwealth_agent_source_instrument":
+                raise RuntimeError(f"registered investment source is wrong for {symbol}")
+    elif by_symbol["SOL"].get("quoteCurrency") != "USDT":
         raise RuntimeError("discovered SOL instrument was not USDT quoted")
 
     account_after = server_request("GET", f"/v1/accounts/{account_id}")
     if account_after.get("defaultCurrency") != "CNY":
         raise RuntimeError("crypto registration changed the account display currency")
     supported = set(account_after.get("supportedCurrencies", []))
-    if not {"CNY", "USDT"}.issubset(supported):
+    expected_supported = {"CNY", "USD" if investment else "USDT"}
+    if not expected_supported.issubset(supported):
         raise RuntimeError("account does not support its display and market quote currencies")
     if server_request("GET", f"/v1/accounts/{account_id}/holdings"):
         raise RuntimeError("Agent changed confirmed holdings before review")
@@ -317,14 +359,14 @@ def run(image: Path) -> None:
     if len(groups) != 1:
         raise RuntimeError(f"Agent created {len(groups)} holding review groups instead of one")
     movements = groups[0].get("proposedMovements", [])
-    if len(movements) != len(EXPECTED_QUANTITIES):
+    if len(movements) != len(expected_symbols):
         raise RuntimeError("holding review group did not contain all image assets")
     if any("holding_snapshot" not in item.get("tags", []) for item in movements):
         raise RuntimeError("holding review group contains a non-snapshot movement")
     symbols_by_id = {
         item["id"]: symbol
         for symbol, item in by_symbol.items()
-        if symbol in EXPECTED_QUANTITIES
+        if symbol in expected_symbols
     }
     observed_quantities: dict[str, Decimal] = {}
     for movement in movements:
@@ -336,27 +378,35 @@ def run(image: Path) -> None:
             observed_quantities[symbol] = Decimal(adjustment["targetQuantity"])
         except (InvalidOperation, KeyError):
             raise RuntimeError("holding review group contains an invalid target quantity")
-    expected_quantities = {
-        symbol: Decimal(quantity) for symbol, quantity in EXPECTED_QUANTITIES.items()
-    }
+    expected_quantities = (
+        {
+            symbol: Decimal(str(item["quantity"]))
+            for symbol, item in EXPECTED_INVESTMENTS.items()
+        }
+        if investment
+        else {
+            symbol: Decimal(quantity)
+            for symbol, quantity in EXPECTED_CRYPTO_QUANTITIES.items()
+        }
+    )
     if observed_quantities != expected_quantities:
         raise RuntimeError("Grok did not preserve the quantities shown in the image")
     if server_request("GET", "/v1/quotes/summary") != before_quotes:
         raise RuntimeError("holding snapshot smoke changed authoritative quotes")
 
-    print(
-        "OK: isolated production Grok created one four-asset review-only holding snapshot."
-    )
+    label = "non-crypto investment" if investment else "four-asset crypto"
+    print(f"OK: isolated production Grok created one review-only {label} holding snapshot.")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("image", type=Path)
+    parser.add_argument("--investment", action="store_true")
     args = parser.parse_args()
     image = args.image.resolve(strict=True)
     if not image.is_file():
         raise RuntimeError("holding snapshot fixture must be a regular file")
-    run(image)
+    run(image, investment=args.investment)
 
 
 if __name__ == "__main__":

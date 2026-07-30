@@ -4006,6 +4006,145 @@ pub fn ensure_account_crypto_instruments(
     })
 }
 
+/// Deterministically register or reuse non-crypto investment metadata for a
+/// holdings account. The caller supplies source-observed identity fields, but
+/// never an instrument ID. This does not create holdings, quotes, balances, or
+/// movements.
+pub fn ensure_account_investment_instruments(
+    path: &Path,
+    account_id: &str,
+    input: Value,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    let specs = parse_investment_instrument_specs(&input)?;
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let account = active_account(document, account_id)
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("account does not exist: {account_id}"))
+            })?;
+        if !matches!(
+            account.get("balanceMode").and_then(Value::as_str),
+            Some("holdings" | "mixed")
+        ) {
+            return Err(LedgerError::InvalidInput(vec![
+                "investment instruments require a holdings or mixed account".to_string(),
+            ]));
+        }
+
+        let mut created_count = 0_u64;
+        let mut updated_count = 0_u64;
+        let mut reused_count = 0_u64;
+        let mut ensured = Vec::new();
+        let mut required_quote_currencies = Vec::new();
+        {
+            let instruments = document["instruments"]
+                .as_array_mut()
+                .expect("validated local ledger instruments should be an array");
+            for spec in &specs {
+                let matching_indexes = instruments
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, instrument)| {
+                        investment_instrument_matches_source(instrument, spec).then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                if matching_indexes.len() > 1 {
+                    return Err(LedgerError::Conflict(format!(
+                        "multiple instruments match {} on {}",
+                        spec.symbol, spec.market
+                    )));
+                }
+                if let Some(index) = matching_indexes.first().copied() {
+                    let existing = &mut instruments[index];
+                    let existing_currency = existing
+                        .get("quoteCurrency")
+                        .and_then(Value::as_str)
+                        .expect("validated instrument quoteCurrency");
+                    if !existing_currency.eq_ignore_ascii_case(&spec.quote_currency) {
+                        return Err(LedgerError::Conflict(format!(
+                            "instrument {} on {} uses a different quote currency",
+                            spec.symbol, spec.market
+                        )));
+                    }
+                    let mut changed = false;
+                    if existing
+                        .get("market")
+                        .and_then(Value::as_str)
+                        .is_none_or(|value| value.trim().is_empty())
+                    {
+                        existing["market"] = json!(spec.market);
+                        changed = true;
+                    }
+                    if changed {
+                        updated_count += 1;
+                    } else {
+                        reused_count += 1;
+                    }
+                    ensured.push(existing.clone());
+                } else {
+                    let base_id = format!(
+                        "inst_{}_{}_{}",
+                        clean_identifier(&spec.instrument_type),
+                        clean_identifier(&spec.market),
+                        clean_identifier(&spec.symbol)
+                    );
+                    let mut instrument_id = base_id.clone();
+                    let mut suffix = 2_u64;
+                    while instruments.iter().any(|instrument| {
+                        instrument.get("id").and_then(Value::as_str) == Some(&instrument_id)
+                    }) {
+                        instrument_id = format!("{base_id}_{suffix}");
+                        suffix += 1;
+                    }
+                    let instrument = json!({
+                        "id": instrument_id,
+                        "type": spec.instrument_type,
+                        "symbol": spec.symbol,
+                        "displayName": spec.display_name,
+                        "quoteCurrency": spec.quote_currency,
+                        "market": spec.market,
+                        "sourceRef": "finwealth_agent_source_instrument"
+                    });
+                    instruments.push(instrument.clone());
+                    ensured.push(instrument);
+                    created_count += 1;
+                }
+                if !required_quote_currencies.contains(&spec.quote_currency) {
+                    required_quote_currencies.push(spec.quote_currency.clone());
+                }
+            }
+        }
+
+        let account = document["accounts"]
+            .as_array_mut()
+            .expect("validated local ledger accounts should be an array")
+            .iter_mut()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+            .expect("active account should still exist");
+        let mut supported = account
+            .get("supportedCurrencies")
+            .and_then(string_array)
+            .unwrap_or_default();
+        for currency in required_quote_currencies {
+            if !supported.contains(&currency) {
+                supported.push(currency);
+            }
+        }
+        account["supportedCurrencies"] = json!(supported);
+        account["updatedAt"] = json!(now);
+
+        Ok(json!({
+            "accountId": account_id,
+            "instruments": ensured,
+            "createdCount": created_count,
+            "updatedCount": updated_count,
+            "reusedCount": reused_count
+        }))
+    })
+}
+
 pub fn update_instrument(
     path: &Path,
     instrument_id: &str,
@@ -11077,15 +11216,175 @@ fn normalized_crypto_symbol_from_instrument(instrument: &Value) -> Option<String
         })
 }
 
+#[derive(Clone)]
+struct InvestmentInstrumentSpec {
+    instrument_type: String,
+    symbol: String,
+    display_name: String,
+    quote_currency: String,
+    market: String,
+}
+
+fn parse_investment_instrument_specs(
+    input: &Value,
+) -> Result<Vec<InvestmentInstrumentSpec>, LedgerError> {
+    let Some(object) = input.as_object() else {
+        return Err(LedgerError::InvalidInput(vec![
+            "investment instrument input must be a JSON object".to_string(),
+        ]));
+    };
+    if object.keys().any(|key| key != "instruments") {
+        return Err(LedgerError::InvalidInput(vec![
+            "investment instrument input only accepts instruments".to_string(),
+        ]));
+    }
+    let Some(items) = object.get("instruments").and_then(Value::as_array) else {
+        return Err(LedgerError::InvalidInput(vec![
+            "instruments must be a non-empty array".to_string(),
+        ]));
+    };
+    if items.is_empty() || items.len() > 100 {
+        return Err(LedgerError::InvalidInput(vec![
+            "instruments must contain between 1 and 100 items".to_string(),
+        ]));
+    }
+
+    let mut specs = Vec::new();
+    let mut identities = BTreeSet::new();
+    let mut errors = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(item) = item.as_object() else {
+            errors.push(format!("instruments[{index}] must be an object"));
+            continue;
+        };
+        for key in item.keys() {
+            if !matches!(
+                key.as_str(),
+                "type" | "symbol" | "displayName" | "quoteCurrency" | "market"
+            ) {
+                errors.push(format!("instruments[{index}].{key} is not accepted"));
+            }
+        }
+        let instrument_type = item
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "equity" | "fund" | "other"))
+            .map(str::to_string);
+        if instrument_type.is_none() {
+            errors.push(format!(
+                "instruments[{index}].type must be equity, fund, or other"
+            ));
+        }
+        let symbol = normalized_source_identifier(item.get("symbol"), 32);
+        if symbol.is_none() {
+            errors.push(format!(
+                "instruments[{index}].symbol must be 1-32 ASCII letters, digits, dots, underscores, or hyphens"
+            ));
+        }
+        let market = normalized_source_identifier(item.get("market"), 24);
+        if market.is_none() {
+            errors.push(format!(
+                "instruments[{index}].market must be 1-24 ASCII letters, digits, dots, underscores, or hyphens"
+            ));
+        }
+        let quote_currency = normalized_source_identifier(item.get("quoteCurrency"), 12)
+            .filter(|value| value.len() >= 2);
+        if quote_currency.is_none() {
+            errors.push(format!(
+                "instruments[{index}].quoteCurrency must be a 2-12 character uppercase code"
+            ));
+        }
+        let display_name = item
+            .get("displayName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.chars().count() <= 120)
+            .map(str::to_string);
+        if display_name.is_none() {
+            errors.push(format!(
+                "instruments[{index}].displayName must contain 1-120 characters"
+            ));
+        }
+        if let (
+            Some(instrument_type),
+            Some(symbol),
+            Some(market),
+            Some(quote_currency),
+            Some(display_name),
+        ) = (
+            instrument_type,
+            symbol,
+            market,
+            quote_currency,
+            display_name,
+        ) {
+            let identity = format!("{instrument_type}\0{market}\0{symbol}");
+            if !identities.insert(identity) {
+                errors.push(format!(
+                    "instruments[{index}] duplicates the same type, market, and symbol"
+                ));
+                continue;
+            }
+            specs.push(InvestmentInstrumentSpec {
+                instrument_type,
+                symbol,
+                display_name,
+                quote_currency,
+                market,
+            });
+        }
+    }
+    if errors.is_empty() {
+        Ok(specs)
+    } else {
+        Err(LedgerError::InvalidInput(errors))
+    }
+}
+
+fn normalized_source_identifier(value: Option<&Value>, max_len: usize) -> Option<String> {
+    let value = value?.as_str()?.trim();
+    if value.is_empty()
+        || value.len() > max_len
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(value.to_ascii_uppercase())
+}
+
+fn investment_instrument_matches_source(
+    instrument: &Value,
+    spec: &InvestmentInstrumentSpec,
+) -> bool {
+    if instrument.get("type").and_then(Value::as_str) != Some(&spec.instrument_type) {
+        return false;
+    }
+    let symbol_matches = instrument
+        .get("symbol")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(&spec.symbol));
+    if !symbol_matches {
+        return false;
+    }
+    instrument
+        .get("market")
+        .and_then(Value::as_str)
+        .is_none_or(|value| {
+            value.trim().is_empty() || value.trim().eq_ignore_ascii_case(&spec.market)
+        })
+}
+
 fn parse_crypto_symbols(input: &Value) -> Result<Vec<String>, LedgerError> {
     let Some(items) = input.get("symbols").and_then(Value::as_array) else {
         return Err(LedgerError::InvalidInput(vec![
             "symbols must be a non-empty array".to_string(),
         ]));
     };
-    if items.is_empty() || items.len() > 20 {
+    if items.is_empty() || items.len() > 100 {
         return Err(LedgerError::InvalidInput(vec![
-            "symbols must contain between 1 and 20 items".to_string(),
+            "symbols must contain between 1 and 100 items".to_string(),
         ]));
     }
     let mut symbols = Vec::new();

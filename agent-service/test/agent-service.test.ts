@@ -632,6 +632,33 @@ test("Finwealth client reads data and submits a draft only to review", async () 
         updatedCount: 0,
         reusedCount: 0,
       };
+    } else if (request.url === "/v1/accounts/acct%2Fbroker/investment-instruments/ensure") {
+      data = {
+        accountId: "acct/broker",
+        instruments: [
+          {
+            id: "inst_aapl",
+            type: "equity",
+            symbol: "AAPL",
+            displayName: "Apple Inc.",
+            quoteCurrency: "USD",
+            market: "NASDAQ",
+          },
+          {
+            id: "inst_510300",
+            type: "fund",
+            symbol: "510300",
+            displayName: "沪深300ETF",
+            quoteCurrency: "CNY",
+            market: "SSE",
+          },
+        ],
+        createdCount: 2,
+        updatedCount: 0,
+        reusedCount: 0,
+      };
+    } else if (request.url === "/v1/accounts/acct%2Fbroker/holding-snapshot-proposals") {
+      data = { id: "grp_investment_snapshot", status: "pending" };
     }
     response.writeHead(status, { "content-type": "application/json" });
     response.end(JSON.stringify({ ok: true, data }));
@@ -695,6 +722,55 @@ test("Finwealth client reads data and submits a draft only to review", async () 
       requestCountAfterValidSnapshot,
       "fabricated IDs must fail before any server request",
     );
+    const investmentSnapshotTool = createFinwealthTools(client).find(
+      (tool) => tool.name === "finwealth_propose_investment_holding_snapshot",
+    );
+    assert.ok(investmentSnapshotTool);
+    await investmentSnapshotTool.execute(
+      "investment-snapshot-with-source-identities",
+      {
+        accountId: "acct/broker",
+        positions: [
+          {
+            type: "equity",
+            symbol: "aapl",
+            displayName: "Apple Inc.",
+            quoteCurrency: "usd",
+            market: "nasdaq",
+            targetQuantity: "12",
+          },
+          {
+            type: "fund",
+            symbol: "510300",
+            displayName: "沪深300ETF",
+            quoteCurrency: "CNY",
+            market: "SSE",
+            targetQuantity: "100",
+          },
+        ],
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    const requestCountAfterInvestmentSnapshot = requests.length;
+    await assert.rejects(
+      investmentSnapshotTool.execute(
+        "investment-snapshot-with-fabricated-id",
+        {
+          accountId: "acct/broker",
+          positions: [{
+            instrumentId: "inst_aapl",
+            targetQuantity: "12",
+          }],
+        } as never,
+        undefined,
+        undefined,
+        {} as never,
+      ),
+      /invalid_investment_snapshot_positions/,
+    );
+    assert.equal(requests.length, requestCountAfterInvestmentSnapshot);
   } finally {
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
@@ -711,15 +787,17 @@ test("Finwealth client reads data and submits a draft only to review", async () 
       "POST /v1/movements/mov_agent_draft/submit-review",
       "POST /v1/accounts/acct%2Fokx/crypto-instruments/ensure",
       "POST /v1/accounts/acct%2Fokx/holding-snapshot-proposals",
+      "POST /v1/accounts/acct%2Fbroker/investment-instruments/ensure",
+      "POST /v1/accounts/acct%2Fbroker/holding-snapshot-proposals",
     ],
   );
   assert.ok(requests.every((item) => item.token === "sidecar-secret"));
   assert.ok(requests.every((item) => !item.path?.includes("confirm")));
   assert.ok(requests.every((item) => !item.path?.includes("approve")));
-  const ensure = requests.at(-2);
+  const ensure = requests.at(-4);
   assert.match(ensure?.key ?? "", /^agent-crypto-instruments-/);
   assert.deepEqual(ensure?.body, { symbols: ["BTC", "ETH"] });
-  const snapshot = requests.at(-1);
+  const snapshot = requests.at(-3);
   assert.match(snapshot?.key ?? "", /^agent-holding-snapshot-/);
   assert.deepEqual(snapshot?.body, {
     asOf: "2026-07-29T10:00:00Z",
@@ -728,6 +806,34 @@ test("Finwealth client reads data and submits a draft only to review", async () 
       { instrumentId: "inst_eth", targetQuantity: "3.2" },
     ],
     note: "OKX 持仓快照",
+  });
+  const investmentEnsure = requests.at(-2);
+  assert.match(investmentEnsure?.key ?? "", /^agent-investment-instruments-/);
+  assert.deepEqual(investmentEnsure?.body, {
+    instruments: [
+      {
+        type: "equity",
+        symbol: "AAPL",
+        displayName: "Apple Inc.",
+        quoteCurrency: "USD",
+        market: "NASDAQ",
+      },
+      {
+        type: "fund",
+        symbol: "510300",
+        displayName: "沪深300ETF",
+        quoteCurrency: "CNY",
+        market: "SSE",
+      },
+    ],
+  });
+  const investmentSnapshot = requests.at(-1);
+  assert.match(investmentSnapshot?.key ?? "", /^agent-holding-snapshot-/);
+  assert.deepEqual(investmentSnapshot?.body, {
+    positions: [
+      { instrumentId: "inst_aapl", targetQuantity: "12" },
+      { instrumentId: "inst_510300", targetQuantity: "100" },
+    ],
   });
 });
 
@@ -741,6 +847,7 @@ test("Finwealth tools expose bounded crypto registration before holding snapshot
       "finwealth_ensure_crypto_instruments",
       "finwealth_propose_movement",
       "finwealth_propose_holding_snapshot",
+      "finwealth_propose_investment_holding_snapshot",
     ],
   );
   const ensure = tools.find((tool) => tool.name === "finwealth_ensure_crypto_instruments");
@@ -750,6 +857,11 @@ test("Finwealth tools expose bounded crypto registration before holding snapshot
   const snapshot = tools.find((tool) => tool.name === "finwealth_propose_holding_snapshot");
   assert.ok(snapshot);
   assert.match(snapshot.description, /服务端.*真实 instrumentId/);
+  const investmentSnapshot = tools.find(
+    (tool) => tool.name === "finwealth_propose_investment_holding_snapshot",
+  );
+  assert.ok(investmentSnapshot);
+  assert.match(investmentSnapshot.description, /Rust.*真实 instrumentId/);
 });
 
 test("crypto snapshot resolution fails closed before review when ensure omits a symbol", async () => {
@@ -795,6 +907,63 @@ test("crypto snapshot resolution fails closed before review when ensure omits a 
   }
   assert.deepEqual(paths, [
     "/v1/accounts/acct_okx/crypto-instruments/ensure",
+  ]);
+});
+
+test("investment snapshot resolution fails closed before review when ensure identity mismatches", async () => {
+  const paths: string[] = [];
+  const server = createServer(async (request, response) => {
+    paths.push(request.url ?? "");
+    for await (const _chunk of request) {
+      // Drain the request before responding.
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      ok: true,
+      data: {
+        accountId: "acct_broker",
+        instruments: [{
+          id: "inst_aapl",
+          type: "equity",
+          symbol: "AAPL",
+          displayName: "Apple Inc.",
+          quoteCurrency: "EUR",
+          market: "NASDAQ",
+        }],
+        createdCount: 1,
+        updatedCount: 0,
+        reusedCount: 0,
+      },
+    }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    const client = new FinwealthClient(
+      `http://127.0.0.1:${address.port}`,
+      "sidecar-secret",
+    );
+    await assert.rejects(
+      client.proposeInvestmentHoldingSnapshot("acct_broker", {
+        positions: [{
+          type: "equity",
+          symbol: "AAPL",
+          displayName: "Apple Inc.",
+          quoteCurrency: "USD",
+          market: "NASDAQ",
+          targetQuantity: "12",
+        }],
+      }),
+      /finwealth_invalid_investment_instrument_response/,
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve()))
+    );
+  }
+  assert.deepEqual(paths, [
+    "/v1/accounts/acct_broker/investment-instruments/ensure",
   ]);
 });
 

@@ -797,6 +797,27 @@ def check_holding_snapshot_proposal(doc: dict) -> None:
     positions = doc["components"]["schemas"]["HoldingSnapshotInput"]["properties"]["positions"]
     if positions.get("minItems") != 1 or positions.get("maxItems") != 100:
         fail("Holding snapshot must accept between 1 and 100 positions")
+    investment_operation = doc["paths"][
+        "/accounts/{accountId}/investment-instruments/ensure"
+    ]["post"]
+    investment_schema = investment_operation["requestBody"]["content"][
+        "application/json"
+    ]["schema"]
+    if (
+        investment_schema.get("$ref")
+        != "#/components/schemas/EnsureInvestmentInstrumentsRequest"
+    ):
+        fail("Investment instrument ensure must use its strict request schema")
+    investment_items = doc["components"]["schemas"][
+        "EnsureInvestmentInstrumentsRequest"
+    ]["properties"]["instruments"]
+    if investment_items.get("minItems") != 1 or investment_items.get("maxItems") != 100:
+        fail("Investment instrument ensure must accept between 1 and 100 descriptors")
+    investment_input = doc["components"]["schemas"][
+        "EnsureInvestmentInstrumentInput"
+    ]
+    if investment_input.get("additionalProperties") is not False:
+        fail("Investment instrument descriptors must reject model-supplied IDs")
     local_text = RUST_LOCAL_LEDGER.read_text(encoding="utf-8")
     for snippet in [
         "pub fn create_holding_snapshot_proposal(",
@@ -805,6 +826,8 @@ def check_holding_snapshot_proposal(doc: dict) -> None:
         'group["skippedPositions"]',
         'movement.get("holdingSnapshot")',
         "holding snapshot does not contain any quantity changes",
+        "pub fn ensure_account_investment_instruments(",
+        '"finwealth_agent_source_instrument"',
     ]:
         if snippet not in local_text:
             fail(f"Holding snapshot implementation is incomplete: {snippet}")
@@ -812,6 +835,8 @@ def check_holding_snapshot_proposal(doc: dict) -> None:
     for snippet in [
         '"/v1/accounts/{account_id}/holding-snapshot-proposals"',
         "local_ledger_holding_snapshot_proposes_and_confirms_multiple_positions_atomically",
+        '"/v1/accounts/{account_id}/investment-instruments/ensure"',
+        "local_ledger_ensures_source_investment_instruments_without_client_ids",
     ]:
         if snippet not in rust_text:
             fail(f"Holding snapshot HTTP slice is incomplete: {snippet}")
