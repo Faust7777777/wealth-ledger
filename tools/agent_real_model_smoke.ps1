@@ -5,7 +5,8 @@ param(
   [switch]$SkipFinancialSummary,
   [switch]$IncludeTextAttachment,
   [switch]$IncludeVisionAttachment,
-  [switch]$CreateVisionDraft
+  [switch]$CreateVisionDraft,
+  [switch]$CreateHoldingSnapshot
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,6 +18,11 @@ $agent = $null
 $sse = $null
 $savedEnvironment = @{}
 $sensitiveValues = @()
+$savedNoProxy = [Environment]::GetEnvironmentVariable("NO_PROXY", "Process")
+$env:NO_PROXY = @("127.0.0.1", "localhost", "::1", $savedNoProxy) |
+  Where-Object { $_ } |
+  Select-Object -Unique |
+  Join-String -Separator ","
 
 function Require-Environment([string]$Name) {
   $value = [Environment]::GetEnvironmentVariable($Name, "Process")
@@ -145,7 +151,12 @@ $token = [Convert]::ToHexString(
 ).ToLowerInvariant()
 
 try {
-  if ($IncludeTextAttachment -and $IncludeVisionAttachment) {
+  $attachmentModes = @(
+    [bool]$IncludeTextAttachment,
+    [bool]$IncludeVisionAttachment,
+    [bool]$CreateHoldingSnapshot
+  ) | Where-Object { $_ }
+  if ($attachmentModes.Count -gt 1) {
     throw "Choose at most one real-model attachment smoke mode."
   }
   if ($CreateVisionDraft -and !$IncludeVisionAttachment) {
@@ -267,6 +278,25 @@ try {
       -Body $accountBody
     $visionAccountId = $account.data.id
   }
+  $holdingAccountId = $null
+  if ($CreateHoldingSnapshot) {
+    $accountBody = @{
+      displayName = "Holding Snapshot Smoke Exchange"
+      accountType = "exchange"
+      defaultCurrency = "USDT"
+      supportedCurrencies = @("USDT")
+      includeInNetWorth = $true
+      balanceMode = "holdings"
+      openingBalances = @()
+    } | ConvertTo-Json -Depth 8 -Compress
+    $account = Invoke-RestMethod `
+      -Method Post `
+      -Uri "$apiBase/v1/accounts" `
+      -Headers @{ "Idempotency-Key" = "real-smoke-holding-account" } `
+      -ContentType "application/json" `
+      -Body $accountBody
+    $holdingAccountId = $account.data.id
+  }
 
   $conversation = Invoke-RestMethod `
     -Method Post `
@@ -317,37 +347,36 @@ try {
     $uploadRequest.Dispose()
     $multipart.Dispose()
     $http.Dispose()
-  } elseif ($IncludeVisionAttachment) {
+  } elseif ($IncludeVisionAttachment -or $CreateHoldingSnapshot) {
     Add-Type -AssemblyName System.Drawing
-    $imagePath = Join-Path $temp "vision-smoke.png"
-    $bitmap = [Drawing.Bitmap]::new(1200, 500)
+    $imageName = if ($CreateHoldingSnapshot) { "okx-holdings-smoke.png" } else { "vision-smoke.png" }
+    $imagePath = Join-Path $temp $imageName
+    $imageHeight = if ($CreateHoldingSnapshot) { 760 } else { 500 }
+    $bitmap = [Drawing.Bitmap]::new(1200, $imageHeight)
     $graphics = [Drawing.Graphics]::FromImage($bitmap)
     $font = [Drawing.Font]::new("Arial", 48, [Drawing.FontStyle]::Bold)
     try {
       $graphics.Clear([Drawing.Color]::White)
-      $graphics.DrawString(
-        "FINWEALTH_VISION_8K2",
-        $font,
-        [Drawing.Brushes]::Black,
-        40,
-        60
-      )
-      $graphics.DrawString(
-        "TOTAL CNY 88.20",
-        $font,
-        [Drawing.Brushes]::Black,
-        40,
-        180
-      )
       $smallFont = [Drawing.Font]::new("Arial", 30, [Drawing.FontStyle]::Regular)
       try {
-        $graphics.DrawString(
-          "MERCHANT TEST CAFE  2026-07-28 12:30",
-          $smallFont,
-          [Drawing.Brushes]::Black,
-          40,
-          310
-        )
+        if ($CreateHoldingSnapshot) {
+          $graphics.DrawString("OKX ASSET OVERVIEW", $font, [Drawing.Brushes]::Black, 40, 40)
+          $graphics.DrawString("BTC    0.25000000", $smallFont, [Drawing.Brushes]::Black, 40, 180)
+          $graphics.DrawString("ETH    3.20000000", $smallFont, [Drawing.Brushes]::Black, 40, 290)
+          $graphics.DrawString("USDT   1250.000000", $smallFont, [Drawing.Brushes]::Black, 40, 400)
+          $graphics.DrawString("SOL    5.50000000", $smallFont, [Drawing.Brushes]::Black, 40, 510)
+          $graphics.DrawString("Snapshot 2026-07-31 09:30 UTC", $smallFont, [Drawing.Brushes]::Black, 40, 630)
+        } else {
+          $graphics.DrawString("FINWEALTH_VISION_8K2", $font, [Drawing.Brushes]::Black, 40, 60)
+          $graphics.DrawString("TOTAL CNY 88.20", $font, [Drawing.Brushes]::Black, 40, 180)
+          $graphics.DrawString(
+            "MERCHANT TEST CAFE  2026-07-28 12:30",
+            $smallFont,
+            [Drawing.Brushes]::Black,
+            40,
+            310
+          )
+        }
       } finally {
         $smallFont.Dispose()
       }
@@ -361,12 +390,13 @@ try {
     $multipart = [Net.Http.MultipartFormDataContent]::new()
     $fileContent = [Net.Http.ByteArrayContent]::new([IO.File]::ReadAllBytes($imagePath))
     $fileContent.Headers.ContentType = [Net.Http.Headers.MediaTypeHeaderValue]::new("image/png")
-    $multipart.Add($fileContent, "file", "vision-smoke.png")
+    $multipart.Add($fileContent, "file", $imageName)
     $uploadRequest = [Net.Http.HttpRequestMessage]::new(
       [Net.Http.HttpMethod]::Post,
       "$apiBase/v1/agent/attachments"
     )
-    $uploadRequest.Headers.Add("Idempotency-Key", "real-smoke-vision")
+    $uploadKey = if ($CreateHoldingSnapshot) { "real-smoke-holding-image" } else { "real-smoke-vision" }
+    $uploadRequest.Headers.Add("Idempotency-Key", $uploadKey)
     $uploadRequest.Content = $multipart
     $uploadResponse = $http.Send($uploadRequest)
     if (!$uploadResponse.IsSuccessStatusCode) {
@@ -381,6 +411,8 @@ try {
   }
   $prompt = if ($IncludeTextAttachment) {
     "请先用 read 工具读取所附 CSV，再调用 finwealth_query 查询 overview；最后只回复 CSV 的 marker 值和当前净资产。不要创建、提交或修改任何记录。"
+  } elseif ($CreateHoldingSnapshot) {
+    "这是 Holding Snapshot Smoke Exchange 的完整 OKX 持仓截图。先用 finwealth_query 查询 accounts、instruments 和 holdings；对截图里缺少标的的加密资产调用 finwealth_ensure_crypto_instruments，并使用返回的真实 instrumentId；然后把截图中的全部资产和当前总数量一次性调用 finwealth_propose_holding_snapshot，生成一个待审核持仓快照。不得确认、批准或采用报价。最后只说明已加入待确认。"
   } elseif ($CreateVisionDraft) {
     "这是一张需要入账的消费票据。先用 finwealth_query 查询 accounts，找到 Vision Smoke Wallet；识别图片后调用 finwealth_propose_movement 创建一条 CNY 支出待审核记录，金额、时间和商户按图片，图片时间按 Asia/Shanghai。资金从该账户流出。不要确认或批准。最后只说明已提交审核。"
   } elseif ($IncludeVisionAttachment) {
@@ -465,6 +497,8 @@ try {
     $events -notmatch '"name":"finwealth_query"' -or
     ($IncludeTextAttachment -and $events -notmatch '"name":"read"') -or
     ($CreateVisionDraft -and $events -notmatch '"name":"finwealth_propose_movement"') -or
+    ($CreateHoldingSnapshot -and $events -notmatch '"name":"finwealth_ensure_crypto_instruments"') -or
+    ($CreateHoldingSnapshot -and $events -notmatch '"name":"finwealth_propose_holding_snapshot"') -or
     $events -notmatch "(?m)^event: run\.completed\r?$"
   ) {
     $eventNames = [regex]::Matches($events, "(?m)^event: ([a-z.]+)\r?$") |
@@ -493,6 +527,50 @@ try {
       Select-Object -First 1
     if ($cnyBalance.amount -ne "100.00") {
       throw "Creating a vision draft changed the confirmed account balance."
+    }
+  }
+
+  if ($CreateHoldingSnapshot) {
+    foreach ($toolName in @(
+      "finwealth_ensure_crypto_instruments",
+      "finwealth_propose_holding_snapshot"
+    )) {
+      $escapedToolName = [regex]::Escape($toolName)
+      if (
+        $events -notmatch "(?s)event: tool\.completed\r?\ndata: \{[^\r\n]*`"name`":`"$escapedToolName`"[^\r\n]*`"isError`":false"
+      ) {
+        $toolCode = Get-ToolErrorCode $temp $toolName
+        throw "The holding snapshot tool $toolName did not complete successfully (code=$toolCode)."
+      }
+    }
+    $instruments = Invoke-RestMethod -Uri "$apiBase/v1/instruments"
+    $symbols = @($instruments.data | ForEach-Object { $_.symbol })
+    foreach ($expectedSymbol in @("BTC", "ETH", "USDT", "SOL")) {
+      if ($expectedSymbol -notin $symbols) {
+        throw "The holding snapshot run did not ensure $expectedSymbol."
+      }
+    }
+    $holdings = Invoke-RestMethod `
+      -Uri "$apiBase/v1/accounts/$holdingAccountId/holdings"
+    if (@($holdings.data).Count -ne 0) {
+      throw "The Agent changed confirmed holdings before review."
+    }
+    $pending = Invoke-RestMethod -Uri "$apiBase/v1/ai/proposals/pending"
+    $groups = @(
+      $pending.data | ForEach-Object { $_.atomicGroups } | Where-Object {
+        $_.targetType -eq "holding" -and $_.targetId -eq $holdingAccountId
+      }
+    )
+    if ($groups.Count -ne 1) {
+      throw "The holding snapshot run created $($groups.Count) review groups instead of one."
+    }
+    if (@($groups[0].proposedMovements).Count -ne 4) {
+      throw "The holding snapshot review group did not contain all four assets."
+    }
+    if (@($groups[0].proposedMovements | Where-Object {
+      "holding_snapshot" -notin @($_.tags)
+    }).Count -ne 0) {
+      throw "The holding snapshot review group contained a non-snapshot movement."
     }
   }
 
@@ -546,6 +624,8 @@ try {
   if ($SkipFinancialSummary) {
     $attachmentLabel = if ($IncludeTextAttachment) {
       ", workspace text attachment"
+    } elseif ($CreateHoldingSnapshot) {
+      ", reviewed multi-asset holding snapshot"
     } elseif ($IncludeVisionAttachment) {
       if ($CreateVisionDraft) { ", reviewed vision bill draft" } else { ", native vision attachment" }
     } else {
@@ -555,6 +635,8 @@ try {
   } else {
     $attachmentLabel = if ($IncludeTextAttachment) {
       ", workspace text attachment"
+    } elseif ($CreateHoldingSnapshot) {
+      ", reviewed multi-asset holding snapshot"
     } elseif ($IncludeVisionAttachment) {
       if ($CreateVisionDraft) { ", reviewed vision bill draft" } else { ", native vision attachment" }
     } else {
@@ -587,6 +669,11 @@ try {
     } else {
       Set-Item "Env:$($entry.Key)" $entry.Value
     }
+  }
+  if ($null -eq $savedNoProxy) {
+    Remove-Item Env:NO_PROXY -ErrorAction SilentlyContinue
+  } else {
+    $env:NO_PROXY = $savedNoProxy
   }
   $resolvedTemp = [System.IO.Path]::GetFullPath($temp)
   if (

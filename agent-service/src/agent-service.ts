@@ -26,6 +26,29 @@ function now(): string {
   return new Date().toISOString();
 }
 
+function diagnosticToken(value: string, fallback: string): string {
+  return /^[A-Za-z0-9_.-]{1,80}$/.test(value) ? value : fallback;
+}
+
+function diagnosticMime(value: string): string {
+  return /^[a-z0-9.+-]{1,40}\/[a-z0-9.+-]{1,60}$/.test(value)
+    ? value
+    : "invalid_mime";
+}
+
+function logRunDiagnostic(
+  event: "run.started" | "tool.started" | "tool.completed" | "run.completed" | "run.failed",
+  runId: string,
+  details: Record<string, unknown> = {},
+): void {
+  process.stdout.write(`${JSON.stringify({
+    ...details,
+    service: "finwealth-agent",
+    event,
+    runId: diagnosticToken(runId, "invalid_run_id"),
+  })}\n`);
+}
+
 function validTimestamp(value: string): boolean {
   return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) &&
     !Number.isNaN(Date.parse(value));
@@ -933,6 +956,11 @@ export class AgentService {
         runId,
         assistantMessageId,
       });
+      logRunDiagnostic("run.started", runId, {
+        attachmentCount: attachments.length,
+        attachmentTypes: [...new Set(attachments.map((item) => item.mimeType))]
+          .map(diagnosticMime),
+      });
       let eventQueue = Promise.resolve();
       const enqueue = (type: string, data: Record<string, unknown>): void => {
         eventQueue = eventQueue.then(() =>
@@ -946,9 +974,19 @@ export class AgentService {
         try {
           result = await this.engine.run(conversation, text, attachments, {
             onDelta: (delta) => enqueue("message.delta", { assistantMessageId, delta }),
-            onToolStarted: (name) => enqueue("tool.started", { runId, name }),
-            onToolCompleted: (name, isError) =>
-              enqueue("tool.completed", { runId, name, isError }),
+            onToolStarted: (name) => {
+              logRunDiagnostic("tool.started", runId, {
+                tool: diagnosticToken(name, "invalid_tool"),
+              });
+              enqueue("tool.started", { runId, name });
+            },
+            onToolCompleted: (name, isError) => {
+              logRunDiagnostic("tool.completed", runId, {
+                tool: diagnosticToken(name, "invalid_tool"),
+                isError,
+              });
+              enqueue("tool.completed", { runId, name, isError });
+            },
           });
         } finally {
           if (this.#activeRuns.get(conversation.id) === runId) {
@@ -979,6 +1017,7 @@ export class AgentService {
           runId,
           assistantMessageId,
         });
+        logRunDiagnostic("run.completed", runId);
       } catch (error) {
         await eventQueue;
         const code =
@@ -998,6 +1037,9 @@ export class AgentService {
           runId,
           assistantMessageId,
           code,
+        });
+        logRunDiagnostic("run.failed", runId, {
+          code: diagnosticToken(code, "agent_run_failed"),
         });
       }
     } finally {

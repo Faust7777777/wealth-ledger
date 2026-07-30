@@ -2771,7 +2771,11 @@ components:
           minItems: 1
           maxItems: 20
           items:
-            enum: [BTC, ETH, USDT]
+            type: string
+            minLength: 1
+            maxLength: 20
+            pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,19}$"
+            description: Crypto asset code observed in the user's source; normalized to uppercase by the server.
     EnsureCryptoInstrumentsResult:
       type: object
       required: [accountId, instruments, createdCount, updatedCount, reusedCount]

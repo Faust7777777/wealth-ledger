@@ -201,7 +201,7 @@ GET /v1/portfolio/allocation
 - 持仓调整输入目标 quantity，不由客户端计算最终余额。服务端在同一账本锁内读取旧 quantity、生成 pending adjustment，并在确认时做 optimistic check；确认前持仓不变。
 - 持仓快照一次接收同一账户的 1–100 个标的，所有变化项进入同一个 atomic group。重复标的、负数、未知标的、不受支持的计价币种或既有 pending adjustment 会使整次请求失败；数量未变化的项目只在 `skippedPositions` 报告。快照组元数据随 pending movement 持久化，刷新待审核列表后仍保留标题、目标账户和未变化项。整组确认或拒绝，不逐项落账。
 - 该入口用于导入或校准交易所/券商当前持仓，不伪造现金买入。成本未知时不生成成本基础；原始 quantity 始终保留，缺报价时不得按 0 估值。
-- `crypto-instruments/ensure` 只登记或复用内置支持的 BTC/ETH/USDT 标的元数据，并补齐账户的报价币种支持；它不创建持仓、余额、报价或 movement。Agent 在持仓快照遇到缺失标的时必须先调用该接口取得真实 `instrumentId`，随后仍只生成待审核快照。
+- `crypto-instruments/ensure` 登记或复用用户消息、附件或查询结果中实际出现的加密资产代码，并补齐账户的报价币种支持；服务端规范化代码并生成真实 `instrumentId`，不接受模型自造 ID。它不创建持仓、余额、报价或 movement。Agent 在持仓快照遇到缺失标的时必须先调用该接口，随后仍只生成待审核快照。内置 public provider 仍只为其明确支持的资产提供结构化行情；其他资产没有报价时保留原始数量并逐项报告缺报价。
 - 持仓估值允许使用最多三跳的 FX 路径，例如 `BTC quantity × BTC/USDT quote × USDT/USD × USD/CNY`；每一段必须来自已保存的有效 Quote/FXRate，结果质量取整条路径中最差状态。
 - `valuation-issues` 是估值问题的权威逐资产读模型，返回账户、资产、原始数量、状态和结构化 reason；不返回面向用户的解释文案。它与 overview 的 `quoteProblemCount` 使用相同估值路径，前端不得再用直连汇率自行推断多跳路径是否缺失。
 - 最新估值刷新可显式配置 `FINWEALTH_QUOTE_PROVIDER=public`：BTC/ETH/USDT 使用 CoinGecko，传统法币 FX 使用 Frankfurter/ECB；默认 `none` 不联网。`public` 不提供历史行情，历史价格仍只在 Yahoo provider 下可用。

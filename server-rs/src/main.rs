@@ -9930,8 +9930,23 @@ mod tests {
         )
         .await;
         assert_eq!(legacy_status, StatusCode::CREATED, "{legacy_body}");
+        let (unrelated_status, unrelated_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            json!({
+                "id": "inst_crypto_sol",
+                "type": "equity",
+                "symbol": "SOL",
+                "displayName": "Unrelated equity",
+                "quoteCurrency": "USD",
+                "market": "test"
+            }),
+        )
+        .await;
+        assert_eq!(unrelated_status, StatusCode::CREATED, "{unrelated_body}");
         let endpoint = format!("/v1/accounts/{account_id}/crypto-instruments/ensure");
-        let input = json!({"symbols": ["btc", "ETH", "ETH", "Tether"]});
+        let input = json!({"symbols": ["btc", "ETH", "ETH", "Tether", "sol", "1inch"]});
         let key = "ensure-crypto-replay";
         let (status, headers, body) = request_json_body_with_idempotency_from(
             router.clone(),
@@ -9943,12 +9958,12 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(headers.get("idempotency-replayed").is_none());
-        assert_eq!(body["data"]["createdCount"], 2);
+        assert_eq!(body["data"]["createdCount"], 4);
         assert_eq!(body["data"]["updatedCount"], 1);
         assert_eq!(body["data"]["reusedCount"], 0);
         assert_eq!(
             body["data"]["instruments"].as_array().map(Vec::len),
-            Some(3)
+            Some(5)
         );
         assert_eq!(
             body["data"]["instruments"]
@@ -9957,7 +9972,21 @@ mod tests {
                 .iter()
                 .map(|instrument| instrument["symbol"].as_str().expect("symbol"))
                 .collect::<Vec<_>>(),
-            vec!["BTC", "ETH", "USDT"]
+            vec!["BTC", "ETH", "USDT", "SOL", "1INCH"]
+        );
+        let sol = body["data"]["instruments"]
+            .as_array()
+            .expect("instruments")
+            .iter()
+            .find(|instrument| instrument["symbol"] == "SOL")
+            .expect("discovered SOL instrument");
+        assert_eq!(sol["displayName"], "SOL");
+        assert_eq!(sol["market"], "crypto");
+        assert_eq!(sol["sourceRef"], "finwealth_agent_discovered_crypto");
+        assert!(
+            sol["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("inst_crypto_sol_") && id != "inst_crypto_sol")
         );
 
         let (replay_status, replay_headers, replay_body) = request_json_body_with_idempotency_from(
@@ -9977,11 +10006,23 @@ mod tests {
         );
         assert_eq!(replay_body, body);
 
+        let (reuse_status, _, reuse_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({"symbols": ["SOL", "sol"]}),
+            Some("ensure-discovered-crypto-reuse"),
+        )
+        .await;
+        assert_eq!(reuse_status, StatusCode::OK, "{reuse_body}");
+        assert_eq!(reuse_body["data"]["createdCount"], 0);
+        assert_eq!(reuse_body["data"]["reusedCount"], 1);
+
         let (invalid_status, invalid_body) = request_json_body_from(
             router.clone(),
             Method::POST,
             &endpoint,
-            json!({"symbols": ["DOGE"]}),
+            json!({"symbols": ["SOL/USDT", "two words", ""]}),
         )
         .await;
         assert_eq!(invalid_status, StatusCode::BAD_REQUEST, "{invalid_body}");
@@ -9993,7 +10034,7 @@ mod tests {
         let document = local_ledger::read_document(&path).expect("ledger should remain readable");
         assert_eq!(document["holdings"], json!([]));
         assert_eq!(document["movements"], json!([]));
-        assert_eq!(document["instruments"].as_array().map(Vec::len), Some(3));
+        assert_eq!(document["instruments"].as_array().map(Vec::len), Some(6));
         assert_eq!(
             document["accounts"][0]["supportedCurrencies"],
             json!(["USDT", "BTC"])

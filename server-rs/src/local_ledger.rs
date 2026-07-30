@@ -3853,9 +3853,9 @@ pub fn create_instrument(
     })
 }
 
-/// Deterministically ensure the small built-in crypto registry needed by a
-/// holdings account.  This mutates metadata only: it never creates holdings,
-/// balances, quotes, or confirmed movements.
+/// Deterministically ensure crypto metadata needed by a holdings account.
+/// This mutates metadata only: it never creates holdings, balances, quotes,
+/// or confirmed movements.
 pub fn ensure_account_crypto_instruments(
     path: &Path,
     account_id: &str,
@@ -3863,7 +3863,7 @@ pub fn ensure_account_crypto_instruments(
     now: &str,
     idempotency: &IdempotencyRequest,
 ) -> Result<IdempotentResponse, LedgerError> {
-    let symbols = parse_supported_crypto_symbols(&input)?;
+    let symbols = parse_crypto_symbols(&input)?;
     idempotent_ledger_write(path, idempotency, 200, |document| {
         let account = active_account(document, account_id)
             .cloned()
@@ -3900,7 +3900,7 @@ pub fn ensure_account_crypto_instruments(
                 .expect("validated local ledger instruments should be an array");
             for symbol in &symbols {
                 if let Some(existing) = instruments.iter_mut().find(|instrument| {
-                    canonical_public_crypto_symbol_from_instrument(instrument)
+                    normalized_crypto_symbol_from_instrument(instrument).as_deref()
                         == Some(symbol.as_str())
                 }) {
                     let mut changed = false;
@@ -3950,10 +3950,14 @@ pub fn ensure_account_crypto_instruments(
                     "id": instrument_id,
                     "type": "crypto",
                     "symbol": symbol,
-                    "displayName": public_crypto_display_name(symbol),
+                    "displayName": crypto_display_name(symbol),
                     "quoteCurrency": preferred_quote_currency,
                     "market": "crypto",
-                    "sourceRef": "finwealth_builtin_crypto"
+                    "sourceRef": if is_builtin_public_crypto_symbol(symbol) {
+                        "finwealth_builtin_crypto"
+                    } else {
+                        "finwealth_agent_discovered_crypto"
+                    }
                 });
                 if !required_quote_currencies.contains(&preferred_quote_currency.to_string()) {
                     required_quote_currencies.push(preferred_quote_currency.to_string());
@@ -11007,30 +11011,63 @@ fn canonical_public_crypto_symbol(value: &str) -> Option<&'static str> {
     }
 }
 
-fn canonical_public_crypto_symbol_from_instrument(instrument: &Value) -> Option<&'static str> {
+fn crypto_display_name(symbol: &str) -> String {
+    match symbol {
+        "BTC" => "Bitcoin".to_string(),
+        "ETH" => "Ethereum".to_string(),
+        "USDT" => "Tether".to_string(),
+        _ => symbol.to_string(),
+    }
+}
+
+fn is_builtin_public_crypto_symbol(symbol: &str) -> bool {
+    matches!(symbol, "BTC" | "ETH" | "USDT")
+}
+
+fn normalize_discovered_crypto_symbol(value: &str) -> Option<String> {
+    if let Some(symbol) = canonical_public_crypto_symbol(value) {
+        return Some(symbol.to_string());
+    }
+    let symbol = value.trim().to_ascii_uppercase();
+    if symbol.is_empty() || symbol.len() > 20 {
+        return None;
+    }
+    let mut chars = symbol.chars();
+    if !chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric())
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return None;
+    }
+    Some(symbol)
+}
+
+fn normalized_crypto_symbol_from_instrument(instrument: &Value) -> Option<String> {
+    if instrument.get("type").and_then(Value::as_str) != Some("crypto") {
+        return None;
+    }
     instrument
         .get("symbol")
         .and_then(Value::as_str)
-        .and_then(|value| value.split(['-', '/', '_']).next())
-        .and_then(canonical_public_crypto_symbol)
+        .and_then(|value| {
+            let normalized = value.trim().to_ascii_uppercase();
+            for separator in ['/', '_', '-'] {
+                if let Some((base, quote)) = normalized.split_once(separator)
+                    && matches!(quote, "BTC" | "ETH" | "USDT" | "USD" | "CNY")
+                {
+                    return normalize_discovered_crypto_symbol(base);
+                }
+            }
+            normalize_discovered_crypto_symbol(&normalized)
+        })
         .or_else(|| {
             instrument
                 .get("displayName")
                 .and_then(Value::as_str)
-                .and_then(canonical_public_crypto_symbol)
+                .and_then(normalize_discovered_crypto_symbol)
         })
 }
 
-fn public_crypto_display_name(symbol: &str) -> &'static str {
-    match symbol {
-        "BTC" => "Bitcoin",
-        "ETH" => "Ethereum",
-        "USDT" => "Tether",
-        _ => unreachable!("validated public crypto symbol"),
-    }
-}
-
-fn parse_supported_crypto_symbols(input: &Value) -> Result<Vec<String>, LedgerError> {
+fn parse_crypto_symbols(input: &Value) -> Result<Vec<String>, LedgerError> {
     let Some(items) = input.get("symbols").and_then(Value::as_array) else {
         return Err(LedgerError::InvalidInput(vec![
             "symbols must be a non-empty array".to_string(),
@@ -11044,12 +11081,13 @@ fn parse_supported_crypto_symbols(input: &Value) -> Result<Vec<String>, LedgerEr
     let mut symbols = Vec::new();
     let mut errors = Vec::new();
     for item in items {
-        match item.as_str().and_then(canonical_public_crypto_symbol) {
-            Some(symbol) if !symbols.iter().any(|existing| existing == symbol) => {
-                symbols.push(symbol.to_string())
-            }
+        match item.as_str().and_then(normalize_discovered_crypto_symbol) {
+            Some(symbol) if !symbols.contains(&symbol) => symbols.push(symbol),
             Some(_) => {}
-            None => errors.push("symbols may only contain BTC, ETH, or USDT".to_string()),
+            None => errors.push(
+                "symbols must be 1-20 ASCII letters, digits, dots, underscores, or hyphens"
+                    .to_string(),
+            ),
         }
     }
     if errors.is_empty() {

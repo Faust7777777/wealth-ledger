@@ -85,9 +85,13 @@ try {
     -Uri "http://127.0.0.1:$ServerPort/v1/accounts/$($account.data.id)/crypto-instruments/ensure" `
     -Headers @{ "Idempotency-Key" = "smoke-crypto-instruments" } `
     -ContentType "application/json" `
-    -Body '{"symbols":["BTC","ETH","USDT"]}'
-  if ($ensured.data.createdCount -ne 3 -or $ensured.data.instruments.Count -ne 3) {
-    throw "Crypto instrument registration did not return three deterministic instruments."
+    -Body '{"symbols":["BTC","ETH","USDT","SOL"]}'
+  if ($ensured.data.createdCount -ne 4 -or $ensured.data.instruments.Count -ne 4) {
+    throw "Crypto instrument registration did not return four deterministic instruments."
+  }
+  $sol = $ensured.data.instruments | Where-Object { $_.symbol -eq "SOL" } | Select-Object -First 1
+  if (!$sol -or $sol.market -ne "crypto" -or $sol.sourceRef -ne "finwealth_agent_discovered_crypto") {
+    throw "Discovered crypto instrument metadata was not normalized by the server."
   }
   $holdingsBeforeSnapshot = Invoke-RestMethod `
     -Method Get `

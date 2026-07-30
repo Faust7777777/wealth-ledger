@@ -420,8 +420,8 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
       "把同一交易所或钱包账户的多项资产数量整理成一个待审核持仓快照。它只创建一个整体审核组，不会确认持仓、修改余额或写入报价。必须先查询真实账户和标的 ID。",
     promptSnippet: "把交易所、钱包文件或截图中的多资产数量整理为一个待审核持仓快照。",
     promptGuidelines: [
-      "先用 finwealth_query 分别读取 accounts、instruments 和 holdings，并确认每个资产对应的真实 instrumentId；不要把 BTC、ETH、USDT 代码当作 ID。",
-      "若 BTC、ETH 或 USDT 缺少标的，先调用 finwealth_ensure_crypto_instruments，再使用返回的真实 instrumentId。其他资产缺失时询问用户，不得虚构或自动登记。",
+      "先用 finwealth_query 分别读取 accounts、instruments 和 holdings，并确认每个资产对应的真实 instrumentId；不要把任何资产代码当作 ID。",
+      "若来源中实际出现的加密资产缺少标的，先调用 finwealth_ensure_crypto_instruments，再使用返回的真实 instrumentId；不得虚构来源中没有的资产。",
       "同一份快照的全部资产必须一次提交；不要为每个资产分别创建账务记录。",
       "targetQuantity 是当前总数量，不是本期增量；不得为负数。文件中不明确、无法可靠识别或不属于目标账户的资产应先询问用户。",
       "该工具只生成待审核组；不得随后调用确认、批准或报价采用接口。",
@@ -453,22 +453,23 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     name: "finwealth_ensure_crypto_instruments",
     label: "登记加密资产标的",
     description:
-      "为一个持仓账户登记或复用内置支持的 BTC、ETH、USDT 标的元数据，并返回真实 instrumentId。它不会创建或改变持仓数量、余额、报价和账务记录。仅在查询 instruments 后确认所需标的缺失时使用。",
-    promptSnippet: "在创建交易所或钱包持仓快照前，补齐 BTC、ETH、USDT 的真实标的 ID。",
+      "为一个持仓账户登记或复用来源中实际出现的加密资产标的元数据，并返回真实 instrumentId。它不会创建或改变持仓数量、余额、报价和账务记录。仅在查询 instruments 后确认所需标的缺失时使用。",
+    promptSnippet: "在创建交易所或钱包持仓快照前，补齐来源中加密资产的真实标的 ID。",
     promptGuidelines: [
       "调用前先用 finwealth_query 查询 accounts 和 instruments；已有标的必须直接复用。",
-      "该工具只允许 BTC、ETH、USDT，不能用于其他代码、股票、基金或任意文本 ticker。",
+      "symbols 只能来自用户消息、附件或查询结果中实际出现的加密资产代码；不得猜测、补全或登记股票、基金和法币。",
       "工具返回后使用其中的真实 instrumentId 创建待审核持仓快照；不得把 symbol 当作 ID。",
       "登记元数据不代表用户持有该资产，也不得据此生成非零数量。",
+      "新标的没有报价时仍保留原始数量；如需估值，另行生成待审核报价候选，不得自动采用。",
     ],
     parameters: Type.Object({
       accountId: Type.String({ minLength: 1 }),
       symbols: Type.Array(
-        Type.Union([
-          Type.Literal("BTC"),
-          Type.Literal("ETH"),
-          Type.Literal("USDT"),
-        ]),
+        Type.String({
+          minLength: 1,
+          maxLength: 20,
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,19}$",
+        }),
         { minItems: 1, maxItems: 20 },
       ),
     }),

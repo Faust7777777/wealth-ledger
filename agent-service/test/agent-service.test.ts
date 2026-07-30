@@ -627,8 +627,9 @@ test("Finwealth client reads data and submits a draft only to review", async () 
         instruments: [
           { id: "inst_btc", symbol: "BTC" },
           { id: "inst_eth", symbol: "ETH" },
+          { id: "inst_sol", symbol: "SOL" },
         ],
-        createdCount: 2,
+        createdCount: 3,
         updatedCount: 0,
         reusedCount: 0,
       };
@@ -655,7 +656,7 @@ test("Finwealth client reads data and submits a draft only to review", async () 
       title: "午餐",
       entries: [],
     });
-    await client.ensureCryptoInstruments("acct/okx", ["BTC", "ETH"]);
+    await client.ensureCryptoInstruments("acct/okx", ["BTC", "ETH", "SOL"]);
     await client.proposeHoldingSnapshot("acct/okx", {
       asOf: "2026-07-29T10:00:00Z",
       positions: [
@@ -687,7 +688,7 @@ test("Finwealth client reads data and submits a draft only to review", async () 
   assert.ok(requests.every((item) => !item.path?.includes("approve")));
   const ensure = requests.at(-2);
   assert.match(ensure?.key ?? "", /^agent-crypto-instruments-/);
-  assert.deepEqual(ensure?.body, { symbols: ["BTC", "ETH"] });
+  assert.deepEqual(ensure?.body, { symbols: ["BTC", "ETH", "SOL"] });
   const snapshot = requests.at(-1);
   assert.match(snapshot?.key ?? "", /^agent-holding-snapshot-/);
   assert.deepEqual(snapshot?.body, {
@@ -715,6 +716,7 @@ test("Finwealth tools expose bounded crypto registration before holding snapshot
   const ensure = tools.find((tool) => tool.name === "finwealth_ensure_crypto_instruments");
   assert.ok(ensure);
   assert.match(ensure.description, /不会创建或改变持仓数量/);
+  assert.match(ensure.description, /来源中实际出现/);
 });
 
 test("Finwealth client applies an approved quote with a stable candidate idempotency key", async () => {
