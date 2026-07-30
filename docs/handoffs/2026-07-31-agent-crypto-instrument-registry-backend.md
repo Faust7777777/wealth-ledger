@@ -34,3 +34,14 @@
 - Rust + Node 本地双进程 Agent smoke 通过。
 - `cargo fmt --check`、`git diff --check` 通过。
 
+## 生产部署
+
+- 集成提交 `6eb4375` 已部署到 VPS；Rust 与 Pi Agent systemd 服务均为 active。
+- 部署前账本备份：`/var/backups/finwealth/20260730-164158Z`。
+- 部署前 Agent 状态备份：`/var/backups/finwealth-agent/20260730-164158Z`。
+- 代码回滚目录：`/opt/finwealth/rollback-20260730-165130Z`，同时保存上一版 Rust 二进制与 Agent 程序目录。
+- 新 Rust 二进制先以生产环境文件独立执行配置校验，通过后才替换并重启服务。
+- Agent 安装时重新执行 31 条 Node 测试、TypeScript 构建和生产依赖审计；测试全过且审计无已知漏洞。
+- loopback 探针确认 `finwealth_ensure_crypto_instruments` 已进入实际运行的 Agent 构建，Agent 模型状态为 configured。
+- 对生产 OKX 账户登记 BTC、ETH、USDT 时三项均复用已有标的，未创建或修补标的；操作前后该账户 holding 条目数不变。
+- `check_vps_readiness.sh --public-base-url https://wuwaidut.com` 通过；未修改 Caddy、Cloudflare、`sub2api.wuwaidut.com` 或中转站配置。
