@@ -29,4 +29,13 @@
 
 - 本批只修改 Agent sidecar、测试、smoke 与后端契约说明，不修改 Flutter。
 - 非 crypto 的股票、基金持仓仍可走既有 App/Rust 真实 instrument ID 接口；本次 Pi 工具不自动登记或猜测非 crypto 标的，后续需要单独的匹配流程。
-- 待全量门禁、推送和部署后补充生产结果。
+
+## 生产部署
+
+- 集成提交 `1ca95e2` 已推送 `origin/feat/integration-self-use` 并部署到 VPS。
+- Agent 状态备份：`/var/backups/finwealth-agent/20260730-201948Z`。
+- 旧 sidecar 回滚目录：`/opt/finwealth/rollback-agent-20260730-202003Z`。
+- VPS 安装阶段重新执行 bubblewrap 边界 smoke、32 条 Agent 测试、TypeScript check/build 与生产依赖审计；审计为 0 个已知漏洞。
+- Rust/Agent 服务均为 active，公网 readiness 与 health 通过；生产 Grok 状态为 configured 且模型数量大于零。
+- 从生产已安装 JS 直接读取工具 schema，确认 position 必须包含 `symbol`，不存在 `instrumentId` 参数。
+- 部署后结构化日志中没有 run/tool error；未触发真实模型请求、未创建测试账户、标的、持仓或待审核项。
