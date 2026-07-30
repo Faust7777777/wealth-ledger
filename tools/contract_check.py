@@ -947,6 +947,15 @@ def check_yield_interest_slice(doc: dict) -> None:
     rust_text = RUST_SERVER.read_text(encoding="utf-8")
     if "local_ledger_yield_terms_accrue_and_confirm_interest_without_touching_principal" not in rust_text:
         fail("Yield-interest HTTP regression is missing")
+    agent_text = AGENT_FINWEALTH_CLIENT.read_text(encoding="utf-8")
+    for snippet in [
+        "finwealth_query_interest_positions",
+        "finwealth_propose_yield_interest",
+        "client.queryInterestPositions(",
+        "client.proposeYieldInterest(",
+    ]:
+        if snippet not in agent_text:
+            fail(f"Yield-interest Agent tool slice is incomplete: {snippet}")
 
     ok("Fixed-yield terms, accrual, and reviewed interest passed")
 
@@ -979,6 +988,17 @@ def check_loan_interest_slice(doc: dict) -> None:
     rust_text = RUST_SERVER.read_text(encoding="utf-8")
     if "local_ledger_loan_disbursement_and_repayment_preserve_accounting_identity" not in rust_text:
         fail("Loan-interest HTTP regression is missing")
+    agent_text = AGENT_FINWEALTH_CLIENT.read_text(encoding="utf-8")
+    for snippet in [
+        "finwealth_query_loan_schedule",
+        "finwealth_propose_loan_interest",
+        "finwealth_propose_loan_payment",
+        "client.getLoanRepaymentSchedule(",
+        "client.proposeLoanInterest(",
+        "client.proposeLoanPayment(",
+    ]:
+        if snippet not in agent_text:
+            fail(f"Loan-interest Agent tool slice is incomplete: {snippet}")
 
     ok("Loan terms, projected payment split, and reviewed interest passed")
 

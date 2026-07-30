@@ -121,6 +121,72 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
     );
   }
 
+  async queryInterestPositions(
+    kind: "yield" | "loan",
+    throughDate?: string,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const path = kind === "yield" ? "/v1/yield-positions" : "/v1/liability-positions";
+    const query = throughDate ? `?throughDate=${encodeURIComponent(throughDate)}` : "";
+    return this.#request("GET", `${path}${query}`, undefined, undefined, signal);
+  }
+
+  async getLoanRepaymentSchedule(
+    accountId: string,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    return this.#request(
+      "GET",
+      `/v1/accounts/${encodeURIComponent(accountId)}/repayment-schedule?limit=${limit}`,
+      undefined,
+      undefined,
+      signal,
+    );
+  }
+
+  async proposeYieldInterest(
+    holdingId: string,
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    return this.#request(
+      "POST",
+      `/v1/holdings/${encodeURIComponent(holdingId)}/interest-proposals`,
+      input,
+      `agent-yield-interest-${randomUUID()}`,
+      signal,
+    );
+  }
+
+  async proposeLoanInterest(
+    accountId: string,
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    return this.#request(
+      "POST",
+      `/v1/accounts/${encodeURIComponent(accountId)}/loan-interest-proposals`,
+      input,
+      `agent-loan-interest-${randomUUID()}`,
+      signal,
+    );
+  }
+
+  async proposeLoanPayment(
+    accountId: string,
+    input: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    return this.#request(
+      "POST",
+      `/v1/accounts/${encodeURIComponent(accountId)}/loan-payment-proposals`,
+      input,
+      `agent-loan-payment-${randomUUID()}`,
+      signal,
+    );
+  }
+
   async proposeMovement(
     input: Record<string, unknown>,
     signal?: AbortSignal,
@@ -739,6 +805,136 @@ export function createFinwealthTools(
     },
   });
 
+  const queryInterestPositions = defineTool({
+    name: "finwealth_query_interest_positions",
+    label: "查询利息与收益",
+    description:
+      "按指定日期读取服务端计算的固定收益或贷款应计结果。计算使用已配置的真实条款；不要由模型自行估算利息。",
+    promptSnippet: "查询固定收益和贷款在指定日期的应计利息。",
+    promptGuidelines: [
+      "先查询再提出利息记录；holdingId、accountId、币种、本金、利率和截止日均以返回值为准。",
+      "没有配置 yieldTerms 或 liabilityTerms 时说明缺少条款，不要猜测年利率或起息日。",
+      "查询不会生成记录，也不会改变余额。",
+    ],
+    parameters: Type.Object({
+      kind: Type.Union([Type.Literal("yield"), Type.Literal("loan")]),
+      throughDate: Type.Optional(Type.String({
+        pattern: "^\\d{4}-\\d{2}-\\d{2}$",
+        description: "本地 ISO 日期；省略时使用服务端当前日期",
+      })),
+    }),
+    async execute(_id, params, signal) {
+      const value = await client.queryInterestPositions(
+        params.kind,
+        params.throughDate,
+        signal,
+      );
+      return { content: [{ type: "text", text: toolText(value) }], details: {} };
+    },
+  });
+
+  const queryLoanSchedule = defineTool({
+    name: "finwealth_query_loan_schedule",
+    label: "查询还款计划",
+    description:
+      "读取贷款账户的服务端还款投影，包含每期利息、本金、未付利息、期末余额和到期气球款。",
+    promptSnippet: "查询贷款未来还款计划和利息拆分。",
+    promptGuidelines: [
+      "必须使用 finwealth_query 返回的真实负债 accountId。",
+      "投影只用于说明和生成待审核还款；不得声称未来还款已经发生。",
+    ],
+    parameters: Type.Object({
+      accountId: Type.String({ minLength: 1, maxLength: 128 }),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 360 })),
+    }),
+    async execute(_id, params, signal) {
+      const value = await client.getLoanRepaymentSchedule(
+        params.accountId,
+        params.limit ?? 24,
+        signal,
+      );
+      return { content: [{ type: "text", text: toolText(value) }], details: {} };
+    },
+  });
+
+  const proposeYieldInterest = defineTool({
+    name: "finwealth_propose_yield_interest",
+    label: "创建收益利息审核",
+    description:
+      "按持仓已配置的收益条款，把指定日期前的应计利息生成待审核组。确认前不增加收款账户余额。",
+    promptSnippet: "把固定收益产品的应计利息加入待审核。",
+    promptGuidelines: [
+      "先调用 finwealth_query_interest_positions，使用返回的真实 holdingId 和 accruedThrough。",
+      "不得自行填写本金、利率、计息方法或利息金额；Rust 会按已配置条款计算并固化依据。",
+      "只生成待审核组，不得调用确认或批准接口。",
+    ],
+    parameters: Type.Object({
+      holdingId: Type.String({ minLength: 1, maxLength: 128 }),
+      throughDate: Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" }),
+      note: Type.Optional(Type.String({ maxLength: 500 })),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      const { holdingId, ...input } = params;
+      const value = await client.proposeYieldInterest(holdingId, input, signal);
+      return { content: [{ type: "text", text: toolText(value) }], details: {} };
+    },
+  });
+
+  const proposeLoanInterest = defineTool({
+    name: "finwealth_propose_loan_interest",
+    label: "创建贷款利息审核",
+    description:
+      "按负债账户已配置的贷款条款，把指定日期前的应计利息生成待审核组。确认前不增加负债。",
+    promptSnippet: "把贷款应计利息加入待审核。",
+    promptGuidelines: [
+      "先调用 finwealth_query_interest_positions，使用真实 accountId 和 accruedThrough。",
+      "不得自行填写本金、年利率或利息金额；Rust 使用未偿本金和已配置条款计算。",
+      "只生成待审核组，不得调用确认或批准接口。",
+    ],
+    parameters: Type.Object({
+      accountId: Type.String({ minLength: 1, maxLength: 128 }),
+      throughDate: Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" }),
+      note: Type.Optional(Type.String({ maxLength: 500 })),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      const { accountId, ...input } = params;
+      const value = await client.proposeLoanInterest(accountId, input, signal);
+      return { content: [{ type: "text", text: toolText(value) }], details: {} };
+    },
+  });
+
+  const proposeLoanPayment = defineTool({
+    name: "finwealth_propose_loan_payment",
+    label: "创建贷款还款审核",
+    description:
+      "把付款日前的贷款利息与一次还款生成同一个待审核原子组。省略金额时使用已配置的计划还款额。",
+    promptSnippet: "把贷款利息与还款加入同一待审核组。",
+    promptGuidelines: [
+      "先查询贷款应计与还款计划；使用真实 accountId、paymentDate 和贷款币种。",
+      "amount 省略时由服务端使用计划金额；用户明确给出其他金额时才传 amount。",
+      "只生成待审核组；确认前不得声称现金或贷款余额已经改变。",
+    ],
+    parameters: Type.Object({
+      accountId: Type.String({ minLength: 1, maxLength: 128 }),
+      paymentDate: Type.String({ pattern: "^\\d{4}-\\d{2}-\\d{2}$" }),
+      amount: Type.Optional(Type.Object({
+        amount: Type.String({
+          pattern: "^(?!0(?:\\.0{1,8})?$)(?:0|[1-9][0-9]*)(?:\\.[0-9]{1,8})?$",
+        }),
+        currency: Type.String({ pattern: "^[A-Z0-9]{2,12}$" }),
+      })),
+      note: Type.Optional(Type.String({ maxLength: 500 })),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      const { accountId, ...input } = params;
+      const value = await client.proposeLoanPayment(accountId, input, signal);
+      return { content: [{ type: "text", text: toolText(value) }], details: {} };
+    },
+  });
+
   const proposeMovement = defineTool({
     name: "finwealth_propose_movement",
     label: "创建待审核记录",
@@ -951,6 +1147,11 @@ export function createFinwealthTools(
 
   return [
     query,
+    queryInterestPositions,
+    queryLoanSchedule,
+    proposeYieldInterest,
+    proposeLoanInterest,
+    proposeLoanPayment,
     ensureCryptoInstruments,
     proposeMovement,
     proposeHoldingSnapshot,

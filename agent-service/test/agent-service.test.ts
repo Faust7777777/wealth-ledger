@@ -1210,6 +1210,11 @@ test("Finwealth tools expose bounded crypto registration before holding snapshot
     tools.map((tool) => tool.name),
     [
       "finwealth_query",
+      "finwealth_query_interest_positions",
+      "finwealth_query_loan_schedule",
+      "finwealth_propose_yield_interest",
+      "finwealth_propose_loan_interest",
+      "finwealth_propose_loan_payment",
       "finwealth_ensure_crypto_instruments",
       "finwealth_propose_movement",
       "finwealth_propose_holding_snapshot",
@@ -1228,6 +1233,121 @@ test("Finwealth tools expose bounded crypto registration before holding snapshot
   );
   assert.ok(investmentSnapshot);
   assert.match(investmentSnapshot.description, /Rust.*真实 instrumentId/);
+});
+
+test("interest tools use server calculations and create review-only proposals", async () => {
+  const requests: Array<{
+    method: string | undefined;
+    path: string | undefined;
+    key: string | undefined;
+    body: unknown;
+  }> = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    requests.push({
+      method: request.method,
+      path: request.url,
+      key: typeof request.headers["idempotency-key"] === "string"
+        ? request.headers["idempotency-key"]
+        : undefined,
+      body: chunks.length
+        ? JSON.parse(Buffer.concat(chunks).toString("utf8"))
+        : undefined,
+    });
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      ok: true,
+      data: request.method === "GET"
+        ? []
+        : { id: "grp_interest", status: "pending" },
+    }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  try {
+    const client = new FinwealthClient(
+      `http://127.0.0.1:${address.port}`,
+      "sidecar-secret",
+    );
+    const tools = createFinwealthTools(client);
+    const byName = (name: string) => {
+      const tool = tools.find((item) => item.name === name);
+      assert.ok(tool, `missing tool ${name}`);
+      return tool;
+    };
+    await byName("finwealth_query_interest_positions").execute(
+      "yield-query",
+      { kind: "yield", throughDate: "2026-07-31" },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    await byName("finwealth_query_interest_positions").execute(
+      "loan-query",
+      { kind: "loan" },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    await byName("finwealth_query_loan_schedule").execute(
+      "schedule-query",
+      { accountId: "acct/loan", limit: 36 },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    await byName("finwealth_propose_yield_interest").execute(
+      "yield-proposal",
+      { holdingId: "hold/fund", throughDate: "2026-07-31", note: "July" },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    await byName("finwealth_propose_loan_interest").execute(
+      "loan-interest-proposal",
+      { accountId: "acct/loan", throughDate: "2026-07-31" },
+      undefined,
+      undefined,
+      {} as never,
+    );
+    await byName("finwealth_propose_loan_payment").execute(
+      "loan-payment-proposal",
+      {
+        accountId: "acct/loan",
+        paymentDate: "2026-08-01",
+        amount: { amount: "2500", currency: "CNY" },
+      },
+      undefined,
+      undefined,
+      {} as never,
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve()))
+    );
+  }
+  assert.deepEqual(requests.map((item) => `${item.method} ${item.path}`), [
+    "GET /v1/yield-positions?throughDate=2026-07-31",
+    "GET /v1/liability-positions",
+    "GET /v1/accounts/acct%2Floan/repayment-schedule?limit=36",
+    "POST /v1/holdings/hold%2Ffund/interest-proposals",
+    "POST /v1/accounts/acct%2Floan/loan-interest-proposals",
+    "POST /v1/accounts/acct%2Floan/loan-payment-proposals",
+  ]);
+  assert.deepEqual(requests.slice(3).map((item) => item.body), [
+    { throughDate: "2026-07-31", note: "July" },
+    { throughDate: "2026-07-31" },
+    {
+      paymentDate: "2026-08-01",
+      amount: { amount: "2500", currency: "CNY" },
+    },
+  ]);
+  assert.match(requests[3]?.key ?? "", /^agent-yield-interest-/);
+  assert.match(requests[4]?.key ?? "", /^agent-loan-interest-/);
+  assert.match(requests[5]?.key ?? "", /^agent-loan-payment-/);
+  assert.ok(requests.every((item) => !item.path?.includes("/confirm")));
 });
 
 test("crypto snapshot resolution fails closed before review when ensure omits a symbol", async () => {
