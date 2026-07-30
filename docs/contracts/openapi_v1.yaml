@@ -379,6 +379,27 @@ paths:
               schema:
                 $ref: "#/components/schemas/AiAtomicGroupResponse"
 
+  /accounts/{accountId}/crypto-instruments/ensure:
+    post:
+      tags: [Portfolio]
+      summary: Ensure deterministic built-in crypto instrument metadata for a holdings account.
+      parameters:
+        - $ref: "#/components/parameters/accountId"
+        - $ref: "#/components/parameters/idempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnsureCryptoInstrumentsRequest"
+      responses:
+        "200":
+          description: Existing or newly registered instruments; holdings and balances are unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnsureCryptoInstrumentsResponse"
+
   /portfolio/overview:
     get:
       tags: [Portfolio]
@@ -2741,6 +2762,43 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Instrument"
+    EnsureCryptoInstrumentsRequest:
+      type: object
+      required: [symbols]
+      properties:
+        symbols:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            enum: [BTC, ETH, USDT]
+    EnsureCryptoInstrumentsResult:
+      type: object
+      required: [accountId, instruments, createdCount, updatedCount, reusedCount]
+      properties:
+        accountId:
+          $ref: "#/components/schemas/ID"
+        instruments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Instrument"
+        createdCount:
+          type: integer
+          minimum: 0
+        updatedCount:
+          type: integer
+          minimum: 0
+        reusedCount:
+          type: integer
+          minimum: 0
+    EnsureCryptoInstrumentsResponse:
+      type: object
+      required: [ok, data]
+      properties:
+        ok:
+          const: true
+        data:
+          $ref: "#/components/schemas/EnsureCryptoInstrumentsResult"
     CreateInstrumentRequest:
       type: object
       required: [type, displayName, quoteCurrency]

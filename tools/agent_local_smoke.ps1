@@ -11,6 +11,11 @@ New-Item -ItemType Directory -Path $temp | Out-Null
 $server = $null
 $agent = $null
 $savedModelEnvironment = @{}
+$savedNoProxy = [Environment]::GetEnvironmentVariable("NO_PROXY", "Process")
+$env:NO_PROXY = @("127.0.0.1", "localhost", "::1", $savedNoProxy) `
+  | Where-Object { $_ } `
+  | Select-Object -Unique `
+  | Join-String -Separator ","
 $token = [Convert]::ToHexString(
   [Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
 ).ToLowerInvariant()
@@ -67,6 +72,28 @@ try {
   if ($null -eq $status) { throw "Agent status did not become ready." }
   if ($status.data.configured -ne $false) {
     throw "Empty Pi configuration must report configured=false."
+  }
+
+  $account = Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://127.0.0.1:$ServerPort/v1/accounts" `
+    -Headers @{ "Idempotency-Key" = "smoke-crypto-account" } `
+    -ContentType "application/json" `
+    -Body '{"displayName":"Smoke Exchange","accountType":"exchange","defaultCurrency":"USDT","supportedCurrencies":["USDT"],"includeInNetWorth":true,"balanceMode":"holdings","openingBalances":[]}'
+  $ensured = Invoke-RestMethod `
+    -Method Post `
+    -Uri "http://127.0.0.1:$ServerPort/v1/accounts/$($account.data.id)/crypto-instruments/ensure" `
+    -Headers @{ "Idempotency-Key" = "smoke-crypto-instruments" } `
+    -ContentType "application/json" `
+    -Body '{"symbols":["BTC","ETH","USDT"]}'
+  if ($ensured.data.createdCount -ne 3 -or $ensured.data.instruments.Count -ne 3) {
+    throw "Crypto instrument registration did not return three deterministic instruments."
+  }
+  $holdingsBeforeSnapshot = Invoke-RestMethod `
+    -Method Get `
+    -Uri "http://127.0.0.1:$ServerPort/v1/accounts/$($account.data.id)/holdings"
+  if ($holdingsBeforeSnapshot.data.Count -ne 0) {
+    throw "Crypto instrument registration unexpectedly created holdings."
   }
 
   $conversation = Invoke-RestMethod `
@@ -204,6 +231,11 @@ try {
   ) | ForEach-Object { Remove-Item "Env:$_" -ErrorAction SilentlyContinue }
   foreach ($entry in $savedModelEnvironment.GetEnumerator()) {
     Set-Item "Env:$($entry.Key)" $entry.Value
+  }
+  if ($null -eq $savedNoProxy) {
+    Remove-Item Env:NO_PROXY -ErrorAction SilentlyContinue
+  } else {
+    $env:NO_PROXY = $savedNoProxy
   }
   $resolvedTemp = [System.IO.Path]::GetFullPath($temp)
   if (

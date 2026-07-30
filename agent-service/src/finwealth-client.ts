@@ -105,6 +105,20 @@ export class FinwealthClient implements AgentQuoteWriter, AgentAutomationRunner 
     );
   }
 
+  async ensureCryptoInstruments(
+    accountId: string,
+    symbols: string[],
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    return this.#request(
+      "POST",
+      `/v1/accounts/${encodeURIComponent(accountId)}/crypto-instruments/ensure`,
+      { symbols },
+      `agent-crypto-instruments-${randomUUID()}`,
+      signal,
+    );
+  }
+
   async lookupStructuredQuotes(
     input: Record<string, unknown>,
     signal?: AbortSignal,
@@ -406,7 +420,8 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
       "把同一交易所或钱包账户的多项资产数量整理成一个待审核持仓快照。它只创建一个整体审核组，不会确认持仓、修改余额或写入报价。必须先查询真实账户和标的 ID。",
     promptSnippet: "把交易所、钱包文件或截图中的多资产数量整理为一个待审核持仓快照。",
     promptGuidelines: [
-      "先用 finwealth_query 分别读取 accounts 和 holdings，并确认每个资产对应的真实 instrumentId；不要把 BTC、ETH、USDT 代码当作 ID。",
+      "先用 finwealth_query 分别读取 accounts、instruments 和 holdings，并确认每个资产对应的真实 instrumentId；不要把 BTC、ETH、USDT 代码当作 ID。",
+      "若 BTC、ETH 或 USDT 缺少标的，先调用 finwealth_ensure_crypto_instruments，再使用返回的真实 instrumentId。其他资产缺失时询问用户，不得虚构或自动登记。",
       "同一份快照的全部资产必须一次提交；不要为每个资产分别创建账务记录。",
       "targetQuantity 是当前总数量，不是本期增量；不得为负数。文件中不明确、无法可靠识别或不属于目标账户的资产应先询问用户。",
       "该工具只生成待审核组；不得随后调用确认、批准或报价采用接口。",
@@ -434,5 +449,39 @@ export function createFinwealthTools(client: FinwealthClient): ToolDefinition[] 
     },
   });
 
-  return [query, proposeMovement, proposeHoldingSnapshot];
+  const ensureCryptoInstruments = defineTool({
+    name: "finwealth_ensure_crypto_instruments",
+    label: "登记加密资产标的",
+    description:
+      "为一个持仓账户登记或复用内置支持的 BTC、ETH、USDT 标的元数据，并返回真实 instrumentId。它不会创建或改变持仓数量、余额、报价和账务记录。仅在查询 instruments 后确认所需标的缺失时使用。",
+    promptSnippet: "在创建交易所或钱包持仓快照前，补齐 BTC、ETH、USDT 的真实标的 ID。",
+    promptGuidelines: [
+      "调用前先用 finwealth_query 查询 accounts 和 instruments；已有标的必须直接复用。",
+      "该工具只允许 BTC、ETH、USDT，不能用于其他代码、股票、基金或任意文本 ticker。",
+      "工具返回后使用其中的真实 instrumentId 创建待审核持仓快照；不得把 symbol 当作 ID。",
+      "登记元数据不代表用户持有该资产，也不得据此生成非零数量。",
+    ],
+    parameters: Type.Object({
+      accountId: Type.String({ minLength: 1 }),
+      symbols: Type.Array(
+        Type.Union([
+          Type.Literal("BTC"),
+          Type.Literal("ETH"),
+          Type.Literal("USDT"),
+        ]),
+        { minItems: 1, maxItems: 20 },
+      ),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      const value = await client.ensureCryptoInstruments(
+        params.accountId,
+        params.symbols,
+        signal,
+      );
+      return { content: [{ type: "text", text: toolText(value) }], details: {} };
+    },
+  });
+
+  return [query, ensureCryptoInstruments, proposeMovement, proposeHoldingSnapshot];
 }

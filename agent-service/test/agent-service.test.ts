@@ -9,6 +9,7 @@ import { AgentService } from "../src/agent-service.js";
 import { EventHub } from "../src/event-hub.js";
 import {
   FinwealthClient,
+  createFinwealthTools,
   normalizeMovementProposalForLedger,
   quoteCandidateInputsFromLookup,
 } from "../src/finwealth-client.js";
@@ -620,6 +621,17 @@ test("Finwealth client reads data and submits a draft only to review", async () 
       data = { id: "grp_agent_review", status: "pending" };
     } else if (request.url === "/v1/accounts/acct%2Fokx/holding-snapshot-proposals") {
       data = { id: "grp_holding_snapshot", status: "pending" };
+    } else if (request.url === "/v1/accounts/acct%2Fokx/crypto-instruments/ensure") {
+      data = {
+        accountId: "acct/okx",
+        instruments: [
+          { id: "inst_btc", symbol: "BTC" },
+          { id: "inst_eth", symbol: "ETH" },
+        ],
+        createdCount: 2,
+        updatedCount: 0,
+        reusedCount: 0,
+      };
     }
     response.writeHead(status, { "content-type": "application/json" });
     response.end(JSON.stringify({ ok: true, data }));
@@ -643,6 +655,7 @@ test("Finwealth client reads data and submits a draft only to review", async () 
       title: "午餐",
       entries: [],
     });
+    await client.ensureCryptoInstruments("acct/okx", ["BTC", "ETH"]);
     await client.proposeHoldingSnapshot("acct/okx", {
       asOf: "2026-07-29T10:00:00Z",
       positions: [
@@ -665,12 +678,16 @@ test("Finwealth client reads data and submits a draft only to review", async () 
       "POST /v1/quotes/lookup",
       "POST /v1/movements/drafts",
       "POST /v1/movements/mov_agent_draft/submit-review",
+      "POST /v1/accounts/acct%2Fokx/crypto-instruments/ensure",
       "POST /v1/accounts/acct%2Fokx/holding-snapshot-proposals",
     ],
   );
   assert.ok(requests.every((item) => item.token === "sidecar-secret"));
   assert.ok(requests.every((item) => !item.path?.includes("confirm")));
   assert.ok(requests.every((item) => !item.path?.includes("approve")));
+  const ensure = requests.at(-2);
+  assert.match(ensure?.key ?? "", /^agent-crypto-instruments-/);
+  assert.deepEqual(ensure?.body, { symbols: ["BTC", "ETH"] });
   const snapshot = requests.at(-1);
   assert.match(snapshot?.key ?? "", /^agent-holding-snapshot-/);
   assert.deepEqual(snapshot?.body, {
@@ -681,6 +698,23 @@ test("Finwealth client reads data and submits a draft only to review", async () 
     ],
     note: "OKX 持仓快照",
   });
+});
+
+test("Finwealth tools expose bounded crypto registration before holding snapshots", () => {
+  const client = new FinwealthClient("http://127.0.0.1:1", "sidecar-secret");
+  const tools = createFinwealthTools(client);
+  assert.deepEqual(
+    tools.map((tool) => tool.name),
+    [
+      "finwealth_query",
+      "finwealth_ensure_crypto_instruments",
+      "finwealth_propose_movement",
+      "finwealth_propose_holding_snapshot",
+    ],
+  );
+  const ensure = tools.find((tool) => tool.name === "finwealth_ensure_crypto_instruments");
+  assert.ok(ensure);
+  assert.match(ensure.description, /不会创建或改变持仓数量/);
 });
 
 test("Finwealth client applies an approved quote with a stable candidate idempotency key", async () => {

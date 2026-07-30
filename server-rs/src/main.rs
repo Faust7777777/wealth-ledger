@@ -96,12 +96,35 @@ impl AgentGateway {
     }
 
     fn new(base_url: Option<String>, internal_token: Option<String>) -> Self {
+        let base_url = base_url.map(|value| value.trim_end_matches('/').to_string());
+        let client_builder = reqwest::Client::builder();
+        let client_builder = if base_url.as_deref().is_some_and(endpoint_is_loopback) {
+            client_builder.no_proxy()
+        } else {
+            client_builder
+        };
         Self {
-            base_url: base_url.map(|value| value.trim_end_matches('/').to_string()),
+            base_url,
             internal_token,
-            client: reqwest::Client::new(),
+            client: client_builder
+                .build()
+                .expect("agent gateway HTTP client should initialize"),
         }
     }
+}
+
+fn endpoint_is_loopback(endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
 }
 
 impl AppState {
@@ -1319,6 +1342,10 @@ fn app_with_state(state: AppState) -> Router {
         .route(
             "/v1/accounts/{account_id}/holding-snapshot-proposals",
             post(create_holding_snapshot_proposal),
+        )
+        .route(
+            "/v1/accounts/{account_id}/crypto-instruments/ensure",
+            post(ensure_account_crypto_instruments),
         )
         .route("/v1/portfolio/overview", get(portfolio_overview))
         .route("/v1/portfolio/valuation-issues", get(valuation_issues))
@@ -3190,16 +3217,20 @@ async fn request_ai_structured_output(
     config: &AiProviderConfig,
     body: &Value,
 ) -> Result<Value, AiProviderFailure> {
-    let client = reqwest::Client::builder()
+    let client_builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(45))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent("finwealth/0.1 self-use AI organizer")
-        .build()
-        .map_err(|_| AiProviderFailure {
-            code: "ai_provider_client_failed",
-            message: "AI provider client could not be initialized.",
-            retryable: true,
-        })?;
+        .user_agent("finwealth/0.1 self-use AI organizer");
+    let client_builder = if endpoint_is_loopback(&config.endpoint) {
+        client_builder.no_proxy()
+    } else {
+        client_builder
+    };
+    let client = client_builder.build().map_err(|_| AiProviderFailure {
+        code: "ai_provider_client_failed",
+        message: "AI provider client could not be initialized.",
+        retryable: true,
+    })?;
     let mut response = client
         .post(&config.endpoint)
         .bearer_auth(&config.api_key)
@@ -4447,24 +4478,23 @@ fn public_latest_quote(
 
 fn public_coin_price(data: &Value, coin_id: &str, quote_currency: &str) -> Result<f64, String> {
     let direct_currency = quote_currency.to_ascii_lowercase();
-    let price = if public_coin_id_for_symbol(quote_currency) == Some(coin_id) {
+    let quote_coin_id = public_coin_id_for_symbol(quote_currency);
+    let price = if quote_coin_id == Some(coin_id) {
         Some(1.0)
-    } else if matches!(direct_currency.as_str(), "usd" | "cny") {
-        data.get(coin_id)
-            .and_then(|coin| coin.get(&direct_currency))
-            .and_then(Value::as_f64)
-    } else if direct_currency == "usdt" {
+    } else if let Some(quote_coin_id) = quote_coin_id {
         let asset_usd = data
             .get(coin_id)
             .and_then(|coin| coin.get("usd"))
             .and_then(Value::as_f64);
-        let tether_usd = data
-            .get("tether")
+        let quote_usd = data
+            .get(quote_coin_id)
             .and_then(|coin| coin.get("usd"))
             .and_then(Value::as_f64);
-        asset_usd
-            .zip(tether_usd)
-            .map(|(asset, tether)| asset / tether)
+        asset_usd.zip(quote_usd).map(|(asset, quote)| asset / quote)
+    } else if matches!(direct_currency.as_str(), "usd" | "cny") {
+        data.get(coin_id)
+            .and_then(|coin| coin.get(&direct_currency))
+            .and_then(Value::as_f64)
     } else {
         None
     }
@@ -5161,6 +5191,33 @@ async fn create_instrument(
     match local_ledger::create_instrument(path, input, &next_local_instrument_id(), &idempotency) {
         Ok(response) => idempotent_response(response),
         Err(error) => local_ledger_error(error, "invalid_instrument_input"),
+    }
+}
+
+async fn ensure_account_crypto_instruments(
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> Response {
+    let Some(path) = state.local_ledger_path.as_ref() else {
+        return not_implemented().await;
+    };
+    let now = current_timestamp();
+    let operation = format!("POST /v1/accounts/{account_id}/crypto-instruments/ensure");
+    let idempotency = match idempotency_request(&headers, &operation, &input, &now) {
+        Ok(request) => request,
+        Err(_) => return invalid_idempotency_key(),
+    };
+    match local_ledger::ensure_account_crypto_instruments(
+        path,
+        &account_id,
+        input,
+        &now,
+        &idempotency,
+    ) {
+        Ok(response) => idempotent_response(response),
+        Err(error) => local_ledger_error(error, "invalid_crypto_instrument_input"),
     }
 }
 
@@ -8636,6 +8693,10 @@ mod tests {
             (Method::POST, "/v1/accounts"),
             (Method::PATCH, "/v1/accounts/missing"),
             (Method::POST, "/v1/accounts/missing/archive"),
+            (
+                Method::POST,
+                "/v1/accounts/missing/crypto-instruments/ensure",
+            ),
             (Method::POST, "/v1/movements/drafts"),
             (Method::POST, "/v1/movements/missing/submit-review"),
             (Method::POST, "/v1/movements/corrections"),
@@ -9828,6 +9889,114 @@ mod tests {
                 .and_then(|movement| movement.get("status"))
                 .and_then(Value::as_str),
             Some("pending_review")
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn local_ledger_ensures_crypto_instruments_without_changing_holdings() {
+        let path = unique_test_ledger_path("ensure_crypto_instruments");
+        local_ledger::load_or_initialize(&path).expect("test ledger should initialize");
+        let router = app_with_state(AppState::local(path.clone()));
+
+        let (account_status, account_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/accounts",
+            json!({
+                "displayName": "Exchange",
+                "accountType": "exchange",
+                "defaultCurrency": "USDT",
+                "supportedCurrencies": ["USDT"],
+                "includeInNetWorth": true,
+                "balanceMode": "holdings",
+                "openingBalances": []
+            }),
+        )
+        .await;
+        assert_eq!(account_status, StatusCode::CREATED, "{account_body}");
+        let account_id = account_body["data"]["id"].as_str().expect("account id");
+        let (legacy_status, legacy_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            "/v1/instruments",
+            json!({
+                "id": "inst_legacy_btc",
+                "type": "crypto",
+                "displayName": "btc",
+                "quoteCurrency": "BTC"
+            }),
+        )
+        .await;
+        assert_eq!(legacy_status, StatusCode::CREATED, "{legacy_body}");
+        let endpoint = format!("/v1/accounts/{account_id}/crypto-instruments/ensure");
+        let input = json!({"symbols": ["btc", "ETH", "ETH", "Tether"]});
+        let key = "ensure-crypto-replay";
+        let (status, headers, body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            input.clone(),
+            Some(key),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(headers.get("idempotency-replayed").is_none());
+        assert_eq!(body["data"]["createdCount"], 2);
+        assert_eq!(body["data"]["updatedCount"], 1);
+        assert_eq!(body["data"]["reusedCount"], 0);
+        assert_eq!(
+            body["data"]["instruments"].as_array().map(Vec::len),
+            Some(3)
+        );
+        assert_eq!(
+            body["data"]["instruments"]
+                .as_array()
+                .expect("instruments")
+                .iter()
+                .map(|instrument| instrument["symbol"].as_str().expect("symbol"))
+                .collect::<Vec<_>>(),
+            vec!["BTC", "ETH", "USDT"]
+        );
+
+        let (replay_status, replay_headers, replay_body) = request_json_body_with_idempotency_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            input,
+            Some(key),
+        )
+        .await;
+        assert_eq!(replay_status, StatusCode::OK, "{replay_body}");
+        assert_eq!(
+            replay_headers
+                .get("idempotency-replayed")
+                .and_then(|value| value.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(replay_body, body);
+
+        let (invalid_status, invalid_body) = request_json_body_from(
+            router.clone(),
+            Method::POST,
+            &endpoint,
+            json!({"symbols": ["DOGE"]}),
+        )
+        .await;
+        assert_eq!(invalid_status, StatusCode::BAD_REQUEST, "{invalid_body}");
+        assert_eq!(
+            invalid_body["error"]["code"],
+            "invalid_crypto_instrument_input"
+        );
+
+        let document = local_ledger::read_document(&path).expect("ledger should remain readable");
+        assert_eq!(document["holdings"], json!([]));
+        assert_eq!(document["movements"], json!([]));
+        assert_eq!(document["instruments"].as_array().map(Vec::len), Some(3));
+        assert_eq!(
+            document["accounts"][0]["supportedCurrencies"],
+            json!(["USDT", "BTC"])
         );
 
         let _ = std::fs::remove_file(path);
@@ -12634,6 +12803,10 @@ mod tests {
 
     #[test]
     fn openai_responses_provider_configuration_is_explicit_and_tls_first() {
+        assert!(endpoint_is_loopback("http://127.0.0.1:9000/v1"));
+        assert!(endpoint_is_loopback("http://[::1]:9000/v1"));
+        assert!(endpoint_is_loopback("http://localhost:9000/v1"));
+        assert!(!endpoint_is_loopback("https://api.openai.com/v1"));
         assert!(
             ai_provider_config_from(None, None, None, None)
                 .expect("private default")
@@ -12731,6 +12904,21 @@ mod tests {
         assert!(public_fx_uses_coingecko(
             &json!({"baseCurrency": "BTC", "quoteCurrency": "CNY"})
         ));
+        let eth_btc = public_latest_quote(
+            &json!({
+                "instrumentId": "inst_eth_btc",
+                "symbol": "ETH",
+                "quoteCurrency": "BTC"
+            }),
+            Some(&prices),
+            now,
+        )
+        .expect("ETH/BTC should map through the shared USD reference");
+        let eth_btc_price = eth_btc["price"]
+            .as_str()
+            .and_then(|value| value.parse::<f64>().ok())
+            .expect("ETH/BTC decimal price");
+        assert!((eth_btc_price - (1800.0 / 64000.0)).abs() < 0.00000001);
 
         let fiat_rate = public_fiat_fx_rate_from_response(
             "USD",

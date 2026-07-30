@@ -3853,6 +3853,145 @@ pub fn create_instrument(
     })
 }
 
+/// Deterministically ensure the small built-in crypto registry needed by a
+/// holdings account.  This mutates metadata only: it never creates holdings,
+/// balances, quotes, or confirmed movements.
+pub fn ensure_account_crypto_instruments(
+    path: &Path,
+    account_id: &str,
+    input: Value,
+    now: &str,
+    idempotency: &IdempotencyRequest,
+) -> Result<IdempotentResponse, LedgerError> {
+    let symbols = parse_supported_crypto_symbols(&input)?;
+    idempotent_ledger_write(path, idempotency, 200, |document| {
+        let account = active_account(document, account_id)
+            .cloned()
+            .ok_or_else(|| {
+                LedgerError::NotFound(format!("account does not exist: {account_id}"))
+            })?;
+        if !matches!(
+            account.get("balanceMode").and_then(Value::as_str),
+            Some("holdings" | "mixed")
+        ) {
+            return Err(LedgerError::InvalidInput(vec![
+                "crypto instruments require a holdings or mixed account".to_string(),
+            ]));
+        }
+        let default_currency = account
+            .get("defaultCurrency")
+            .and_then(Value::as_str)
+            .unwrap_or(DEFAULT_BASE_CURRENCY);
+        let preferred_quote_currency =
+            if matches!(default_currency, "USD" | "CNY" | "USDT" | "BTC" | "ETH") {
+                default_currency
+            } else {
+                "USDT"
+            };
+
+        let mut created_count = 0_u64;
+        let mut updated_count = 0_u64;
+        let mut reused_count = 0_u64;
+        let mut ensured = Vec::new();
+        let mut required_quote_currencies = Vec::new();
+        {
+            let instruments = document["instruments"]
+                .as_array_mut()
+                .expect("validated local ledger instruments should be an array");
+            for symbol in &symbols {
+                if let Some(existing) = instruments.iter_mut().find(|instrument| {
+                    canonical_public_crypto_symbol_from_instrument(instrument)
+                        == Some(symbol.as_str())
+                }) {
+                    let mut changed = false;
+                    let missing_symbol = existing
+                        .get("symbol")
+                        .and_then(Value::as_str)
+                        .is_none_or(|value| value.trim().is_empty());
+                    if missing_symbol {
+                        existing["symbol"] = json!(symbol);
+                        changed = true;
+                    }
+                    if existing
+                        .get("market")
+                        .and_then(Value::as_str)
+                        .is_none_or(|value| value.trim().is_empty())
+                    {
+                        existing["market"] = json!("crypto");
+                        changed = true;
+                    }
+                    if changed {
+                        updated_count += 1;
+                    } else {
+                        reused_count += 1;
+                    }
+                    let quote_currency = existing
+                        .get("quoteCurrency")
+                        .and_then(Value::as_str)
+                        .expect("validated instrument quoteCurrency")
+                        .to_string();
+                    if !required_quote_currencies.contains(&quote_currency) {
+                        required_quote_currencies.push(quote_currency);
+                    }
+                    ensured.push(existing.clone());
+                    continue;
+                }
+
+                let base_id = format!("inst_crypto_{}", symbol.to_ascii_lowercase());
+                let mut instrument_id = base_id.clone();
+                let mut suffix = 2_u64;
+                while instruments.iter().any(|instrument| {
+                    instrument.get("id").and_then(Value::as_str) == Some(&instrument_id)
+                }) {
+                    instrument_id = format!("{base_id}_{suffix}");
+                    suffix += 1;
+                }
+                let instrument = json!({
+                    "id": instrument_id,
+                    "type": "crypto",
+                    "symbol": symbol,
+                    "displayName": public_crypto_display_name(symbol),
+                    "quoteCurrency": preferred_quote_currency,
+                    "market": "crypto",
+                    "sourceRef": "finwealth_builtin_crypto"
+                });
+                if !required_quote_currencies.contains(&preferred_quote_currency.to_string()) {
+                    required_quote_currencies.push(preferred_quote_currency.to_string());
+                }
+                instruments.push(instrument.clone());
+                ensured.push(instrument);
+                created_count += 1;
+            }
+        }
+
+        let account = document["accounts"]
+            .as_array_mut()
+            .expect("validated local ledger accounts should be an array")
+            .iter_mut()
+            .find(|account| account.get("id").and_then(Value::as_str) == Some(account_id))
+            .expect("active account should still exist");
+        let mut supported = account
+            .get("supportedCurrencies")
+            .and_then(string_array)
+            .unwrap_or_default();
+        for currency in required_quote_currencies {
+            if !supported.contains(&currency) {
+                supported.push(currency);
+            }
+        }
+        account["supportedCurrencies"] = json!(supported);
+        account["updatedAt"] = json!(now);
+
+        Ok(json!({
+            "accountId": account_id,
+            "instruments": ensured,
+            "createdCount": created_count,
+            "updatedCount": updated_count,
+            "reusedCount": reused_count
+        }))
+    })
+}
+
 pub fn update_instrument(
     path: &Path,
     instrument_id: &str,
@@ -10856,8 +10995,68 @@ fn infer_yahoo_symbol_from_id(instrument_id: &str) -> Option<String> {
 /// small deterministic set supported by the built-in public provider; never
 /// turn an arbitrary display name into an outbound ticker.
 fn infer_public_crypto_symbol(display_name: &str) -> Option<String> {
-    let symbol = display_name.trim().to_ascii_uppercase();
-    matches!(symbol.as_str(), "BTC" | "ETH" | "USDT").then_some(symbol)
+    canonical_public_crypto_symbol(display_name).map(str::to_string)
+}
+
+fn canonical_public_crypto_symbol(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "BTC" | "BITCOIN" => Some("BTC"),
+        "ETH" | "ETHEREUM" => Some("ETH"),
+        "USDT" | "TETHER" => Some("USDT"),
+        _ => None,
+    }
+}
+
+fn canonical_public_crypto_symbol_from_instrument(instrument: &Value) -> Option<&'static str> {
+    instrument
+        .get("symbol")
+        .and_then(Value::as_str)
+        .and_then(|value| value.split(['-', '/', '_']).next())
+        .and_then(canonical_public_crypto_symbol)
+        .or_else(|| {
+            instrument
+                .get("displayName")
+                .and_then(Value::as_str)
+                .and_then(canonical_public_crypto_symbol)
+        })
+}
+
+fn public_crypto_display_name(symbol: &str) -> &'static str {
+    match symbol {
+        "BTC" => "Bitcoin",
+        "ETH" => "Ethereum",
+        "USDT" => "Tether",
+        _ => unreachable!("validated public crypto symbol"),
+    }
+}
+
+fn parse_supported_crypto_symbols(input: &Value) -> Result<Vec<String>, LedgerError> {
+    let Some(items) = input.get("symbols").and_then(Value::as_array) else {
+        return Err(LedgerError::InvalidInput(vec![
+            "symbols must be a non-empty array".to_string(),
+        ]));
+    };
+    if items.is_empty() || items.len() > 20 {
+        return Err(LedgerError::InvalidInput(vec![
+            "symbols must contain between 1 and 20 items".to_string(),
+        ]));
+    }
+    let mut symbols = Vec::new();
+    let mut errors = Vec::new();
+    for item in items {
+        match item.as_str().and_then(canonical_public_crypto_symbol) {
+            Some(symbol) if !symbols.iter().any(|existing| existing == symbol) => {
+                symbols.push(symbol.to_string())
+            }
+            Some(_) => {}
+            None => errors.push("symbols may only contain BTC, ETH, or USDT".to_string()),
+        }
+    }
+    if errors.is_empty() {
+        Ok(symbols)
+    } else {
+        Err(LedgerError::InvalidInput(errors))
+    }
 }
 
 fn clean_identifier(value: &str) -> String {
